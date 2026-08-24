@@ -129,3 +129,9 @@ desktop.ini
 # Local agent + editor settings are per-developer, not team config.
 .claude/
 .vscode/
+
+# ---------------------------------------------------------------------------
+# Internal specs, migration runbooks and onboarding notes. Kept local only --
+# not published to the team repo. Remove this line to start sharing them.
+# ---------------------------------------------------------------------------
+docs/

@@ -10,7 +10,7 @@ app + Salesforce.
 
 ## Region
 All resources live in **`ap-south-1`** (migrated from `eu-north-1` on
-2026-08-01 — see [docs/MIGRATION_ap-south-1.md](docs/MIGRATION_ap-south-1.md)).
+2026-08-01; the migration runbook is kept internal).
 Scripts pin the region explicitly via `cloud/scripts/aws.sh` so a different
 local `aws configure` default cannot send resources elsewhere.
 
@@ -34,7 +34,6 @@ AI_voice/
 │   ├── app3M_fat9M_16MB.csv      # Vendored partition table
 │   └── sdkconfig.*               # IDF config snapshots
 ├── app/                          # React Native (Expo) mobile app — own git repo
-├── docs/                         # Specs, migration runbooks, onboarding
 ├── _archive/                     # Retired code + build caches (see below)
 ├── .env.example                  # Config template (copy to .env at this root)
 └── .gitignore

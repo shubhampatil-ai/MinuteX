@@ -1,0 +1,28 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+group = 'expo.modules.audiofocus'
+version = '1.0.0'
+
+android {
+  namespace 'expo.modules.audiofocus'
+  compileSdk rootProject.ext.has('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 35
+
+  defaultConfig {
+    minSdk rootProject.ext.has('minSdkVersion') ? rootProject.ext.minSdkVersion : 24
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+
+  kotlinOptions {
+    jvmTarget = '17'
+  }
+}
+
+dependencies {
+  implementation project(':expo-modules-core')
+  implementation "org.jetbrains.kotlin:kotlin-stdlib:${rootProject.ext.has('kotlinVersion') ? rootProject.ext.kotlinVersion : '2.0.21'}"
+}

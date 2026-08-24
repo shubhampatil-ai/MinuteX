@@ -1,0 +1,131 @@
+# ============================================================================
+# AI_voice / MinuteX — monorepo ignore rules
+#
+# Layout:  app/ (Expo RN)  ·  cloud/ (AWS Lambdas)  ·  device/ (ESP32 firmware)
+#
+# Rule of thumb: commit SOURCE and LOCKFILES, ignore anything a build or a
+# package manager can regenerate, and never commit a real credential.
+# ============================================================================
+
+
+# ---------------------------------------------------------------------------
+# Secrets — NEVER commit these
+# ---------------------------------------------------------------------------
+# The real backend config (ElevenLabs, Groq, Salesforce, AWS keys).
+# Teammates copy .env.example -> .env and fill in their own values.
+.env
+.env.local
+.env.*.local
+
+# Pre-migration env snapshots — these held live secrets.
+.env.bak-*
+
+# Backup of the previous ElevenLabs API key, written by
+# cloud/scripts/29_rotate_elevenlabs_key.sh for one-command rollback.
+.keybackup/
+
+# Mobile signing material + service credentials. Leaking any of these means
+# someone else can ship a build as you.
+*.jks
+*.keystore
+*.p8
+*.p12
+*.pem
+*.key
+*.mobileprovision
+**/google-services.json
+**/GoogleService-Info.plist
+
+
+# ---------------------------------------------------------------------------
+# app/ — Expo / React Native
+# ---------------------------------------------------------------------------
+# Reinstalled with `npm install` (package-lock.json IS committed).
+node_modules/
+
+# Expo local state: dev-server cache, paired devices, generated types.
+.expo/
+expo-env.d.ts
+
+# Build output.
+dist/
+web-build/
+*.tsbuildinfo
+
+# Native projects. This app is managed/prebuild — android/ and ios/ are
+# GENERATED from app.json + plugins/, so committing them causes drift.
+# Delete these two lines only if you deliberately switch to bare workflow.
+/app/android/
+/app/ios/
+
+# Leftover Expo module template. Not part of the app; it is the sole source
+# of ~30 phantom `tsc --noEmit` errors, so keep it out of the repo.
+/app/example/
+
+# Native module build scratch (Kotlin/Gradle). The Gradle lock + cache files
+# under .gradle/ were previously tracked and dirtied every teammate's build.
+.gradle/
+.kotlin/
+**/android/build/
+**/android/.cxx/
+*.orig.*
+
+# Metro / Haste caches.
+.metro-health-check*
+.metro-cache/
+
+
+# ---------------------------------------------------------------------------
+# cloud/ — Python Lambdas
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Deployment artifacts. Rebuilt by cloud/scripts/_package_lambda.py, which
+# vendors cloud/shared/*.py flat into each zip.
+function.zip
+
+# Generated transcripts / audio pulled down while debugging.
+# NOTE: cloud/tests/sample.wav is a committed fixture — see exception below.
+*.wav
+!cloud/tests/sample.wav
+transcripts/
+*_transcript.txt
+*_transcript.json
+
+
+# ---------------------------------------------------------------------------
+# device/ — ESP32-S3 firmware (PlatformIO)
+# ---------------------------------------------------------------------------
+# Build output and the ~440 MB ESP-IDF component cache. Regenerable, but the
+# first rebuild costs 20-45 min (see the header in device/platformio.ini).
+.pio/
+device/.pio/
+device/managed_components/
+*.bin
+*.elf
+
+
+# ---------------------------------------------------------------------------
+# Retired code + build caches (~585 MB), kept on disk for reference only.
+# Remove this line if you want the archived sources in the repo.
+# ---------------------------------------------------------------------------
+_archive/
+
+
+# ---------------------------------------------------------------------------
+# Editor / OS cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+
+# Local agent + editor settings are per-developer, not team config.
+.claude/
+.vscode/

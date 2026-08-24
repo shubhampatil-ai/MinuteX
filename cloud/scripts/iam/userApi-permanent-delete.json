@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PermanentDeleteAudioAndTranscript",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": [
+        "arn:aws:s3:::meeting-recorder-shubham-aps1/recordings/*",
+        "arn:aws:s3:::meeting-recorder-shubham-aps1/transcripts/*"
+      ]
+    },
+    {
+      "Sid": "PermanentDeleteRecordingRow",
+      "Effect": "Allow",
+      "Action": "dynamodb:DeleteItem",
+      "Resource": "arn:aws:dynamodb:ap-south-1:624734879550:table/Recordings"
+    }
+  ]
+}

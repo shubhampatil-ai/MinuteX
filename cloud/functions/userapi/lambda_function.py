@@ -1,0 +1,8161 @@
+"""userApi — read-side API for the AI_recorder app.
+
+A logged-in user fetches the recordings belonging to the device(s) they own.
+There was no user/account concept before this; this Lambda introduces one.
+
+Routes (HTTP API, payload format v2.0):
+  POST   /signup               {email, password, name?}   -> {token, user_id, email, name}
+  POST   /login                {email, password}          -> {token, user_id, email}
+  GET    /me                   (JWT)                       -> {user:{...}}
+  PATCH  /me                   {name?, avatar_url?} (JWT)  -> {user:{...}}
+  POST   /me/password          {current_password, new_password} (JWT) -> {changed}
+  POST   /devices/pair-request {device_id}       (JWT)    -> {pairing_code, expires_in}
+  POST   /devices/pair         {device_id, pairing_code} (JWT) -> {device:{...}}
+  POST   /devices/claim        {apiKey}          (JWT)    -> {device_id, claimed}   (LEGACY)
+  GET    /devices              (JWT)                       -> {devices:[device_id,...], details:[{...}]}
+  GET    /devices/{device_id}  (JWT)                       -> {device:{...}}
+  PATCH  /devices/{device_id}  {name}              (JWT)    -> {device:{...}}
+  DELETE /devices/{device_id}  (JWT)                       -> {device_id, unpaired}
+  POST   /devices/{device_id}/factory-reset (JWT)          -> {device_id, reset}
+  GET    /recordings           (JWT)                       -> {recordings:[summary,...]}
+  GET    /recordings/{key}     (JWT)                       -> {recording:{...full..., audio_url}}
+  DELETE /recordings/{key}     (JWT)  SOFT -> {trashed, key, deleted_at}
+  POST   /recordings/restore/{key}   (JWT)  -> {restored, key, status}
+  DELETE /recordings/permanent/{key} (JWT)  -> {deleted, key}
+  GET    /trash                (JWT)        -> {recordings:[...], count}
+  POST   /recordings/upload-request  {source, format?, title?, duration?,
+                                      size?, folder_id?} (JWT)
+                                  -> {upload_url, key, recording_id, expires_in,
+                                      content_type, folder_id}
+         folder_id files the recording at PRESIGN time, so a recording started
+         from inside a folder is never briefly unfiled.
+  POST   /recordings/upload-complete {key, duration?} (JWT) -> {key, status}
+
+  AI Meeting Workspace (JWT) — on-demand generation, see the section at the
+  bottom of this file. NOTE the path shape: the action is a literal prefix and
+  the recording key comes LAST, because API Gateway only allows a greedy {key+}
+  in the final position (a "/recordings/{key+}/chat" route is rejected outright
+  — see the _ROUTES comment).
+  GET    /recordings/ai/documents/{key+}                     -> {documents, available}
+  POST   /recordings/ai/documents/{key+}  {type, regenerate?} -> {document, cached}
+  PATCH  /recordings/ai/documents/{key+}  {type, content?, label?} -> {document}
+  DELETE /recordings/ai/documents/{key+}  {type}              -> {deleted, type}
+  POST   /recordings/ai/custom-document/{key+} {prompt}       -> {document}
+  POST   /recordings/ai/update-documents/{key+} {}            -> {updated, remaining}
+  POST   /recordings/ai/reprocess/{key+}  {}                  -> 202 {status, started_at}
+  POST   /recordings/ai/quick/{key+}      {action, regenerate?} -> {document, cached}
+  POST   /recordings/ai/highlights/{key+} {regenerate?}      -> {meeting_highlights}
+  GET    /recordings/ai/chat/{key+}                          -> {chat_history, suggestions}
+  POST   /recordings/ai/chat/{key+}       {message, history?} -> {reply, chat_history}
+  DELETE /recordings/ai/chat/{key+}                          -> {cleared}
+  GET    /recordings/ai/tasks/{key+}                         -> {tasks}
+  POST   /recordings/ai/tasks/{key+}      {task, ...}         -> {task}
+  PATCH  /recordings/ai/tasks/{key+}      {id, ...}           -> {task}
+  DELETE /recordings/ai/tasks/{key+}      {id}                -> {deleted, id}
+
+  CRM — Salesforce connect + configuration (see the CRM sections below).
+  GET    /crm/salesforce/connect                    (JWT)    -> {authorize_url}
+  GET    /crm/salesforce/callback  ?code&state    (NO JWT — Salesforce redirect) -> 302
+  GET    /crm/salesforce/status                     (JWT)    -> {connected, ...}
+  DELETE /crm/salesforce                             (JWT)    -> {disconnected}
+  GET    /crm/salesforce/objects                    (JWT)    -> {objects, suggested}
+  GET    /crm/salesforce/fields/{object_name}       (JWT)    -> {number_fields, ...}
+  GET    /crm/salesforce/config                     (JWT)    -> {config}
+  PUT    /crm/salesforce/config     {mappings:[...]}  (JWT)   -> {config}
+  POST   /crm/salesforce/lookup     {object, lookup_value} (JWT)
+                              -> {status: found|not_found|ambiguous, ...}
+  POST   /crm/salesforce/sync/{key+} {object}         (JWT)   -> {crm_record}
+
+  Every /crm route that TALKS to Salesforce (objects, fields, config PUT,
+  lookup, sync) answers 409 {"code": "salesforce_reconnect_required"} when the
+  stored Salesforce refresh token is dead. That is NOT 401 on purpose: 401 from
+  this API means the MinuteX JWT itself is bad, and the app reacts by clearing
+  the session and sending the user to /login. See SF_RECONNECT_STATUS.
+
+Recording sources (one AI pipeline, three ways in — see README):
+  - Every recording carries a `source` attribute: DEVICE | MOBILE | UPLOAD.
+    DEVICE rows keep their device_id; MOBILE/UPLOAD rows have no device.
+  - MOBILE (in-app phone recording) and UPLOAD (imported audio file) get
+    their presigned PUT from /recordings/upload-request here — the caller is
+    a logged-in user, so user_id comes from the JWT, never the request. The
+    DEVICE presign stays on the device-facing getUploadUrl Lambda (x-api-key
+    auth) — different authentication, same S3 bucket, same pipeline after.
+  - S3 layout (the {device_id} slot is a reserved literal for non-device
+    sources, so one parser serves all three):
+        DEVICE  recordings/{user_id}/{device_id}/{recording_id}.wav
+        MOBILE  recordings/{user_id}/mobile/{recording_id}.{ext}
+        UPLOAD  recordings/{user_id}/uploads/{recording_id}.{ext}
+  - After the PUT, the S3 ObjectCreated trigger runs the ONE transcription /
+    AI pipeline regardless of source. No per-source processing exists.
+  - Status lifecycle (the Recordings 'status' attribute):
+        uploading -> uploaded -> transcribing -> generating_ai
+        -> complete | transcribed (legacy: AI step failed) | failed
+
+Identity model (user-owned architecture):
+  - Users table:        PK user_id (uuid). GSI email-index on email (login).
+                        Attrs: user_id, email, password_hash, salt, created_at.
+  - Devices table:      PK device_id. THE source of truth for device ownership.
+                        Attrs: device_id, status (UNPAIRED|PAIRING|PAIRED),
+                        paired_user_id (absent unless PAIRED), paired_at,
+                        last_seen, firmware_version, serial_number, plus the
+                        transient pairing_code_hash / pairing_expires_at /
+                        pairing_user_id while status == PAIRING.
+                        GSI paired-user-index (paired_user_id HASH) lists a
+                        user's devices without a scan.
+  - DeviceKeys table:   PK apiKey -> deviceId. Device AUTHENTICATION only
+                        (the fixed firmware contract) — never ownership.
+  - UserDevices table:  PK user_id, SK device_id. LEGACY claim link, kept so
+                        recordings uploaded before user-ownership (rows with
+                        no user_id) stay visible. New code writes it only as
+                        a compatibility mirror of a successful pair/claim.
+  - Pairing: a user requests a 6-digit code for a device_id
+    (/devices/pair-request, code stored hashed with a 5-minute expiry,
+    status -> PAIRING), then confirms it (/devices/pair). Firmware
+    confirmation is MOCKED behind FirmwareVerifier — replace that class when
+    the real device round-trip exists. One device belongs to at most ONE
+    user: enforced with DynamoDB conditional writes (409 on conflict).
+  - Recordings: new uploads carry user_id (stamped by getUploadUrl at
+    presign time) and are queried via the Recordings 'user-index' GSI
+    (user_id HASH, created_at RANGE). Legacy rows without user_id are still
+    reached through the 'device-index' GSI (device_id HASH, created_at
+    RANGE) for devices the caller owns. Unpairing stamps the departing
+    owner's user_id onto the device's legacy rows so their history survives
+    (and the next owner never sees it), then removes only the ownership
+    link — recordings, AI data and the device row are never deleted.
+
+AI Meeting Workspace:
+  - The transcript stays the source of truth, but it is no longer the primary
+    view: after processing, the app lands on a workspace of AI output
+    (executive summary -> highlights -> documents -> Quick AI -> chat), with
+    the transcript beneath it as reference.
+  - Staged output (summary, meeting_highlights) is produced by the
+    S3-triggered transcribeRecording Lambda. On-demand output (documents,
+    Quick AI, chat) is produced HERE, because it needs the caller's JWT.
+  - Both halves import the SAME lambda-shared modules — groq_client (one
+    client, one retry policy, one TPM budget), prompts (every template) and
+    ai_schema (strict coercion). There is no second Groq integration, and no
+    prompt text lives in this file. Adding a document type is one entry in
+    prompts.DOCUMENTS.
+  - Generated documents are cached on the recording row under a fingerprint of
+    the transcript they came from, so an unchanged transcript never pays for
+    the same document twice. See the AI section at the bottom.
+
+Zero external dependencies (matches the other Lambdas):
+  - Groq is called over stdlib urllib (see lambda-shared/groq_client.py).
+  - Passwords hashed with hashlib.scrypt (stdlib).
+  - JWT is HS256 signed with hmac + hashlib (stdlib). Signing secret from
+    Secrets Manager (JWT_SECRET_ARN) with an env fallback (JWT_SECRET) for MVP.
+  - boto3 is bundled in the Lambda Python runtime.
+
+Nothing here moves audio bytes — S3 object traffic always goes browser/app
+<-> S3 via presigned URLs (a presigned url is a local signing operation, not
+a request to AWS; this Lambda never issues a GetObject/PutObject call
+itself). The only Recordings writes are the upload-request ownership stub
+and the upload-complete status flip — mirroring exactly what getUploadUrl
+does for DEVICE recordings, so the pipeline downstream of S3 cannot tell
+the sources apart. (The Lambda role therefore needs s3:PutObject on
+recordings/* for the presigned PUT to be honored — see
+scripts/18_wire_upload_routes.sh.)
+"""
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+
+import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
+
+# The shared AI core — the SAME modules transcribeRecording uses. Vendored flat
+# into this function's zip (see scripts/21_deploy_ai_workspace.sh).
+import ai_schema
+import groq_client
+import prompts
+import stt_result
+import transcript_store
+
+REGION = os.environ.get("AWS_REGION")
+USERS_TABLE = os.environ.get("USERS_TABLE", "Users")
+USER_DEVICES_TABLE = os.environ.get("USER_DEVICES_TABLE", "UserDevices")
+DEVICE_KEYS_TABLE = os.environ.get("DEVICE_KEYS_TABLE", "DeviceKeys")
+DEVICES_TABLE = os.environ.get("DEVICES_TABLE", "Devices")
+RECORDINGS_TABLE = os.environ.get("RECORDINGS_TABLE", "Recordings")
+CRM_CONNECTIONS_TABLE = os.environ.get("CRM_CONNECTIONS_TABLE", "CrmConnections")
+CONTACTS_TABLE = os.environ.get("CONTACTS_TABLE", "Contacts")
+FOLDERS_TABLE = os.environ.get("FOLDERS_TABLE", "Folders")
+FOLDER_CONTACTS_TABLE = os.environ.get("FOLDER_CONTACTS_TABLE", "FolderContacts")
+MEETING_PARTICIPANTS_TABLE = os.environ.get("MEETING_PARTICIPANTS_TABLE",
+                                            "MeetingParticipants")
+TASKS_TABLE = os.environ.get("TASKS_TABLE", "Tasks")
+DEVICE_INDEX = os.environ.get("DEVICE_INDEX", "device-index")
+USER_INDEX = os.environ.get("USER_INDEX", "user-index")
+PAIRED_USER_INDEX = os.environ.get("PAIRED_USER_INDEX", "paired-user-index")
+EMAIL_INDEX = os.environ.get("EMAIL_INDEX", "email-index")
+# Indexes on the organization-layer tables (see
+# scripts/31_create_workspace_tables.sh for the full key schema of each).
+CONTACTS_OWNER_INDEX = os.environ.get("CONTACTS_OWNER_INDEX", "owner-index")
+CONTACTS_EMAIL_INDEX = os.environ.get("CONTACTS_EMAIL_INDEX", "owner-email-index")
+CONTACTS_PHONE_INDEX = os.environ.get("CONTACTS_PHONE_INDEX", "owner-phone-index")
+FOLDERS_OWNER_INDEX = os.environ.get("FOLDERS_OWNER_INDEX", "owner-index")
+FOLDER_CONTACTS_CONTACT_INDEX = os.environ.get("FOLDER_CONTACTS_CONTACT_INDEX",
+                                               "contact-index")
+PARTICIPANTS_CONTACT_INDEX = os.environ.get("PARTICIPANTS_CONTACT_INDEX",
+                                            "contact-index")
+TASKS_OWNER_INDEX = os.environ.get("TASKS_OWNER_INDEX", "owner-index")
+TASKS_MEETING_INDEX = os.environ.get("TASKS_MEETING_INDEX", "meeting-index")
+TASKS_FOLDER_INDEX = os.environ.get("TASKS_FOLDER_INDEX", "folder-index")
+TASKS_ASSIGNEE_INDEX = os.environ.get("TASKS_ASSIGNEE_INDEX", "assignee-index")
+TASKS_DEDUPE_INDEX = os.environ.get("TASKS_DEDUPE_INDEX", "dedupe-index")
+JWT_TTL = int(os.environ.get("JWT_TTL", "86400"))  # seconds (default 24h)
+PAIRING_CODE_TTL = int(os.environ.get("PAIRING_CODE_TTL", "300"))  # seconds
+BUCKET_NAME = os.environ.get("BUCKET_NAME")
+AUDIO_URL_EXPIRY = int(os.environ.get("AUDIO_URL_EXPIRY", "3600"))  # seconds
+
+# --- Salesforce Connected App (web-server OAuth flow) ---
+SALESFORCE_LOGIN_URL = os.environ.get("SALESFORCE_LOGIN_URL", "https://login.salesforce.com")
+SALESFORCE_CLIENT_ID = os.environ.get("SALESFORCE_CLIENT_ID", "")
+SALESFORCE_REDIRECT_URI = os.environ.get("SALESFORCE_REDIRECT_URI", "")
+SALESFORCE_CLIENT_SECRET_ARN = os.environ.get("SALESFORCE_CLIENT_SECRET_ARN", "")
+SALESFORCE_KMS_KEY_ID = os.environ.get("SALESFORCE_KMS_KEY_ID", "")
+SALESFORCE_STATE_TTL = int(os.environ.get("SALESFORCE_STATE_TTL", "600"))  # seconds
+# REST API version used for every data/metadata call. Pinned, not "latest":
+# Salesforce keeps old versions working for years, and a floating version
+# would let an org's upgrade silently change describe output under us.
+SALESFORCE_API_VERSION = os.environ.get("SALESFORCE_API_VERSION", "v62.0")
+# Where the callback redirects the browser once the exchange is done — a deep
+# link back into the app, e.g. "minutex://crm/salesforce/connected".
+SALESFORCE_RETURN_URL = os.environ.get("SALESFORCE_RETURN_URL", "")
+
+# Wall-clock ceiling for one on-demand AI generation. Unlike the S3-triggered
+# pipeline (which can spend 300s because nobody is waiting), these routes answer
+# a user staring at a spinner behind API Gateway's 30s integration timeout, so
+# the deadline exists to bound the map-reduce path — a document/highlights call
+# on a very long transcript stops mapping and returns what it has rather than
+# being killed mid-flight. Raising the Lambda timeout beyond 29s does not help;
+# the gateway cuts first.
+ONDEMAND_DEADLINE_SECONDS = int(os.environ.get("ONDEMAND_DEADLINE_SECONDS", "22"))
+
+# Device lifecycle states (the Devices table 'status' attribute).
+STATUS_UNPAIRED = "UNPAIRED"
+STATUS_PAIRING = "PAIRING"
+STATUS_PAIRED = "PAIRED"
+
+# Cosmetic device label (PATCH /devices/{id}); empty clears it.
+DEVICE_NAME_MAX = 64
+
+# A CRM record identifier supplied by hand (PATCH /recordings/{key+}) — a site
+# visit number, a lead email, an opportunity number, whatever the user mapped.
+# Generous ceiling: Salesforce identifiers vary by org and field type, so this
+# is only a sanity bound, not a format rule. Validating the shape is
+# Salesforce's job — the lookup either finds the record or it doesn't.
+CRM_IDENTIFIER_MAX = 255
+
+# ---------------------------------------------------------------------------
+# Recording sources — the enum every recording carries. DEVICE recordings are
+# presigned by the device-facing getUploadUrl Lambda; MOBILE and UPLOAD are
+# presigned here (JWT auth). One S3 bucket, one pipeline after upload.
+# ---------------------------------------------------------------------------
+SOURCE_DEVICE = "DEVICE"
+SOURCE_MOBILE = "MOBILE"
+SOURCE_UPLOAD = "UPLOAD"
+USER_UPLOAD_SOURCES = (SOURCE_MOBILE, SOURCE_UPLOAD)
+
+# The reserved {device_id}-slot literal per non-device source. Real device
+# ids can never collide with these (enforced below at pairing time).
+SOURCE_SEGMENTS = {SOURCE_MOBILE: "mobile", SOURCE_UPLOAD: "uploads"}
+RESERVED_DEVICE_IDS = frozenset(SOURCE_SEGMENTS.values())
+
+# Import formats accepted by /recordings/upload-request — every common audio
+# container. The transcription service (Deepgram/ElevenLabs remote-URL mode)
+# accepts all of these, so no server-side conversion is needed. Phone
+# recordings arrive as m4a (the platform encoder), device recordings as wav.
+# The value is the Content-Type the presigned PUT is signed with.
+UPLOAD_FORMATS = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "m4a": "audio/mp4",
+    "aac": "audio/aac",
+    "ogg": "audio/ogg",
+    "opus": "audio/opus",
+    "flac": "audio/flac",
+    "webm": "audio/webm",
+    "mp4": "audio/mp4",
+    "mp2": "audio/mpeg",
+    "mpga": "audio/mpeg",
+    "amr": "audio/amr",
+    "3gp": "audio/3gpp",
+    "aiff": "audio/aiff",
+    "aif": "audio/aiff",
+    "wma": "audio/x-ms-wma",
+    "caf": "audio/x-caf",
+    "mka": "audio/x-matroska",
+}
+# Upload ceilings — set to the TRANSCRIPTION SERVICE's own documented limits,
+# not to an arbitrary product cap. ElevenLabs Scribe accepts up to 3 GB and 10
+# hours in the remote-URL (source_url) mode this pipeline uses; verified against
+# their published speech-to-text limits on 2026-08-17.
+#
+# These were 2 GB / 4 hours, which predate asynchronous STT and were really a
+# proxy for "what can finish inside one Lambda invocation". That constraint is
+# gone: the transcription no longer happens inside a Lambda at all (see
+# transcribeRecording's module docstring), so the only real limits left are the
+# provider's. A 6-hour recording now uploads, transcribes and completes while
+# the user is elsewhere.
+#
+# NOTE the units differ deliberately: 3 GB here is the DECIMAL gigabyte
+# ElevenLabs documents (3,000,000,000 bytes), not 3 GiB. Using the binary value
+# would put our ceiling ~7% ABOVE the provider's and turn a rejected upload into
+# a paid-for transcription that fails after the bytes are already in S3.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(3 * 1000 * 1000 * 1000)))
+MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", str(10 * 3600)))
+UPLOAD_URL_EXPIRY = int(os.environ.get("UPLOAD_URL_EXPIRY", "900"))  # seconds
+
+# Recording processing statuses (the Recordings 'status' attribute). The
+# userApi only ever writes the first two; the transcription pipeline owns the
+# rest. "transcribed" is the legacy value for "transcript ok, AI step failed".
+STATUS_UPLOADING = "uploading"
+STATUS_UPLOADED = "uploaded"
+
+# Fields returned in the LIST view (lightweight — no transcript/timestamps).
+# `folder_id` rides along so the Desk and the folder views can filter the ONE
+# master list client-side without a second request per meeting. Absent on rows
+# with no folder, which is what "General" means.
+LIST_FIELDS = ("audio_s3_key", "recording_id", "user_id", "device_id",
+               "source", "meeting_id", "recorded_at", "duration",
+               "title", "summary", "language", "status", "created_at",
+               "folder_id")
+
+_ddb = boto3.resource("dynamodb", region_name=REGION)
+_users = _ddb.Table(USERS_TABLE)
+_user_devices = _ddb.Table(USER_DEVICES_TABLE)
+# Mostly presigning (a local signing operation — no network call), which is all
+# this client did originally. It now also performs two REAL object operations:
+#   * GET  — transcript_store.hydrate, reading an offloaded transcript for the
+#            AI routes (documents, chat, highlights).
+#   * PUT  — the ElevenLabs STT webhook, storing a delivered transcript.
+# Both are on the transcripts/ prefix, never on the audio itself.
+_s3 = boto3.client("s3", region_name=REGION)
+_device_keys = _ddb.Table(DEVICE_KEYS_TABLE)
+_devices = _ddb.Table(DEVICES_TABLE)
+_recordings = _ddb.Table(RECORDINGS_TABLE)
+_crm_connections = _ddb.Table(CRM_CONNECTIONS_TABLE)
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# ---------------------------------------------------------------------------
+# JWT secret — fetched once per container from Secrets Manager, env fallback.
+# ---------------------------------------------------------------------------
+_jwt_secret_cache = None
+
+
+def _jwt_secret():
+    global _jwt_secret_cache
+    if _jwt_secret_cache is not None:
+        return _jwt_secret_cache
+    arn = os.environ.get("JWT_SECRET_ARN")
+    if arn:
+        sm = boto3.client("secretsmanager", region_name=REGION)
+        _jwt_secret_cache = sm.get_secret_value(SecretId=arn)["SecretString"]
+    else:
+        env = os.environ.get("JWT_SECRET")
+        if not env:
+            raise RuntimeError("neither JWT_SECRET_ARN nor JWT_SECRET is set")
+        _jwt_secret_cache = env
+    return _jwt_secret_cache
+
+
+# ---------------------------------------------------------------------------
+# base64url helpers (no padding) used by both JWT and scrypt storage.
+# ---------------------------------------------------------------------------
+def _b64u_encode(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64u_decode(s):
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+# ---------------------------------------------------------------------------
+# Password hashing (scrypt, stdlib). Stored as base64url(salt) + base64url(hash).
+# ---------------------------------------------------------------------------
+_SCRYPT = dict(n=2 ** 14, r=8, p=1, dklen=32)
+
+
+def _hash_password(password, salt=None):
+    if salt is None:
+        salt = os.urandom(16)
+    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, **_SCRYPT)
+    return _b64u_encode(salt), _b64u_encode(dk)
+
+
+def _verify_password(password, salt_b64, hash_b64):
+    salt = _b64u_decode(salt_b64)
+    _, computed = _hash_password(password, salt=salt)
+    # constant-time compare
+    return hmac.compare_digest(computed, hash_b64)
+
+
+# ---------------------------------------------------------------------------
+# JWT (HS256) — mint + verify with hmac/hashlib. Payload carries sub + exp.
+# ---------------------------------------------------------------------------
+def _jwt_sign(claims):
+    header = {"alg": "HS256", "typ": "JWT"}
+    seg = (_b64u_encode(json.dumps(header, separators=(",", ":")).encode()) + "." +
+           _b64u_encode(json.dumps(claims, separators=(",", ":")).encode()))
+    sig = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
+    return seg + "." + _b64u_encode(sig)
+
+
+def _jwt_verify(token):
+    """Return the claims dict if valid + unexpired, else None."""
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+    except (ValueError, AttributeError):
+        return None
+    seg = header_b64 + "." + payload_b64
+    expected = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
+    try:
+        if not hmac.compare_digest(expected, _b64u_decode(sig_b64)):
+            return None
+        claims = json.loads(_b64u_decode(payload_b64))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(claims, dict) or claims.get("exp", 0) < int(time.time()):
+        return None
+    return claims
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers (API Gateway HTTP API, payload v2.0).
+# ---------------------------------------------------------------------------
+def _resp(status, body):
+    return {
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(body, default=str),
+    }
+
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _body(event):
+    raw = event.get("body") or "{}"
+    if event.get("isBase64Encoded"):
+        raw = base64.b64decode(raw).decode("utf-8")
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        raise ApiError(400, "invalid JSON body")
+    if not isinstance(data, dict):
+        raise ApiError(400, "body must be a JSON object")
+    return data
+
+
+def _require_auth(event):
+    """Extract + verify the Bearer token, return the user_id (sub)."""
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    auth = headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise ApiError(401, "missing bearer token")
+    claims = _jwt_verify(auth[7:].strip())
+    if not claims or not claims.get("sub"):
+        raise ApiError(401, "invalid or expired token")
+    return claims["sub"]
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# ---------------------------------------------------------------------------
+# Route handlers
+# ---------------------------------------------------------------------------
+def _mint_for(user_id, email):
+    claims = {"sub": user_id, "email": email,
+              "iat": int(time.time()), "exp": int(time.time()) + JWT_TTL}
+    return _jwt_sign(claims)
+
+
+def signup(event):
+    data = _body(event)
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    if not _EMAIL_RE.match(email):
+        raise ApiError(400, "valid email required")
+    if len(password) < 8:
+        raise ApiError(400, "password must be at least 8 characters")
+
+    # Reject duplicate email (GSI lookup).
+    existing = _users.query(IndexName=EMAIL_INDEX,
+                            KeyConditionExpression=Key("email").eq(email))
+    if existing.get("Items"):
+        raise ApiError(409, "email already registered")
+
+    name = (data.get("name") or "").strip()[:100]
+    user_id = str(uuid.uuid4())
+    salt_b64, hash_b64 = _hash_password(password)
+    _users.put_item(
+        Item={"user_id": user_id, "email": email,
+              "password_hash": hash_b64, "salt": salt_b64,
+              "name": name, "avatar_url": "",
+              "created_at": _now_iso()},
+        # Guard against a race creating the same user_id (uuid collision ~never).
+        ConditionExpression="attribute_not_exists(user_id)",
+    )
+    return _resp(201, {"token": _mint_for(user_id, email),
+                       "user_id": user_id, "email": email, "name": name})
+
+
+def login(event):
+    data = _body(event)
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    if not email or not password:
+        raise ApiError(400, "email and password required")
+
+    res = _users.query(IndexName=EMAIL_INDEX,
+                       KeyConditionExpression=Key("email").eq(email))
+    items = res.get("Items") or []
+    # Always run a hash to keep timing similar whether or not the user exists.
+    if not items:
+        _hash_password(password)  # burn time, then fail
+        raise ApiError(401, "invalid credentials")
+    user = items[0]
+    if not _verify_password(password, user["salt"], user["password_hash"]):
+        raise ApiError(401, "invalid credentials")
+    return _resp(200, {"token": _mint_for(user["user_id"], user["email"]),
+                       "user_id": user["user_id"], "email": user["email"]})
+
+
+# ---------------------------------------------------------------------------
+# Profile (the logged-in user's own account).
+# ---------------------------------------------------------------------------
+def _public_user(item):
+    """The safe, client-facing view of a Users row (never salt/hash)."""
+    return {
+        "user_id": item.get("user_id", ""),
+        "email": item.get("email", ""),
+        "name": item.get("name", ""),
+        "avatar_url": item.get("avatar_url", ""),
+        "created_at": item.get("created_at", ""),
+    }
+
+
+def get_me(event):
+    user_id = _require_auth(event)
+    item = _users.get_item(Key={"user_id": user_id}).get("Item")
+    if not item:
+        raise ApiError(404, "user not found")
+    return _resp(200, {"user": _public_user(item)})
+
+
+def patch_me(event):
+    user_id = _require_auth(event)
+    data = _body(event)
+    # Only these fields are updatable via the profile screen.
+    sets, names, values = [], {}, {}
+    if "name" in data:
+        names["#name"] = "name"
+        values[":name"] = (data.get("name") or "").strip()[:100]
+        sets.append("#name = :name")
+    if "avatar_url" in data:
+        names["#a"] = "avatar_url"
+        values[":a"] = (data.get("avatar_url") or "").strip()[:1000]
+        sets.append("#a = :a")
+    if not sets:
+        raise ApiError(400, "nothing to update (name or avatar_url)")
+    _users.update_item(
+        Key={"user_id": user_id},
+        UpdateExpression="SET " + ", ".join(sets),
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+        ConditionExpression="attribute_exists(user_id)",
+    )
+    item = _users.get_item(Key={"user_id": user_id}).get("Item")
+    return _resp(200, {"user": _public_user(item)})
+
+
+def change_password(event):
+    user_id = _require_auth(event)
+    data = _body(event)
+    current = data.get("current_password") or ""
+    new = data.get("new_password") or ""
+    if len(new) < 8:
+        raise ApiError(400, "new password must be at least 8 characters")
+    item = _users.get_item(Key={"user_id": user_id}).get("Item")
+    if not item:
+        raise ApiError(404, "user not found")
+    if not _verify_password(current, item["salt"], item["password_hash"]):
+        raise ApiError(401, "current password is incorrect")
+    salt_b64, hash_b64 = _hash_password(new)
+    _users.update_item(
+        Key={"user_id": user_id},
+        UpdateExpression="SET password_hash = :h, salt = :s",
+        ExpressionAttributeValues={":h": hash_b64, ":s": salt_b64},
+    )
+    return _resp(200, {"changed": True})
+
+
+# ---------------------------------------------------------------------------
+# Devices — pairing service (user-owned architecture).
+#
+# The Devices table (PK device_id) is the source of truth for ownership.
+# The app only ever handles device_id + pairing_code; the device API key
+# stays between the firmware and DeviceKeys (see the module docstring).
+# ---------------------------------------------------------------------------
+_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_PAIRING_CODE_RE = re.compile(r"^\d{6}$")
+
+
+class FirmwareVerifier:
+    """Seam for the real device-side pairing confirmation.
+
+    In the target flow the device proves it heard the pairing code (it sends
+    device_id + its API key + the code to the backend). That firmware path is
+    NOT built yet, so this MVP mock auto-approves. Replace confirm_pairing()
+    with the real round-trip (e.g. a device-acknowledged flag written by the
+    device-facing endpoint) without touching the route handlers.
+    """
+
+    def confirm_pairing(self, device_id: str, pairing_code: str) -> bool:
+        print(f"[mock-firmware] confirm_pairing device={device_id} auto-approved")
+        return True
+
+    def factory_reset(self, device_id: str) -> bool:
+        """Ask the device to wipe its local state (creds, queued recordings).
+
+        Mocked like confirm_pairing: the real implementation queues the
+        command and waits for the device to acknowledge it. Returning False
+        must leave server state untouched, so the caller can retry.
+        """
+        print(f"[mock-firmware] factory_reset device={device_id} auto-acknowledged")
+        return True
+
+
+_firmware = FirmwareVerifier()
+
+
+def _hash_pairing_code(device_id: str, code: str) -> str:
+    # Stored instead of the raw code so a DB read can't harvest live codes.
+    return hashlib.sha256(f"{device_id}:{code}".encode("utf-8")).hexdigest()
+
+
+def _get_device(device_id: str) -> dict:
+    if not _DEVICE_ID_RE.match(device_id or ""):
+        raise ApiError(400, "valid device_id required")
+    # "mobile"/"uploads" are reserved S3 path segments for non-device
+    # recording sources — a device must never be provisioned with them.
+    if device_id in RESERVED_DEVICE_IDS:
+        raise ApiError(400, "reserved device_id")
+    item = _devices.get_item(Key={"device_id": device_id}).get("Item")
+    if not item:
+        raise ApiError(404, "device not found")
+    return item
+
+
+def _public_device(item: dict) -> dict:
+    """Client-facing view of a Devices row (never pairing_code_hash)."""
+    return {
+        "device_id": item.get("device_id", ""),
+        # Falls back to device_id so clients always have something to render.
+        "name": item.get("name") or item.get("device_id", ""),
+        "status": item.get("status", STATUS_UNPAIRED),
+        "paired_at": item.get("paired_at") or None,
+        "last_seen": item.get("last_seen") or None,
+        "firmware_version": item.get("firmware_version") or None,
+        "serial_number": item.get("serial_number") or None,
+        # Not reported by the hardware yet (MVP) — explicit nulls, see spec.
+        "battery": None,
+        "storage": None,
+    }
+
+
+def _user_owns_device(user_id: str, device: dict) -> bool:
+    """Paired owner, or a legacy UserDevices claim (pre-pairing data)."""
+    if device.get("paired_user_id") == user_id:
+        return True
+    row = _user_devices.get_item(
+        Key={"user_id": user_id, "device_id": device.get("device_id", "")}
+    ).get("Item")
+    return row is not None
+
+
+def pair_request(event):
+    """POST /devices/pair-request {device_id} -> {pairing_code, expires_in}."""
+    user_id = _require_auth(event)
+    data = _body(event)
+    device_id = (data.get("device_id") or "").strip()
+    device = _get_device(device_id)
+
+    if device.get("paired_user_id"):
+        raise ApiError(409, "device already paired")
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    try:
+        _devices.update_item(
+            Key={"device_id": device_id},
+            UpdateExpression=("SET #st = :pairing, pairing_code_hash = :h, "
+                              "pairing_expires_at = :exp, pairing_user_id = :u"),
+            # Single-user enforcement: never overwrite an existing owner,
+            # even if this handler raced a concurrent /devices/pair.
+            ConditionExpression=("attribute_exists(device_id) AND "
+                                 "attribute_not_exists(paired_user_id)"),
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={
+                ":pairing": STATUS_PAIRING,
+                ":h": _hash_pairing_code(device_id, code),
+                ":exp": int(time.time()) + PAIRING_CODE_TTL,
+                ":u": user_id,
+            },
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ApiError(409, "device already paired")
+        raise
+    return _resp(200, {"pairing_code": code, "expires_in": PAIRING_CODE_TTL})
+
+
+def pair_device(event):
+    """POST /devices/pair {device_id, pairing_code} -> {device:{...}}.
+
+    Firmware confirmation is mocked (FirmwareVerifier). The conditional
+    update makes exactly one confirm win, so two users can never both end
+    up owning the device.
+    """
+    user_id = _require_auth(event)
+    data = _body(event)
+    device_id = (data.get("device_id") or "").strip()
+    code = str(data.get("pairing_code") or "").strip()
+    if not _PAIRING_CODE_RE.match(code):
+        raise ApiError(400, "pairing_code must be 6 digits")
+    device = _get_device(device_id)
+
+    if device.get("paired_user_id"):
+        raise ApiError(409, "device already paired")
+    stored_hash = device.get("pairing_code_hash")
+    if device.get("status") != STATUS_PAIRING or not stored_hash:
+        raise ApiError(400, "no pairing in progress — call /devices/pair-request first")
+    if int(device.get("pairing_expires_at") or 0) < int(time.time()):
+        _lapse_pairing(device_id)
+        raise ApiError(410, "pairing code expired — request a new one")
+    if not hmac.compare_digest(_hash_pairing_code(device_id, code), stored_hash):
+        raise ApiError(403, "invalid pairing code")
+    if device.get("pairing_user_id") != user_id:
+        raise ApiError(403, "pairing code was issued to a different account")
+    if not _firmware.confirm_pairing(device_id, code):
+        raise ApiError(502, "device did not confirm pairing")
+
+    now = _now_iso()
+    try:
+        _devices.update_item(
+            Key={"device_id": device_id},
+            UpdateExpression=("SET #st = :paired, paired_user_id = :u, paired_at = :now "
+                              "REMOVE pairing_code_hash, pairing_expires_at, pairing_user_id"),
+            ConditionExpression=("#st = :pairing AND pairing_code_hash = :h AND "
+                                 "attribute_not_exists(paired_user_id)"),
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={
+                ":paired": STATUS_PAIRED, ":pairing": STATUS_PAIRING,
+                ":u": user_id, ":now": now, ":h": stored_hash,
+            },
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ApiError(409, "device already paired")
+        raise
+    # Legacy compatibility mirror — keeps pre-user_id recordings reachable
+    # through the UserDevices join (see the module docstring).
+    _user_devices.put_item(Item={"user_id": user_id, "device_id": device_id,
+                                 "claimed_at": now})
+    return _resp(200, {"device": _public_device(_get_device(device_id))})
+
+
+def _lapse_pairing(device_id: str) -> None:
+    """Best-effort reset of an expired PAIRING attempt back to UNPAIRED."""
+    try:
+        _devices.update_item(
+            Key={"device_id": device_id},
+            UpdateExpression=("SET #st = :unpaired "
+                              "REMOVE pairing_code_hash, pairing_expires_at, pairing_user_id"),
+            ConditionExpression="#st = :pairing AND attribute_not_exists(paired_user_id)",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":unpaired": STATUS_UNPAIRED,
+                                       ":pairing": STATUS_PAIRING},
+        )
+    except ClientError:
+        pass  # someone else already moved the state on — fine
+
+
+def get_device_detail(event):
+    """GET /devices/{device_id} -> {device:{...}} (owner only)."""
+    user_id = _require_auth(event)
+    device_id = (event.get("pathParameters") or {}).get("device_id", "")
+    device = _get_device(device_id)
+    if not _user_owns_device(user_id, device):
+        # 404, not 403 — don't leak which device_ids exist to non-owners.
+        raise ApiError(404, "device not found")
+    return _resp(200, {"device": _public_device(device)})
+
+
+def unpair_device(event):
+    """DELETE /devices/{device_id} — remove ownership, keep everything else.
+
+    Deletes NOTHING except the ownership link: the device row, its
+    recordings and AI outputs all survive. Before releasing the device,
+    legacy recordings (rows with no user_id) are stamped with the departing
+    owner's user_id so their history stays in their account and the next
+    owner can never see it.
+    """
+    user_id = _require_auth(event)
+    device_id = (event.get("pathParameters") or {}).get("device_id", "")
+    device = _get_device(device_id)
+    if device.get("paired_user_id") != user_id:
+        raise ApiError(404, "device not found")
+
+    _stamp_user_on_legacy_recordings(device_id, user_id)
+    try:
+        _devices.update_item(
+            Key={"device_id": device_id},
+            UpdateExpression="SET #st = :unpaired REMOVE paired_user_id, paired_at",
+            ConditionExpression="paired_user_id = :u",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":unpaired": STATUS_UNPAIRED, ":u": user_id},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ApiError(409, "device ownership changed — refresh and retry")
+        raise
+    # Drop the legacy claim link too, or the device-index union would keep
+    # showing this user the NEXT owner's recordings.
+    _user_devices.delete_item(Key={"user_id": user_id, "device_id": device_id})
+    return _resp(200, {"device_id": device_id, "unpaired": True})
+
+
+def rename_device(event):
+    """PATCH /devices/{device_id} {name} -> {device:{...}} (owner only).
+
+    Cosmetic, user-scoped label. Stored on the Devices row rather than the
+    ownership link because only one user can own a device at a time; the
+    unpair path clears it so the next owner doesn't inherit the old name.
+    """
+    user_id = _require_auth(event)
+    device_id = (event.get("pathParameters") or {}).get("device_id", "")
+    device = _get_device(device_id)
+    if not _user_owns_device(user_id, device):
+        raise ApiError(404, "device not found")
+
+    data = _body(event)
+    if "name" not in data:
+        raise ApiError(400, "name required")
+    name = (data.get("name") or "").strip()
+    if len(name) > DEVICE_NAME_MAX:
+        raise ApiError(400, f"name must be at most {DEVICE_NAME_MAX} characters")
+
+    if name:
+        _devices.update_item(
+            Key={"device_id": device_id},
+            UpdateExpression="SET #nm = :n",
+            ExpressionAttributeNames={"#nm": "name"},
+            ExpressionAttributeValues={":n": name},
+        )
+    else:
+        # Empty string clears the label back to the default (device_id).
+        _devices.update_item(
+            Key={"device_id": device_id},
+            UpdateExpression="REMOVE #nm",
+            ExpressionAttributeNames={"#nm": "name"},
+        )
+    return _resp(200, {"device": _public_device(_get_device(device_id))})
+
+
+def factory_reset_device(event):
+    """POST /devices/{device_id}/factory-reset -> {device_id, reset, unpaired}.
+
+    Owner-only. Asks the firmware to wipe itself FIRST (mocked) and only then
+    releases ownership, so a device that never acknowledged stays paired and
+    the call can be retried. Recordings are always preserved — same contract
+    as unpair; a reset wipes the hardware, not the user's history.
+    """
+    user_id = _require_auth(event)
+    device_id = (event.get("pathParameters") or {}).get("device_id", "")
+    device = _get_device(device_id)
+    if device.get("paired_user_id") != user_id:
+        raise ApiError(404, "device not found")
+
+    if not _firmware.factory_reset(device_id):
+        raise ApiError(502, "device did not acknowledge factory reset")
+
+    _stamp_user_on_legacy_recordings(device_id, user_id)
+    now = _now_iso()
+    try:
+        _devices.update_item(
+            Key={"device_id": device_id},
+            UpdateExpression=("SET #st = :unpaired, factory_reset_at = :now "
+                              "REMOVE paired_user_id, paired_at, #nm, "
+                              "pairing_code_hash, pairing_expires_at, pairing_user_id"),
+            ConditionExpression="paired_user_id = :u",
+            ExpressionAttributeNames={"#st": "status", "#nm": "name"},
+            ExpressionAttributeValues={":unpaired": STATUS_UNPAIRED, ":u": user_id,
+                                       ":now": now},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ApiError(409, "device ownership changed — refresh and retry")
+        raise
+    _user_devices.delete_item(Key={"user_id": user_id, "device_id": device_id})
+    return _resp(200, {"device_id": device_id, "reset": True, "unpaired": True,
+                       "factory_reset_at": now})
+
+
+def _stamp_user_on_legacy_recordings(device_id: str, user_id: str) -> None:
+    """Give un-owned rows of this device to user_id (idempotent, paginated)."""
+    kwargs = dict(IndexName=DEVICE_INDEX,
+                  KeyConditionExpression=Key("device_id").eq(device_id))
+    while True:
+        res = _recordings.query(**kwargs)
+        for item in res.get("Items", []):
+            if item.get("user_id"):
+                continue
+            try:
+                _recordings.update_item(
+                    Key={"audio_s3_key": item["audio_s3_key"]},
+                    UpdateExpression="SET user_id = :u",
+                    ConditionExpression="attribute_not_exists(user_id)",
+                    ExpressionAttributeValues={":u": user_id},
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                    raise
+        lek = res.get("LastEvaluatedKey")
+        if not lek:
+            return
+        kwargs["ExclusiveStartKey"] = lek
+
+
+def claim_device(event):
+    """POST /devices/claim {apiKey} — LEGACY pairing path (typed device key).
+
+    Kept so already-shipped app builds keep working, but bridged into the
+    new ownership model: the claim now performs a real pairing (Devices row
+    -> PAIRED) with the same single-user guarantee, so a claimed device can
+    upload under the user-owned rules. New app builds should use
+    /devices/pair-request + /devices/pair instead — the app should never
+    handle the device API key (see module docstring, Security).
+    """
+    user_id = _require_auth(event)
+    data = _body(event)
+    api_key = (data.get("apiKey") or "").strip()
+    if not api_key:
+        raise ApiError(400, "apiKey required")
+
+    # Verify the device key exists (DeviceKeys: PK apiKey -> deviceId).
+    dk = _device_keys.get_item(Key={"apiKey": api_key}).get("Item")
+    if not dk or not dk.get("deviceId"):
+        raise ApiError(403, "invalid device key")
+    device_id = dk["deviceId"]
+
+    # Single-user enforcement, same rule as pairing: one owner, ever.
+    now = _now_iso()
+    try:
+        _devices.update_item(
+            Key={"device_id": device_id},
+            UpdateExpression=("SET #st = :paired, paired_user_id = :u, paired_at = :now "
+                              "REMOVE pairing_code_hash, pairing_expires_at, pairing_user_id"),
+            ConditionExpression=("attribute_not_exists(paired_user_id) OR "
+                                 "paired_user_id = :u"),
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":paired": STATUS_PAIRED,
+                                       ":u": user_id, ":now": now},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ApiError(409, "device already paired to another account")
+        raise
+
+    _user_devices.put_item(Item={"user_id": user_id, "device_id": device_id,
+                                 "claimed_at": now})
+    return _resp(200, {"device_id": device_id, "claimed": True})
+
+
+def _owned_devices(user_id: str) -> list:
+    """device_ids the user owns: paired (Devices GSI) + legacy claims."""
+    ids = set()
+    res = _user_devices.query(
+        KeyConditionExpression=Key("user_id").eq(user_id))
+    ids.update(it["device_id"] for it in res.get("Items", []))
+    res = _devices.query(
+        IndexName=PAIRED_USER_INDEX,
+        KeyConditionExpression=Key("paired_user_id").eq(user_id))
+    ids.update(it["device_id"] for it in res.get("Items", []))
+    return sorted(ids)
+
+
+def list_devices(event):
+    user_id = _require_auth(event)
+    ids = _owned_devices(user_id)
+    # `devices` keeps the original list-of-ids shape (existing app builds
+    # render it directly); `details` adds the full rows where they exist.
+    details = []
+    for device_id in ids:
+        item = _devices.get_item(Key={"device_id": device_id}).get("Item")
+        if item:
+            details.append(_public_device(item))
+    return _resp(200, {"devices": ids, "details": details})
+
+
+# ---------------------------------------------------------------------------
+# Recording sources & user uploads (MOBILE / UPLOAD presign service).
+#
+# The mirror image of getUploadUrl's DEVICE flow: authenticate (JWT instead
+# of x-api-key), build the user-owned S3 key, presign the PUT, upsert the
+# ownership stub. Downstream of S3 everything is source-agnostic — the same
+# ObjectCreated trigger runs the same transcription + AI pipeline.
+# ---------------------------------------------------------------------------
+_FORMAT_RE = re.compile(r"^[a-z0-9]{1,8}$")
+
+
+def _source_from_key(key: str) -> str:
+    """Derive the source from an S3 key (for rows written before the source
+    attribute existed). recordings/{uid}/mobile/... -> MOBILE,
+    recordings/{uid}/uploads/... -> UPLOAD, anything else -> DEVICE (both the
+    user-owned device layout and the legacy {device_id}/{file} layout)."""
+    parts = (key or "").split("/")
+    if len(parts) == 4 and parts[0] == "recordings":
+        if parts[2] == SOURCE_SEGMENTS[SOURCE_MOBILE]:
+            return SOURCE_MOBILE
+        if parts[2] == SOURCE_SEGMENTS[SOURCE_UPLOAD]:
+            return SOURCE_UPLOAD
+    return SOURCE_DEVICE
+
+
+def _with_source(row: dict) -> dict:
+    """Ensure the client-facing row always carries `source` (derived for
+    legacy rows) and that non-device sources never leak a device_id."""
+    source = row.get("source") or _source_from_key(row.get("audio_s3_key", ""))
+    row["source"] = source
+    if source != SOURCE_DEVICE:
+        row["device_id"] = None
+    return row
+
+
+def _with_crm_records(row: dict, user_id: str) -> dict:
+    """Normalize `crm_records` for the detail view.
+
+    Returns one entry per CONFIGURED mapping, in configuration order, so the UI
+    renders straight from this list without cross-referencing the config: a
+    mapping with no identifier yet comes back as not_linked rather than absent.
+    Stored entries for objects the user has since UNMAPPED are omitted from the
+    list (nothing to render them against) but left untouched in DynamoDB, so
+    re-adding the mapping restores the association.
+
+    Only called on the single-recording routes: the list view would pay a
+    config read per request for data it doesn't render.
+    """
+    mappings = _mappings_from_config(_user_crm_config(user_id))
+    stored = row.get("crm_records") or {}
+    out = {}
+    for mapping in mappings:
+        entry = stored.get(mapping["object"])
+        out[mapping["object"]] = (_public_crm_record(entry, mapping)
+                                 if isinstance(entry, dict) and entry
+                                 else _empty_crm_record(mapping))
+    row["crm_records"] = out
+    return row
+
+
+def _as_duration(value):
+    """Client-supplied duration -> Decimal seconds (DynamoDB rejects floats).
+    Returns None when absent/invalid rather than failing the upload."""
+    if value is None or value == "":
+        return None
+    try:
+        d = Decimal(str(round(float(value), 2)))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+    return d if d >= 0 else None
+
+
+def request_upload(event):
+    """POST /recordings/upload-request {source, format?, title?, duration?,
+    size?} -> {upload_url, key, recording_id, expires_in, content_type}.
+
+    Validates, mints the recording identity, presigns the S3 PUT and writes
+    the ownership stub (status="uploading") — so the recording exists in the
+    timeline before a single byte is uploaded, exactly like DEVICE presigns.
+    """
+    user_id = _require_auth(event)
+    if not BUCKET_NAME:
+        raise ApiError(500, "server misconfigured (no bucket)")
+    data = _body(event)
+
+    source = str(data.get("source") or "").strip().upper()
+    if source not in USER_UPLOAD_SOURCES:
+        raise ApiError(400, "source must be MOBILE or UPLOAD "
+                            "(DEVICE recordings are presigned by the device API)")
+
+    fmt = str(data.get("format") or "wav").strip().lower().lstrip(".")
+    if not _FORMAT_RE.match(fmt) or fmt not in UPLOAD_FORMATS:
+        raise ApiError(400, "unsupported format — use one of: "
+                            + ", ".join(sorted(UPLOAD_FORMATS)))
+
+    # Advisory pre-flight limits. The client validates before uploading; we
+    # reject here too so a misbehaving client fails fast, before the PUT.
+    size = data.get("size")
+    if size is not None:
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            raise ApiError(400, "size must be a number of bytes")
+        if size > MAX_UPLOAD_BYTES:
+            # Reported in GB to match the constant's own unit. Dividing by
+            # 1024*1024 used to render the 2 GiB ceiling as "max 2048 MB",
+            # which no user could reconcile with the "up to 2 GB" the upload
+            # screen advertised.
+            raise ApiError(413, f"file too large — max "
+                                f"{MAX_UPLOAD_BYTES / 1_000_000_000:g} GB")
+    duration = _as_duration(data.get("duration"))
+    if duration is not None and duration > MAX_DURATION_SECONDS:
+        raise ApiError(400, f"recording too long — max "
+                            f"{MAX_DURATION_SECONDS // 3600} hours")
+
+    title = (str(data.get("title") or "")).strip()[:200]
+
+    # Optional folder, for a recording started from inside one. Validated
+    # BEFORE anything is written or presigned: a bad folder id must fail the
+    # request outright rather than produce an unfiled recording the user then
+    # has to find and move by hand.
+    #
+    # Filing happens HERE rather than after the upload completes, so the row is
+    # created already carrying its folder. There is no window in which the
+    # meeting shows up in General and then jumps, and killing the app mid-upload
+    # cannot leave it unfiled.
+    folder_id = str(data.get("folder_id") or "").strip()
+    if folder_id:
+        _owned_folder(user_id, folder_id)   # 404 if it isn't the caller's
+
+    # recording_id keeps the device convention "{meeting_id}_{timestamp}" so
+    # the pipeline's one key parser works unchanged. e.g. mobile-3fa8c2_1754.
+    prefix = "mobile" if source == SOURCE_MOBILE else "upload"
+    meeting_id = f"{prefix}-{uuid.uuid4().hex[:10]}"
+    recorded_at = str(int(time.time()))
+    recording_id = f"{meeting_id}_{recorded_at}"
+    segment = SOURCE_SEGMENTS[source]
+    key = f"recordings/{user_id}/{segment}/{recording_id}.{fmt}"
+    content_type = UPLOAD_FORMATS[fmt]
+
+    # ContentType is deliberately NOT signed. Signing it forces the client to
+    # send back a byte-identical Content-Type, and React Native's fetch()
+    # OVERRIDES that header with the Blob's own type when the body is a Blob —
+    # producing SignatureDoesNotMatch (403) on every phone upload. The
+    # extension already encodes the format, and content_type is still returned
+    # so clients that CAN control the header send a useful one.
+    upload_url = _s3.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": BUCKET_NAME, "Key": key},
+        ExpiresIn=UPLOAD_URL_EXPIRY,
+    )
+
+    # Ownership stub BEFORE the upload exists (mirrors getUploadUrl). The
+    # transcribe Lambda upserts onto the same audio_s3_key row and never
+    # removes these fields. if_not_exists keeps a re-request of the same id
+    # (can't happen — uuid — but cheap) from resetting created_at/status.
+    # device_id is deliberately ABSENT (not NULL): it is the device-index
+    # GSI's hash key, and DynamoDB rejects NULL for an index key — a
+    # non-device recording must simply not appear in that index. The API
+    # still returns device_id: null (see _with_source).
+    # `documents`/`tasks` are seeded as empty maps here so the AI workspace's
+    # per-document writes AND task CRUD are single atomic nested SETs
+    # (`SET documents.<type> = :doc`, `SET tasks.<id> = :task`). DynamoDB will
+    # not auto-create a parent map, and there is no legal single expression
+    # that creates it and sets a key at once, so seeding both at insert time
+    # keeps the common path to one round trip. (_save_document/_save_task
+    # still handle an absent map, for rows created before this existed.)
+    sets = ("SET recording_id = :rid, user_id = :uid, "
+            "#src = :src, meeting_id = :mid, recorded_at = :ts, s3_key = :key, "
+            "#dur = if_not_exists(#dur, :dur), "
+            "title = if_not_exists(title, :title), "
+            "#st = if_not_exists(#st, :uploading), "
+            "#docs = if_not_exists(#docs, :emptymap), "
+            "#tasks = if_not_exists(#tasks, :emptymap), "
+            "created_at = if_not_exists(created_at, :now)")
+    names = {"#st": "status", "#dur": "duration",
+             "#src": "source", "#docs": DOCUMENTS_ATTR,
+             "#tasks": TASKS_ATTR}
+    values = {
+        ":rid": recording_id, ":uid": user_id,
+        ":src": source, ":mid": meeting_id, ":ts": recorded_at,
+        ":key": key, ":dur": duration, ":title": title,
+        ":uploading": STATUS_UPLOADING, ":emptymap": {},
+        ":now": _now_iso(),
+    }
+    # Only written when a folder was given. Absent means General, which is the
+    # one representation the rest of the system expects — writing "" here would
+    # also break the sparse folder-index rule the Tasks table lives by.
+    if folder_id:
+        sets += ", folder_id = :fid"
+        values[":fid"] = folder_id
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression=sets,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
+    return _resp(200, {"upload_url": upload_url, "key": key,
+                       "recording_id": recording_id,
+                       "expires_in": UPLOAD_URL_EXPIRY,
+                       "content_type": content_type,
+                       "folder_id": folder_id})
+
+
+def complete_upload(event):
+    """POST /recordings/upload-complete {key, duration?} -> {key, status}.
+
+    Marks the row "uploaded" once the client's PUT succeeded (mirrors the
+    device's POST /device/upload-complete). Never moves the status backwards:
+    if the S3 trigger already advanced it (transcribing/…/complete), only the
+    duration is filled in.
+    """
+    user_id = _require_auth(event)
+    data = _body(event)
+    key = str(data.get("key") or "").strip()
+    if not key:
+        raise ApiError(400, "key required")
+
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    # 404 (not 403) for both missing and someone else's — don't leak keys.
+    if not item or item.get("user_id") != user_id:
+        raise ApiError(404, "recording not found")
+
+    duration = _as_duration(data.get("duration"))
+    names = {"#st": "status"}
+    values = {":uploaded": STATUS_UPLOADED, ":uploading": STATUS_UPLOADING,
+              ":now": _now_iso()}
+    sets = ["#st = :uploaded", "upload_completed_at = :now"]
+    if duration is not None:
+        names["#dur"] = "duration"
+        values[":dur"] = duration
+        sets.append("#dur = :dur")
+    try:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET " + ", ".join(sets),
+            ConditionExpression="#st = :uploading",
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+        return _resp(200, {"key": key, "status": STATUS_UPLOADED})
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+    # Status already advanced past "uploading" — keep it, backfill duration.
+    if duration is not None:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET #dur = :dur, upload_completed_at = :now",
+            ExpressionAttributeNames={"#dur": "duration"},
+            ExpressionAttributeValues={":dur": duration, ":now": _now_iso()},
+        )
+    current = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+    return _resp(200, {"key": key, "status": current.get("status", "")})
+
+
+def list_recordings(event):
+    """Recordings the user OWNS: user-index rows (new uploads carry user_id)
+    unioned with legacy device-index rows for owned devices, deduped."""
+    user_id = _require_auth(event)
+    devices = _owned_devices(user_id)
+
+    # Optional ?device_id= filter (must be one the user owns).
+    qs = event.get("queryStringParameters") or {}
+    want = (qs.get("device_id") or "").strip()
+    if want:
+        if want not in devices:
+            raise ApiError(403, "device not owned by user")
+        devices = [want]
+
+    seen = set()
+    out = []
+
+    def _collect(items):
+        for item in items:
+            key = item.get("audio_s3_key", "")
+            if key in seen:
+                continue
+            # Trashed rows belong to GET /trash, not the Desk. This is the ONLY
+            # thing filtered here: _is_trashed tests one exact string, so every
+            # other lifecycle — complete, failed, uploading, transcribing,
+            # generating_ai, and legacy rows carrying no recording_status at
+            # all — still lists exactly as it did before Trash existed.
+            if _is_trashed(item):
+                continue
+            seen.add(key)
+            # Every LIST_FIELD defaults to "" so the shape is uniform for the
+            # app. For folder_id that means General reads as "" rather than a
+            # missing key — deliberately: the client tests it for truthiness,
+            # and one representation on the wire beats two. The STORED
+            # attribute is still absent (see move_recording_to_folder), which
+            # is what keeps the sparse folder-index correct.
+            out.append(_with_source({k: item.get(k, "") for k in LIST_FIELDS}))
+
+    # user-index: user_id HASH, created_at RANGE. Newest first. This is the
+    # primary (user-owned) path; it also covers recordings stamped to the
+    # user by a past unpair, whose device is no longer in `devices`.
+    res = _recordings.query(
+        IndexName=USER_INDEX,
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ScanIndexForward=False,
+    )
+    items = res.get("Items", [])
+    if want:
+        items = [it for it in items if it.get("device_id") == want]
+    _collect(items)
+
+    for dev in devices:
+        # device-index: device_id HASH, created_at RANGE. Newest first.
+        # Legacy rows (uploaded before user ownership) have no user_id and
+        # are only reachable this way.
+        res = _recordings.query(
+            IndexName=DEVICE_INDEX,
+            KeyConditionExpression=Key("device_id").eq(dev),
+            ScanIndexForward=False,
+        )
+        _collect(res.get("Items", []))
+    # Merge across sources, newest first by created_at.
+    out.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    return _resp(200, {"recordings": out, "count": len(out)})
+
+
+# Speaker naming. Diarization only separates VOICES ("0", "1", …) — the audio
+# carries no names — so the mapping from label to human name is supplied by the
+# user and stored alongside the recording, NOT baked into the transcript. That
+# keeps the transcript the verbatim record, lets a name be corrected at any
+# time, and works on recordings that were transcribed long before this existed.
+MAX_SPEAKER_NAME = 60
+MAX_SPEAKERS = 32
+
+
+def _clean_speaker_names(raw):
+    """Validate a {label: name} map from the client.
+
+    Labels are the diarization labels already in the transcript ("0", "1",
+    "agent"). An empty/blank name REMOVES the mapping, so the UI can clear a
+    name by sending "" rather than needing a separate delete route.
+    """
+    if not isinstance(raw, dict):
+        raise ApiError(400, "speaker_names must be an object of {label: name}")
+    if len(raw) > MAX_SPEAKERS:
+        raise ApiError(400, f"too many speakers (max {MAX_SPEAKERS})")
+    out = {}
+    for label, name in raw.items():
+        label = str(label).strip()
+        if not label or len(label) > MAX_SPEAKER_NAME:
+            raise ApiError(400, "invalid speaker label")
+        if name is None:
+            continue
+        name = str(name).strip()[:MAX_SPEAKER_NAME]
+        if name:                      # blank clears the mapping
+            out[label] = name
+    return out
+
+
+def _user_crm_config(user_id: str) -> dict:
+    """The user's stored CRM config, or {} when Salesforce isn't connected."""
+    conn = _get_salesforce_connection(user_id)
+    return (conn or {}).get("config") or {}
+
+
+def _legacy_crm_object_for(user_id: str) -> str:
+    """Which object an old `site_visit_number` PATCH refers to.
+
+    The pre-mappings API had no object in the request because there was only
+    ever one. To keep those callers working, resolve it to the user's FIRST
+    configured mapping — which for an upgraded user is exactly the object their
+    old single-object config became. Returns "" when nothing is configured, and
+    the caller reports that rather than inventing an object name.
+    """
+    mappings = _mappings_from_config(_user_crm_config(user_id))
+    return mappings[0]["object"] if mappings else ""
+
+
+def patch_recording(event):
+    """PATCH /recordings/{key+} {speaker_names?, title?, site_visit_number?}.
+
+    The only user-editable fields on a recording. Ownership is enforced the
+    same way as get_recording — a miss is reported as 404, never 403, so the
+    endpoint can't be used to probe for other users' recordings.
+
+    site_visit_number is the CRM manual-entry path: null or "" clears it.
+    """
+    user_id = _require_auth(event)
+    key = _url_unquote((event.get("pathParameters") or {}).get("key", ""))
+    if not key:
+        raise ApiError(400, "recording key required")
+
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item:
+        raise ApiError(404, "recording not found")
+    if item.get("user_id") != user_id and \
+            item.get("device_id") not in _owned_devices(user_id):
+        raise ApiError(404, "recording not found")
+
+    data = _body(event)
+    sets, names, values = [], {}, {}
+
+    if "speaker_names" in data:
+        cleaned = _clean_speaker_names(data.get("speaker_names") or {})
+        sets.append("speaker_names = :sn")
+        values[":sn"] = cleaned
+        # Bump the version only when the map actually changes — a no-op rename
+        # (same name resent, or clearing an already-absent label) must not
+        # invalidate every generated document over nothing. Documents compare
+        # their own stamped version against this counter (see
+        # _needs_speaker_update) to know whether a rename happened since they
+        # were generated, without storing a redundant status on each of them.
+        if cleaned != (item.get("speaker_names") or {}):
+            sets.append("speaker_mapping_version = if_not_exists(speaker_mapping_version, :zero) + :one")
+            values[":zero"] = 0
+            values[":one"] = 1
+
+    if "title" in data:
+        title = str(data.get("title") or "").strip()[:200]
+        sets.append("title = :t")
+        values[":t"] = title
+
+    # CRM record identifiers — the manual-entry / correction path. The AI
+    # extraction in transcribeRecording finds an identifier when it was spoken;
+    # this is how the user supplies one that wasn't, or fixes a wrong one.
+    #
+    # Written into the generic `crm_records` map keyed by Salesforce object, so
+    # one code path serves every configured object. A human typing the value IS
+    # the authority (confidence "manual", no evidence to ground), which is why
+    # it always outranks an extraction.
+    #
+    #   {"crm_records": {"Lead": "a@b.com", "SiteVisit__c": null}}
+    #
+    # `site_visit_number` is still accepted so an app build from before this
+    # change keeps working; it is normalized into the same map. Reading it
+    # requires knowing which object the user mapped it to, which only the
+    # config knows — hence the lookup below.
+    if "crm_records" in data or "site_visit_number" in data:
+        requested = data.get("crm_records")
+        if requested is None:
+            requested = {}
+        if not isinstance(requested, dict):
+            raise ApiError(400, "crm_records must be an object keyed by "
+                                "Salesforce object name")
+        if "site_visit_number" in data:
+            legacy_object = _legacy_crm_object_for(user_id)
+            if not legacy_object:
+                raise ApiError(400, "no Salesforce object is configured for "
+                                    "this — set up Salesforce mapping first")
+            requested = {**requested, legacy_object: data.get("site_visit_number")}
+
+        mappings_by_object = {m["object"]: m for m
+                              in _mappings_from_config(_user_crm_config(user_id))}
+        stored = dict((item or {}).get("crm_records") or {})
+        for object_name, raw in requested.items():
+            key_name = str(object_name).strip()
+            if not key_name:
+                raise ApiError(400, "crm_records keys must be object names")
+            mapping = mappings_by_object.get(key_name) or {"object": key_name}
+
+            # A bare string is the identifier; an object may additionally carry
+            # a resolved record_id/status (the app sends that after a lookup, so
+            # confirming does not need a second round trip).
+            if isinstance(raw, dict):
+                value = str(raw.get("lookup_value") or "").strip()[:CRM_IDENTIFIER_MAX]
+                record_id = str(raw.get("record_id") or "").strip()[:64]
+                requested_status = str(raw.get("status") or "").strip()
+            else:
+                value = ("" if raw is None
+                         else str(raw).strip()[:CRM_IDENTIFIER_MAX])
+                record_id, requested_status = "", ""
+
+            if not value:
+                # Explicit null/"" removes it — the user saying "this meeting
+                # isn't about one of those", which must be able to undo a bad
+                # extraction. Dropped from the map rather than stored as null so
+                # "absent" has exactly one representation.
+                stored.pop(key_name, None)
+                continue
+
+            prior = stored.get(key_name) if isinstance(stored.get(key_name), dict) else {}
+            prior_value = str(prior.get("lookup_value") or prior.get("value") or "")
+            # Changing the identifier invalidates any record resolved from the
+            # OLD one — keeping the stale record_id would push this meeting's
+            # notes onto the previous record.
+            if value != prior_value:
+                record_id = record_id or ""
+                prior = {}
+
+            status = requested_status if requested_status in CRM_STATUSES else ""
+            if not status:
+                status = (CRM_STATUS_RECORD_FOUND if record_id
+                          else CRM_STATUS_LOOKUP_PENDING)
+            # Confirmation is the user's act, and it is what gates the push.
+            # A client asking to jump straight to synced/syncing is refused:
+            # only the push route may write those.
+            if status in (CRM_STATUS_SYNCING, CRM_STATUS_SYNCED):
+                raise ApiError(400, "sync status is set by the sync itself")
+            if status in (CRM_STATUS_CONFIRMED, CRM_STATUS_RECORD_FOUND) and not record_id:
+                raise ApiError(400, f"{key_name}: a record_id is required to "
+                                    f"mark it {status}")
+
+            entry = {
+                "object": key_name,
+                "label": mapping.get("object_label") or key_name,
+                "lookup_field": mapping.get("lookup_field") or
+                                prior.get("lookup_field") or "",
+                "lookup_value": value,
+                "record_id": record_id,
+                "record_label": str(raw.get("record_label") or "")[:255]
+                                if isinstance(raw, dict) else "",
+                "status": status,
+                # Manual entry always outranks an extraction — a human typing
+                # the identifier IS the authority.
+                "source": "manual",
+                "updated_at": _now_iso(),
+            }
+            stored[key_name] = entry
+        sets.append("crm_records = :cr")
+        values[":cr"] = stored
+
+    if not sets:
+        raise ApiError(400, "nothing to update — send speaker_names, title "
+                            "and/or crm_records")
+
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET " + ", ".join(sets),
+        **({"ExpressionAttributeNames": names} if names else {}),
+        ExpressionAttributeValues=values,
+    )
+    updated = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+    # Hydrated like get_recording: the app ADOPTS this response as its current
+    # recording (see updateRecording in lib/api.ts), and its Transcript tab
+    # renders from `timestamps`. Returning the bare row would blank that tab the
+    # moment a user renamed a speaker — which is precisely the screen they are
+    # looking at when they do it.
+    updated = transcript_store.hydrate(_s3, BUCKET_NAME, updated)
+    return _resp(200, {"recording": _with_crm_records(_with_source(updated), user_id)})
+
+
+# ---------------------------------------------------------------------------
+# Trash — soft delete, restore, permanent delete
+#
+# Delete is TWO STEPS, not one. DELETE /recordings/{key+} moves a recording to
+# Trash; only DELETE /recordings/permanent/{key+} actually destroys anything.
+# The user gets an undo for the common case (a mis-tap, a brief deleted in a
+# tidying spree) and still has a way to really be rid of something.
+#
+# SOFT DELETE IS A FLAG ON THE EXISTING ROW — never a copy, never a second
+# table. `recording_status = "trashed"` plus a `deleted_at` stamp, written with
+# update_item onto the row that is already there. Everything the recording owns
+# (transcript, documents, tasks, chat, highlights, speaker names, crm_records)
+# is an attribute ON that row, so trashing touches none of it and restoring
+# brings all of it back intact. Copying the row into a "trash table" instead
+# would duplicate every AI artifact and give us two rows that could drift.
+#
+# WHY A NEW ATTRIBUTE RATHER THAN status = "trashed": `status` is the PIPELINE's
+# field (uploading -> transcribing -> generating_ai -> complete/failed) and the
+# transcription Lambda writes it without asking anyone. Overloading it would
+# mean a webhook landing after a trash could quietly un-trash the recording, and
+# would also destroy the information needed to restore the row to what it was.
+# `recording_status` is a separate axis — lifecycle, not progress — owned
+# exclusively by this file. The two never race.
+#
+# BACKWARD COMPATIBILITY: every row written before this existed has no
+# `recording_status` at all. MISSING MEANS ACTIVE — see _is_trashed. No
+# backfill is needed and no existing recording changes behaviour.
+#
+# RETENTION: `deleted_at` is stamped so a "Trash for 30 days" sweep can be added
+# later without another migration. Nothing expires automatically today; a
+# recording stays in Trash until the user acts on it. Deliberate — a retention
+# job that deletes user data is not something to ship as a side effect of
+# adding a Trash screen.
+# ---------------------------------------------------------------------------
+
+# The lifecycle axis, kept separate from the pipeline's `status` (see above).
+RECORDING_STATUS_ATTR = "recording_status"
+RECORDING_TRASHED = "trashed"
+RECORDING_ACTIVE = "active"
+
+
+def _is_trashed(item):
+    """True if this row is in Trash.
+
+    Missing/blank `recording_status` reads as ACTIVE, which is what makes
+    every pre-Trash recording keep working with no backfill. Only the exact
+    string "trashed" hides a recording.
+    """
+    return (item.get(RECORDING_STATUS_ATTR) or "").strip() == RECORDING_TRASHED
+
+
+# Statuses during which the PIPELINE may still write to this row — the S3
+# trigger's bytes are landing and transcribeRecording is about to fire.
+#
+# Permanent delete is refused here: transcribeRecording writes with
+# update_item, which would RESURRECT a row deleted under it as a fragment with
+# no user_id and no audio — a ghost that lists but never opens.
+#
+# Trashing during these states is FINE, and deliberately allowed: setting a
+# flag on a live row races nothing, the pipeline keeps writing `status` on its
+# own axis, and the user who just uploaded a wrong file shouldn't have to wait
+# out a transcription before removing it. The mid-pipeline states
+# ("transcribing"/"generating_ai") are absent from this set on purpose — a
+# recording stuck there for an hour is the one a user most wants gone, and the
+# reprocess route already treats those as recoverable-or-dead.
+DELETE_BLOCKING_STATUSES = frozenset({"uploading", "uploaded"})
+
+
+def delete_recording(event):
+    """DELETE /recordings/{key+} -> {trashed, key, deleted_at}.
+
+    Moves the recording to Trash. NOTHING is destroyed: no S3 object is
+    touched and the DynamoDB row stays exactly where it is, with every AI
+    artifact still attached. POST .../restore puts it back.
+
+    Ownership is enforced as get_recording does — someone else's recording
+    answers 404, never 403, so this can't be used to probe for other users'
+    keys.
+    """
+    _, key, item = _owned_recording(event, hydrate=False)
+
+    # Already in Trash: report success rather than 409. The client may be
+    # retrying a request whose response was lost, and "it is in Trash" is
+    # exactly the state the caller asked for either way.
+    if _is_trashed(item):
+        return _resp(200, {"trashed": True, "key": key,
+                           "deleted_at": item.get("deleted_at", "")})
+
+    deleted_at = _now_iso()
+    # The PIPELINE's `status` is deliberately left alone. It records what the
+    # transcription actually achieved, and restore needs it intact to put the
+    # recording back the way the user had it.
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET #rs = :trashed, deleted_at = :t",
+        ExpressionAttributeNames={"#rs": RECORDING_STATUS_ATTR},
+        ExpressionAttributeValues={":trashed": RECORDING_TRASHED,
+                                   ":t": deleted_at},
+    )
+    print(f"[trash] {key} moved to trash (status '{item.get('status')}')")
+    return _resp(200, {"trashed": True, "key": key, "deleted_at": deleted_at})
+
+
+def restore_recording(event):
+    """POST /recordings/restore/{key+} -> {restored, key, status}.
+
+    Takes the recording out of Trash and returns it to the Desk with its
+    transcript and every AI artifact exactly as they were — nothing is
+    re-transcribed and no AI call is made, because nothing was ever removed.
+
+    The recording keeps the pipeline `status` it had when it was trashed, so a
+    completed meeting comes back complete and a failed one comes back failed
+    (still offering Try again). That is why delete_recording leaves `status`
+    untouched: there is no "previous status" to guess at, because the real one
+    was never overwritten.
+    """
+    _, key, item = _owned_recording(event, hydrate=False)
+
+    if not _is_trashed(item):
+        raise ApiError(409, "this recording isn't in Trash")
+
+    # A row trashed mid-upload could come back still claiming "uploading"
+    # forever if its trigger never fired while it sat in Trash. Restoring it
+    # as "failed" puts it in a state the app can actually act on — the detail
+    # screen offers Try again — instead of a spinner that never resolves.
+    # Every other status is restored verbatim.
+    status = (item.get("status") or "").strip()
+    restored_status = "failed" if status in DELETE_BLOCKING_STATUSES else status
+
+    names = {"#rs": RECORDING_STATUS_ATTR}
+    values = {":active": RECORDING_ACTIVE}
+    expr = "SET #rs = :active"
+    if restored_status != status:
+        names["#s"] = "status"
+        values[":s"] = restored_status
+        expr += ", #s = :s"
+    # REMOVE, not SET-to-empty: an absent deleted_at is how a row that was
+    # never trashed looks, and restore should leave no trace of the trip.
+    expr += " REMOVE deleted_at"
+
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression=expr,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
+    print(f"[trash] {key} restored (status '{restored_status}')")
+    return _resp(200, {"restored": True, "key": key, "status": restored_status})
+
+
+def list_trash(event):
+    """GET /trash -> {recordings:[summary,...], count}.
+
+    The Trash twin of list_recordings: the same two-index union (user-index
+    plus legacy device-index), the same dedupe, the same lightweight LIST_FIELDS
+    projection — inverted to keep ONLY trashed rows, and carrying deleted_at so
+    the screen can show when each one was removed.
+
+    Sorted by deleted_at descending: in Trash the question is "what did I just
+    delete", not "when was this recorded", so the most recently binned row
+    leads. created_at breaks ties for rows trashed in the same instant (a bulk
+    delete) and covers legacy rows with no stamp.
+    """
+    user_id = _require_auth(event)
+    devices = _owned_devices(user_id)
+
+    seen = set()
+    out = []
+
+    def _collect(items):
+        for item in items:
+            key = item.get("audio_s3_key", "")
+            if key in seen or not _is_trashed(item):
+                continue
+            seen.add(key)
+            row = _with_source({k: item.get(k, "") for k in LIST_FIELDS})
+            row["deleted_at"] = item.get("deleted_at", "")
+            out.append(row)
+
+    res = _recordings.query(
+        IndexName=USER_INDEX,
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ScanIndexForward=False,
+    )
+    _collect(res.get("Items", []))
+
+    for dev in devices:
+        res = _recordings.query(
+            IndexName=DEVICE_INDEX,
+            KeyConditionExpression=Key("device_id").eq(dev),
+            ScanIndexForward=False,
+        )
+        _collect(res.get("Items", []))
+
+    out.sort(key=lambda r: (r.get("deleted_at", ""), r.get("created_at", "")),
+             reverse=True)
+    return _resp(200, {"recordings": out, "count": len(out)})
+
+
+def permanently_delete_recording(event):
+    """DELETE /recordings/permanent/{key+} -> {deleted, key}.
+
+    The ONLY route in this file that destroys data. Removes:
+
+      * the audio object in S3, at the key that IS the primary key;
+      * the transcript object, at transcript_store.s3_key_for(key);
+      * the DynamoDB row — and with it EVERY AI artifact, because documents,
+        tasks, chat history, highlights, speaker names and crm_records are all
+        attributes ON that row rather than separate tables. One delete_item
+        takes them all, so nothing can be orphaned.
+
+    ORDER: S3 first, DynamoDB last. If this dies halfway the row survives, so
+    the user can simply tap Delete permanently again and the operation
+    converges. The reverse order would strand the S3 objects with nothing
+    pointing at them: invisible in the app, still billed, findable only by
+    diffing the bucket against the table.
+
+    The S3 deletes are BEST-EFFORT for the same reason. S3 DELETE is idempotent
+    (removing an absent key is a 204, not an error), so the only way they fail
+    is a genuine S3/permission problem — and letting that block the row delete
+    would leave the user staring at a recording they explicitly asked to be rid
+    of. A leaked object is a billing footnote; a delete that doesn't delete is
+    a broken product.
+
+    NOT gated on the recording being in Trash. The app always routes through
+    Trash, but a caller that knows what it wants shouldn't be forced through a
+    two-step dance — and gating would make recovery from a half-finished
+    restore harder, not safer.
+    """
+    _, key, item = _owned_recording(event, hydrate=False)
+
+    # See DELETE_BLOCKING_STATUSES: transcribeRecording's update_item would
+    # resurrect the row as a ghost fragment if it landed after the delete.
+    status = (item.get("status") or "").strip()
+    if status in DELETE_BLOCKING_STATUSES:
+        raise ApiError(409, "this recording is still being processed — "
+                            "try again in a minute")
+
+    if BUCKET_NAME:
+        # Both objects, both best-effort, each isolated: a missing transcript
+        # (a recording that never got past upload has none) must not stop the
+        # audio delete.
+        for what, s3_key in (("audio", key),
+                             ("transcript", transcript_store.s3_key_for(key))):
+            try:
+                _s3.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+            except Exception as err:  # noqa: BLE001 — see the docstring
+                print(f"[delete] {what} object {s3_key} not removed: {err}")
+
+    _recordings.delete_item(Key={"audio_s3_key": key})
+    print(f"[delete] {key} permanently removed (was '{status}')")
+    return _resp(200, {"deleted": True, "key": key})
+
+
+def get_recording(event):
+    user_id = _require_auth(event)
+    # Greedy {key+} path var: value is the full remaining path with real
+    # slashes (e.g. "esp32-001/Meeting.wav"), already URL-decoded by API GW.
+    # A client that double-encodes (%252F) still decodes cleanly here.
+    key = (event.get("pathParameters") or {}).get("key", "")
+    key = _url_unquote(key)
+    if not key:
+        raise ApiError(400, "recording key required")
+
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item:
+        raise ApiError(404, "recording not found")
+    # Ownership check: the recording is stamped with the user's user_id
+    # (user-owned uploads / unpair backfill), or — legacy rows only — its
+    # device is one the user currently owns.
+    if item.get("user_id") != user_id and \
+            item.get("device_id") not in _owned_devices(user_id):
+        # Do not leak existence of recordings owned by others.
+        raise ApiError(404, "recording not found")
+
+    # Playback: a short-lived presigned GET so the app can stream the .wav
+    # directly from S3 without ever holding real AWS credentials. Best-effort
+    # — a bucket/config problem here shouldn't break the rest of the detail
+    # view (transcript/summary still load fine without playback).
+    audio_url = None
+    if BUCKET_NAME:
+        try:
+            audio_url = _s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": BUCKET_NAME, "Key": key},
+                ExpiresIn=AUDIO_URL_EXPIRY,
+            )
+        except Exception:
+            audio_url = None
+
+    # The transcript + timestamps now live in S3 (see transcript_store), so they
+    # are merged back in here under their ORIGINAL field names. The response
+    # stays byte-identical to what the app already parses — its Transcript tab
+    # renders from `timestamps`, so this is what keeps that tab working without
+    # any app-side change or new build. Legacy rows still holding the values
+    # inline pass through untouched.
+    item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+    return _resp(200, {"recording": _with_crm_records(
+        _with_source({**item, "audio_url": audio_url}), user_id)})
+
+
+def _url_unquote(s):
+    # Path params arrive URL-encoded; keys contain '/' and may be double-encoded.
+    from urllib.parse import unquote
+    prev = None
+    cur = s
+    # Decode until stable (handles %252F -> %2F -> /).
+    while cur != prev:
+        prev = cur
+        cur = unquote(cur)
+    return cur
+
+
+# ===========================================================================
+# AI MEETING WORKSPACE — on-demand generation (documents, Quick AI, chat).
+#
+# Everything below is the JWT-authenticated half of the AI pipeline. The staged
+# half (transcript -> executive summary -> meeting highlights) runs in the
+# S3-triggered transcribeRecording Lambda; these routes cover what the user
+# asks for interactively, from the workspace screen.
+#
+# The Groq client, the prompt templates and the coercion layer are IMPORTED
+# from lambda-shared/ — the exact modules transcribeRecording uses. There is no
+# second Groq integration and no duplicated prompt anywhere in this file: a
+# document type is one entry in prompts.DOCUMENTS, and adding one needs no code
+# here at all.
+#
+# Routes (action first, recording key LAST — API Gateway rejects a greedy
+# {key+} in any but the final position, so /recordings/{key+}/chat cannot exist):
+#   GET    /recordings/ai/documents/{key+}                     -> {documents, available}
+#   POST   /recordings/ai/documents/{key+}  {type, regenerate?} -> {document, cached}
+#   PATCH  /recordings/ai/documents/{key+}  {type, content}     -> {document}
+#   POST   /recordings/ai/update-documents/{key+} {}            -> {updated, remaining}
+#   POST   /recordings/ai/quick/{key+}      {action, regenerate?} -> {document, cached}
+#   POST   /recordings/ai/highlights/{key+} {regenerate?}      -> {meeting_highlights}
+#   GET    /recordings/ai/chat/{key+}                          -> {chat_history, suggestions}
+#   POST   /recordings/ai/chat/{key+}       {message, history?} -> {reply, chat_history}
+#   DELETE /recordings/ai/chat/{key+}                          -> {cleared}
+#
+# CACHING (spec section 10) — the rule is "transcript unchanged AND document
+# exists -> return the cached version; only regenerate when the user asks".
+# Implemented by storing each document under a fingerprint of the transcript it
+# was generated FROM (ai_schema.fingerprint). A stored document whose
+# fingerprint no longer matches the recording's current transcript is stale and
+# is regenerated transparently. That's why the cache can't key on a timestamp:
+# reprocessing rewrites updated_at even when the transcript is byte-identical,
+# which would throw away perfectly good documents.
+# ===========================================================================
+
+# Documents live in ONE map attribute on the recording row rather than a
+# separate table: they are always read with the recording, never queried
+# independently, and a map keeps generation atomic (one UpdateItem) without a
+# transaction. DynamoDB's 400KB item ceiling is the constraint to respect —
+# hence MAX_DOCUMENT_CHARS below and the transcript budget that bounds inputs.
+DOCUMENTS_ATTR = "documents"
+CHAT_ATTR = "chat_history"
+
+# Tasks: same reasoning as documents — a map keyed by task id, nested SET/
+# REMOVE for atomic writes, always read with the recording. See the "Tasks"
+# section further down for the full CRUD surface (create/update/delete,
+# assign, record-notification).
+TASKS_ATTR = "tasks"
+
+# A generated document is prose for a human to read; anything longer than this
+# is a runaway model, not a document. Also keeps the row well inside the 400KB
+# item limit once eight document types and a chat history coexist on it.
+MAX_DOCUMENT_CHARS = 24_000
+
+# Chat history retention. Kept ON the recording row (same reasoning as
+# documents) and capped so a long-running conversation can't grow the item
+# without bound. The cap is on stored TURNS; the per-request context window is
+# bounded separately by CHAT_HISTORY_TURNS below.
+MAX_CHAT_TURNS = 40
+
+# How many prior turns are sent back to Groq as conversation context. Small on
+# purpose: the meeting content is the expensive part of the prompt and the TPM
+# quota is shared with every other caller, so history gets the smaller share.
+# "Do not resend unnecessary data" (spec section 6) is a rate-limit
+# requirement here, not a nicety.
+CHAT_HISTORY_TURNS = 6
+
+MAX_CHAT_MESSAGE_CHARS = 2_000
+
+# Transcript budget for on-demand calls, in CHARACTERS.
+#
+# Unlike the staged pipeline, these routes answer a user who is waiting, so
+# map-reducing a 90-minute transcript across many paced Groq calls is the wrong
+# trade — it would blow the API Gateway timeout. Instead ONE call gets the
+# analysis (always) plus as much transcript as the TPM window allows, and
+# prompts.build_context() labels the truncation so the model knows its record
+# is partial and says so rather than inventing the rest.
+#
+# Derived from the shared TPM budget so raising GROQ_TPM_LIMIT after a plan
+# upgrade widens this automatically, with no second constant to remember.
+def _transcript_budget_chars(system_prompt, reserve_tokens=1200):
+    """Characters of transcript that fit one TPM window alongside `system_prompt`.
+
+    reserve_tokens leaves room for the analysis digest and the model's own
+    reply, both of which ride in the same window as the transcript.
+    """
+    budget_tokens = groq_client.chunk_budget(system_prompt) - reserve_tokens
+    return max(2000, int(budget_tokens * groq_client.CHARS_PER_TOKEN))
+
+
+# ---------------------------------------------------------------------------
+# Ownership. Every AI route resolves the recording through this ONE function,
+# so none of them can accidentally skip the check.
+#
+# A miss is reported as 404, never 403 — identical to get_recording/
+# patch_recording — so these endpoints cannot be used to probe for the
+# existence of other users' recordings.
+# ---------------------------------------------------------------------------
+def _owned_recording(event, hydrate=True):
+    """(user_id, key, item) for the {key+} in the path, or ApiError.
+
+    `hydrate=False` skips the S3 fetch for the transcript — pass it on routes
+    that never read the transcript text (they only need the fingerprint, via
+    _row_fingerprint) so they stay a single DynamoDB read.
+
+    The key is read through _url_unquote for the same reason get_recording does:
+    the app sends encodeURIComponent(key), so the slashes arrive as %2F, and API
+    Gateway decodes path parameters once before the Lambda sees them. Decoding
+    until stable also absorbs a client that double-encodes (%252F -> %2F -> /).
+    """
+    user_id = _require_auth(event)
+    key = _url_unquote((event.get("pathParameters") or {}).get("key", ""))
+    if not key:
+        raise ApiError(400, "recording key required")
+
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item:
+        raise ApiError(404, "recording not found")
+    if item.get("user_id") != user_id and \
+            item.get("device_id") not in _owned_devices(user_id):
+        raise ApiError(404, "recording not found")
+    # Hydrated AFTER the ownership check, never before: an unauthorized caller
+    # must not be able to make us spend an S3 GET on someone else's transcript.
+    # Every AI route below reaches the transcript through this one call, so the
+    # S3-vs-inline split is invisible to all of them.
+    if hydrate:
+        item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+    return user_id, key, item
+
+
+def _require_transcript(item):
+    """The transcript, or a 409 explaining that AI needs one.
+
+    409 rather than 400: the request is well-formed and will succeed later —
+    the recording just hasn't finished transcribing. The app uses this to keep
+    showing its progress UI instead of surfacing an error.
+    """
+    transcript = (item.get("transcript") or "").strip()
+    if not transcript:
+        status = item.get("status") or "unknown"
+        if status == "failed":
+            raise ApiError(409, "this recording has no usable transcript, so "
+                                "AI output can't be generated")
+        raise ApiError(409, f"transcript not ready yet (status: {status})")
+    return transcript
+
+
+def _groq_error(err, what):
+    """Map a GroqError onto the HTTP status the app should see.
+
+    502 for a retryable upstream failure (the app shows "Unable to generate AI
+    output. Retry"), 500 for a configuration error that retrying won't fix. The
+    transcript is never touched either way — spec section 13.
+    """
+    print(f"[ai] {what} failed: {err}")
+    if isinstance(err, groq_client.GroqError) and err.retryable:
+        raise ApiError(502, f"Unable to generate {what}. Please retry.")
+    raise ApiError(500, f"Unable to generate {what}.")
+
+
+# ---------------------------------------------------------------------------
+# Document storage + cache
+# ---------------------------------------------------------------------------
+def _stored_documents(item):
+    docs = item.get(DOCUMENTS_ATTR)
+    return docs if isinstance(docs, dict) else {}
+
+
+def _public_document(doc_type, doc, speaker_mapping_version=0):
+    """One stored document in API shape.
+
+    label prefers a user-set/custom-generated label stored ON the document
+    over the static per-type template label, so Rename (which writes
+    doc["label"]) and freeform generation (which has no template label at
+    all) both work the same way as the 8 fixed types.
+
+    `speaker_mapping_version` is the RECORDING's current counter (see
+    patch_recording), passed in by every caller so `status` can be computed
+    here rather than stored redundantly on the document itself — storing it
+    would mean rewriting every document on every rename, one nested SET each,
+    which defeats the whole point of _save_document's nested-path design.
+    """
+    label = doc.get("label") or \
+        (prompts.DOCUMENTS.get(doc_type) or {}).get("label", doc_type)
+    return {
+        "type": doc_type,
+        "label": label,
+        "content": doc.get("content", ""),
+        "format": doc.get("format", "markdown"),
+        "generated_at": doc.get("generated_at", ""),
+        "edited": bool(doc.get("edited")),
+        "ai_version": doc.get("ai_version", ""),
+        # True for a freeform request — the app uses this to hide
+        # "Regenerate" (there is no fixed prompt/type to regenerate against,
+        # same reasoning it already applies to chat-drafted documents).
+        "is_custom": doc.get("type_kind") == "custom",
+        "speaker_mapping_version": doc.get("speaker_mapping_version", 0),
+        "status": "needs_update" if _needs_speaker_update(doc, speaker_mapping_version) else "current",
+    }
+
+
+def _row_fingerprint(item):
+    """The recording's current transcript fingerprint, WITHOUT reading S3.
+
+    Routes that only compare cache identity (document listing, an edit's
+    provenance stamp) need the fingerprint, never the transcript text. The
+    transcribe Lambda already stamps `transcript_fingerprint` on the row, so
+    preferring it keeps those routes on a single DynamoDB read now that the
+    transcript itself lives in S3.
+
+    Falls back to hashing an inline transcript for legacy rows written before
+    that stamp existed — computing it from whatever is actually present is what
+    keeps a pre-existing document from flipping to "stale" and silently
+    inviting a regeneration the user didn't ask for.
+    """
+    stamped = item.get("transcript_fingerprint")
+    if stamped:
+        return stamped
+    return ai_schema.fingerprint(item.get("transcript") or "")
+
+
+def _is_fresh(doc, fingerprint):
+    """True when a stored document was generated from the CURRENT transcript
+    by the CURRENT prompt version — i.e. the cache may serve it.
+
+    A user-EDITED document is always fresh: the user's own text must never be
+    silently replaced by a regeneration. Only an explicit regenerate=true
+    overwrites it, and the app warns before sending that.
+    """
+    if not isinstance(doc, dict) or not doc.get("content"):
+        return False
+    if doc.get("edited"):
+        return True
+    return (doc.get("transcript_fingerprint") == fingerprint
+            and doc.get("ai_version") == ai_schema.AI_VERSION)
+
+
+def _needs_speaker_update(doc, speaker_mapping_version):
+    """True when `doc` was generated under an OLDER speaker_names mapping than
+    the recording's current one — i.e. a rename happened since this document
+    was written and its content may still say the old name.
+
+    Deliberately a version-counter comparison, not a text search for "Speaker
+    N" or the old name in `content`: a text search can both miss (a since-
+    superseded name that's still a valid substring of the new one) and
+    false-positive no better than the version check, while costing a scan over
+    up to MAX_DOCUMENT_CHARS on every list call. The counter is exact and
+    free to compare.
+
+    A user-EDITED document is never flagged — the user's own text must never
+    be silently marked wrong just because a rename happened after they wrote
+    it, mirroring _is_fresh's treatment of `edited`.
+    """
+    if not isinstance(doc, dict) or not doc.get("content") or doc.get("edited"):
+        return False
+    return (doc.get("speaker_mapping_version") or 0) < speaker_mapping_version
+
+
+def _save_document(key, doc_type, doc):
+    """Write one entry into the documents map, creating the map if absent.
+
+    A NESTED-PATH SET is the only safe form here. The workspace can fire two
+    generations at once (two Quick AI taps, or a document while a quick action
+    is still running), and a whole-map `SET #docs = :map` read-modify-write
+    loses every concurrent write but the last — verified against real DynamoDB:
+    8 concurrent whole-map writes left 1 document, 8 nested-path writes left
+    all 8.
+
+    Two DynamoDB constraints shape the rest, both verified empirically:
+
+      * `SET #docs = if_not_exists(#docs, :empty), #docs.#t = :doc` is REJECTED
+        at parse time — "Two document paths overlap with each other". It fails
+        regardless of the item's contents, so there is no single-expression way
+        to create-the-map-and-set-a-key. TransactWriteItems can't help either
+        ("cannot include multiple operations on one item"), and seeding the doc
+        into the if_not_exists value SILENTLY DISCARDS it when the map already
+        exists.
+      * A nested SET whose parent map is absent throws ValidationException
+        ("The document path provided in the update expression is invalid for
+        update") — it does not auto-create the parent.
+
+    So: attempt the nested SET (the steady-state path, one round trip), and only
+    if the parent map is missing create it — guarded by attribute_not_exists so
+    a racing writer's map is never blanked — then retry.
+    """
+    names = {"#docs": DOCUMENTS_ATTR, "#t": doc_type}
+    values = {":doc": doc, ":now": _now_iso()}
+
+    def _set_nested():
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET #docs.#t = :doc, updated_at = :now",
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+
+    try:
+        _set_nested()
+        return
+    except ClientError as err:
+        # Match the message, not just the code: ValidationException is generic,
+        # and a real expression bug should surface rather than be retried.
+        if err.response.get("Error", {}).get("Code") != "ValidationException" \
+                or "invalid for update" not in str(err):
+            raise
+
+    # The row predates the documents map. Create it, tolerating the race where
+    # a concurrent generation created it first.
+    try:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET #docs = :empty",
+            ConditionExpression="attribute_not_exists(#docs)",
+            ExpressionAttributeNames={"#docs": DOCUMENTS_ATTR},
+            ExpressionAttributeValues={":empty": {}},
+        )
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                != "ConditionalCheckFailedException":
+            raise
+        # Someone else created it between our two calls — exactly what we want.
+    _set_nested()
+
+
+def _generate_document(item, doc_type, system_prompt, label):
+    """Run ONE Groq call for a document and return the stored shape.
+
+    The only place a document is produced. Both /documents and /quick funnel
+    through it, which is why a Quick AI action and its document twin can share
+    a cache entry — they are byte-identical generations.
+    """
+    transcript = _require_transcript(item)
+    highlights = item.get("meeting_highlights")
+    context = prompts.build_context(
+        item,
+        highlights=highlights if isinstance(highlights, dict) else None,
+        transcript_budget_chars=_transcript_budget_chars(system_prompt),
+    )
+    try:
+        content = groq_client.complete(
+            system_prompt, context, label=f"document:{doc_type}",
+            json_mode=False, temperature=0.3,
+            # Bail out rather than sleep through a 429 into API Gateway's 29s
+            # ceiling — being killed mid-retry returns an opaque gateway 500
+            # instead of a clean "retry" the app can act on.
+            deadline=time.monotonic() + ONDEMAND_DEADLINE_SECONDS,
+        )
+    except groq_client.GroqError as err:
+        _groq_error(err, label)
+
+    content = (content or "").strip()
+    if not content:
+        raise ApiError(502, f"Unable to generate {label}. Please retry.")
+    if len(content) > MAX_DOCUMENT_CHARS:
+        content = content[:MAX_DOCUMENT_CHARS].rstrip() + "\n\n[Output truncated.]"
+
+    return {
+        "content": content,
+        "format": "markdown",
+        "generated_at": _now_iso(),
+        # The cache identity: what transcript and prompt version produced this.
+        "transcript_fingerprint": ai_schema.fingerprint(transcript),
+        "ai_version": ai_schema.AI_VERSION,
+        "edited": False,
+        # The speaker_names version this generation saw — lets a later rename
+        # be detected as "this document may now be stale" (see
+        # _needs_speaker_update) without storing a computed status here.
+        "speaker_mapping_version": item.get("speaker_mapping_version") or 0,
+    }
+
+
+def generate_document(event):
+    """POST /recordings/{key+}/documents {type, regenerate?} -> {document}.
+
+    Serves the cached document when the transcript hasn't changed (spec
+    section 10); regenerate=true forces a fresh Groq call.
+    """
+    _, key, item = _owned_recording(event)
+    data = _body(event)
+
+    doc_type = str(data.get("type") or "").strip().lower()
+    if doc_type not in prompts.DOCUMENTS:
+        raise ApiError(400, "unknown document type — use one of: "
+                            + ", ".join(sorted(prompts.DOCUMENT_KEYS)))
+
+    regenerate = bool(data.get("regenerate"))
+    transcript = _require_transcript(item)
+    fingerprint = ai_schema.fingerprint(transcript)
+
+    speaker_mapping_version = item.get("speaker_mapping_version") or 0
+    stored = _stored_documents(item).get(doc_type)
+    if not regenerate and _is_fresh(stored, fingerprint):
+        return _resp(200, {"document": _public_document(doc_type, stored, speaker_mapping_version),
+                           "cached": True})
+
+    spec = prompts.DOCUMENTS[doc_type]
+    doc = _generate_document(item, doc_type, spec["system"], spec["label"])
+    _save_document(key, doc_type, doc)
+    return _resp(200, {"document": _public_document(doc_type, doc, speaker_mapping_version),
+                       "cached": False})
+
+
+# Custom document keys are namespaced so they can never collide with one of
+# the 8 fixed prompts.DOCUMENT_KEYS (which are all plain snake_case words) —
+# letting update_document/delete_document's "must be a known type OR a
+# custom_ key" check stay a simple prefix test rather than a stored set.
+CUSTOM_DOC_PREFIX = "custom_"
+MAX_CUSTOM_PROMPT_CHARS = 500
+
+
+def _is_known_doc_type(doc_type, item):
+    return doc_type in prompts.DOCUMENTS or (
+        doc_type.startswith(CUSTOM_DOC_PREFIX)
+        and doc_type in _stored_documents(item)
+    )
+
+
+def generate_custom_document(event):
+    """POST /recordings/ai/custom-document/{key+} {prompt} -> {document}.
+
+    The freeform twin of generate_document: no fixed type, no cache lookup
+    (every request is a fresh ask, since two different freeform prompts on
+    the same meeting are two different documents, not a cache hit/miss on
+    one) — just a title call + the generation itself, both against
+    prompts.CUSTOM_DOCUMENT_SYSTEM / CUSTOM_TITLE_SYSTEM. Always persisted
+    immediately (never a preview-then-save step) so it shows up in
+    Documents(N) exactly like a template document does.
+    """
+    _, key, item = _owned_recording(event)
+    data = _body(event)
+
+    prompt = str(data.get("prompt") or "").strip()
+    if not prompt:
+        raise ApiError(400, "prompt required")
+    if len(prompt) > MAX_CUSTOM_PROMPT_CHARS:
+        raise ApiError(400, f"prompt too long (max {MAX_CUSTOM_PROMPT_CHARS} chars)")
+
+    _require_transcript(item)
+
+    # A short label call first. Best-effort: if it fails or comes back empty,
+    # fall back to a trimmed slice of the prompt itself rather than failing
+    # the whole request over a cosmetic title.
+    label = ""
+    try:
+        label = groq_client.complete(
+            prompts.CUSTOM_TITLE_SYSTEM, prompt, label="custom-doc-title",
+            json_mode=False, temperature=0.2,
+            deadline=time.monotonic() + min(8, ONDEMAND_DEADLINE_SECONDS // 2),
+        ).strip().strip('"')
+    except groq_client.GroqError as err:
+        print(f"[ai] custom document title failed, using fallback: {err}")
+    if not label:
+        label = prompt[:60] + ("…" if len(prompt) > 60 else "")
+
+    doc = _generate_document(
+        item, "custom", prompts.CUSTOM_DOCUMENT_SYSTEM + "\n\nTHE USER'S REQUEST:\n" + prompt,
+        label,
+    )
+    doc["label"] = label
+    doc["type_kind"] = "custom"
+    doc["source_prompt"] = prompt
+
+    doc_type = CUSTOM_DOC_PREFIX + uuid.uuid4().hex[:12]
+    _save_document(key, doc_type, doc)
+    return _resp(200, {"document": _public_document(
+        doc_type, doc, item.get("speaker_mapping_version") or 0)})
+
+
+def list_documents(event):
+    """GET /recordings/{key+}/documents -> {documents, available,
+    speaker_mapping_version, documents_needing_update}.
+
+    `documents` holds what has been generated — the 8 fixed types AND any
+    custom_* documents, so Documents(N) renders every real document with one
+    call. `available` advertises the 8 fixed types with a `fresh` flag (custom
+    documents have no "available slot" to advertise — each freeform request
+    makes a new one, there's nothing to offer before it's asked for).
+
+    `documents_needing_update` is the same information already carried by each
+    document's own `status`, flattened into one list so the app can render a
+    "N documents need updating" banner without re-deriving it from 8+
+    individual fields.
+    """
+    # No hydration: this route lists documents and compares cache identity —
+    # it never reads the transcript text, so it must not pay for the S3 GET.
+    _, _key, item = _owned_recording(event, hydrate=False)
+    stored = _stored_documents(item)
+    fingerprint = _row_fingerprint(item)
+    speaker_mapping_version = item.get("speaker_mapping_version") or 0
+
+    out = {}
+    for doc_type, doc in stored.items():
+        if isinstance(doc, dict) and doc.get("content"):
+            out[doc_type] = _public_document(doc_type, doc, speaker_mapping_version)
+
+    available = [
+        {"type": t, "label": prompts.DOCUMENTS[t]["label"],
+         "generated": t in out,
+         "fresh": _is_fresh(stored.get(t), fingerprint)}
+        for t in prompts.DOCUMENT_KEYS
+    ]
+    needing_update = [t for t, d in out.items() if d["status"] == "needs_update"]
+    return _resp(200, {"documents": out, "available": available,
+                       "speaker_mapping_version": speaker_mapping_version,
+                       "documents_needing_update": needing_update})
+
+
+def update_document(event):
+    """PATCH /recordings/{key+}/documents {type, content?, label?} -> {document}.
+
+    Documents are editable (spec section 4), and — for both fixed-type and
+    custom documents — RENAMABLE: `label` alone (no content) just relabels the
+    stored document; either field, or both, may be sent in one call. Editing
+    content marks the document so regeneration never silently overwrites the
+    user's own text — see _is_fresh. A custom document accepts its own
+    synthetic `custom_<id>` type here exactly like a fixed type would.
+    """
+    # No hydration: an edit stores the user's own text and only needs the
+    # fingerprint for provenance (via _row_fingerprint) — not the transcript.
+    _, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+
+    doc_type = str(data.get("type") or "").strip().lower()
+    if not _is_known_doc_type(doc_type, item):
+        raise ApiError(400, "unknown document type")
+    if "content" not in data and "label" not in data:
+        raise ApiError(400, "content and/or label required")
+
+    existing = _stored_documents(item).get(doc_type) or {}
+    doc = dict(existing)
+
+    if "content" in data:
+        content = str(data.get("content") or "")
+        if len(content) > MAX_DOCUMENT_CHARS:
+            raise ApiError(400, f"document too long (max {MAX_DOCUMENT_CHARS} chars)")
+        doc.update({
+            "content": content,
+            "format": "markdown",
+            "edited": True,
+            "generated_at": existing.get("generated_at") or _now_iso(),
+            "edited_at": _now_iso(),
+            # Keep the provenance of the generation this edit started from; a
+            # blank fingerprint would make the edit look stale on next read.
+            "transcript_fingerprint": existing.get("transcript_fingerprint")
+                or _row_fingerprint(item),
+            "ai_version": existing.get("ai_version") or ai_schema.AI_VERSION,
+            # The user just hand-verified this content against whatever names
+            # are current right now, so it can't be "behind" any rename that
+            # already happened — re-stamp to the current version. _is_fresh's
+            # `edited` short-circuit means _needs_speaker_update would already
+            # return False here regardless, but stamping keeps the field
+            # meaningful if the document is ever un-edited or inspected raw.
+            "speaker_mapping_version": item.get("speaker_mapping_version") or 0,
+        })
+
+    if "label" in data:
+        label = str(data.get("label") or "").strip()[:120]
+        if not label:
+            raise ApiError(400, "label cannot be empty")
+        doc["label"] = label
+
+    _save_document(key, doc_type, doc)
+    return _resp(200, {"document": _public_document(
+        doc_type, doc, item.get("speaker_mapping_version") or 0)})
+
+
+def delete_document(event):
+    """DELETE /recordings/ai/documents/{key+} {type} -> {deleted}.
+
+    Removes one entry from the documents map via a nested REMOVE, mirroring
+    _save_document's nested-SET pattern for the same "never lose a concurrent
+    write" reason — a whole-map read-modify-write here could just as easily
+    resurrect a document someone else deleted a moment ago.
+    """
+    _, key, item = _owned_recording(event)
+    data = _body(event)
+    doc_type = str(data.get("type") or "").strip().lower()
+    if not _is_known_doc_type(doc_type, item):
+        raise ApiError(400, "unknown document type")
+    if doc_type not in _stored_documents(item):
+        raise ApiError(404, "document not found")
+
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET updated_at = :now REMOVE #docs.#t",
+        ExpressionAttributeNames={"#docs": DOCUMENTS_ATTR, "#t": doc_type},
+        ExpressionAttributeValues={":now": _now_iso()},
+    )
+    return _resp(200, {"deleted": True, "type": doc_type})
+
+
+def _regenerate_custom_document(item, doc_type, doc):
+    """Re-run a custom document against its ORIGINAL prompt.
+
+    Same system prompt generate_custom_document used to create it, but
+    skipping that route's title call — the document may since have been
+    renamed by the user (update_document's `label`), and a regeneration must
+    not silently discard that rename by re-rolling a fresh title. `label`
+    falls back to the doc_type only in the pathological case of a custom
+    document that somehow has neither a stored label nor content, which
+    shouldn't happen in practice since generate_custom_document always sets one.
+    """
+    label = doc.get("label") or doc_type
+    prompt = doc.get("source_prompt") or ""
+    fresh = _generate_document(
+        item, doc_type,
+        prompts.CUSTOM_DOCUMENT_SYSTEM + "\n\nTHE USER'S REQUEST:\n" + prompt,
+        label,
+    )
+    fresh["label"] = label
+    fresh["type_kind"] = "custom"
+    fresh["source_prompt"] = prompt
+    return fresh
+
+
+def update_stale_documents(event):
+    """POST /recordings/ai/update-documents/{key+} {} -> {updated, remaining}.
+
+    "Update All": regenerates every document currently flagged needs_update
+    (see _needs_speaker_update) against the recording's CURRENT speaker_names,
+    reusing the same generation primitives generate_document/
+    generate_custom_document already use — no separate Groq integration.
+
+    Runs against a DEADLINE SHARED across the whole loop (not reset per
+    document, unlike a single generate_document call) because this can touch
+    every document type in one request and API Gateway's ceiling is fixed
+    regardless of how many documents there are to redo. Documents attempted
+    before the deadline trips come back in `updated`; anything not yet
+    attempted comes back in `remaining` so the app can show "N of M updated —
+    tap again" and re-call this route to finish the rest, rather than risking
+    an opaque gateway timeout by trying to force everything into one request.
+    """
+    _, key, item = _owned_recording(event)
+    speaker_mapping_version = item.get("speaker_mapping_version") or 0
+
+    stale = [
+        (doc_type, doc) for doc_type, doc in _stored_documents(item).items()
+        if _needs_speaker_update(doc, speaker_mapping_version)
+    ]
+
+    deadline = time.monotonic() + ONDEMAND_DEADLINE_SECONDS
+    updated = []
+    remaining = []
+    for doc_type, doc in stale:
+        if time.monotonic() >= deadline:
+            remaining.append(doc_type)
+            continue
+        if doc_type.startswith(CUSTOM_DOC_PREFIX):
+            fresh = _regenerate_custom_document(item, doc_type, doc)
+        else:
+            spec = prompts.DOCUMENTS.get(doc_type)
+            if not spec:
+                # An unrecognized non-custom key predates today's DOCUMENT_KEYS
+                # or belongs to a retired type — nothing to regenerate it
+                # against, so leave it exactly as update_document/Regenerate
+                # already would (it has no fixed prompt either).
+                continue
+            fresh = _generate_document(item, doc_type, spec["system"], spec["label"])
+        _save_document(key, doc_type, fresh)
+        updated.append({"type": doc_type,
+                        "document": _public_document(doc_type, fresh, speaker_mapping_version)})
+
+    return _resp(200, {"updated": updated, "remaining": remaining})
+
+
+# ---------------------------------------------------------------------------
+# Reprocess — re-run the WHOLE pipeline for one recording.
+#
+# This is the app-facing equivalent of scripts/26_reprocess_stuck.py, and it
+# deliberately reuses that script's approach: re-invoke transcribeRecording with
+# the SAME synthetic S3 event the real trigger sends, rather than adding a
+# "reprocess" branch inside the pipeline that could drift from production
+# behaviour. The audio is still in S3 (nothing is deleted on failure), so a
+# replay is always possible.
+#
+# Until now the ONLY way to recover a failed/stuck recording was an operator
+# running that script from a laptop; the user's own screen was a dead end.
+#
+# Two things make this safe to expose to end users:
+#   * ASYNC invoke ("Event"). The pipeline takes minutes — far past API
+#     Gateway's ~30s ceiling — so waiting would guarantee a gateway timeout on
+#     a run that is actually succeeding. The app polls `status` as it already
+#     does for a first-time upload, so no new client machinery is needed.
+#   * A COOLDOWN. Each replay costs one ElevenLabs STT + up to 3 Groq calls, so
+#     a user tapping Retry repeatedly (or a client retry loop) would burn real
+#     money. `reprocess_started_at` on the row is the guard; a repeat inside the
+#     window is refused with 429 rather than silently double-charging.
+# ---------------------------------------------------------------------------
+REPROCESS_COOLDOWN_SECONDS = int(
+    os.environ.get("REPROCESS_COOLDOWN_SECONDS", "300"))
+
+# Only these statuses may be replayed.
+#   failed / transcribed  terminal, and the user can see something went wrong.
+#   transcribing / generating_ai  stranded mid-pipeline (the 400 KB
+#       DynamoDB failure that motivated script 26); the app would otherwise
+#       poll them forever.
+# "uploading"/"uploaded" are deliberately EXCLUDED: the real S3 trigger may
+# still be about to fire for those, and replaying would race the live pipeline.
+# "complete" is excluded because Regenerate already covers redoing AI output
+# without paying for transcription again.
+REPROCESSABLE_STATUSES = frozenset(
+    {"failed", "transcribed", "transcribing", "generating_ai"})
+
+# Statuses during which a DELETE is refused with 409 — see delete_recording.
+# Only the two windows where the S3 trigger genuinely may be about to write:
+# the bytes are landing ("uploading"/"uploaded"). The mid-pipeline states are
+# deliberately NOT here — a recording stuck at "transcribing" for an hour is
+# the single most likely thing a user wants to delete, and REPROCESSABLE_
+# STATUSES already treats those as recoverable-or-dead rather than live.
+DELETE_BLOCKING_STATUSES = frozenset({"uploading", "uploaded"})
+
+_lambda_client = boto3.client("lambda", region_name=REGION)
+
+TRANSCRIBE_LAMBDA_NAME = os.environ.get("TRANSCRIBE_LAMBDA_NAME",
+                                        "transcribeRecording")
+
+
+def _s3_trigger_event(bucket, key):
+    """The exact event shape S3 sends transcribeRecording.
+
+    quote_plus, not quote: S3 encodes spaces as "+" and the handler calls
+    unquote_plus. Getting this wrong would reprocess the WRONG key for any
+    recording whose name contains a space — of which there are plenty
+    ("WhatsApp Audio 2026-07-27 at ..."). Same reasoning as script 26.
+    """
+    return {"Records": [{
+        "eventSource": "aws:s3",
+        "eventName": "ObjectCreated:Put",
+        "s3": {"bucket": {"name": bucket},
+               "object": {"key": urllib.parse.quote_plus(key)}},
+    }]}
+
+
+def reprocess_recording(event):
+    """POST /recordings/ai/reprocess/{key+} {} -> {status, started_at}.
+
+    Re-runs transcription + AI analysis for a recording that failed or stalled.
+    Returns 202: the work is accepted and running, not finished.
+    """
+    _, key, item = _owned_recording(event, hydrate=False)
+
+    status = (item.get("status") or "").strip()
+    if status not in REPROCESSABLE_STATUSES:
+        if status == "complete":
+            # Not an error the user should see as a failure — it just means
+            # there is nothing to recover. Regenerate is the right tool.
+            raise ApiError(409, "this recording already processed successfully "
+                                "— use Regenerate to redo the AI output")
+        raise ApiError(409, f"a recording with status '{status}' can't be "
+                            "reprocessed yet")
+
+    # Cooldown. Compared against the row's own last attempt so it survives a
+    # cold start and holds across every container.
+    last = item.get("reprocess_started_at")
+    if last:
+        # _now_iso() writes "...Z"; fromisoformat wants an offset it recognises.
+        # A timestamp we can't parse must never permanently block recovery, so
+        # an unparseable value falls through and the reprocess is allowed.
+        try:
+            started = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            started = None
+        if started is not None:
+            elapsed = time.time() - started.timestamp()
+            if 0 <= elapsed < REPROCESS_COOLDOWN_SECONDS:
+                wait = int(REPROCESS_COOLDOWN_SECONDS - elapsed)
+                raise ApiError(429, "already reprocessing — try again in "
+                                    f"{wait}s if it still looks stuck")
+
+    if not BUCKET_NAME:
+        raise ApiError(500, "server is missing BUCKET_NAME")
+
+    started_at = _now_iso()
+    # Stamp BEFORE invoking: if the invoke succeeds but the response is lost in
+    # flight, the cooldown has still been recorded and a client retry cannot
+    # double-charge. The reverse order could spend twice for one user tap.
+    #
+    # The STT markers are CLEARED in the same write, and that is load-bearing
+    # for correctness, not tidiness. A reprocess of a row whose first
+    # transcription job is still in flight creates two live jobs for one
+    # recording; the webhook decides which delivery counts by comparing
+    # request_id against stt_request_id. Removing the OLD id here means the
+    # stale job's late delivery matches nothing and is dropped, during the
+    # window before the new job has registered its own id. Leaving it would let
+    # the old transcript land on top of the new one.
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET reprocess_started_at = :t, #s = :s "
+                         "REMOVE stt_request_id, stt_transcription_id, "
+                         "stt_completed_request_id, stt_completed_at",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":t": started_at, ":s": "transcribing"},
+    )
+
+    try:
+        _lambda_client.invoke(
+            FunctionName=TRANSCRIBE_LAMBDA_NAME,
+            InvocationType="Event",  # async — see the section comment
+            Payload=json.dumps(_s3_trigger_event(BUCKET_NAME, key)).encode("utf-8"),
+        )
+    except Exception as err:  # noqa: BLE001 — surfaced as a clean 502 below
+        print(f"[reprocess] invoke failed for {key}: {err}")
+        # Put the status back so the app doesn't show a spinner for a run that
+        # never started, and clear the cooldown so the user can retry at once.
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET #s = :s REMOVE reprocess_started_at",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": status},
+        )
+        raise ApiError(502, "couldn't start reprocessing. Please retry.")
+
+    print(f"[reprocess] {key} re-invoked (was '{status}')")
+    return _resp(202, {"status": "transcribing", "started_at": started_at,
+                       "previous_status": status})
+
+
+def quick_action(event):
+    """POST /recordings/{key+}/quick {action, regenerate?} -> {document}.
+
+    Quick AI (spec section 5): one tap, no typing. Several actions ALIAS a
+    document type — "Generate Minutes of Meeting" is the same deliverable as
+    the Minutes document — and aliasing means they share the prompt AND the
+    cache entry, so tapping the Quick button after generating the document is
+    free rather than a second identical Groq call.
+    """
+    _, key, item = _owned_recording(event)
+    data = _body(event)
+
+    action = str(data.get("action") or "").strip().lower()
+    spec = prompts.QUICK_ACTIONS.get(action)
+    if not spec:
+        raise ApiError(400, "unknown quick action — use one of: "
+                            + ", ".join(sorted(prompts.QUICK_ACTION_KEYS)))
+
+    regenerate = bool(data.get("regenerate"))
+    transcript = _require_transcript(item)
+    fingerprint = ai_schema.fingerprint(transcript)
+
+    # Aliased actions store under the DOCUMENT key (shared cache); standalone
+    # extractions store under their own action key. Either way the stored shape
+    # is identical, so export/copy/share treat them the same.
+    store_key = spec["alias"] or action
+
+    speaker_mapping_version = item.get("speaker_mapping_version") or 0
+    stored = _stored_documents(item).get(store_key)
+    if not regenerate and _is_fresh(stored, fingerprint):
+        return _resp(200, {"document": _public_document(store_key, stored, speaker_mapping_version),
+                           "action": action, "cached": True})
+
+    doc = _generate_document(item, store_key, spec["system"], spec["label"])
+    _save_document(key, store_key, doc)
+    return _resp(200, {"document": _public_document(store_key, doc, speaker_mapping_version),
+                       "action": action, "cached": False})
+
+
+def regenerate_highlights(event):
+    """POST /recordings/{key+}/highlights {regenerate?} -> {meeting_highlights}.
+
+    The staged pipeline normally writes highlights right after the summary. This
+    route exists for the two cases where it didn't: the second Groq call was
+    rate-limited during processing, or the recording predates this feature. The
+    workspace calls it on first open when the field is missing, which is what
+    makes the whole thing work on the existing back catalogue.
+
+    Single Groq call, truncating a long transcript rather than map-reducing it —
+    the response has to land inside API Gateway's 29s window. `segments_covered`
+    / `segments_total` in the response say whether the whole meeting was seen.
+    """
+    _, key, item = _owned_recording(event)
+    data = _body(event) if event.get("body") else {}
+    regenerate = bool(data.get("regenerate"))
+
+    stored = item.get("meeting_highlights")
+    if not regenerate and isinstance(stored, dict) and \
+            not ai_schema.highlights_empty(stored):
+        return _resp(200, {"meeting_highlights": stored, "cached": True})
+
+    transcript = _require_transcript(item)
+
+    # ONE Groq call, never a map-reduce — see _transcript_budget_chars for the
+    # full reasoning. A long transcript is TRUNCATED to what fits a single TPM
+    # window rather than split across paced calls: map-reducing a 45k-char
+    # transcript here took 22s on the first chunk and then died on a 429 retry
+    # at API Gateway's 29s ceiling, returning an opaque gateway 500. The staged
+    # pipeline (which has 300s and nobody waiting) is where full-fidelity
+    # map-reduce belongs; this route exists to backfill rows it missed.
+    budget = _transcript_budget_chars(prompts.HIGHLIGHTS_SYSTEM, reserve_tokens=900)
+    truncated = len(transcript) > budget
+    deadline = time.monotonic() + ONDEMAND_DEADLINE_SECONDS
+    try:
+        raw = groq_client.complete_json(
+            prompts.HIGHLIGHTS_SYSTEM, transcript[:budget],
+            label="highlights", deadline=deadline)
+    except groq_client.GroqError as err:
+        _groq_error(err, "meeting highlights")
+    highlights = ai_schema.coerce_highlights(raw)
+    # Report coverage honestly: 1-of-2 tells the app (and anyone reading the
+    # response) that this covers the start of a longer meeting.
+    covered, total = (1, 2) if truncated else (1, 1)
+
+    # Storing an all-empty result would make the cache serve emptiness forever
+    # (it's indistinguishable from "never generated"). A meeting really can
+    # have no decisions or numbers, so this is returned but not persisted.
+    if not ai_schema.highlights_empty(highlights):
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression=("SET meeting_highlights = :h, ai_version = :v, "
+                              "transcript_fingerprint = :fp, updated_at = :now"),
+            ExpressionAttributeValues={
+                ":h": highlights, ":v": ai_schema.AI_VERSION,
+                ":fp": ai_schema.fingerprint(transcript), ":now": _now_iso(),
+            },
+        )
+    return _resp(200, {"meeting_highlights": highlights, "cached": False,
+                       "segments_covered": covered, "segments_total": total})
+
+
+# ---------------------------------------------------------------------------
+# AI Chat — "Ask MinuteX"
+# ---------------------------------------------------------------------------
+def _stored_chat(item):
+    hist = item.get(CHAT_ATTR)
+    return hist if isinstance(hist, list) else []
+
+
+def _clean_history(raw):
+    """Validate a client-supplied history array.
+
+    The client may send its own history (so a conversation works before
+    anything is persisted), but it is never trusted as-is: only user/assistant
+    roles, only strings, and only the last CHAT_HISTORY_TURNS entries — a
+    client that sent 500 turns would otherwise blow the TPM window on history
+    and leave nothing for the transcript.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ApiError(400, "history must be an array of {role, content}")
+    out = []
+    for m in raw[-(CHAT_HISTORY_TURNS * 2):]:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip().lower()
+        content = str(m.get("content") or "").strip()[:MAX_CHAT_MESSAGE_CHARS]
+        if role in ("user", "assistant") and content:
+            out.append({"role": role, "content": content})
+    return out
+
+
+def chat(event):
+    """POST /recordings/{key+}/chat {message, history?} -> {reply, chat_history}.
+
+    Reuses the shared Groq client with the chat prompt from prompts.py. Context
+    is the stored analysis + highlights + as much transcript as the TPM window
+    allows (prompts.build_context handles the ordering and labels any
+    truncation, so the model knows when its record is partial).
+
+    Generated documents are deliberately NOT included in the context: they are
+    derived from the same transcript and analysis already present, so sending
+    them would spend the TPM budget restating what the model can already see —
+    exactly the "do not resend unnecessary data" constraint in spec section 6.
+    """
+    _, key, item = _owned_recording(event)
+    data = _body(event)
+
+    message = str(data.get("message") or "").strip()
+    if not message:
+        raise ApiError(400, "message required")
+    if len(message) > MAX_CHAT_MESSAGE_CHARS:
+        raise ApiError(400, f"message too long (max {MAX_CHAT_MESSAGE_CHARS} chars)")
+
+    _require_transcript(item)
+
+    # Client history wins when supplied (it reflects what the user actually has
+    # on screen); otherwise continue from what's stored.
+    history = _clean_history(data.get("history"))
+    if not history:
+        history = _clean_history(_stored_chat(item))
+
+    highlights = item.get("meeting_highlights")
+    context = prompts.build_context(
+        item,
+        highlights=highlights if isinstance(highlights, dict) else None,
+        transcript_budget_chars=_transcript_budget_chars(prompts.CHAT_SYSTEM),
+    )
+    # The meeting content goes in the SYSTEM turn, not the user turn: it is
+    # standing context for the whole conversation, and keeping the user turn to
+    # just the question is what lets history stay meaningful across turns.
+    system = prompts.CHAT_SYSTEM + "\n\n" + context
+
+    try:
+        reply = groq_client.complete(
+            system, message, label="chat", json_mode=False, temperature=0.3,
+            history=history,
+            deadline=time.monotonic() + ONDEMAND_DEADLINE_SECONDS,
+        )
+    except groq_client.GroqError as err:
+        _groq_error(err, "a reply")
+
+    reply = (reply or "").strip()
+    if not reply:
+        raise ApiError(502, "Unable to generate a reply. Please retry.")
+
+    now = _now_iso()
+    turns = _stored_chat(item) + [
+        {"role": "user", "content": message, "at": now},
+        {"role": "assistant", "content": reply[:MAX_DOCUMENT_CHARS], "at": now},
+    ]
+    # Trim oldest-first so the item can't grow without bound.
+    turns = turns[-(MAX_CHAT_TURNS * 2):]
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET chat_history = :h, updated_at = :now",
+        ExpressionAttributeValues={":h": turns, ":now": now},
+    )
+    return _resp(200, {"reply": reply, "chat_history": turns})
+
+
+def get_chat(event):
+    """GET /recordings/{key+}/chat -> {chat_history, suggestions}.
+
+    Suggestions are served from the backend so the prompt catalogue lives in
+    one place (prompts.py) rather than being hardcoded in the app — the same
+    reason the document list is advertised by the API.
+    """
+    _, _key, item = _owned_recording(event)
+    return _resp(200, {"chat_history": _stored_chat(item),
+                       "suggestions": CHAT_SUGGESTIONS})
+
+
+def clear_chat(event):
+    """DELETE /recordings/{key+}/chat -> {cleared}. Starts a fresh conversation."""
+    _, key, _item = _owned_recording(event)
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET chat_history = :empty, updated_at = :now",
+        ExpressionAttributeValues={":empty": [], ":now": _now_iso()},
+    )
+    return _resp(200, {"cleared": True})
+
+
+# Suggested prompts, grouped exactly as specified (spec section 6). Data, so
+# the app renders whatever the backend advertises and a new suggestion ships
+# without an app release.
+CHAT_SUGGESTIONS = [
+    {"group": "Meeting", "prompts": [
+        "Summarize this meeting",
+        "Explain what this meeting was about",
+    ]},
+    {"group": "Business", "prompts": [
+        "What was decided?",
+        "What are the risks?",
+        "What are the deadlines?",
+        "What are the action items?",
+    ]},
+    {"group": "Sales", "prompts": [
+        "What buying signals were there?",
+        "What objections were raised?",
+        "What was said about budget?",
+        "What pricing was discussed?",
+        "Were any competitors mentioned?",
+    ]},
+    {"group": "Project", "prompts": [
+        "What tasks came out of this?",
+        "What are the deliverables?",
+        "What materials are needed?",
+        "What is the timeline?",
+    ]},
+    {"group": "Reports", "prompts": [
+        "Write the minutes of meeting",
+        "Write an executive summary",
+        "Write a site visit report",
+    ]},
+    {"group": "Follow-up", "prompts": [
+        "Draft a follow-up email",
+        "Draft a WhatsApp update",
+        "Draft a reminder message",
+    ]},
+]
+
+
+# ===========================================================================
+# TASKS — persisted assign/notify (Task Detail -> Assign To -> Notify).
+#
+# Previously entirely client-side (lib/task-model.ts): a task, its assignee
+# and its notification log all lived only in React state and were lost on
+# reload. This persists the CORE fields on the recording row — task text,
+# assignee, due date, priority, status, and which channels it's been notified
+# through — the same way `documents` does: one map attribute, keyed by task
+# id, nested SET/REMOVE for atomic writes.
+#
+# Deliberately NOT persisted here (stay client-side, per the same tradeoff
+# already accepted for generated-document rename before this change, and
+# documented in task-model.ts): subtasks, attachments, freeform notes, and the
+# per-task activity log. None of those need a backend concept to be useful —
+# attachments in particular have nowhere to actually store a file (only
+# recordings have an S3 upload pipeline) — and adding them now would be
+# persisting client bookkeeping the spec didn't ask for. A task's identity
+# (id, task, assignee, due, priority, status, notified_via) is what actually
+# needs to survive a reload/second-device; the rest is per-session UI state
+# built ON TOP of a task the app already knows how to look up by id.
+#
+# Routes (action first, key LAST — same API Gateway constraint as documents):
+#   GET    /recordings/ai/tasks/{key+}                         -> {tasks}
+#   POST   /recordings/ai/tasks/{key+}      {task, ...}         -> {task}
+#   PATCH  /recordings/ai/tasks/{key+}      {id, ...}           -> {task}
+#   DELETE /recordings/ai/tasks/{key+}      {id}                -> {deleted, id}
+#
+# Tasks are seeded from the AI's extracted tasks (ai_tasks) on first read
+# (get_recording), same as the app
+# used to do client-side in meeting-context.tsx's load() — but ONCE,
+# server-side, so every device/session sees the same seeded set instead of
+# each client re-deriving its own copy with its own local ids.
+# ===========================================================================
+MAX_TASK_TEXT = 300
+MAX_TASK_NOTE_TEXT = 500
+MAX_TASKS = 200
+TASK_STATUSES = ("Open", "In Progress", "Completed")
+TASK_PRIORITIES = ("Low", "Medium", "High")
+NOTIFY_CHANNELS = ("whatsapp", "email", "sms", "app")
+
+
+def _stored_tasks(item):
+    tasks = item.get(TASKS_ATTR)
+    return tasks if isinstance(tasks, dict) else {}
+
+
+def _public_task(task_id, t):
+    """One stored task in API shape."""
+    assignee = t.get("assignee")
+    return {
+        "id": task_id,
+        "task": t.get("task", ""),
+        "due": t.get("due", ""),
+        "priority": t.get("priority", "Medium"),
+        "status": t.get("status", "Open"),
+        "assignee": assignee if isinstance(assignee, dict) else None,
+        "notified_via": t.get("notified_via", []),
+        "created_at": t.get("created_at", ""),
+        "updated_at": t.get("updated_at", ""),
+        # Present only when this task was seeded from an AI action_item,
+        # so the app can show "detected from meeting transcript" once
+        # rather than trying to infer it from the id.
+        "from_action_item": bool(t.get("from_action_item")),
+    }
+
+
+def _save_task(key, task_id, t):
+    """Write one entry into the tasks map — identical nested-SET-then-
+    create-map-if-absent pattern as _save_document, and for the same reason:
+    two concurrent task writes (e.g. assign + status change) must not lose
+    one to a whole-map read-modify-write. See _save_document's docstring for
+    the full DynamoDB-constraint reasoning; it applies verbatim here with
+    `tasks` in place of `documents`.
+    """
+    names = {"#tasks": TASKS_ATTR, "#t": task_id}
+    values = {":task": t, ":now": _now_iso()}
+
+    def _set_nested():
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET #tasks.#t = :task, updated_at = :now",
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+
+    try:
+        _set_nested()
+        return
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") != "ValidationException" \
+                or "invalid for update" not in str(err):
+            raise
+
+    try:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET #tasks = :empty",
+            ConditionExpression="attribute_not_exists(#tasks)",
+            ExpressionAttributeNames={"#tasks": TASKS_ATTR},
+            ExpressionAttributeValues={":empty": {}},
+        )
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                != "ConditionalCheckFailedException":
+            raise
+    _set_nested()
+
+
+def _seeded_task_from_ai_task(t):
+    """One entry from the analysis's ai_tasks field
+    ({task, assignee, due_date, priority}, already never-fabricated per
+    prompts.SUMMARY_SYSTEM) -> the persisted task shape.
+
+    The only seeding source. The analysis's older `action_items` field was
+    removed from the schema, along with the fallback that read it."""
+    if not isinstance(t, dict) or not (t.get("task") or "").strip():
+        return None
+    assignee = (t.get("assignee") or "").strip()
+    priority = t.get("priority") or "Medium"
+    if priority not in TASK_PRIORITIES:
+        priority = "Medium"
+    return {
+        "task": t["task"].strip()[:MAX_TASK_TEXT],
+        "due": (t.get("due_date") or "").strip()[:100],
+        "priority": priority,
+        "status": "Open",
+        "assignee": {"name": assignee, "source": "manual"} if assignee else None,
+        "notified_via": [],
+        "from_action_item": True,
+    }
+
+
+def _seed_tasks_from_action_items(key, item):
+    """First-read seed: turn the AI's extracted tasks into real, id-bearing
+    entries in the persisted `tasks` map — once, server-side. Idempotent
+    (checks the map is genuinely empty first) so this never re-seeds over
+    tasks a user has since edited, reordered, or deleted individually.
+
+    Seeds from `ai_tasks` (the analysis schema: task/assignee/due_date/
+    priority) — the single source. The analysis's older `action_items` field
+    was removed from the schema, so the fallback that read it is gone too; a
+    row old enough to have only `action_items` seeds nothing until it is
+    reprocessed, which writes `ai_tasks`.
+
+    Mirrors what meeting-context.tsx used to do client-side on first load
+    (taskFromActionItem), except now every session sees the SAME seeded
+    tasks with the SAME ids, because it happens once here rather than once
+    per client.
+    """
+    if _stored_tasks(item):
+        return item  # already seeded (or user has since created/edited tasks)
+
+    source = item.get("ai_tasks") or []
+    if not isinstance(source, list) or not source:
+        return item
+    builder = _seeded_task_from_ai_task
+
+    now = _now_iso()
+    seeded = {}
+    for raw in source[:MAX_TASKS]:
+        built = builder(raw)
+        if built is None:
+            continue
+        built["created_at"] = now
+        built["updated_at"] = now
+        seeded[uuid.uuid4().hex[:12]] = built
+    if not seeded:
+        return item
+
+    try:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET #tasks = :seeded",
+            # Only seed into a map that is STILL empty at write time — a
+            # concurrent request (two devices opening the same meeting at
+            # once) must not both seed and double the task list.
+            ConditionExpression="#tasks = :empty OR attribute_not_exists(#tasks)",
+            ExpressionAttributeNames={"#tasks": TASKS_ATTR},
+            ExpressionAttributeValues={":seeded": seeded, ":empty": {}},
+        )
+        item = dict(item)
+        item[TASKS_ATTR] = seeded
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                != "ConditionalCheckFailedException":
+            raise
+        # Someone else seeded (or created tasks) between our read and this
+        # write — re-read so the caller sees the real current state.
+        fresh = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+        if fresh:
+            item = fresh
+    return item
+
+
+def list_tasks(event):
+    """GET /recordings/ai/tasks/{key+} -> {tasks}. Seeds from the AI's
+    extracted tasks on first call so the list is never empty for a meeting
+    the AI found work in, without every client re-deriving its own copy."""
+    _, key, item = _owned_recording(event)
+    item = _seed_tasks_from_action_items(key, item)
+    stored = _stored_tasks(item)
+    tasks = [_public_task(tid, t) for tid, t in stored.items()
+              if isinstance(t, dict)]
+    tasks.sort(key=lambda t: t.get("created_at", ""))
+    return _resp(200, {"tasks": tasks})
+
+
+def _clean_assignee(raw):
+    """Validate a client-supplied assignee — permissive on shape (the app's
+    four sources — team/recent/phone/manual — all normalize to the same
+    {name, phone?, email?} before sending), strict on types and length so a
+    malformed value can't corrupt the stored task."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ApiError(400, "assignee must be an object or null")
+    name = str(raw.get("name") or "").strip()[:100]
+    if not name:
+        raise ApiError(400, "assignee.name required")
+    out = {"name": name}
+    phone = str(raw.get("phone") or "").strip()[:32]
+    email = str(raw.get("email") or "").strip()[:200]
+    if phone:
+        out["phone"] = phone
+    if email:
+        out["email"] = email
+    source = str(raw.get("source") or "manual").strip().lower()
+    out["source"] = source if source in ("team", "recent", "phone", "manual") else "manual"
+    return out
+
+
+def create_task(event):
+    """POST /recordings/ai/tasks/{key+} {task, due?, priority?, status?,
+    assignee?} -> {task}. Manual task creation — the app also gets tasks for
+    free via list_tasks's action_item seeding; this is for a task the user
+    adds themselves that the AI never extracted."""
+    _, key, item = _owned_recording(event)
+    data = _body(event)
+
+    text = str(data.get("task") or "").strip()[:MAX_TASK_TEXT]
+    if not text:
+        raise ApiError(400, "task required")
+    if len(_stored_tasks(_seed_tasks_from_action_items(key, item))) >= MAX_TASKS:
+        raise ApiError(400, f"too many tasks (max {MAX_TASKS})")
+
+    priority = str(data.get("priority") or "Medium").strip()
+    if priority not in TASK_PRIORITIES:
+        priority = "Medium"
+    status = str(data.get("status") or "Open").strip()
+    if status not in TASK_STATUSES:
+        status = "Open"
+
+    now = _now_iso()
+    task_id = uuid.uuid4().hex[:12]
+    t = {
+        "task": text,
+        "due": str(data.get("due") or "").strip()[:100],
+        "priority": priority,
+        "status": status,
+        "assignee": _clean_assignee(data.get("assignee")),
+        "notified_via": [],
+        "created_at": now,
+        "updated_at": now,
+        "from_action_item": False,
+    }
+    _save_task(key, task_id, t)
+    return _resp(201, {"task": _public_task(task_id, t)})
+
+
+def update_task(event):
+    """PATCH /recordings/ai/tasks/{key+} {id, task?, due?, priority?,
+    status?, assignee?, notify_channels?} -> {task}.
+
+    One route for every task mutation (edit/reassign/status-change/record-a-
+    notification) rather than one per field — matching the app's own
+    updateTask/assignTask/setTaskStatus/recordNotification, which are all
+    "patch this task with these fields" at the HTTP boundary regardless of
+    how many separate UI actions call them.
+
+    `notify_channels`, when present, is ADDED to the stored set (not
+    replaced) — Notify Assignee can be run more than once, and a channel
+    already notified should stay marked even if a later call notifies only
+    the others.
+    """
+    _, key, item = _owned_recording(event)
+    data = _body(event)
+
+    task_id = str(data.get("id") or "").strip()
+    if not task_id:
+        raise ApiError(400, "id required")
+    item = _seed_tasks_from_action_items(key, item)
+    existing = _stored_tasks(item).get(task_id)
+    if not existing:
+        raise ApiError(404, "task not found")
+
+    t = dict(existing)
+    if "task" in data:
+        text = str(data.get("task") or "").strip()[:MAX_TASK_TEXT]
+        if not text:
+            raise ApiError(400, "task cannot be empty")
+        t["task"] = text
+    if "due" in data:
+        t["due"] = str(data.get("due") or "").strip()[:100]
+    if "priority" in data:
+        priority = str(data.get("priority") or "").strip()
+        if priority not in TASK_PRIORITIES:
+            raise ApiError(400, "priority must be one of: " + ", ".join(TASK_PRIORITIES))
+        t["priority"] = priority
+    if "status" in data:
+        status = str(data.get("status") or "").strip()
+        if status not in TASK_STATUSES:
+            raise ApiError(400, "status must be one of: " + ", ".join(TASK_STATUSES))
+        t["status"] = status
+    if "assignee" in data:
+        t["assignee"] = _clean_assignee(data.get("assignee"))
+    if "notify_channels" in data:
+        raw = data.get("notify_channels")
+        if not isinstance(raw, list):
+            raise ApiError(400, "notify_channels must be an array")
+        channels = [c for c in (str(c).strip().lower() for c in raw)
+                   if c in NOTIFY_CHANNELS]
+        existing_channels = set(t.get("notified_via") or [])
+        t["notified_via"] = sorted(existing_channels | set(channels))
+
+    t["updated_at"] = _now_iso()
+    _save_task(key, task_id, t)
+    return _resp(200, {"task": _public_task(task_id, t)})
+
+
+def delete_task(event):
+    """DELETE /recordings/ai/tasks/{key+} {id} -> {deleted, id}."""
+    _, key, item = _owned_recording(event)
+    data = _body(event)
+    task_id = str(data.get("id") or "").strip()
+    if not task_id:
+        raise ApiError(400, "id required")
+    item = _seed_tasks_from_action_items(key, item)
+    if task_id not in _stored_tasks(item):
+        raise ApiError(404, "task not found")
+
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET updated_at = :now REMOVE #tasks.#t",
+        ExpressionAttributeNames={"#tasks": TASKS_ATTR, "#t": task_id},
+        ExpressionAttributeValues={":now": _now_iso()},
+    )
+    return _resp(200, {"deleted": True, "id": task_id})
+
+
+# ---------------------------------------------------------------------------
+# CONTACTS, FOLDERS, PARTICIPANTS, TASKS — the organization layer.
+#
+# Four ideas, deliberately kept orthogonal:
+#
+#   Folder   organizes MEETINGS. A recording belongs to zero or one folder
+#            (`folder_id` on the recording row; absent == General). Folders are
+#            a VIEW over the one master collection — moving a meeting rewrites
+#            a single attribute and never copies the row. Deleting a folder
+#            never deletes a meeting.
+#
+#   Contact  is a PERSON, globally unique per owner. Not owned by a folder:
+#            "Rahul in Client Alpha" and "Rahul in Product" are the same
+#            Contact row reached from two folders.
+#
+#   FolderContact  many-to-many between the two, uniqueness enforced by the
+#            composite primary key rather than by a check.
+#
+#   MeetingParticipant  maps a diarization speaker label to a Contact FOR ONE
+#            MEETING. The transcript keeps its "0"/"1" labels forever — this
+#            layer sits beside it, exactly like the existing `speaker_names`
+#            map (which stays, and stays authoritative for display names; see
+#            _sync_speaker_name_from_contact).
+#
+#   Task     is first-class and lives in its own table, so it can be queried
+#            by assignee / folder / status / due date across every meeting.
+#            The recording row's embedded `tasks` map is still written (see
+#            _mirror_task_to_recording) and is NOT the read path any more.
+#
+# WHY the mirror exists: the embedded map is the store this app shipped with.
+# Until a backfill has been run and verified against production data, deleting
+# it would be an unrecoverable one-way step, and any client build still reading
+# it would silently show an empty task list. So every write goes to both, reads
+# come from Tasks, and the map is a warm standby that can be dropped in a later
+# change once the counts have been confirmed. Section 15 of the spec asks for
+# exactly this ordering.
+#
+# OWNERSHIP: every entity here carries owner_user_id and every route resolves
+# it through _owned_folder / _owned_contact / _owned_task, which raise 404
+# (never 403) on a miss — identical to _owned_recording, and for the same
+# reason: a 403 would confirm that someone else's folder id exists.
+# ---------------------------------------------------------------------------
+
+# Field ceilings. Generous but bounded — these are display strings, and an
+# unbounded write is how a single row grows past DynamoDB's 400KB item limit.
+CONTACT_NAME_MAX = 120
+CONTACT_EMAIL_MAX = 254        # RFC 5321 maximum path length
+CONTACT_PHONE_MAX = 32
+CONTACT_COMPANY_MAX = 120
+CONTACT_ROLE_MAX = 80
+CONTACT_NOTES_MAX = 500
+FOLDER_NAME_MAX = 80
+FOLDER_DESCRIPTION_MAX = 300
+
+# Folder appearance — a colour and an icon, both chosen from a CLOSED SET
+# rather than accepted as free text.
+#
+# Why an enum and not a hex string / arbitrary icon name: these values are
+# rendered directly into the app's UI, and the palette has to stay coherent in
+# both light and dark themes. Letting a client store "#000000" or "puce" would
+# either break contrast somewhere or render nothing at all, and there would be
+# no way to re-theme later without rewriting stored data. The client sends a
+# TOKEN; the app owns what each token looks like.
+FOLDER_COLORS = ("slate", "blue", "green", "amber", "teal", "red", "purple")
+FOLDER_COLOR_DEFAULT = "slate"
+
+# Icon tokens map to the app's existing SF-Symbol vocabulary (lib/icons.tsx).
+# Kept deliberately small — a folder icon is a glanceable category hint, not a
+# sticker library.
+FOLDER_ICONS = ("folder", "briefcase", "person.2", "building", "chart",
+                "lightbulb", "flag", "heart", "star", "phone", "cart", "gear")
+FOLDER_ICON_DEFAULT = "folder"
+
+
+def _clean_folder_color(raw, current=FOLDER_COLOR_DEFAULT):
+    """A colour token from the closed set. Unknown/empty falls back rather than
+    erroring: appearance is cosmetic, and refusing to save a folder because a
+    newer client sent a colour this deploy doesn't know yet would be worse than
+    showing the default."""
+    token = str(raw or "").strip().lower()
+    if not token:
+        return current
+    return token if token in FOLDER_COLORS else current
+
+
+def _clean_folder_icon(raw, current=FOLDER_ICON_DEFAULT):
+    """An icon token from the closed set. Same fallback reasoning as colour."""
+    token = str(raw or "").strip().lower()
+    if not token:
+        return current
+    return token if token in FOLDER_ICONS else current
+PARTICIPANT_ROLE_MAX = 80
+
+# Page sizes for the list routes. A mobile client never needs more in one
+# screen, and an unbounded response is how a large account times out.
+CONTACTS_PAGE_DEFAULT = 50
+CONTACTS_PAGE_MAX = 200
+TASKS_PAGE_DEFAULT = 50
+TASKS_PAGE_MAX = 200
+FOLDERS_MAX = 500              # a user's whole folder list, one query
+
+# Task vocabulary. The three legacy statuses the embedded map has always used
+# stay EXACTLY as they are ("Open"/"In Progress"/"Completed") because existing
+# rows and the shipped app both speak them; CANCELLED is added because the spec
+# requires a terminal non-completed state. Sending the spec's uppercase form is
+# also accepted (see _clean_task_status) so a client written against either
+# vocabulary works.
+TASK_STATUS_OPEN = "Open"
+TASK_STATUS_IN_PROGRESS = "In Progress"
+TASK_STATUS_COMPLETED = "Completed"
+TASK_STATUS_CANCELLED = "Cancelled"
+TASK_STATUSES_V2 = (TASK_STATUS_OPEN, TASK_STATUS_IN_PROGRESS,
+                    TASK_STATUS_COMPLETED, TASK_STATUS_CANCELLED)
+# The states that stop a task being "overdue" no matter what its due date says.
+TASK_TERMINAL_STATUSES = (TASK_STATUS_COMPLETED, TASK_STATUS_CANCELLED)
+
+# Alias table: accept the spec's SCREAMING_SNAKE vocabulary and the app's
+# Title Case, store the Title Case form. Kept as one map so there is exactly
+# one place where the two vocabularies meet.
+_TASK_STATUS_ALIASES = {
+    "open": TASK_STATUS_OPEN,
+    "in_progress": TASK_STATUS_IN_PROGRESS,
+    "in progress": TASK_STATUS_IN_PROGRESS,
+    "inprogress": TASK_STATUS_IN_PROGRESS,
+    "completed": TASK_STATUS_COMPLETED,
+    "complete": TASK_STATUS_COMPLETED,
+    "done": TASK_STATUS_COMPLETED,
+    "cancelled": TASK_STATUS_CANCELLED,
+    "canceled": TASK_STATUS_CANCELLED,
+}
+
+# How a task's assignee came to be what it is. This is the field that keeps the
+# system honest about identity: UNRESOLVED means "the AI (or a legacy row) gave
+# us a NAME and we refused to guess which Contact it meant". Nothing downstream
+# treats an unresolved assignee as a person.
+RESOLUTION_RESOLVED = "RESOLVED"
+RESOLUTION_UNRESOLVED = "UNRESOLVED"
+RESOLUTION_AMBIGUOUS = "AMBIGUOUS"
+RESOLUTION_NONE = "NONE"          # no assignee at all — not a failure state
+RESOLUTION_STATUSES = (RESOLUTION_RESOLVED, RESOLUTION_UNRESOLVED,
+                       RESOLUTION_AMBIGUOUS, RESOLUTION_NONE)
+
+# Where a task came from. AI tasks are fingerprinted for idempotency; MANUAL
+# ones never are (a user is allowed to create two identical tasks on purpose).
+TASK_SOURCE_AI = "AI"
+TASK_SOURCE_MANUAL = "MANUAL"
+TASK_SOURCE_LEGACY = "LEGACY"     # migrated out of the embedded map
+TASK_SOURCES = (TASK_SOURCE_AI, TASK_SOURCE_MANUAL, TASK_SOURCE_LEGACY)
+
+_contacts = _ddb.Table(CONTACTS_TABLE)
+_folders = _ddb.Table(FOLDERS_TABLE)
+_folder_contacts = _ddb.Table(FOLDER_CONTACTS_TABLE)
+_meeting_participants = _ddb.Table(MEETING_PARTICIPANTS_TABLE)
+_tasks = _ddb.Table(TASKS_TABLE)
+
+
+# ---------------------------------------------------------------------------
+# Normalization. Every dedupe decision in this file rests on these three
+# functions, so they are written to be boring and total: same input always
+# gives the same output, and an unusable input gives "" rather than raising.
+# ---------------------------------------------------------------------------
+def _norm_email(raw):
+    """Lowercased, trimmed email — or "" if it isn't one.
+
+    Case-insensitive because that is how mail actually works (the domain is
+    definitionally case-insensitive and no real provider distinguishes local
+    parts). This is the value stored in `email_lc` and used as the GSI key, so
+    two spellings of one address can never become two contacts.
+
+    Deliberately NOT doing provider-specific canonicalization (stripping dots
+    or +tags the way Gmail does): that is a Gmail rule, not an email rule, and
+    applying it globally would merge two genuinely different addresses on
+    providers where the local part is significant.
+    """
+    email = str(raw or "").strip().lower()[:CONTACT_EMAIL_MAX]
+    return email if email and _EMAIL_RE.match(email) else ""
+
+
+def _norm_phone(raw):
+    """Phone reduced to comparable digits, or "".
+
+    Keeps a leading + and strips every separator, so "+91 98765 43210",
+    "+919876543210" and "+91-98765-43210" all collapse to one value. This is
+    NOT full E.164 validation — we have no country context to expand a local
+    number with, and guessing one would be exactly the kind of silent identity
+    inference section 5 forbids. A bare 10-digit local number therefore stays
+    distinct from the same number written internationally, which is the safe
+    direction to fail: two contacts the user can merge by hand, rather than one
+    contact wrongly fused from two people.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    plus = s.startswith("+")
+    digits = re.sub(r"\D", "", s)
+    if len(digits) < 7:      # too short to identify anyone
+        return ""
+    return ("+" if plus else "") + digits[:CONTACT_PHONE_MAX]
+
+
+def _norm_name(raw):
+    """Collapsed-whitespace, casefolded name for COMPARISON only.
+
+    Used to detect that two contacts might be the same person — never to
+    decide that they are. See _match_contacts: a name match alone is always
+    reported as ambiguous, never auto-merged.
+    """
+    return re.sub(r"\s+", " ", str(raw or "").strip()).casefold()
+
+
+def _norm_folder_name(raw):
+    """Folder display name -> comparison key. Same idea as _norm_name; this is
+    what makes "Client Alpha" and "client  alpha" one folder, which is what a
+    user expects from a folder list."""
+    return re.sub(r"\s+", " ", str(raw or "").strip()).casefold()
+
+
+# ---------------------------------------------------------------------------
+# Contacts — public shape + ownership
+# ---------------------------------------------------------------------------
+def _public_contact(item):
+    """One Contact row in API shape.
+
+    `minutex_user_id` is present only when this contact has been matched to a
+    real MinuteX account (see _resolve_minutex_user). It is what makes a task
+    notification-ready, so it is never fabricated: absent means "we have no
+    account for this person", which the app must treat as "cannot notify
+    in-app", not as "not yet looked up".
+    """
+    return {
+        "id": item.get("contact_id", ""),
+        "name": item.get("name", ""),
+        "email": item.get("email", ""),
+        "phone": item.get("phone", ""),
+        "company": item.get("company", ""),
+        "role": item.get("role", ""),
+        "notes": item.get("notes", ""),
+        "minutex_user_id": item.get("minutex_user_id", ""),
+        "created_at": item.get("created_at", ""),
+        "updated_at": item.get("updated_at", ""),
+    }
+
+
+def _owned_contact(user_id, contact_id):
+    """The Contact row, or 404. The ownership check is the whole point."""
+    cid = str(contact_id or "").strip()
+    if not cid:
+        raise ApiError(400, "contact id required")
+    item = _contacts.get_item(Key={"contact_id": cid}).get("Item")
+    if not item or item.get("owner_user_id") != user_id:
+        # 404 not 403 — see this section's header.
+        raise ApiError(404, "contact not found")
+    return item
+
+
+def _resolve_minutex_user(email_lc):
+    """The MinuteX user_id for an email, or "".
+
+    This is the ONLY honest source of `assignee_user_id` in the system: there
+    is no team/org directory, so "is this contact also a MinuteX user" can only
+    be answered by looking their email up in the Users table via its
+    email-index GSI (the same index login uses). No email -> no answer, which
+    is why a contact with only a phone number is never notification-ready.
+    """
+    if not email_lc:
+        return ""
+    try:
+        res = _users.query(
+            IndexName=EMAIL_INDEX,
+            KeyConditionExpression=Key("email").eq(email_lc),
+            Limit=1,
+        )
+    except ClientError as err:
+        # A missing index must not take down contact creation — the contact is
+        # still perfectly valid without a linked account.
+        print(f"[warn] minutex user lookup failed for {email_lc}: {err}")
+        return ""
+    items = res.get("Items", [])
+    return items[0].get("user_id", "") if items else ""
+
+
+def _find_contact_by_email(user_id, email_lc):
+    """Exact-email match within this owner's namespace, or None."""
+    if not email_lc:
+        return None
+    res = _contacts.query(
+        IndexName=CONTACTS_EMAIL_INDEX,
+        KeyConditionExpression=Key("owner_user_id").eq(user_id)
+                               & Key("email_lc").eq(email_lc),
+        Limit=1,
+    )
+    items = res.get("Items", [])
+    return items[0] if items else None
+
+
+def _find_contact_by_phone(user_id, phone_e164):
+    """Exact-phone match within this owner's namespace, or None."""
+    if not phone_e164:
+        return None
+    res = _contacts.query(
+        IndexName=CONTACTS_PHONE_INDEX,
+        KeyConditionExpression=Key("owner_user_id").eq(user_id)
+                               & Key("phone_e164").eq(phone_e164),
+        Limit=1,
+    )
+    items = res.get("Items", [])
+    return items[0] if items else None
+
+
+def _all_contacts(user_id, limit=CONTACTS_PAGE_MAX):
+    """This owner's contacts via owner-index. Bounded: the name-matching paths
+    below need to compare against the set, and an unbounded read of a large
+    account inside a 29s request is not something to leave lying around."""
+    res = _contacts.query(
+        IndexName=CONTACTS_OWNER_INDEX,
+        KeyConditionExpression=Key("owner_user_id").eq(user_id),
+        ScanIndexForward=False,
+        Limit=limit,
+    )
+    return res.get("Items", [])
+
+
+def _match_contacts(user_id, name="", email="", phone=""):
+    """Find the contact(s) a (name, email, phone) triple could refer to.
+
+    Returns (status, matches):
+      ("exact",     [one])   a STRONG identifier matched — email or phone.
+      ("ambiguous", [n>=1])  only the NAME matched. Never treated as identity.
+      ("none",      [])      nothing matched.
+
+    This is the function that implements section 5's core rule, so the ordering
+    matters: strong identifiers first, and a name match NEVER upgrades to
+    "exact" no matter how confident it looks. Two people genuinely called
+    "Rahul Sharma" is an ordinary situation, and silently assigning one
+    person's task to the other is the failure this exists to prevent — hence a
+    single name match is still reported as ambiguous, not as a hit.
+    """
+    email_lc = _norm_email(email)
+    phone_e164 = _norm_phone(phone)
+
+    if email_lc:
+        hit = _find_contact_by_email(user_id, email_lc)
+        if hit:
+            return "exact", [hit]
+    if phone_e164:
+        hit = _find_contact_by_phone(user_id, phone_e164)
+        if hit:
+            return "exact", [hit]
+
+    wanted = _norm_name(name)
+    if not wanted:
+        return "none", []
+    matches = [c for c in _all_contacts(user_id)
+               if _norm_name(c.get("name")) == wanted]
+    if not matches:
+        return "none", []
+    return "ambiguous", matches
+
+
+def _contact_item(user_id, name, email="", phone="", company="", role="",
+                  notes=""):
+    """Build a Contact row. Optional GSI key attributes (email_lc, phone_e164)
+    are OMITTED when empty rather than written as "" — DynamoDB rejects an
+    empty-string index key outright, so writing one would fail the whole put.
+    Same rule the Recordings/Devices tables already follow."""
+    now = _now_iso()
+    email_lc = _norm_email(email)
+    phone_e164 = _norm_phone(phone)
+    item = {
+        "contact_id": uuid.uuid4().hex[:16],
+        "owner_user_id": user_id,
+        "name": str(name or "").strip()[:CONTACT_NAME_MAX],
+        "email": email_lc,
+        "phone": str(phone or "").strip()[:CONTACT_PHONE_MAX],
+        "company": str(company or "").strip()[:CONTACT_COMPANY_MAX],
+        "role": str(role or "").strip()[:CONTACT_ROLE_MAX],
+        "notes": str(notes or "").strip()[:CONTACT_NOTES_MAX],
+        "name_lc": _norm_name(name),
+        "created_at": now,
+        "updated_at": now,
+    }
+    if email_lc:
+        item["email_lc"] = email_lc
+        linked = _resolve_minutex_user(email_lc)
+        if linked:
+            item["minutex_user_id"] = linked
+    if phone_e164:
+        item["phone_e164"] = phone_e164
+    return item
+
+
+def create_contact(event):
+    """POST /contacts {name, email?, phone?, company?, role?, notes?,
+    folder_id?} -> 201 {contact, folder_id?} | 200 {contact, existing:true}
+                 | 409 {ambiguous}
+
+    Deduplication is by STRONG identifier only:
+      * an email or phone that already exists returns the EXISTING contact
+        (200, existing:true) instead of making a second row for one person;
+      * a name that already exists answers 409 with the candidates, because
+        two people can share a name and picking one for the user is exactly
+        the silent-merge section 5 forbids. Send `force:true` to say "yes, this
+        really is a different person" and create it anyway.
+
+    `folder_id` is the create-from-inside-a-folder path (section 7): the
+    contact is created globally and associated with that folder in one call.
+    """
+    user_id = _require_auth(event)
+    data = _body(event)
+
+    name = str(data.get("name") or "").strip()[:CONTACT_NAME_MAX]
+    if not name:
+        raise ApiError(400, "name required")
+
+    raw_email = str(data.get("email") or "").strip()
+    if raw_email and not _norm_email(raw_email):
+        raise ApiError(400, "email is not a valid address")
+    raw_phone = str(data.get("phone") or "").strip()
+    if raw_phone and not _norm_phone(raw_phone):
+        raise ApiError(400, "phone is not a usable number")
+
+    # A folder_id, if given, must be the caller's before anything is written —
+    # otherwise a failed association would leave an orphaned contact behind.
+    folder_id = str(data.get("folder_id") or "").strip()
+    if folder_id:
+        _owned_folder(user_id, folder_id)
+
+    status, matches = _match_contacts(user_id, name, raw_email, raw_phone)
+    if status == "exact":
+        existing = matches[0]
+        if folder_id:
+            _link_folder_contact(folder_id, existing["contact_id"])
+        return _resp(200, {"contact": _public_contact(existing),
+                           "existing": True,
+                           "reason": "a contact with this email or phone "
+                                     "already exists"})
+    if status == "ambiguous" and not data.get("force"):
+        raise AmbiguousContact(matches)
+
+    item = _contact_item(user_id, name, raw_email, raw_phone,
+                         data.get("company"), data.get("role"),
+                         data.get("notes"))
+    # attribute_not_exists on the PK: a uuid collision is astronomically
+    # unlikely, but "astronomically unlikely" is not "cannot silently
+    # overwrite a real person's record".
+    _contacts.put_item(Item=item,
+                       ConditionExpression="attribute_not_exists(contact_id)")
+    if folder_id:
+        _link_folder_contact(folder_id, item["contact_id"])
+    _audit("contact.created", user_id, item["contact_id"],
+           folder_id=folder_id or None)
+    out = {"contact": _public_contact(item)}
+    if folder_id:
+        out["folder_id"] = folder_id
+    return _resp(201, out)
+
+
+class AmbiguousContact(ApiError):
+    """409 + the candidate list, so the app can ask "which Rahul?".
+
+    A distinct exception rather than a plain ApiError because the body needs
+    the candidates in it — the whole point is that the client can render a
+    choice instead of a dead end. Carries a stable `code` for the same reason
+    SalesforceReconnectRequired does: clients branch on the code, not on
+    English text.
+    """
+
+    def __init__(self, matches):
+        super().__init__(409, "more than one contact could match — choose one "
+                              "or send force:true to create a new person")
+        self.code = "contact_ambiguous"
+        self.candidates = [_public_contact(m) for m in matches]
+
+
+def list_contacts(event):
+    """GET /contacts?search=&limit=&cursor= -> {contacts, count, next_cursor}
+
+    Search is server-side (section 30) over name / email / company. It is a
+    substring filter applied to the owner's page, not a full-text index —
+    DynamoDB has no such index, and the alternative (pulling every contact to
+    the phone and filtering there) is what section 31 rules out. `limit` bounds
+    every response, and `next_cursor` pages.
+    """
+    user_id = _require_auth(event)
+    qs = event.get("queryStringParameters") or {}
+    limit = _clean_limit(qs.get("limit"), CONTACTS_PAGE_DEFAULT,
+                         CONTACTS_PAGE_MAX)
+    search = str(qs.get("search") or "").strip().casefold()
+
+    query = {
+        "IndexName": CONTACTS_OWNER_INDEX,
+        "KeyConditionExpression": Key("owner_user_id").eq(user_id),
+        "ScanIndexForward": False,
+    }
+    cursor = _decode_cursor(qs.get("cursor"))
+    if cursor:
+        query["ExclusiveStartKey"] = cursor
+
+    out, last_key = [], None
+    # A search filters AFTER the page is read, so a page of 50 rows can yield
+    # fewer than 50 matches. Keep reading until the page is full or the index
+    # is exhausted, bounded so one request can't walk a whole large table.
+    for _ in range(_SEARCH_MAX_PAGES):
+        query["Limit"] = limit + 1 if not search else max(limit * 4, 100)
+        res = _contacts.query(**query)
+        for item in res.get("Items", []):
+            if search and not _contact_matches_search(item, search):
+                continue
+            out.append(item)
+        last_key = res.get("LastEvaluatedKey")
+        if not last_key or len(out) >= limit:
+            break
+        query["ExclusiveStartKey"] = last_key
+
+    more = out[limit:]
+    out = out[:limit]
+    # When the trim dropped rows, the cursor must resume from the last row we
+    # actually RETURNED, not from where the scan stopped — otherwise the next
+    # page would skip everything in between.
+    next_cursor = ""
+    if more:
+        next_cursor = _encode_cursor({"owner_user_id": user_id,
+                                      "created_at": out[-1]["created_at"],
+                                      "contact_id": out[-1]["contact_id"]})
+    elif last_key:
+        next_cursor = _encode_cursor(last_key)
+    return _resp(200, {"contacts": [_public_contact(c) for c in out],
+                       "count": len(out),
+                       "next_cursor": next_cursor})
+
+
+def _contact_matches_search(item, needle):
+    """Substring match over the fields a human would search by."""
+    for field in ("name", "email", "company", "role", "phone"):
+        if needle in str(item.get(field) or "").casefold():
+            return True
+    return False
+
+
+def get_contact(event):
+    """GET /contacts/{contact_id} -> {contact, folders}
+
+    Returns the folders the contact is associated with alongside it: the
+    contact detail screen shows exactly that, and it saves a second round trip.
+    """
+    user_id = _require_auth(event)
+    contact_id = (event.get("pathParameters") or {}).get("contact_id", "")
+    item = _owned_contact(user_id, contact_id)
+    folder_ids = _folders_for_contact(item["contact_id"])
+    folders = []
+    for fid in folder_ids:
+        row = _folders.get_item(Key={"folder_id": fid}).get("Item")
+        # Ownership re-checked per folder: an association row is not authority
+        # to read a folder, and a stale one must not leak another user's name.
+        if row and row.get("owner_user_id") == user_id:
+            folders.append(_public_folder(row))
+    return _resp(200, {"contact": _public_contact(item), "folders": folders})
+
+
+def update_contact(event):
+    """PATCH /contacts/{contact_id} {name?, email?, phone?, company?, role?,
+    notes?} -> {contact}
+
+    Changing an email/phone re-checks for a collision with ANOTHER contact and
+    refuses (409) rather than creating two rows that dedupe to one identity.
+    The linked MinuteX account is re-resolved whenever the email changes, so a
+    contact who signs up later becomes notification-ready on their next edit.
+    """
+    user_id = _require_auth(event)
+    contact_id = (event.get("pathParameters") or {}).get("contact_id", "")
+    item = _owned_contact(user_id, contact_id)
+    data = _body(event)
+
+    updates, removes = {}, []
+
+    if "name" in data:
+        name = str(data.get("name") or "").strip()[:CONTACT_NAME_MAX]
+        if not name:
+            raise ApiError(400, "name cannot be empty")
+        updates["name"] = name
+        updates["name_lc"] = _norm_name(name)
+
+    if "email" in data:
+        raw = str(data.get("email") or "").strip()
+        if raw:
+            email_lc = _norm_email(raw)
+            if not email_lc:
+                raise ApiError(400, "email is not a valid address")
+            clash = _find_contact_by_email(user_id, email_lc)
+            if clash and clash.get("contact_id") != item["contact_id"]:
+                raise ApiError(409, "another contact already uses this email")
+            updates["email"] = email_lc
+            updates["email_lc"] = email_lc
+            linked = _resolve_minutex_user(email_lc)
+            if linked:
+                updates["minutex_user_id"] = linked
+            else:
+                # The old link belonged to the OLD address; keeping it would
+                # attribute this person's tasks to an unrelated account.
+                removes.append("minutex_user_id")
+        else:
+            updates["email"] = ""
+            removes.extend(["email_lc", "minutex_user_id"])
+
+    if "phone" in data:
+        raw = str(data.get("phone") or "").strip()
+        if raw:
+            phone_e164 = _norm_phone(raw)
+            if not phone_e164:
+                raise ApiError(400, "phone is not a usable number")
+            clash = _find_contact_by_phone(user_id, phone_e164)
+            if clash and clash.get("contact_id") != item["contact_id"]:
+                raise ApiError(409, "another contact already uses this phone")
+            updates["phone"] = raw[:CONTACT_PHONE_MAX]
+            updates["phone_e164"] = phone_e164
+        else:
+            updates["phone"] = ""
+            removes.append("phone_e164")
+
+    for field, cap in (("company", CONTACT_COMPANY_MAX),
+                       ("role", CONTACT_ROLE_MAX),
+                       ("notes", CONTACT_NOTES_MAX)):
+        if field in data:
+            updates[field] = str(data.get(field) or "").strip()[:cap]
+
+    if not updates and not removes:
+        raise ApiError(400, "nothing to update")
+
+    updates["updated_at"] = _now_iso()
+    _apply_update(_contacts, {"contact_id": item["contact_id"]},
+                  updates, removes)
+    fresh = _contacts.get_item(
+        Key={"contact_id": item["contact_id"]}).get("Item") or {}
+    _audit("contact.updated", user_id, item["contact_id"],
+           fields=sorted(set(updates) | set(removes)))
+    return _resp(200, {"contact": _public_contact(fresh)})
+
+
+def delete_contact(event):
+    """DELETE /contacts/{contact_id} -> {deleted, id, unlinked_folders,
+    unassigned_tasks}
+
+    Deleting a PERSON does not delete their history. Folder associations and
+    participant rows that point at them are removed (they would otherwise be
+    orphans referencing a row that no longer exists), and tasks assigned to
+    them are set back to UNRESOLVED with the name preserved in
+    assignee_name_legacy — the work still exists, it just no longer claims to
+    belong to a contact record that is gone. Meetings and tasks themselves are
+    never deleted (section 36).
+    """
+    user_id = _require_auth(event)
+    contact_id = (event.get("pathParameters") or {}).get("contact_id", "")
+    item = _owned_contact(user_id, contact_id)
+    cid = item["contact_id"]
+
+    unlinked = 0
+    for fid in _folders_for_contact(cid):
+        _folder_contacts.delete_item(Key={"folder_id": fid, "contact_id": cid})
+        unlinked += 1
+
+    participants = 0
+    res = _meeting_participants.query(
+        IndexName=PARTICIPANTS_CONTACT_INDEX,
+        KeyConditionExpression=Key("contact_id").eq(cid),
+    )
+    for row in res.get("Items", []):
+        _meeting_participants.delete_item(
+            Key={"audio_s3_key": row["audio_s3_key"],
+                 "speaker_id": row["speaker_id"]})
+        participants += 1
+
+    unassigned = 0
+    res = _tasks.query(
+        IndexName=TASKS_ASSIGNEE_INDEX,
+        KeyConditionExpression=Key("assignee_contact_id").eq(cid),
+    )
+    for row in res.get("Items", []):
+        if row.get("owner_user_id") != user_id:
+            continue
+        _apply_update(
+            _tasks, {"task_id": row["task_id"]},
+            {"resolution_status": RESOLUTION_UNRESOLVED,
+             "assignee_name_legacy": row.get("assignee_name")
+                                     or item.get("name", ""),
+             "updated_at": _now_iso()},
+            ["assignee_contact_id", "assignee_user_id"])
+        unassigned += 1
+
+    _contacts.delete_item(Key={"contact_id": cid})
+    _audit("contact.deleted", user_id, cid, unlinked_folders=unlinked,
+           unassigned_tasks=unassigned)
+    return _resp(200, {"deleted": True, "id": cid,
+                       "unlinked_folders": unlinked,
+                       "unlinked_participants": participants,
+                       "unassigned_tasks": unassigned})
+
+
+# ---------------------------------------------------------------------------
+# Folders
+# ---------------------------------------------------------------------------
+def _public_folder(item, meeting_count=None):
+    out = {
+        "id": item.get("folder_id", ""),
+        "name": item.get("name", ""),
+        "description": item.get("description", ""),
+        # Appearance tokens, never raw colours — see FOLDER_COLORS. Defaulted
+        # on read so folders created before these existed render normally
+        # instead of the app having to handle a missing value everywhere.
+        "color": item.get("color") or FOLDER_COLOR_DEFAULT,
+        "icon": item.get("icon") or FOLDER_ICON_DEFAULT,
+        "created_at": item.get("created_at", ""),
+        "updated_at": item.get("updated_at", ""),
+    }
+    if meeting_count is not None:
+        out["meeting_count"] = meeting_count
+    return out
+
+
+def _owned_folder(user_id, folder_id):
+    """The Folder row, or 404 (never 403 — see the section header)."""
+    fid = str(folder_id or "").strip()
+    if not fid:
+        raise ApiError(400, "folder id required")
+    item = _folders.get_item(Key={"folder_id": fid}).get("Item")
+    if not item or item.get("owner_user_id") != user_id:
+        raise ApiError(404, "folder not found")
+    return item
+
+
+def _folder_by_name(user_id, name_lc):
+    """Existing folder with this normalized name, or None. Uses owner-index's
+    range key, so this is a point query rather than a scan."""
+    if not name_lc:
+        return None
+    res = _folders.query(
+        IndexName=FOLDERS_OWNER_INDEX,
+        KeyConditionExpression=Key("owner_user_id").eq(user_id)
+                               & Key("name_lc").eq(name_lc),
+        Limit=1,
+    )
+    items = res.get("Items", [])
+    return items[0] if items else None
+
+
+def create_folder(event):
+    """POST /folders {name, description?, color?, icon?} -> 201 {folder}
+
+    `color` and `icon` are TOKENS from a closed set (FOLDER_COLORS /
+    FOLDER_ICONS), not hex or arbitrary names — see those constants.
+
+    Names are unique per owner (case- and whitespace-insensitively): a folder
+    list with two "Client Alpha"s is a bug from the user's point of view, not a
+    feature. Enforced with a conditional write on a deterministic uniqueness
+    row rather than a read-then-write, so two simultaneous creates cannot both
+    succeed (section 25).
+    """
+    user_id = _require_auth(event)
+    data = _body(event)
+    name = str(data.get("name") or "").strip()[:FOLDER_NAME_MAX]
+    if not name:
+        raise ApiError(400, "name required")
+    name_lc = _norm_folder_name(name)
+
+    now = _now_iso()
+    item = {
+        "folder_id": uuid.uuid4().hex[:16],
+        "owner_user_id": user_id,
+        "name": name,
+        "name_lc": name_lc,
+        "description": str(data.get("description")
+                           or "").strip()[:FOLDER_DESCRIPTION_MAX],
+        "color": _clean_folder_color(data.get("color")),
+        "icon": _clean_folder_icon(data.get("icon")),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    # Uniqueness is claimed on a SEPARATE deterministic row
+    # (folder_id = "name#{owner}#{name_lc}") whose primary key encodes the
+    # constraint. A GSI cannot be given a uniqueness condition — DynamoDB
+    # conditions only apply to the item being written, and the name index is
+    # eventually consistent, so a read-then-write against it genuinely does let
+    # two concurrent creates both see "no duplicate" and both succeed. Claiming
+    # the key first turns that race into a ConditionalCheckFailed for exactly
+    # one of them.
+    claim_id = _folder_name_claim(user_id, name_lc)
+    try:
+        _folders.put_item(
+            Item={"folder_id": claim_id, "owner_user_id": user_id,
+                  "claims_folder_id": item["folder_id"], "created_at": now},
+            ConditionExpression="attribute_not_exists(folder_id)")
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                == "ConditionalCheckFailedException":
+            raise ApiError(409, "a folder with this name already exists")
+        raise
+
+    try:
+        _folders.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(folder_id)")
+    except Exception:
+        # Never leave a claim behind that no folder owns — it would make the
+        # name permanently unusable.
+        _folders.delete_item(Key={"folder_id": claim_id})
+        raise
+
+    _audit("folder.created", user_id, item["folder_id"])
+    return _resp(201, {"folder": _public_folder(item, meeting_count=0)})
+
+
+def _folder_name_claim(user_id, name_lc):
+    """The deterministic uniqueness-row id for (owner, normalized name).
+
+    Lives in the Folders table under a key shape no real folder_id can take (a
+    real one is a 16-char uuid hex), so claims and folders never collide.
+    Claim rows are filtered out of every read path by _is_folder_claim.
+    """
+    return f"name#{user_id}#{name_lc}"
+
+
+def _is_folder_claim(item):
+    return str(item.get("folder_id", "")).startswith("name#")
+
+
+def list_folders(event):
+    """GET /folders -> {folders, count}
+
+    Each folder carries its meeting_count, which is what the folder list
+    screen renders. Counts come from ONE query of the recordings user-index
+    tallied in memory, not one query per folder — the N+1 section 31 forbids.
+    """
+    user_id = _require_auth(event)
+    res = _folders.query(
+        IndexName=FOLDERS_OWNER_INDEX,
+        KeyConditionExpression=Key("owner_user_id").eq(user_id),
+        Limit=FOLDERS_MAX,
+    )
+    rows = [r for r in res.get("Items", []) if not _is_folder_claim(r)]
+    counts = _folder_meeting_counts(user_id)
+    folders = [_public_folder(r, meeting_count=counts.get(r["folder_id"], 0))
+               for r in rows]
+    folders.sort(key=lambda f: _norm_folder_name(f["name"]))
+    return _resp(200, {"folders": folders, "count": len(folders),
+                       "general_count": counts.get("", 0)})
+
+
+def _folder_meeting_counts(user_id):
+    """{folder_id: count} across the user's recordings, plus "" for General.
+
+    One user-index query, tallied here. Trashed rows are excluded so a count
+    matches what the folder actually shows.
+    """
+    counts = {}
+    kwargs = {
+        "IndexName": USER_INDEX,
+        "KeyConditionExpression": Key("user_id").eq(user_id),
+        "ProjectionExpression": "folder_id, recording_status",
+    }
+    while True:
+        res = _recordings.query(**kwargs)
+        for row in res.get("Items", []):
+            if _is_trashed(row):
+                continue
+            fid = str(row.get("folder_id") or "")
+            counts[fid] = counts.get(fid, 0) + 1
+        last = res.get("LastEvaluatedKey")
+        if not last:
+            break
+        kwargs["ExclusiveStartKey"] = last
+    return counts
+
+
+def get_folder(event):
+    """GET /folders/{folder_id} -> {folder, contacts}"""
+    user_id = _require_auth(event)
+    folder_id = (event.get("pathParameters") or {}).get("folder_id", "")
+    item = _owned_folder(user_id, folder_id)
+    counts = _folder_meeting_counts(user_id)
+    contacts = _folder_contact_rows(user_id, item["folder_id"])
+    return _resp(200, {
+        "folder": _public_folder(item,
+                                 meeting_count=counts.get(item["folder_id"], 0)),
+        "contacts": [_public_contact(c) for c in contacts],
+    })
+
+
+def update_folder(event):
+    """PATCH /folders/{folder_id} {name?, description?, color?, icon?}
+       -> {folder}
+
+    A rename moves the uniqueness claim: the new name is claimed first, and
+    only once that succeeds is the old claim released — so a failed rename
+    never frees a name that is still in use.
+    """
+    user_id = _require_auth(event)
+    folder_id = (event.get("pathParameters") or {}).get("folder_id", "")
+    item = _owned_folder(user_id, folder_id)
+    data = _body(event)
+
+    updates = {}
+    old_claim = None
+
+    if "name" in data:
+        name = str(data.get("name") or "").strip()[:FOLDER_NAME_MAX]
+        if not name:
+            raise ApiError(400, "name cannot be empty")
+        name_lc = _norm_folder_name(name)
+        if name_lc != item.get("name_lc"):
+            claim_id = _folder_name_claim(user_id, name_lc)
+            try:
+                _folders.put_item(
+                    Item={"folder_id": claim_id, "owner_user_id": user_id,
+                          "claims_folder_id": item["folder_id"],
+                          "created_at": _now_iso()},
+                    ConditionExpression="attribute_not_exists(folder_id)")
+            except ClientError as err:
+                if err.response.get("Error", {}).get("Code") \
+                        == "ConditionalCheckFailedException":
+                    raise ApiError(409,
+                                   "a folder with this name already exists")
+                raise
+            old_claim = _folder_name_claim(user_id, item.get("name_lc") or "")
+        updates["name"] = name
+        updates["name_lc"] = name_lc
+
+    if "description" in data:
+        updates["description"] = str(
+            data.get("description") or "").strip()[:FOLDER_DESCRIPTION_MAX]
+
+    if "color" in data:
+        updates["color"] = _clean_folder_color(
+            data.get("color"), item.get("color") or FOLDER_COLOR_DEFAULT)
+    if "icon" in data:
+        updates["icon"] = _clean_folder_icon(
+            data.get("icon"), item.get("icon") or FOLDER_ICON_DEFAULT)
+
+    if not updates:
+        raise ApiError(400, "nothing to update — send name, description, "
+                            "color and/or icon")
+
+    updates["updated_at"] = _now_iso()
+    try:
+        _apply_update(_folders, {"folder_id": item["folder_id"]}, updates, [])
+    except Exception:
+        if old_claim is not None:
+            # Roll the new claim back so a failed rename doesn't reserve a name.
+            _folders.delete_item(
+                Key={"folder_id": _folder_name_claim(user_id,
+                                                     updates["name_lc"])})
+        raise
+    if old_claim:
+        _folders.delete_item(Key={"folder_id": old_claim})
+
+    fresh = _folders.get_item(
+        Key={"folder_id": item["folder_id"]}).get("Item") or {}
+    counts = _folder_meeting_counts(user_id)
+    _audit("folder.updated", user_id, item["folder_id"])
+    return _resp(200, {"folder": _public_folder(
+        fresh, meeting_count=counts.get(item["folder_id"], 0))})
+
+
+def delete_folder(event):
+    """DELETE /folders/{folder_id} -> {deleted, id, meetings_moved,
+    contacts_unlinked, tasks_unfiled}
+
+    Deleting the ORGANIZATION never deletes the CONTENT (section 24). Meetings
+    in the folder move to General (folder_id removed), tasks lose their folder
+    context the same way, contact associations go (the folder they pointed at
+    is gone) but the Contacts themselves are untouched.
+    """
+    user_id = _require_auth(event)
+    folder_id = (event.get("pathParameters") or {}).get("folder_id", "")
+    item = _owned_folder(user_id, folder_id)
+    fid = item["folder_id"]
+
+    moved = 0
+    for row in _recordings_in_folder(user_id, fid):
+        _apply_update(_recordings, {"audio_s3_key": row["audio_s3_key"]},
+                      {"updated_at": _now_iso()}, ["folder_id"])
+        moved += 1
+
+    unfiled = 0
+    res = _tasks.query(
+        IndexName=TASKS_FOLDER_INDEX,
+        KeyConditionExpression=Key("folder_id").eq(fid),
+    )
+    for row in res.get("Items", []):
+        if row.get("owner_user_id") != user_id:
+            continue
+        _apply_update(_tasks, {"task_id": row["task_id"]},
+                      {"updated_at": _now_iso()}, ["folder_id"])
+        unfiled += 1
+
+    unlinked = 0
+    res = _folder_contacts.query(
+        KeyConditionExpression=Key("folder_id").eq(fid))
+    for row in res.get("Items", []):
+        _folder_contacts.delete_item(
+            Key={"folder_id": fid, "contact_id": row["contact_id"]})
+        unlinked += 1
+
+    _folders.delete_item(Key={"folder_id": fid})
+    claim = _folder_name_claim(user_id, item.get("name_lc") or "")
+    _folders.delete_item(Key={"folder_id": claim})
+
+    _audit("folder.deleted", user_id, fid, meetings_moved=moved,
+           tasks_unfiled=unfiled, contacts_unlinked=unlinked)
+    return _resp(200, {"deleted": True, "id": fid, "meetings_moved": moved,
+                       "contacts_unlinked": unlinked, "tasks_unfiled": unfiled})
+
+
+def _recordings_in_folder(user_id, folder_id):
+    """The user's recordings carrying this folder_id.
+
+    Filtered on the user-index rather than indexed by folder: a recording's
+    folder changes often and a dedicated GSI on the Recordings table would add
+    write cost to the hot upload path for a query that only runs on folder
+    delete and folder browse.
+    """
+    out = []
+    kwargs = {
+        "IndexName": USER_INDEX,
+        "KeyConditionExpression": Key("user_id").eq(user_id),
+    }
+    while True:
+        res = _recordings.query(**kwargs)
+        for row in res.get("Items", []):
+            if str(row.get("folder_id") or "") == folder_id:
+                out.append(row)
+        last = res.get("LastEvaluatedKey")
+        if not last:
+            break
+        kwargs["ExclusiveStartKey"] = last
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Folder <-> Contact association
+# ---------------------------------------------------------------------------
+def _link_folder_contact(folder_id, contact_id):
+    """Idempotent association write. The composite PK (folder_id, contact_id)
+    means a repeat is an overwrite of an identical row, so "add twice" cannot
+    produce two associations — the constraint is structural, not checked."""
+    _folder_contacts.put_item(Item={
+        "folder_id": folder_id,
+        "contact_id": contact_id,
+        "created_at": _now_iso(),
+    })
+
+
+def _folders_for_contact(contact_id):
+    """Folder ids this contact is associated with (reverse lookup via GSI)."""
+    res = _folder_contacts.query(
+        IndexName=FOLDER_CONTACTS_CONTACT_INDEX,
+        KeyConditionExpression=Key("contact_id").eq(contact_id),
+    )
+    return [r["folder_id"] for r in res.get("Items", [])]
+
+
+def _folder_contact_rows(user_id, folder_id):
+    """Hydrated Contact rows for a folder.
+
+    Association rows are ids only, so each one is fetched — bounded by the
+    association count, and each is re-ownership-checked so a stale row can
+    never surface another user's contact.
+    """
+    res = _folder_contacts.query(
+        KeyConditionExpression=Key("folder_id").eq(folder_id))
+    out = []
+    for row in res.get("Items", []):
+        c = _contacts.get_item(
+            Key={"contact_id": row["contact_id"]}).get("Item")
+        if c and c.get("owner_user_id") == user_id:
+            out.append(c)
+    out.sort(key=lambda c: _norm_name(c.get("name")))
+    return out
+
+
+def add_folder_contact(event):
+    """POST /folders/{folder_id}/contacts/{contact_id} -> {linked}
+
+    Both ids are ownership-checked before anything is written: this is the
+    route that would otherwise let a caller attach ANOTHER tenant's contact to
+    their own folder, which is the cross-tenant hole section 22 names.
+    """
+    user_id = _require_auth(event)
+    params = event.get("pathParameters") or {}
+    folder = _owned_folder(user_id, params.get("folder_id", ""))
+    contact = _owned_contact(user_id, params.get("contact_id", ""))
+    _link_folder_contact(folder["folder_id"], contact["contact_id"])
+    _audit("folder.contact_linked", user_id, folder["folder_id"],
+           contact_id=contact["contact_id"])
+    return _resp(200, {"linked": True, "folder_id": folder["folder_id"],
+                       "contact_id": contact["contact_id"],
+                       "contact": _public_contact(contact)})
+
+
+def remove_folder_contact(event):
+    """DELETE /folders/{folder_id}/contacts/{contact_id} -> {unlinked}
+
+    Removes the ASSOCIATION only. The global Contact survives — it is still a
+    real person, possibly in other folders (section 36).
+    """
+    user_id = _require_auth(event)
+    params = event.get("pathParameters") or {}
+    folder = _owned_folder(user_id, params.get("folder_id", ""))
+    contact = _owned_contact(user_id, params.get("contact_id", ""))
+    _folder_contacts.delete_item(Key={"folder_id": folder["folder_id"],
+                                      "contact_id": contact["contact_id"]})
+    _audit("folder.contact_unlinked", user_id, folder["folder_id"],
+           contact_id=contact["contact_id"])
+    return _resp(200, {"unlinked": True, "folder_id": folder["folder_id"],
+                       "contact_id": contact["contact_id"]})
+
+
+def list_folder_contacts(event):
+    """GET /folders/{folder_id}/contacts -> {contacts, count}"""
+    user_id = _require_auth(event)
+    folder_id = (event.get("pathParameters") or {}).get("folder_id", "")
+    folder = _owned_folder(user_id, folder_id)
+    rows = _folder_contact_rows(user_id, folder["folder_id"])
+    return _resp(200, {"contacts": [_public_contact(c) for c in rows],
+                       "count": len(rows)})
+
+
+# ---------------------------------------------------------------------------
+# Meeting <-> Folder
+# ---------------------------------------------------------------------------
+def move_recording_to_folder(event):
+    """PATCH /recordings/folder/{key+} {folder_id} -> {recording}
+
+    ONE attribute changes. The meeting is never copied, never duplicated, and
+    keeps its identity, transcript, AI output and tasks (section 1).
+    `folder_id: null` moves it to General by REMOVING the attribute, so
+    "General" has exactly one representation (absent) rather than two (absent
+    or "").
+
+    Tasks sourced from this meeting follow it, because a task's folder is
+    inherited from its meeting — leaving them behind would file a task under a
+    folder its own meeting is no longer in.
+
+    The action comes first and {key+} last for the same hard API Gateway reason
+    as every other keyed route here (a greedy variable is only legal in the
+    final position).
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+    if "folder_id" not in data:
+        raise ApiError(400, "folder_id required (send null for General)")
+
+    raw = data.get("folder_id")
+    updates = {"updated_at": _now_iso()}
+    removes = []
+    folder_id = ""
+    if raw is None or str(raw).strip() == "":
+        removes.append("folder_id")
+    else:
+        folder = _owned_folder(user_id, str(raw).strip())
+        folder_id = folder["folder_id"]
+        updates["folder_id"] = folder_id
+
+    _apply_update(_recordings, {"audio_s3_key": key}, updates, removes)
+
+    moved_tasks = 0
+    for row in _tasks_for_recording(key):
+        if row.get("owner_user_id") != user_id:
+            continue
+        if folder_id:
+            _apply_update(_tasks, {"task_id": row["task_id"]},
+                          {"folder_id": folder_id,
+                           "updated_at": _now_iso()}, [])
+        else:
+            _apply_update(_tasks, {"task_id": row["task_id"]},
+                          {"updated_at": _now_iso()}, ["folder_id"])
+        moved_tasks += 1
+
+    _audit("meeting.folder_changed", user_id, key,
+           folder_id=folder_id or None, tasks_moved=moved_tasks)
+    fresh = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+    fresh = transcript_store.hydrate(_s3, BUCKET_NAME, fresh)
+    return _resp(200, {
+        "recording": _with_crm_records(_with_source(fresh), user_id),
+        "folder_id": folder_id,
+        "tasks_moved": moved_tasks,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Meeting participants — speaker label -> Contact
+# ---------------------------------------------------------------------------
+def _public_participant(row, contact=None):
+    out = {
+        "speaker_id": row.get("speaker_id", ""),
+        "contact_id": row.get("contact_id", ""),
+        "participant_role": row.get("participant_role", ""),
+        "created_at": row.get("created_at", ""),
+        "updated_at": row.get("updated_at", ""),
+    }
+    if contact is not None:
+        out["contact"] = _public_contact(contact)
+    return out
+
+
+def _participant_rows(key):
+    res = _meeting_participants.query(
+        KeyConditionExpression=Key("audio_s3_key").eq(key))
+    return res.get("Items", [])
+
+
+def list_participants(event):
+    """GET /recordings/participants/{key+} -> {participants, speakers,
+    folder_contacts, folder_id}
+
+    Everything the speaker-mapping screen needs in ONE call: the labels the
+    transcript actually contains, whatever each is already mapped to, and the
+    folder's contacts to offer FIRST in the picker (section 10). The global
+    contact list stays a separate paged call — offering the folder's people
+    first is a shortcut, never a restriction.
+    """
+    user_id, key, item = _owned_recording(event)
+    rows = _participant_rows(key)
+
+    participants = []
+    for row in rows:
+        contact = None
+        cid = row.get("contact_id")
+        if cid:
+            c = _contacts.get_item(Key={"contact_id": cid}).get("Item")
+            if c and c.get("owner_user_id") == user_id:
+                contact = c
+        participants.append(_public_participant(row, contact))
+    participants.sort(key=lambda p: _speaker_sort_key(p["speaker_id"]))
+
+    folder_id = str(item.get("folder_id") or "")
+    folder_contacts = []
+    if folder_id:
+        folder = _folders.get_item(Key={"folder_id": folder_id}).get("Item")
+        if folder and folder.get("owner_user_id") == user_id:
+            folder_contacts = [_public_contact(c)
+                               for c in _folder_contact_rows(user_id, folder_id)]
+
+    return _resp(200, {
+        "participants": participants,
+        "speakers": _speaker_labels(item),
+        "speaker_names": item.get("speaker_names") or {},
+        "folder_id": folder_id,
+        "folder_contacts": folder_contacts,
+    })
+
+
+def _speaker_sort_key(label):
+    """Numeric labels sort numerically ("2" before "10"), others alphabetically
+    after them — so the participant list reads in speaker order."""
+    s = str(label or "")
+    return (0, int(s), "") if s.isdigit() else (1, 0, s)
+
+
+def _speaker_labels(item):
+    """The diarization labels this recording's transcript actually contains.
+
+    Read from `timestamps` (the per-segment diarization output) with
+    `speaker_names` as a fallback for rows whose transcript has been offloaded
+    or predates diarization. Derived, never stored: the transcript is the
+    source of truth for who spoke.
+    """
+    labels = []
+    seen = set()
+    for seg in (item.get("timestamps") or []):
+        if not isinstance(seg, dict):
+            continue
+        label = str(seg.get("speaker", "")).strip()
+        if label and label not in seen:
+            seen.add(label)
+            labels.append(label)
+    for label in (item.get("speaker_names") or {}):
+        if label not in seen:
+            seen.add(label)
+            labels.append(label)
+    labels.sort(key=_speaker_sort_key)
+    return labels
+
+
+def set_participant(event):
+    """PUT /recordings/participants/{key+} {speaker_id, contact_id,
+    participant_role?} -> {participant}
+
+    Maps one speaker label to one Contact. The TRANSCRIPT IS NEVER TOUCHED —
+    labels stay "0"/"1" forever (section 9); this row is what lets the UI show
+    a name over them.
+
+    Also mirrors the contact's name into the recording's existing
+    `speaker_names` map, because that map is what every already-shipped
+    surface renders from (documents, highlights, the transcript view) and what
+    `speaker_mapping_version` invalidates generated documents against. Writing
+    only the new row would map the speaker for this screen while every AI
+    document kept saying "Speaker 0".
+
+    `contact_id: null` clears the mapping.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+
+    speaker_id = str(data.get("speaker_id") or "").strip()[:MAX_SPEAKER_NAME]
+    if not speaker_id:
+        raise ApiError(400, "speaker_id required")
+
+    raw_contact = data.get("contact_id")
+    if raw_contact is None or str(raw_contact).strip() == "":
+        _meeting_participants.delete_item(
+            Key={"audio_s3_key": key, "speaker_id": speaker_id})
+        _sync_speaker_name_from_contact(user_id, key, item, speaker_id, None)
+        _audit("meeting.participant_cleared", user_id, key,
+               speaker_id=speaker_id)
+        return _resp(200, {"cleared": True, "speaker_id": speaker_id})
+
+    contact = _owned_contact(user_id, str(raw_contact).strip())
+    now = _now_iso()
+    row = {
+        "audio_s3_key": key,
+        "speaker_id": speaker_id,
+        "contact_id": contact["contact_id"],
+        "owner_user_id": user_id,
+        "participant_role": str(data.get("participant_role")
+                                or "").strip()[:PARTICIPANT_ROLE_MAX],
+        "created_at": now,
+        "updated_at": now,
+    }
+    _meeting_participants.put_item(Item=row)
+    _sync_speaker_name_from_contact(user_id, key, item, speaker_id, contact)
+
+    # Mapping a speaker is the event that can resolve AI tasks assigned to that
+    # speaker — this is the join in section 18's chain.
+    resolved = _resolve_tasks_for_speaker(user_id, key, speaker_id, contact)
+
+    _audit("meeting.participant_set", user_id, key, speaker_id=speaker_id,
+           contact_id=contact["contact_id"], tasks_resolved=resolved)
+    return _resp(200, {"participant": _public_participant(row, contact),
+                       "tasks_resolved": resolved})
+
+
+def _sync_speaker_name_from_contact(user_id, key, item, speaker_id, contact):
+    """Keep the recording's `speaker_names` map in step with the mapping.
+
+    Reuses the EXISTING mechanism rather than adding a second one: the map is
+    already what every rendered surface reads and what
+    `speaker_mapping_version` guards generated documents with, so a mapping
+    change must bump that counter exactly as a manual rename does — otherwise
+    documents generated under the old names would never be marked stale.
+    """
+    names = dict(item.get("speaker_names") or {})
+    if contact is None:
+        names.pop(speaker_id, None)
+    else:
+        names[speaker_id] = contact.get("name", "")[:MAX_SPEAKER_NAME]
+    if names == (item.get("speaker_names") or {}):
+        return
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression=("SET speaker_names = :sn, updated_at = :now, "
+                          "speaker_mapping_version = "
+                          "if_not_exists(speaker_mapping_version, :zero) + :one"),
+        ExpressionAttributeValues={":sn": names, ":now": _now_iso(),
+                                   ":zero": 0, ":one": 1},
+    )
+
+
+# ---------------------------------------------------------------------------
+# First-class Tasks
+# ---------------------------------------------------------------------------
+def _task_fingerprint(recording_key, text, assignee_hint=""):
+    """Stable identity for an AI-extracted task: MEETING + task text.
+
+    So the same extraction re-run (a reprocess, a duplicated Groq call, a
+    retried invocation) recognizes what it already created instead of adding a
+    second copy. Including the recording key means identical text in two
+    different meetings correctly stays two tasks.
+
+    THE ASSIGNEE IS DELIBERATELY NOT PART OF THIS, and `assignee_hint` is
+    accepted-but-ignored so existing call sites keep reading naturally.
+    A fingerprint must be stable over a task's whole life, and the assignee is
+    the single most-edited field on a task — the AI says "Speaker 2", the user
+    corrects it to "Siddhesh Gawade". Hashing it meant the corrected task no
+    longer matched its own extraction, so the seeder saw a gap and created a
+    duplicate. Observed on production data: three meetings where a reassigned
+    task came back twice.
+
+    The cost of dropping it is that two genuinely different tasks with
+    IDENTICAL text in ONE meeting collapse to one fingerprint. That is the
+    right trade: the AI does not emit the same sentence twice for one meeting,
+    and if it did, one task is a better outcome than a duplicate that
+    reappears every time someone fixes an assignee.
+
+    Not applied to manual tasks — a user typing the same task twice on purpose
+    is not a duplicate to be suppressed.
+    """
+    basis = "\x00".join([recording_key, _norm_name(text)])
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
+
+
+def _public_task_v2(row):
+    """A first-class Task in API shape.
+
+    `is_overdue` is COMPUTED, never stored (section 14): a stored flag would be
+    wrong the moment the clock passed midnight with nothing writing to the row.
+    """
+    due = row.get("due_date") or ""
+    status = row.get("status") or TASK_STATUS_OPEN
+    return {
+        "id": row.get("task_id", ""),
+        "task": row.get("title", ""),
+        "title": row.get("title", ""),
+        "description": row.get("description", ""),
+        "status": status,
+        "priority": row.get("priority", "Medium"),
+        "due": due,
+        "due_date": due,
+        "is_overdue": _is_overdue(due, status),
+        "assignee_contact_id": row.get("assignee_contact_id", ""),
+        "assignee_user_id": row.get("assignee_user_id", ""),
+        "assignee_name": row.get("assignee_name", ""),
+        "assignee_name_legacy": row.get("assignee_name_legacy", ""),
+        "assignee_speaker_id": row.get("assignee_speaker_id", ""),
+        "resolution_status": row.get("resolution_status", RESOLUTION_NONE),
+        "folder_id": row.get("folder_id", ""),
+        "source_recording_id": row.get("source_recording_id", ""),
+        "source_type": row.get("source_type", TASK_SOURCE_MANUAL),
+        "ai_confidence": row.get("ai_confidence", ""),
+        "ai_evidence": row.get("ai_evidence", ""),
+        "notified_via": row.get("notified_via", []),
+        "created_at": row.get("created_at", ""),
+        "updated_at": row.get("updated_at", ""),
+        "completed_at": row.get("completed_at", ""),
+        "from_action_item": row.get("source_type") == TASK_SOURCE_AI,
+        # The legacy API's assignee shape, so a client build written against
+        # the embedded-map API keeps rendering an assignee without changes.
+        "assignee": ({"name": row.get("assignee_name")
+                              or row.get("assignee_name_legacy") or "",
+                      "email": row.get("assignee_email", ""),
+                      "phone": row.get("assignee_phone", ""),
+                      "source": "manual"}
+                     if (row.get("assignee_name")
+                         or row.get("assignee_name_legacy")) else None),
+    }
+
+
+def _is_overdue(due, status):
+    """True when a non-terminal task's due date is in the past.
+
+    Timezone-safe: the stored value may be a full ISO timestamp or a bare
+    date. A bare date is treated as END of that day in UTC, so a task due
+    "2026-08-20" is not overdue at 00:01 on the 20th. Anything unparseable
+    (the AI can emit "next Friday", which is real data we must not crash on)
+    is simply not overdue — it cannot be compared, so it is not claimed.
+    """
+    if not due or status in TASK_TERMINAL_STATUSES:
+        return False
+    text = str(due).strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            when = datetime.fromisoformat(text).replace(
+                hour=23, minute=59, second=59, tzinfo=timezone.utc)
+        else:
+            when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+    return when < datetime.now(timezone.utc)
+
+
+def _clean_task_status(raw, field="status"):
+    """Accept either vocabulary, store the Title Case form."""
+    text = str(raw or "").strip()
+    if not text:
+        raise ApiError(400, f"{field} cannot be empty")
+    mapped = _TASK_STATUS_ALIASES.get(text.casefold())
+    if not mapped:
+        raise ApiError(400, f"{field} must be one of: "
+                            + ", ".join(TASK_STATUSES_V2))
+    return mapped
+
+
+def _clean_task_priority(raw):
+    text = str(raw or "").strip()
+    for p in TASK_PRIORITIES:
+        if text.casefold() == p.casefold():
+            return p
+    raise ApiError(400, "priority must be one of: " + ", ".join(TASK_PRIORITIES))
+
+
+def _tasks_for_recording(key):
+    """Every task sourced from one meeting (meeting-index)."""
+    res = _tasks.query(
+        IndexName=TASKS_MEETING_INDEX,
+        KeyConditionExpression=Key("source_recording_id").eq(key),
+    )
+    return res.get("Items", [])
+
+
+# Fingerprints of AI-seeded tasks the user has DELETED. Kept on the recording
+# row because that is what the seeder already reads, so honoring a tombstone
+# costs no extra request.
+#
+# WHY this is needed: seeding is idempotent through the fingerprint index,
+# which asks "does a task with this fingerprint exist?". Deleting the task
+# removes that row — and therefore the answer — so the very next read would
+# helpfully re-create the task the user just threw away. A deletion has to
+# leave a mark behind, or "delete" means "hide until you look again".
+DELETED_TASK_FINGERPRINTS_ATTR = "deleted_task_fingerprints"
+# Bounded so a user repeatedly seeding-and-deleting cannot grow the recording
+# row without limit (DynamoDB items cap at 400KB). Oldest entries fall off;
+# the worst case if one is evicted is that a very old deleted AI task can
+# reappear once, which is far better than an unwritable recording row.
+MAX_DELETED_FINGERPRINTS = 200
+
+
+def _deleted_fingerprints(item):
+    raw = item.get(DELETED_TASK_FINGERPRINTS_ATTR)
+    return [f for f in raw if isinstance(f, str)] if isinstance(raw, list) else []
+
+
+def _tombstone_fingerprint(key, item, fingerprint):
+    """Record that an AI-seeded task was deliberately deleted."""
+    if not fingerprint:
+        return
+    existing = _deleted_fingerprints(item)
+    if fingerprint in existing:
+        return
+    updated = (existing + [fingerprint])[-MAX_DELETED_FINGERPRINTS:]
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET #d = :d, updated_at = :now",
+        ExpressionAttributeNames={"#d": DELETED_TASK_FINGERPRINTS_ATTR},
+        ExpressionAttributeValues={":d": updated, ":now": _now_iso()},
+    )
+
+
+def _find_task_by_fingerprint(user_id, fingerprint):
+    """The existing task with this fingerprint, or None (dedupe-index)."""
+    if not fingerprint:
+        return None
+    res = _tasks.query(
+        IndexName=TASKS_DEDUPE_INDEX,
+        KeyConditionExpression=Key("owner_user_id").eq(user_id)
+                               & Key("fingerprint").eq(fingerprint),
+        Limit=1,
+    )
+    items = res.get("Items", [])
+    return items[0] if items else None
+
+
+def _owned_task(user_id, task_id):
+    tid = str(task_id or "").strip()
+    if not tid:
+        raise ApiError(400, "task id required")
+    row = _tasks.get_item(Key={"task_id": tid}).get("Item")
+    if not row or row.get("owner_user_id") != user_id:
+        raise ApiError(404, "task not found")
+    return row
+
+
+def _write_task(row):
+    """Put a Task row, omitting every empty GSI key attribute.
+
+    folder_id / assignee_contact_id / fingerprint are all index keys, and
+    DynamoDB rejects an empty string as one — so "no folder" must be an ABSENT
+    attribute, not "". Centralized here so no caller has to remember.
+    """
+    clean = {k: v for k, v in row.items()
+             if not (k in _TASK_SPARSE_KEYS and not v)}
+    _tasks.put_item(Item=clean)
+    return clean
+
+
+_TASK_SPARSE_KEYS = ("folder_id", "assignee_contact_id", "fingerprint",
+                     "assignee_user_id")
+
+# The key attributes of each Tasks index, used to build a resume cursor that is
+# valid for the index the query actually ran against (see list_all_tasks). A
+# cursor carrying only the table key is rejected on a GSI query.
+_TASK_INDEX_KEYS = {
+    TASKS_OWNER_INDEX: ("owner_user_id", "created_at"),
+    TASKS_MEETING_INDEX: ("source_recording_id", "created_at"),
+    TASKS_FOLDER_INDEX: ("folder_id", "created_at"),
+    TASKS_ASSIGNEE_INDEX: ("assignee_contact_id", "created_at"),
+    TASKS_DEDUPE_INDEX: ("owner_user_id", "fingerprint"),
+}
+
+
+def _new_task_row(user_id, title, *, recording_key="", folder_id="",
+                  description="", due="", priority="Medium",
+                  status=TASK_STATUS_OPEN, source_type=TASK_SOURCE_MANUAL,
+                  assignee_contact=None, assignee_name="",
+                  assignee_speaker_id="", ai_confidence="", ai_evidence="",
+                  fingerprint="", notified_via=None):
+    """Assemble a Task row, deriving the identity fields consistently.
+
+    The resolution_status logic is the important part and lives ONLY here:
+      * a Contact  -> RESOLVED, and assignee_user_id is filled from the
+                      contact's linked MinuteX account when it has one;
+      * a bare NAME -> UNRESOLVED, with the name kept in assignee_name_legacy
+                      so nothing is lost and the user can resolve it later;
+      * neither     -> NONE, which is not a failure, just an unassigned task.
+    A name is never silently turned into a contact here (section 16).
+    """
+    now = _now_iso()
+    row = {
+        "task_id": uuid.uuid4().hex[:16],
+        "owner_user_id": user_id,
+        "title": str(title or "").strip()[:MAX_TASK_TEXT],
+        "description": str(description or "").strip()[:MAX_TASK_NOTE_TEXT],
+        "status": status,
+        "priority": priority,
+        "due_date": str(due or "").strip()[:100],
+        "folder_id": folder_id or "",
+        "source_recording_id": recording_key or "",
+        "source_type": source_type,
+        "ai_confidence": str(ai_confidence or "")[:32],
+        "ai_evidence": str(ai_evidence or "")[:MAX_TASK_NOTE_TEXT],
+        "fingerprint": fingerprint or "",
+        "notified_via": list(notified_via or []),
+        "assignee_speaker_id": str(assignee_speaker_id or "")[:MAX_SPEAKER_NAME],
+        "created_at": now,
+        "updated_at": now,
+        "completed_at": "",
+    }
+    if assignee_contact:
+        row["assignee_contact_id"] = assignee_contact["contact_id"]
+        row["assignee_name"] = assignee_contact.get("name", "")
+        row["assignee_email"] = assignee_contact.get("email", "")
+        row["assignee_phone"] = assignee_contact.get("phone", "")
+        row["resolution_status"] = RESOLUTION_RESOLVED
+        linked = assignee_contact.get("minutex_user_id") or ""
+        if linked:
+            row["assignee_user_id"] = linked
+    elif str(assignee_name or "").strip():
+        # A NAME, not an identity. Preserved verbatim, explicitly unresolved.
+        row["assignee_name_legacy"] = str(assignee_name).strip()[:CONTACT_NAME_MAX]
+        row["resolution_status"] = RESOLUTION_UNRESOLVED
+    else:
+        row["resolution_status"] = RESOLUTION_NONE
+    if status == TASK_STATUS_COMPLETED:
+        row["completed_at"] = now
+    return row
+
+
+def _mirror_task_to_recording(key, task_row):
+    """Write the task into the recording row's legacy embedded map too.
+
+    The dual-write from the migration plan: the Tasks table is authoritative
+    and is what every read path uses, but the embedded map this app shipped
+    with is kept in step so (a) nothing is lost if the new table has to be
+    rebuilt and (b) an older client build still reading the map keeps working.
+    Reuses _save_task, so the concurrency-safe nested-SET behavior is shared
+    rather than reimplemented.
+
+    Best-effort ON PURPOSE: the authoritative write has already succeeded by
+    the time this runs, so a mirror failure must not fail the request. It is
+    logged instead — a divergence is a thing to notice, not a thing to 500 on.
+    """
+    if not key:
+        return
+    try:
+        _save_task(key, task_row["task_id"], {
+            "task": task_row.get("title", ""),
+            "due": task_row.get("due_date", ""),
+            "priority": task_row.get("priority", "Medium"),
+            "status": task_row.get("status", TASK_STATUS_OPEN),
+            "assignee": ({"name": task_row.get("assignee_name")
+                                  or task_row.get("assignee_name_legacy") or "",
+                          "source": "manual"}
+                         if (task_row.get("assignee_name")
+                             or task_row.get("assignee_name_legacy")) else None),
+            "notified_via": task_row.get("notified_via", []),
+            "created_at": task_row.get("created_at", ""),
+            "updated_at": task_row.get("updated_at", ""),
+            "from_action_item": task_row.get("source_type") == TASK_SOURCE_AI,
+            # Marks the map entry as a mirror, so the backfill can tell an
+            # already-migrated entry from a genuine legacy one.
+            "task_id": task_row["task_id"],
+        })
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] task mirror failed for {key}/{task_row['task_id']}: "
+              f"{type(e).__name__}: {e}")
+
+
+def _migrate_embedded_tasks(user_id, key, item):
+    """Bring one recording's embedded tasks into the Tasks table, once.
+
+    The read-path half of the migration (section 15): the first time a
+    meeting's tasks are read through the new API, any entry in the legacy map
+    that has no counterpart in the Tasks table is copied across. Idempotent by
+    construction — an entry is skipped when a task with its `legacy_task_id`
+    already exists, so this can run on every read forever without duplicating.
+
+    Legacy assignees become UNRESOLVED with their name preserved, never a
+    guessed Contact (section 16).
+
+    Returns the number of rows created.
+    """
+    stored = _stored_tasks(item)
+    if not stored:
+        return 0
+    existing = {r.get("legacy_task_id") for r in _tasks_for_recording(key)}
+    folder_id = str(item.get("folder_id") or "")
+    created = 0
+    for legacy_id, t in stored.items():
+        if not isinstance(t, dict) or legacy_id in existing:
+            continue
+        # An entry with no task text is not a task. Migrating it would create a
+        # blank row the user can neither read nor act on, so it is skipped —
+        # the same rule scripts/32_backfill_tasks.py applies, and the two must
+        # agree or the eager and lazy paths would produce different results.
+        if not str(t.get("task") or "").strip():
+            continue
+        # A mirrored entry carries the new task_id it came from — that is our
+        # own write coming back, not a legacy task to migrate.
+        if t.get("task_id"):
+            continue
+        assignee = t.get("assignee") if isinstance(t.get("assignee"), dict) else {}
+        status = t.get("status") or TASK_STATUS_OPEN
+        if status not in TASK_STATUSES_V2:
+            status = _TASK_STATUS_ALIASES.get(str(status).casefold(),
+                                              TASK_STATUS_OPEN)
+        row = _new_task_row(
+            user_id, t.get("task", ""),
+            recording_key=key, folder_id=folder_id,
+            due=t.get("due", ""),
+            priority=t.get("priority") or "Medium",
+            status=status,
+            source_type=(TASK_SOURCE_AI if t.get("from_action_item")
+                         else TASK_SOURCE_LEGACY),
+            assignee_name=(assignee or {}).get("name", ""),
+            notified_via=t.get("notified_via") or [],
+        )
+        # Preserve the original identity and timestamps: the migrated task IS
+        # the old task, not a new one that happens to look like it.
+        row["legacy_task_id"] = legacy_id
+        row["created_at"] = t.get("created_at") or row["created_at"]
+        row["updated_at"] = t.get("updated_at") or row["updated_at"]
+        if (assignee or {}).get("email"):
+            row["assignee_email"] = assignee["email"]
+        if (assignee or {}).get("phone"):
+            row["assignee_phone"] = assignee["phone"]
+        # A migrated task that ORIGINALLY came from the AI must carry the same
+        # fingerprint the seeder would compute for it, or the two idempotency
+        # schemes cannot see each other and both create the same task.
+        #
+        # This is not hypothetical — it is what happened on real data: the
+        # embedded map was itself seeded from `ai_tasks` long ago, so migration
+        # (keyed on legacy_task_id) and seeding (keyed on fingerprint) each
+        # produced their own copy, and a meeting with 5 tasks read back 10.
+        #
+        # Only AI-sourced entries get one. A task the user typed by hand has no
+        # counterpart in `ai_tasks` and must not be suppressed by a collision
+        # with one.
+        if t.get("from_action_item"):
+            row["fingerprint"] = _task_fingerprint(
+                key, row["title"], row.get("assignee_name_legacy") or "")
+        _write_task(row)
+        created += 1
+    if created:
+        print(f"[migrate] {key}: {created} embedded task(s) -> Tasks table")
+    return created
+
+
+def _seed_ai_tasks(user_id, key, item):
+    """Create first-class Tasks from the AI's extracted `ai_tasks`, once.
+
+    Replaces the embedded map's seeding path. Idempotent through the
+    fingerprint index, which is stronger than the old "is the map empty?"
+    check: it survives the user deleting one seeded task (that task stays
+    deleted instead of reappearing) and it makes a second AI run — a
+    reprocess, a retried invocation, two devices opening the meeting at once —
+    a no-op rather than a duplicate (section 20).
+
+    Assignees arrive as NAMES from the transcript. They become UNRESOLVED
+    tasks, except where the meeting's speaker mapping already identifies the
+    speaker, in which case the chain of section 18 resolves them properly.
+    """
+    source = item.get("ai_tasks") or []
+    if not isinstance(source, list) or not source:
+        return 0
+
+    folder_id = str(item.get("folder_id") or "")
+    # Speaker -> Contact for this meeting, so an AI task naming a mapped
+    # speaker resolves immediately instead of waiting to be resolved twice.
+    by_speaker = {}
+    for row in _participant_rows(key):
+        cid = row.get("contact_id")
+        if not cid:
+            continue
+        c = _contacts.get_item(Key={"contact_id": cid}).get("Item")
+        if c and c.get("owner_user_id") == user_id:
+            by_speaker[str(row.get("speaker_id"))] = c
+
+    tombstoned = set(_deleted_fingerprints(item))
+    created = 0
+    for raw in source[:MAX_TASKS]:
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("task") or "").strip()
+        if not title:
+            continue
+        assignee_name = str(raw.get("assignee") or "").strip()
+        speaker_id = str(raw.get("assignee_speaker_id") or "").strip()
+        fingerprint = _task_fingerprint(key, title, assignee_name or speaker_id)
+        if fingerprint in tombstoned:
+            continue  # the user deleted this one; do not resurrect it
+        if _find_task_by_fingerprint(user_id, fingerprint):
+            continue
+
+        contact = by_speaker.get(speaker_id) if speaker_id else None
+        priority = raw.get("priority") or "Medium"
+        if priority not in TASK_PRIORITIES:
+            priority = "Medium"
+        row = _new_task_row(
+            user_id, title,
+            recording_key=key, folder_id=folder_id,
+            due=raw.get("due_date") or "",
+            priority=priority,
+            source_type=TASK_SOURCE_AI,
+            assignee_contact=contact,
+            assignee_name="" if contact else assignee_name,
+            assignee_speaker_id=speaker_id,
+            ai_confidence=str(raw.get("confidence") or ""),
+            ai_evidence=str(raw.get("evidence") or ""),
+            fingerprint=fingerprint,
+        )
+        try:
+            _write_task(row)
+        except ClientError as err:
+            # Lost a race with a concurrent seeder — its row is as good as ours.
+            if err.response.get("Error", {}).get("Code") \
+                    != "ConditionalCheckFailedException":
+                raise
+            continue
+        _mirror_task_to_recording(key, row)
+        created += 1
+    if created:
+        print(f"[seed] {key}: {created} AI task(s) created")
+    return created
+
+
+def _resolve_tasks_for_speaker(user_id, key, speaker_id, contact):
+    """Attach a newly-mapped speaker's Contact to that speaker's open tasks.
+
+    This is the join that completes section 18: the AI recorded WHICH SPEAKER
+    owed the task, the user has now said who that speaker is, so the task can
+    finally name a person — including their MinuteX user id when they have an
+    account, which is what makes it notification-ready.
+
+    Only tasks whose assignee_speaker_id matches are touched, and only ones
+    not already resolved to a contact: a user who hand-assigned a task keeps
+    their choice.
+    """
+    resolved = 0
+    for row in _tasks_for_recording(key):
+        if row.get("owner_user_id") != user_id:
+            continue
+        if str(row.get("assignee_speaker_id") or "") != str(speaker_id):
+            continue
+        if row.get("assignee_contact_id"):
+            continue
+        updates = {
+            "assignee_contact_id": contact["contact_id"],
+            "assignee_name": contact.get("name", ""),
+            "assignee_email": contact.get("email", ""),
+            "assignee_phone": contact.get("phone", ""),
+            "resolution_status": RESOLUTION_RESOLVED,
+            "updated_at": _now_iso(),
+        }
+        removes = ["assignee_name_legacy"]
+        linked = contact.get("minutex_user_id") or ""
+        if linked:
+            updates["assignee_user_id"] = linked
+        else:
+            removes.append("assignee_user_id")
+        _apply_update(_tasks, {"task_id": row["task_id"]}, updates, removes)
+        resolved += 1
+    return resolved
+
+
+def list_meeting_tasks(event):
+    """GET /recordings/ai/tasks/{key+} -> {tasks}
+
+    Same route the app already calls, now served from the Tasks table. On the
+    way it (1) migrates any legacy embedded tasks and (2) seeds the AI's
+    extracted tasks — both idempotent, so this is safe on every call and a
+    meeting the AI found work in is never empty.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    _migrate_embedded_tasks(user_id, key, item)
+    _seed_ai_tasks(user_id, key, item)
+    rows = [r for r in _tasks_for_recording(key)
+            if r.get("owner_user_id") == user_id]
+    rows.sort(key=lambda r: r.get("created_at", ""))
+    return _resp(200, {"tasks": [_public_task_v2(r) for r in rows],
+                       "count": len(rows)})
+
+
+def create_meeting_task(event):
+    """POST /recordings/ai/tasks/{key+} {task, due?, priority?, status?,
+    assignee_contact_id?, assignee?} -> 201 {task}
+
+    A task the user adds themselves. `assignee_contact_id` is the first-class
+    path (a real Contact); the legacy `assignee: {name}` object is still
+    accepted from older clients and stored as an UNRESOLVED name rather than
+    being guessed into a contact.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+
+    title = str(data.get("task") or data.get("title") or "").strip()
+    if not title:
+        raise ApiError(400, "task required")
+
+    existing = [r for r in _tasks_for_recording(key)
+                if r.get("owner_user_id") == user_id]
+    if len(existing) >= MAX_TASKS:
+        raise ApiError(400, f"too many tasks (max {MAX_TASKS})")
+
+    contact = None
+    if data.get("assignee_contact_id"):
+        contact = _owned_contact(user_id, data["assignee_contact_id"])
+    legacy_name = ""
+    if contact is None and isinstance(data.get("assignee"), dict):
+        legacy_name = str(data["assignee"].get("name") or "").strip()
+
+    row = _new_task_row(
+        user_id, title,
+        recording_key=key,
+        folder_id=str(item.get("folder_id") or ""),
+        description=data.get("description") or "",
+        due=data.get("due") or data.get("due_date") or "",
+        priority=(_clean_task_priority(data["priority"])
+                  if data.get("priority") else "Medium"),
+        status=(_clean_task_status(data["status"])
+                if data.get("status") else TASK_STATUS_OPEN),
+        source_type=TASK_SOURCE_MANUAL,
+        assignee_contact=contact,
+        assignee_name=legacy_name,
+    )
+    _write_task(row)
+    _mirror_task_to_recording(key, row)
+    _audit("task.created", user_id, row["task_id"], recording_key=key)
+    return _resp(201, {"task": _public_task_v2(row)})
+
+
+def update_meeting_task(event):
+    """PATCH /recordings/ai/tasks/{key+} {id, ...} -> {task}
+
+    The one mutation route, exactly as before (edit / reassign / status /
+    notification-record all patch the same row). Status changes stamp or clear
+    `completed_at` so a completion time is real rather than inferred.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+    task_id = str(data.get("id") or "").strip()
+    if not task_id:
+        raise ApiError(400, "id required")
+
+    # Migrate first: the id the client holds may be a legacy map id it got
+    # from a previous build, which only exists in the Tasks table afterwards.
+    _migrate_embedded_tasks(user_id, key, item)
+    row = _find_task_for_update(user_id, key, task_id)
+    updates, removes = {}, []
+
+    if "task" in data or "title" in data:
+        title = str(data.get("task") or data.get("title") or "").strip()
+        if not title:
+            raise ApiError(400, "task cannot be empty")
+        updates["title"] = title[:MAX_TASK_TEXT]
+    if "description" in data:
+        updates["description"] = str(
+            data.get("description") or "").strip()[:MAX_TASK_NOTE_TEXT]
+    if "due" in data or "due_date" in data:
+        raw = data.get("due") if "due" in data else data.get("due_date")
+        updates["due_date"] = str(raw or "").strip()[:100]
+    if "priority" in data:
+        updates["priority"] = _clean_task_priority(data["priority"])
+    if "status" in data:
+        status = _clean_task_status(data["status"])
+        updates["status"] = status
+        if status == TASK_STATUS_COMPLETED:
+            # Preserve an existing completion time — re-saving a completed task
+            # must not move the moment it was finished.
+            if not row.get("completed_at"):
+                updates["completed_at"] = _now_iso()
+        else:
+            updates["completed_at"] = ""
+
+    if "assignee_contact_id" in data:
+        raw = data.get("assignee_contact_id")
+        if raw is None or str(raw).strip() == "":
+            removes.extend(["assignee_contact_id", "assignee_user_id"])
+            updates["assignee_name"] = ""
+            updates["assignee_email"] = ""
+            updates["assignee_phone"] = ""
+            updates["resolution_status"] = RESOLUTION_NONE
+        else:
+            contact = _owned_contact(user_id, str(raw).strip())
+            updates["assignee_contact_id"] = contact["contact_id"]
+            updates["assignee_name"] = contact.get("name", "")
+            updates["assignee_email"] = contact.get("email", "")
+            updates["assignee_phone"] = contact.get("phone", "")
+            updates["resolution_status"] = RESOLUTION_RESOLVED
+            removes.append("assignee_name_legacy")
+            linked = contact.get("minutex_user_id") or ""
+            if linked:
+                updates["assignee_user_id"] = linked
+            else:
+                removes.append("assignee_user_id")
+    elif "assignee" in data:
+        # Legacy shape from an older client: a NAME. Kept unresolved.
+        raw = data.get("assignee")
+        if raw is None:
+            removes.extend(["assignee_contact_id", "assignee_user_id",
+                            "assignee_name_legacy"])
+            updates["assignee_name"] = ""
+            updates["resolution_status"] = RESOLUTION_NONE
+        elif isinstance(raw, dict):
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                raise ApiError(400, "assignee.name required")
+            updates["assignee_name_legacy"] = name[:CONTACT_NAME_MAX]
+            updates["assignee_name"] = ""
+            updates["resolution_status"] = RESOLUTION_UNRESOLVED
+            removes.extend(["assignee_contact_id", "assignee_user_id"])
+        else:
+            raise ApiError(400, "assignee must be an object or null")
+
+    if "notify_channels" in data:
+        raw = data.get("notify_channels")
+        if not isinstance(raw, list):
+            raise ApiError(400, "notify_channels must be an array")
+        channels = [c for c in (str(c).strip().lower() for c in raw)
+                    if c in NOTIFY_CHANNELS]
+        # ADDED, not replaced — same rule as before: a channel already
+        # notified stays marked when a later call notifies only the others.
+        updates["notified_via"] = sorted(
+            set(row.get("notified_via") or []) | set(channels))
+
+    if not updates and not removes:
+        raise ApiError(400, "nothing to update")
+
+    updates["updated_at"] = _now_iso()
+    _apply_update(_tasks, {"task_id": row["task_id"]}, updates, removes)
+    fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item") or {}
+    _mirror_task_to_recording(key, fresh)
+    _audit("task.updated", user_id, row["task_id"],
+           fields=sorted(set(updates) | set(removes)))
+    return _resp(200, {"task": _public_task_v2(fresh)})
+
+
+def _find_task_for_update(user_id, key, task_id):
+    """Resolve a task id that may be either a Tasks-table id or a legacy
+    embedded-map id, so a client holding an old id still works after migration.
+    """
+    row = _tasks.get_item(Key={"task_id": task_id}).get("Item")
+    if row and row.get("owner_user_id") == user_id:
+        return row
+    for candidate in _tasks_for_recording(key):
+        if candidate.get("legacy_task_id") == task_id \
+                and candidate.get("owner_user_id") == user_id:
+            return candidate
+    raise ApiError(404, "task not found")
+
+
+def delete_meeting_task(event):
+    """DELETE /recordings/ai/tasks/{key+} {id} -> {deleted, id}
+
+    Removes the authoritative row AND its legacy mirror entry, so a deleted
+    task cannot come back from the map on a later migration pass.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+    task_id = str(data.get("id") or "").strip()
+    if not task_id:
+        raise ApiError(400, "id required")
+
+    _migrate_embedded_tasks(user_id, key, item)
+    row = _find_task_for_update(user_id, key, task_id)
+    _tasks.delete_item(Key={"task_id": row["task_id"]})
+    # An AI-seeded task carries a fingerprint, which is also what stops it
+    # being seeded twice. Removing the row removes that guard, so the deletion
+    # must be recorded explicitly or the next read re-creates it.
+    _tombstone_fingerprint(key, item, row.get("fingerprint") or "")
+
+    for mirror_id in filter(None, [row["task_id"], row.get("legacy_task_id")]):
+        try:
+            _recordings.update_item(
+                Key={"audio_s3_key": key},
+                UpdateExpression="SET updated_at = :now REMOVE #tasks.#t",
+                ExpressionAttributeNames={"#tasks": TASKS_ATTR,
+                                          "#t": mirror_id},
+                ExpressionAttributeValues={":now": _now_iso()},
+            )
+        except ClientError as err:
+            # The map (or the entry) may simply not exist — not an error.
+            if err.response.get("Error", {}).get("Code") \
+                    not in ("ValidationException",):
+                raise
+    _audit("task.deleted", user_id, row["task_id"], recording_key=key)
+    return _resp(200, {"deleted": True, "id": task_id})
+
+
+def list_all_tasks(event):
+    """GET /tasks?status=&folder_id=&assignee_contact_id=&recording_key=
+                  &overdue=&due_before=&assigned_to_me=&limit=&cursor=
+       -> {tasks, count, next_cursor}
+
+    The cross-meeting task query the Task Tracker is built on (section 21).
+    Every filter is applied SERVER-side, and the query is driven off whichever
+    GSI the filter set makes cheapest — folder-index for a folder filter,
+    assignee-index for an assignee, meeting-index for one meeting, otherwise
+    owner-index. Filters that DynamoDB cannot express as a key condition
+    (overdue, which depends on the current time) are applied after the read,
+    which is why the page loop below keeps reading until the page fills.
+    """
+    user_id = _require_auth(event)
+    qs = event.get("queryStringParameters") or {}
+    limit = _clean_limit(qs.get("limit"), TASKS_PAGE_DEFAULT, TASKS_PAGE_MAX)
+
+    status = str(qs.get("status") or "").strip()
+    status = _clean_task_status(status) if status else ""
+    folder_id = str(qs.get("folder_id") or "").strip()
+    assignee_contact_id = str(qs.get("assignee_contact_id") or "").strip()
+    recording_key = _url_unquote(str(qs.get("recording_key") or "").strip())
+    overdue_only = str(qs.get("overdue") or "").strip().lower() in ("1", "true")
+    assigned_to_me = str(qs.get("assigned_to_me")
+                         or "").strip().lower() in ("1", "true")
+    due_before = str(qs.get("due_before") or "").strip()
+
+    # Ownership of a filter target is checked BEFORE it is used as a key: a
+    # folder or contact id the caller doesn't own must 404, not silently
+    # return that other tenant's tasks.
+    if folder_id:
+        _owned_folder(user_id, folder_id)
+    if assignee_contact_id:
+        _owned_contact(user_id, assignee_contact_id)
+
+    if folder_id:
+        base = {"IndexName": TASKS_FOLDER_INDEX,
+                "KeyConditionExpression": Key("folder_id").eq(folder_id)}
+    elif assignee_contact_id:
+        base = {"IndexName": TASKS_ASSIGNEE_INDEX,
+                "KeyConditionExpression":
+                    Key("assignee_contact_id").eq(assignee_contact_id)}
+    elif recording_key:
+        base = {"IndexName": TASKS_MEETING_INDEX,
+                "KeyConditionExpression":
+                    Key("source_recording_id").eq(recording_key)}
+    else:
+        base = {"IndexName": TASKS_OWNER_INDEX,
+                "KeyConditionExpression": Key("owner_user_id").eq(user_id)}
+    base["ScanIndexForward"] = False
+
+    cursor = _decode_cursor(qs.get("cursor"))
+    if cursor:
+        base["ExclusiveStartKey"] = cursor
+
+    out, last_key = [], None
+    for _ in range(_SEARCH_MAX_PAGES):
+        base["Limit"] = max(limit * 2, 100)
+        res = _tasks.query(**base)
+        for row in res.get("Items", []):
+            # EVERY row is re-checked against the caller, including on indexes
+            # not keyed by owner (folder/assignee/meeting): the index is a
+            # lookup path, never an authorization decision.
+            if row.get("owner_user_id") != user_id:
+                continue
+            if status and row.get("status") != status:
+                continue
+            if assigned_to_me and row.get("assignee_user_id") != user_id:
+                continue
+            if overdue_only and not _is_overdue(row.get("due_date"),
+                                                row.get("status")):
+                continue
+            if due_before:
+                due = str(row.get("due_date") or "")
+                if not due or due > due_before:
+                    continue
+            out.append(row)
+        last_key = res.get("LastEvaluatedKey")
+        if not last_key or len(out) >= limit:
+            break
+        base["ExclusiveStartKey"] = last_key
+
+    # The cursor must resume from the last row we actually RETURNED, not from
+    # wherever the index scan happened to stop.
+    #
+    # Those are different positions whenever the filters trimmed the page, and
+    # getting it wrong is silent: an earlier version emitted "" when the results
+    # overflowed the page, so a client with 7 matching tasks and limit=3 saw
+    # three and stopped, with the other four unreachable. A task tracker that
+    # quietly hides work is worse than one that errors.
+    #
+    # Both index key attributes AND the table key go into the cursor, because
+    # ExclusiveStartKey on a GSI query needs enough to identify the row in both
+    # the index and the base table.
+    overflowed = len(out) > limit
+    out = out[:limit]
+    next_cursor = ""
+    if overflowed and out:
+        anchor = out[-1]
+        index_name = base.get("IndexName") or ""
+        cursor_key = {"task_id": anchor["task_id"]}
+        for attr in _TASK_INDEX_KEYS.get(index_name, ()):
+            if anchor.get(attr) not in (None, ""):
+                cursor_key[attr] = anchor[attr]
+        next_cursor = _encode_cursor(cursor_key)
+    elif last_key:
+        next_cursor = _encode_cursor(last_key)
+    return _resp(200, {"tasks": [_public_task_v2(r) for r in out],
+                       "count": len(out), "next_cursor": next_cursor})
+
+
+def get_task(event):
+    """GET /tasks/{task_id} -> {task, contact?, folder?, recording?}
+
+    The task detail screen's one call: the task plus the entities it points at
+    (section 13's who / where / why), each ownership-checked in its own right.
+    """
+    user_id = _require_auth(event)
+    task_id = (event.get("pathParameters") or {}).get("task_id", "")
+    row = _owned_task(user_id, task_id)
+    out = {"task": _public_task_v2(row)}
+
+    cid = row.get("assignee_contact_id")
+    if cid:
+        c = _contacts.get_item(Key={"contact_id": cid}).get("Item")
+        if c and c.get("owner_user_id") == user_id:
+            out["contact"] = _public_contact(c)
+    fid = row.get("folder_id")
+    if fid:
+        f = _folders.get_item(Key={"folder_id": fid}).get("Item")
+        if f and f.get("owner_user_id") == user_id:
+            out["folder"] = _public_folder(f)
+    key = row.get("source_recording_id")
+    if key:
+        rec = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+        if rec and (rec.get("user_id") == user_id
+                    or rec.get("device_id") in _owned_devices(user_id)):
+            out["recording"] = {"audio_s3_key": key,
+                                "title": rec.get("title", ""),
+                                "recorded_at": rec.get("recorded_at", ""),
+                                "folder_id": str(rec.get("folder_id") or "")}
+    return _resp(200, {**out})
+
+
+def update_task_v2(event):
+    """PATCH /tasks/{task_id} — the same mutation as the meeting-scoped route,
+    reached by task id alone so the Task Tracker doesn't need to know which
+    meeting a task came from."""
+    user_id = _require_auth(event)
+    task_id = (event.get("pathParameters") or {}).get("task_id", "")
+    row = _owned_task(user_id, task_id)
+    # Delegate to the meeting-scoped implementation by handing it the shape it
+    # expects — one code path for task mutation, not two that can drift.
+    forged = dict(event)
+    forged["pathParameters"] = {
+        "key": urllib.parse.quote(row.get("source_recording_id") or "",
+                                  safe="")}
+    body = _body(event)
+    body["id"] = row["task_id"]
+    forged["body"] = json.dumps(body)
+    forged["isBase64Encoded"] = False
+    if not row.get("source_recording_id"):
+        # A task with no source meeting (never happens today, but the field is
+        # nullable by design) can't go through the meeting route — patch it
+        # directly with the same validation by reusing the helpers.
+        raise ApiError(409, "this task has no source meeting")
+    return update_meeting_task(forged)
+
+
+def resolve_task_assignee(event):
+    """POST /tasks/{task_id}/resolve {contact_id} -> {task}
+
+    The explicit "which Rahul?" answer (section 19). A user choosing a Contact
+    for an unresolved task is the ONLY way an unresolved assignee becomes a
+    resolved one by name — nothing in this system upgrades a name to an
+    identity on its own.
+    """
+    user_id = _require_auth(event)
+    task_id = (event.get("pathParameters") or {}).get("task_id", "")
+    row = _owned_task(user_id, task_id)
+    data = _body(event)
+    contact = _owned_contact(user_id, data.get("contact_id"))
+
+    updates = {
+        "assignee_contact_id": contact["contact_id"],
+        "assignee_name": contact.get("name", ""),
+        "assignee_email": contact.get("email", ""),
+        "assignee_phone": contact.get("phone", ""),
+        "resolution_status": RESOLUTION_RESOLVED,
+        "updated_at": _now_iso(),
+    }
+    removes = ["assignee_name_legacy"]
+    linked = contact.get("minutex_user_id") or ""
+    if linked:
+        updates["assignee_user_id"] = linked
+    else:
+        removes.append("assignee_user_id")
+    _apply_update(_tasks, {"task_id": row["task_id"]}, updates, removes)
+    fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item") or {}
+    if fresh.get("source_recording_id"):
+        _mirror_task_to_recording(fresh["source_recording_id"], fresh)
+    _audit("task.assignee_resolved", user_id, row["task_id"],
+           contact_id=contact["contact_id"])
+    return _resp(200, {"task": _public_task_v2(fresh)})
+
+
+def suggest_task_assignees(event):
+    """GET /tasks/{task_id}/assignee-candidates -> {status, candidates}
+
+    Who an unresolved task's NAME might refer to, ranked by the folder it is
+    in. Returns candidates for the user to choose from — it never picks. The
+    `status` mirrors _match_contacts: "ambiguous" with one candidate still
+    means "you decide", because a lone name match is not an identity.
+    """
+    user_id = _require_auth(event)
+    task_id = (event.get("pathParameters") or {}).get("task_id", "")
+    row = _owned_task(user_id, task_id)
+    name = row.get("assignee_name_legacy") or row.get("assignee_name") or ""
+    if not name:
+        return _resp(200, {"status": "none", "candidates": [],
+                           "searched_name": ""})
+
+    status, matches = _match_contacts(user_id, name=name)
+    folder_id = str(row.get("folder_id") or "")
+    in_folder = set(_folder_contact_ids(folder_id)) if folder_id else set()
+    # Folder members first: a name spoken in a Client Alpha meeting most likely
+    # means the Client Alpha contact. A ranking hint for the human, not a
+    # decision — the status stays "ambiguous" either way.
+    candidates = sorted(
+        matches,
+        key=lambda c: (0 if c["contact_id"] in in_folder else 1,
+                       _norm_name(c.get("name"))))
+    return _resp(200, {
+        "status": status,
+        "searched_name": name,
+        "candidates": [{**_public_contact(c),
+                        "in_folder": c["contact_id"] in in_folder}
+                       for c in candidates],
+    })
+
+
+def _folder_contact_ids(folder_id):
+    if not folder_id:
+        return []
+    res = _folder_contacts.query(
+        KeyConditionExpression=Key("folder_id").eq(folder_id))
+    return [r["contact_id"] for r in res.get("Items", [])]
+
+
+# ---------------------------------------------------------------------------
+# Shared plumbing for this section
+# ---------------------------------------------------------------------------
+# How many index pages one filtered list request may read before giving up and
+# returning what it has with a cursor. Bounds worst-case latency when a filter
+# matches very few rows in a large table.
+_SEARCH_MAX_PAGES = 5
+
+
+def _clean_limit(raw, default, maximum):
+    try:
+        value = int(str(raw or "").strip() or default)
+    except (TypeError, ValueError):
+        raise ApiError(400, "limit must be an integer")
+    if value < 1:
+        raise ApiError(400, "limit must be at least 1")
+    return min(value, maximum)
+
+
+def _encode_cursor(last_key):
+    """DynamoDB LastEvaluatedKey -> opaque base64url pagination cursor.
+
+    Opaque on purpose: it is a server-side implementation detail, and a client
+    that took it apart would break the moment an index changed.
+    """
+    if not last_key:
+        return ""
+    return _b64u_encode(json.dumps(last_key, default=str).encode("utf-8"))
+
+
+def _decode_cursor(raw):
+    if not raw:
+        return None
+    try:
+        data = json.loads(_b64u_decode(str(raw)))
+    except (ValueError, TypeError):
+        raise ApiError(400, "invalid cursor")
+    if not isinstance(data, dict):
+        raise ApiError(400, "invalid cursor")
+    return data
+
+
+def _apply_update(table, key, updates, removes):
+    """One UpdateItem from a {field: value} dict plus a list of REMOVEs.
+
+    Exists because this section does a lot of partial updates and hand-built
+    UpdateExpressions are where reserved-word collisions hide. Every name is
+    aliased through ExpressionAttributeNames, so a field called `status`,
+    `role` or `name` — all DynamoDB reserved words — can never break a write.
+    """
+    if not updates and not removes:
+        return
+    names, values, sets = {}, {}, []
+    for i, (field, value) in enumerate(updates.items()):
+        names[f"#f{i}"] = field
+        values[f":v{i}"] = value
+        sets.append(f"#f{i} = :v{i}")
+    drops = []
+    for i, field in enumerate(removes or []):
+        names[f"#r{i}"] = field
+        drops.append(f"#r{i}")
+    expr = ""
+    if sets:
+        expr = "SET " + ", ".join(sets)
+    if drops:
+        expr += (" " if expr else "") + "REMOVE " + ", ".join(drops)
+    kwargs = {"Key": key, "UpdateExpression": expr,
+              "ExpressionAttributeNames": names}
+    if values:
+        kwargs["ExpressionAttributeValues"] = values
+    table.update_item(**kwargs)
+
+
+def _audit(action, user_id, entity_id, **extra):
+    """Structured audit line for an important mutation (section 33/37).
+
+    Goes to CloudWatch via print, like every other log in this file — there is
+    no separate audit store, and inventing one would be a bigger change than
+    this asks for. Deliberately logs IDS AND COUNTS ONLY: never a contact's
+    name, email or phone, never task text, never transcript content. Those are
+    the personal data section 37 rules out, and an audit trail that leaks them
+    is worse than none.
+    """
+    fields = " ".join(f"{k}={v}" for k, v in sorted(extra.items())
+                      if v is not None)
+    print(f"[audit] {action} user={user_id} entity={entity_id}"
+          + (f" {fields}" if fields else ""))
+
+
+
+# ---------------------------------------------------------------------------
+# CRM — Salesforce connect (Phase 1: OAuth only; no record linking yet).
+#
+# Web-server (authorization code) flow:
+#   1. GET  /crm/salesforce/connect  (JWT) mints a signed, expiring `state`
+#      (HMAC over user_id + exp, same secret as the JWT — no extra table
+#      needed for CSRF protection) and returns the Salesforce authorize URL.
+#   2. The app opens that URL in a browser. The user logs in / approves on
+#      Salesforce's own page — we never see their password (see the
+#      Username-Password flow note below for why that path was rejected).
+#   3. Salesforce redirects to GET /crm/salesforce/callback?code=...&state=...
+#      — this route is UNAUTHENTICATED (no JWT: the browser, not the app,
+#      calls it). `state` is verified instead, exactly like the pairing
+#      code hash stands in for a session there.
+#   4. The callback exchanges `code` for tokens over stdlib urllib (matches
+#      the zero-dependency convention — see module docstring), envelope-
+#      encrypts the refresh token with KMS, and writes one CrmConnections
+#      row (PK user_id, SK provider) — a new single-purpose table, same
+#      shape convention as Devices/DeviceKeys/UserDevices.
+#   5. GET /crm/salesforce/status and DELETE /crm/salesforce let the app
+#      show connection state and disconnect, without ever exposing tokens.
+#
+# SalesforceClient is a seam (mirrors FirmwareVerifier): every real network
+# call to Salesforce goes through it, so Phase 5/7 (record lookup, push)
+# plug in later without touching the route handlers, and it is the one
+# place a test can monkeypatch.
+# ---------------------------------------------------------------------------
+CRM_PROVIDER_SALESFORCE = "salesforce"
+
+
+def _salesforce_client_secret():
+    """Connected App consumer secret — Secrets Manager, same lazy-cache
+    pattern as _jwt_secret(). No env-var fallback: unlike the JWT secret
+    there is no pre-existing plaintext deployment to stay compatible with,
+    so this should never be allowed to land as a plaintext env var."""
+    global _salesforce_secret_cache
+    if _salesforce_secret_cache is not None:
+        return _salesforce_secret_cache
+    if not SALESFORCE_CLIENT_SECRET_ARN:
+        raise RuntimeError("SALESFORCE_CLIENT_SECRET_ARN is not set")
+    sm = boto3.client("secretsmanager", region_name=REGION)
+    _salesforce_secret_cache = sm.get_secret_value(
+        SecretId=SALESFORCE_CLIENT_SECRET_ARN)["SecretString"]
+    return _salesforce_secret_cache
+
+
+_salesforce_secret_cache = None
+_kms = boto3.client("kms", region_name=REGION)
+
+
+def _kms_encrypt(plaintext: str) -> str:
+    resp = _kms.encrypt(KeyId=SALESFORCE_KMS_KEY_ID, Plaintext=plaintext.encode("utf-8"))
+    return _b64u_encode(resp["CiphertextBlob"])
+
+
+def _kms_decrypt(ciphertext_b64: str) -> str:
+    resp = _kms.decrypt(CiphertextBlob=_b64u_decode(ciphertext_b64), KeyId=SALESFORCE_KMS_KEY_ID)
+    return resp["Plaintext"].decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# PKCE (RFC 7636). Salesforce Connected Apps now REQUIRE a code challenge:
+# without one the authorize call fails with
+#   error=invalid_request&error_description=missing required code challenge
+#
+# WHERE THE VERIFIER LIVES — the one design decision worth stating, because the
+# obvious answer is wrong here. In a public-client flow the app keeps the
+# verifier and performs the exchange itself. In THIS flow the app never sees an
+# authorization code: Salesforce redirects to our Lambda, and the Lambda
+# exchanges the code using the client secret from Secrets Manager (which must
+# never ship in a mobile binary). So a verifier stored on the device could
+# never reach the code that needs it.
+#
+# The verifier is therefore generated server-side in /connect and carried
+# inside the SIGNED STATE — the only value that provably round-trips through
+# Salesforce back to /callback. That gives PKCE exactly the properties it
+# needs, for free, from machinery that already exists:
+#   * per attempt      — a fresh verifier every /connect call
+#   * tamper-proof     — the state is HMAC-signed; editing it invalidates it
+#   * expiring         — SALESFORCE_STATE_TTL bounds the transaction
+#   * correctly paired — verifier and state are the SAME string, so a verifier
+#                        from another attempt is structurally impossible
+#
+# The state is opaque to the client and the verifier is never in a URL
+# parameter of its own, never logged, and never stored at rest.
+# ---------------------------------------------------------------------------
+PKCE_VERIFIER_BYTES = 32          # -> 43 chars base64url, RFC 7636 minimum
+PKCE_METHOD = "S256"
+
+
+def _new_pkce_verifier() -> str:
+    """A fresh, cryptographically random code_verifier (RFC 7636 §4.1)."""
+    return _b64u_encode(secrets.token_bytes(PKCE_VERIFIER_BYTES))
+
+
+def _pkce_challenge(verifier: str) -> str:
+    """code_challenge = BASE64URL(SHA256(ASCII(verifier))), no padding."""
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return _b64u_encode(digest)
+
+
+def _sign_oauth_state(user_id: str, verifier: str = "") -> str:
+    """HMAC-signed, expiring state param — the CSRF guard for the redirect
+    round-trip, and the carrier for the PKCE verifier.
+
+    Reuses the JWT secret rather than a new one: this is not a session token,
+    just a tamper-proof "this browser redirect really started from an
+    authenticated /connect call for this user" claim. The verifier rides inside
+    the signed payload (see the PKCE note above), so it cannot be swapped
+    between attempts without breaking the signature.
+    """
+    payload = {"sub": user_id, "exp": int(time.time()) + SALESFORCE_STATE_TTL}
+    if verifier:
+        payload["cv"] = verifier
+    seg = _b64u_encode(json.dumps(payload, separators=(",", ":")).encode())
+    sig = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
+    return seg + "." + _b64u_encode(sig)
+
+
+def _verify_oauth_state(state: str) -> tuple:
+    """Return (user_id, code_verifier) from `state`, or raise ApiError.
+
+    The verifier comes back as "" for a state minted before PKCE existed; the
+    caller decides whether that is acceptable (it is not, for an exchange).
+    """
+    try:
+        seg, sig_b64 = state.split(".")
+        expected = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, _b64u_decode(sig_b64)):
+            raise ValueError("bad signature")
+        payload = json.loads(_b64u_decode(seg))
+    except (ValueError, TypeError, KeyError):
+        raise ApiError(400, "invalid or tampered state")
+    if not isinstance(payload, dict) or payload.get("exp", 0) < int(time.time()):
+        raise ApiError(410, "connect session expired — try again")
+    user_id = payload.get("sub")
+    if not user_id:
+        raise ApiError(400, "invalid state")
+    return user_id, str(payload.get("cv") or "")
+
+
+def _salesforce_error_message(body: str) -> str:
+    """Salesforce's own error text out of a REST error body.
+
+    Errors come back as [{"message", "errorCode", "fields": [...]}]. Surfacing
+    the org's wording (and the offending field) is the whole point: only
+    Salesforce knows that a validation rule fired or which field is read-only,
+    and a generic "update failed" would leave the user with nothing to act on.
+    Returns "" when the body isn't parseable, so callers keep their default.
+    """
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return ""
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return ""
+    parts = []
+    for err in parsed[:3]:
+        if not isinstance(err, dict):
+            continue
+        message = str(err.get("message") or "").strip()
+        if not message:
+            continue
+        fields = [str(f) for f in (err.get("fields") or []) if f]
+        parts.append(f"{message} ({', '.join(fields)})" if fields else message)
+    return " · ".join(parts)[:500]
+
+
+class SalesforceAuthExpired(Exception):
+    """The ACCESS token was rejected (401) — internal, never surfaced.
+
+    Distinct from the user-visible failure on purpose: this one means "mint a
+    new access token from the refresh token and retry", which _sf_call does
+    transparently. A dead REFRESH token is the user-visible failure and is
+    raised as SalesforceReconnectRequired (HTTP 409) — see below.
+    """
+
+
+# HTTP status for "your MinuteX session is fine, but the SALESFORCE credential
+# behind this route is dead; reconnect Salesforce".
+#
+# It is deliberately NOT 401. 401 on this API means one specific thing — the
+# MinuteX JWT is missing/expired — and the app acts on it globally: lib/api.ts
+# clears the stored token at the single choke point every authenticated call
+# passes through, and the screen then redirects to /login. Returning 401 for a
+# dead Salesforce refresh token made those two unrelated failures
+# indistinguishable on the wire, so opening CRM Mapping with a stale Salesforce
+# connection destroyed a perfectly good MinuteX session and bounced the user to
+# the login screen (the bug this constant exists to prevent).
+#
+# 409 Conflict is the honest code: the request is authenticated and well-formed,
+# but conflicts with the current state of the resource — Salesforce is linked
+# yet unusable. The app reads `code` (not the prose) to offer "Reconnect".
+SF_RECONNECT_STATUS = 409
+SF_RECONNECT_CODE = "salesforce_reconnect_required"
+
+
+class SalesforceReconnectRequired(ApiError):
+    """The user's stored Salesforce refresh token is dead — they must redo the
+    OAuth connect. Carries a stable `code` so the app can branch on identity
+    rather than on wording, and never on a status code that means something
+    else."""
+
+    def __init__(self, message: str):
+        super().__init__(SF_RECONNECT_STATUS, message)
+        self.code = SF_RECONNECT_CODE
+
+
+class SalesforceClient:
+    """Seam for every real Salesforce network call (mirrors FirmwareVerifier
+    for devices). Zero external dependencies — stdlib urllib, matching the
+    rest of the repo's Groq/ElevenLabs integrations."""
+
+    def _post_form(self, url: str, form: dict, what: str) -> dict:
+        """POST an x-www-form-urlencoded body, return the parsed JSON."""
+        body = urllib.parse.urlencode(form).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            print(f"[salesforce] {what} failed: {e.code} {detail[:300]}")
+            raise ApiError(502, f"Salesforce rejected the {what} — try again")
+        except urllib.error.URLError as e:
+            print(f"[salesforce] {what} network error: {e}")
+            raise ApiError(502, "could not reach Salesforce")
+
+    def _get_json(self, url: str, access_token: str, what: str):
+        """Authenticated GET against the REST API.
+
+        Raises SalesforceAuthExpired on 401 so the caller can refresh the
+        access token and retry ONCE — distinguishing "this token is stale"
+        (recoverable, and expected: access tokens are short-lived) from "this
+        request is wrong" (not recoverable by retrying).
+        """
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {access_token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            if e.code == 401:
+                raise SalesforceAuthExpired(detail[:200])
+            print(f"[salesforce] {what} failed: {e.code} {detail[:300]}")
+            if e.code == 403:
+                raise ApiError(403, "your Salesforce user lacks permission for "
+                                    "this — ask your admin")
+            if e.code == 404:
+                raise ApiError(404, f"{what}: not found in your Salesforce org")
+            raise ApiError(502, f"Salesforce {what} failed")
+        except urllib.error.URLError as e:
+            print(f"[salesforce] {what} network error: {e}")
+            raise ApiError(502, "could not reach Salesforce")
+
+    def exchange_code(self, code: str, code_verifier: str = "") -> dict:
+        """Authorization code -> {access_token, refresh_token, instance_url,
+        id, ...}. Raises ApiError(502) on any Salesforce-side failure.
+
+        `code_verifier` completes the PKCE pair whose challenge was sent at
+        authorize time; Salesforce rejects the exchange without it. The client
+        secret still comes from Secrets Manager — PKCE is in ADDITION to it,
+        not a replacement, because this is a confidential client.
+        """
+        form = {"grant_type": "authorization_code",
+                "code": code,
+                "client_id": SALESFORCE_CLIENT_ID,
+                "client_secret": _salesforce_client_secret(),
+                "redirect_uri": SALESFORCE_REDIRECT_URI}
+        if code_verifier:
+            form["code_verifier"] = code_verifier
+        return self._post_form(
+            f"{SALESFORCE_LOGIN_URL}/services/oauth2/token", form, "connection")
+
+    def refresh_access_token(self, refresh_token: str) -> dict:
+        """refresh_token -> a fresh short-lived {access_token, instance_url?}.
+
+        Access tokens are deliberately NOT stored: they expire in hours, and
+        keeping them would mean a second secret to encrypt, rotate and leak.
+        The refresh token is the only durable credential, so every request
+        path mints an access token on demand.
+
+        The response MAY carry a new refresh_token: with Refresh Token Rotation
+        enabled on the Connected App, Salesforce returns one on every refresh
+        and invalidates the token just used. Callers must persist it — see
+        _persist_rotated_refresh_token, which _sf_call invokes on every
+        successful refresh. (This docstring previously claimed Salesforce never
+        rotates here; that is true only with rotation off, and believing it
+        caused every call after the first to fail with invalid_grant.)
+
+        A 400 means the refresh token itself is dead (user revoked access in
+        Salesforce, or an admin uninstalled the Connected App) — surfaced as
+        SF_RECONNECT_STATUS so the app knows to prompt for reconnection rather
+        than retrying, without it being mistaken for MinuteX session expiry.
+        """
+        try:
+            return self._post_form(
+                f"{SALESFORCE_LOGIN_URL}/services/oauth2/token",
+                {"grant_type": "refresh_token",
+                 "refresh_token": refresh_token,
+                 "client_id": SALESFORCE_CLIENT_ID,
+                 "client_secret": _salesforce_client_secret()},
+                "token refresh")
+        except ApiError as e:
+            if e.status == 502 and "rejected" in e.message:
+                raise SalesforceReconnectRequired(
+                    "your Salesforce connection has expired — "
+                    "reconnect Salesforce in Settings")
+            raise
+
+    def whoami(self, instance_url: str, access_token: str) -> dict:
+        """GET the identity URL to confirm the token works and fetch the
+        connected org/user display info shown on the status screen."""
+        try:
+            return self._get_json(f"{instance_url}/services/oauth2/userinfo",
+                                  access_token, "org info")
+        except SalesforceAuthExpired:
+            # Only called immediately after a fresh exchange/refresh, so a 401
+            # here is not the ordinary stale-token case worth retrying.
+            raise ApiError(502, "connected, but could not read Salesforce org info")
+        except ApiError:
+            raise ApiError(502, "connected, but could not read Salesforce org info")
+
+    def list_objects(self, instance_url: str, access_token: str) -> list:
+        """Every object in the org, as [{name, label, custom, createable, ...}].
+
+        The global describe is one call and returns the full object list with
+        enough metadata to filter client-side — much cheaper than describing
+        each object just to decide whether to offer it.
+        """
+        data = self._get_json(
+            f"{instance_url}/services/data/{SALESFORCE_API_VERSION}/sobjects/",
+            access_token, "object list")
+        return data.get("sobjects") or []
+
+    def describe_object(self, instance_url: str, access_token: str,
+                        object_name: str) -> dict:
+        """Full describe of ONE object, including every field's type/length."""
+        return self._get_json(
+            f"{instance_url}/services/data/{SALESFORCE_API_VERSION}"
+            f"/sobjects/{urllib.parse.quote(object_name)}/describe/",
+            access_token, f"describe {object_name}")
+
+    def update_record(self, instance_url: str, access_token: str,
+                      object_name: str, record_id: str, fields: dict) -> None:
+        """PATCH one record's fields. Works for ANY object — the caller supplies
+        the object name, the record Id and the field map, all of which come from
+        the user's configuration, so there is no per-object push code.
+
+        Returns None on success: Salesforce answers 204 with an empty body.
+        Raises SalesforceAuthExpired on 401 (so _sf_call can refresh + retry),
+        and ApiError with Salesforce's own message on a validation/permission
+        failure, because only the org's message says WHICH field it rejected.
+        """
+        body = json.dumps(fields).encode("utf-8")
+        req = urllib.request.Request(
+            f"{instance_url}/services/data/{SALESFORCE_API_VERSION}"
+            f"/sobjects/{urllib.parse.quote(object_name)}"
+            f"/{urllib.parse.quote(record_id)}",
+            data=body, method="PATCH",
+            headers={"Authorization": f"Bearer {access_token}",
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                r.read()
+                return None
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            if e.code == 401:
+                raise SalesforceAuthExpired(detail[:200])
+            message = _salesforce_error_message(detail)
+            print(f"[salesforce] update {object_name}/{record_id} failed: "
+                  f"{e.code} {detail[:300]}")
+            if e.code == 404:
+                # The record was deleted (or is no longer visible) since we
+                # resolved it — the association is stale, not the request wrong.
+                raise ApiError(404, message or "that Salesforce record no longer "
+                                               "exists — look it up again")
+            if e.code == 403:
+                raise ApiError(403, message or "your Salesforce user cannot edit "
+                                               "this record — ask your admin")
+            if e.code in (400, 422):
+                raise ApiError(422, message or "Salesforce rejected the update")
+            raise ApiError(502, message or "Salesforce update failed")
+        except urllib.error.URLError as e:
+            print(f"[salesforce] update network error: {e}")
+            raise ApiError(502, "could not reach Salesforce")
+
+    def query(self, instance_url: str, access_token: str, soql: str) -> dict:
+        """Run a SOQL query. Used to resolve a user-supplied identifier to a
+        Salesforce record Id, against whichever object/field the user mapped."""
+        return self._get_json(
+            f"{instance_url}/services/data/{SALESFORCE_API_VERSION}/query/"
+            f"?q={urllib.parse.quote(soql)}",
+            access_token, "record lookup")
+
+    def revoke(self, refresh_token: str) -> None:
+        """Best-effort revoke on disconnect — Salesforce still lets the user
+        revoke from their own org's Connected Apps page either way, so a
+        failure here must never block the local disconnect."""
+        form = urllib.parse.urlencode({"token": refresh_token}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{SALESFORCE_LOGIN_URL}/services/oauth2/revoke", data=form, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            urllib.request.urlopen(req, timeout=10).read()
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            print(f"[salesforce] revoke failed (non-fatal): {e}")
+
+
+_salesforce = SalesforceClient()
+
+
+def _sf_call(user_id: str, fn):
+    """Run `fn(instance_url, access_token)` against the user's Salesforce org.
+
+    Owns the whole access-token lifecycle so no route handler repeats it:
+    decrypt the refresh token, mint an access token, call, and on a 401 mint
+    once more and retry. Access tokens are never persisted (see
+    refresh_access_token) — each request pays one cheap refresh call, which
+    keeps exactly one durable secret per user instead of two.
+
+    Raises ApiError(400) when Salesforce isn't connected, and
+    SalesforceReconnectRequired (409) when the refresh token itself is dead —
+    never 401, which on this API means the MinuteX session died. Overloading
+    401 here signed the user out of MinuteX entirely; see SF_RECONNECT_STATUS.
+    """
+    conn = _get_salesforce_connection(user_id)
+    if not conn or not conn.get("refresh_token_enc"):
+        raise ApiError(400, "Salesforce is not connected")
+    instance_url = conn.get("instance_url") or ""
+    stored_enc = conn["refresh_token_enc"]
+    refresh_token = _kms_decrypt(stored_enc)
+
+    tokens = _salesforce.refresh_access_token(refresh_token)
+    access_token = tokens.get("access_token")
+    if not access_token:
+        raise SalesforceReconnectRequired(
+            "your Salesforce connection has expired — "
+            "reconnect Salesforce in Settings")
+    # Persist BEFORE calling fn(): under rotation the token we just used is
+    # already dead, so losing the replacement to a failure inside fn() would
+    # brick the connection until the user reconnects.
+    rotated = _persist_rotated_refresh_token(user_id, tokens, stored_enc)
+    if rotated:
+        refresh_token = rotated
+    # Salesforce can hand back a different instance_url after an org move.
+    instance_url = tokens.get("instance_url") or instance_url
+    if not instance_url:
+        raise ApiError(502, "Salesforce did not report an instance URL")
+
+    try:
+        return fn(instance_url, access_token)
+    except SalesforceAuthExpired:
+        # The token we just minted was rejected — rare, but it happens when a
+        # session is invalidated mid-flight. One more attempt, then give up.
+        # Uses `refresh_token`, which the block above updated if it rotated:
+        # retrying with the consumed one would fail every time under rotation.
+        print("[salesforce] access token rejected; refreshing once and retrying")
+        stored_enc = _kms_encrypt(refresh_token) if rotated else stored_enc
+        tokens = _salesforce.refresh_access_token(refresh_token)
+        access_token = tokens.get("access_token")
+        if not access_token:
+            raise SalesforceReconnectRequired(
+                "your Salesforce connection has expired — "
+                "reconnect Salesforce in Settings")
+        _persist_rotated_refresh_token(user_id, tokens, stored_enc)
+        try:
+            return fn(tokens.get("instance_url") or instance_url, access_token)
+        except SalesforceAuthExpired:
+            raise SalesforceReconnectRequired(
+                "Salesforce kept rejecting the session — "
+                "reconnect Salesforce in Settings")
+
+
+def salesforce_connect(event):
+    """GET /crm/salesforce/connect (JWT) -> {authorize_url}.
+
+    Mints a fresh PKCE verifier per attempt, sends only its SHA-256 challenge
+    to Salesforce, and carries the verifier itself inside the signed state so
+    /callback can complete the exchange (see the PKCE note above for why the
+    verifier is server-side rather than on the device).
+    """
+    user_id = _require_auth(event)
+    if not SALESFORCE_CLIENT_ID or not SALESFORCE_REDIRECT_URI:
+        raise ApiError(500, "Salesforce integration is not configured")
+    verifier = _new_pkce_verifier()
+    state = _sign_oauth_state(user_id, verifier)
+    qs = urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id": SALESFORCE_CLIENT_ID,
+        "redirect_uri": SALESFORCE_REDIRECT_URI,
+        "state": state,
+        # Only the CHALLENGE goes over the wire. The verifier is never a URL
+        # parameter — that is the entire point of PKCE.
+        "code_challenge": _pkce_challenge(verifier),
+        "code_challenge_method": PKCE_METHOD,
+    })
+    return _resp(200, {"authorize_url": f"{SALESFORCE_LOGIN_URL}/services/oauth2/authorize?{qs}"})
+
+
+def salesforce_callback(event):
+    """GET /crm/salesforce/callback?code&state (Salesforce redirect, NO JWT).
+
+    Verifies `state` instead of a bearer token, exchanges the code, and
+    redirects the browser to SALESFORCE_RETURN_URL (a deep link back into
+    the app) with a simple ok/error query param — the browser tab, not this
+    Lambda, is the one thing that can hand control back to the app.
+    """
+    qs = event.get("queryStringParameters") or {}
+    error = qs.get("error")
+
+    def _redirect(ok: bool, reason: str = "") -> dict:
+        params = {"connected": "1"} if ok else {"connected": "0", "reason": reason}
+        target = SALESFORCE_RETURN_URL or "/"
+        location = f"{target}?{urllib.parse.urlencode(params)}"
+        return {"statusCode": 302, "headers": {"Location": location}, "body": ""}
+
+    if error:
+        print(f"[salesforce] callback error param: {error}")
+        return _redirect(False, "denied")
+
+    code = qs.get("code")
+    state = qs.get("state")
+    if not code or not state:
+        return _redirect(False, "missing_params")
+
+    try:
+        # Verifies the signature and expiry (invalid/tampered/expired state all
+        # raise), and yields the PKCE verifier bound to THIS attempt.
+        user_id, code_verifier = _verify_oauth_state(state)
+        if not code_verifier:
+            # A signed state with no verifier means the /connect that produced
+            # it predates PKCE. Salesforce would reject the exchange anyway;
+            # failing here is clearer and never falls back to a non-PKCE
+            # exchange, which would be a downgrade.
+            print("[salesforce] callback: state carries no PKCE verifier")
+            return _redirect(False, "pkce_missing")
+        tokens = _salesforce.exchange_code(code, code_verifier)
+    except ApiError as e:
+        # e.message is Salesforce's or our own wording — never the code, the
+        # verifier or any token.
+        print(f"[salesforce] callback failed: {e.message}")
+        return _redirect(False, "exchange_failed")
+
+    refresh_token = tokens.get("refresh_token")
+    access_token = tokens.get("access_token")
+    instance_url = tokens.get("instance_url")
+    if not refresh_token or not access_token or not instance_url:
+        print("[salesforce] token response missing required fields")
+        return _redirect(False, "exchange_failed")
+
+    identity = {}
+    try:
+        identity = _salesforce.whoami(instance_url, access_token)
+    except ApiError:
+        pass  # non-fatal — connection still succeeded, org info is cosmetic
+
+    # tokens["id"] is an identity URL of the form
+    # "{instance}/id/{org_id}/{user_id}" — org_id/user_id are also in
+    # `identity` when whoami() succeeded, but that call is best-effort, so
+    # parse the always-present id URL as the reliable fallback.
+    id_parts = (tokens.get("id") or "").rstrip("/").split("/")
+    org_id_fallback = id_parts[-2] if len(id_parts) >= 2 else ""
+
+    now = _now_iso()
+    _crm_connections.put_item(Item={
+        "user_id": user_id,
+        "provider": CRM_PROVIDER_SALESFORCE,
+        "instance_url": instance_url,
+        "refresh_token_enc": _kms_encrypt(refresh_token),
+        "org_id": identity.get("organization_id") or org_id_fallback,
+        "sf_user_id": identity.get("user_id") or "",
+        "sf_username": identity.get("preferred_username") or identity.get("email") or "",
+        "connected_at": now,
+        "updated_at": now,
+    })
+    return _redirect(True)
+
+
+def _get_salesforce_connection(user_id: str) -> dict:
+    return _crm_connections.get_item(
+        Key={"user_id": user_id, "provider": CRM_PROVIDER_SALESFORCE}).get("Item")
+
+
+def _persist_rotated_refresh_token(user_id: str, tokens: dict,
+                                   old_enc: str) -> str:
+    """Store the refresh token Salesforce hands back on a refresh, if it rotated.
+
+    REFRESH TOKEN ROTATION. When the Connected App has rotation enabled,
+    /services/oauth2/token returns a NEW refresh_token on every refresh and
+    invalidates the one just used. Keeping the original then guarantees exactly
+    one working call per connect, and `invalid_grant: expired access/refresh
+    token` on every request after that — which is the bug this exists to fix.
+
+    Rotation is OFF by default, and then no refresh_token comes back at all;
+    that is why this is conditional rather than unconditional. Both modes are
+    handled by the same path: only a token that is present AND different is
+    written.
+
+    Returns the refresh token to use from here on — the rotated one when it
+    rotated, otherwise the caller's existing one.
+
+    CONCURRENCY. Two in-flight requests for the same user can each refresh; the
+    second rotation invalidates the first, and whichever write lands last wins.
+    The conditional write makes the LOSER fail its own update instead of
+    clobbering the newer token with an older one. A lost race still leaves that
+    request's token dead, but the stored token stays the newest one written, so
+    the account self-heals on the next call rather than needing a reconnect.
+    """
+    new_token = (tokens.get("refresh_token") or "").strip()
+    if not new_token:
+        return ""  # rotation off (or nothing returned) — nothing to persist
+
+    new_enc = _kms_encrypt(new_token)
+    try:
+        _crm_connections.update_item(
+            Key={"user_id": user_id, "provider": CRM_PROVIDER_SALESFORCE},
+            UpdateExpression="SET refresh_token_enc = :new, updated_at = :now",
+            # Only overwrite the exact ciphertext we read. A concurrent request
+            # that already rotated past us fails here rather than reinstating a
+            # token Salesforce has since invalidated.
+            ConditionExpression="refresh_token_enc = :old",
+            ExpressionAttributeValues={
+                ":new": new_enc, ":old": old_enc, ":now": _now_iso()},
+        )
+        print("[salesforce] refresh token rotated; stored the new one")
+    except Exception as e:  # noqa: BLE001
+        # Includes ConditionalCheckFailedException (someone else rotated first).
+        # Never fatal: we hold a VALID access token for this request, so failing
+        # the user's call over a bookkeeping write would be strictly worse.
+        print(f"[salesforce] could not persist rotated refresh token "
+              f"(non-fatal): {type(e).__name__}: {e}")
+    return new_token
+
+
+def salesforce_status(event):
+    """GET /crm/salesforce/status (JWT) -> {connected, instance_url?, sf_username?, connected_at?}."""
+    user_id = _require_auth(event)
+    conn = _get_salesforce_connection(user_id)
+    if not conn:
+        return _resp(200, {"connected": False})
+    return _resp(200, {
+        "connected": True,
+        "instance_url": conn.get("instance_url", ""),
+        "sf_username": conn.get("sf_username", ""),
+        "connected_at": conn.get("connected_at", ""),
+    })
+
+
+def salesforce_disconnect(event):
+    """DELETE /crm/salesforce (JWT) -> {disconnected}."""
+    user_id = _require_auth(event)
+    conn = _get_salesforce_connection(user_id)
+    if conn and conn.get("refresh_token_enc"):
+        try:
+            refresh_token = _kms_decrypt(conn["refresh_token_enc"])
+            _salesforce.revoke(refresh_token)
+        except Exception as e:  # noqa: BLE001 - revoke is best-effort, never blocks disconnect
+            print(f"[salesforce] revoke on disconnect failed (non-fatal): {e}")
+    _crm_connections.delete_item(Key={"user_id": user_id, "provider": CRM_PROVIDER_SALESFORCE})
+    return _resp(200, {"disconnected": True})
+
+
+# ---------------------------------------------------------------------------
+# CRM configuration — the user maps THEIR org's schema, for ANY object.
+#
+# No object or field name is hardcoded anywhere in this codebase, and none
+# should be: every Salesforce org names things differently, and a customer maps
+# whichever objects they actually use — Site Visit, Lead, Contact, Opportunity,
+# a custom object, several at once. The app reads the org's REAL schema through
+# the Describe API and the user picks from it, which also makes an invalid
+# configuration unrepresentable: you cannot select a field that isn't there.
+#
+# The config is a LIST of mappings, each one "this object, identified by this
+# field":
+#
+#   {"enabled": true,
+#    "mappings": [{"object": "Lead", "lookup_field": "Email",
+#                  "label": "Lead Email", ...}, ...]}
+#
+# Every consumer — the API response, the app's inputs, extraction, lookup,
+# push — iterates that list. Adding support for a new object is therefore a
+# configuration change by the customer, never a code change here: there is no
+# `if object == ...` anywhere, and an empty list legitimately means "connected,
+# but show no record fields".
+#
+#   GET  /crm/salesforce/objects        -> the org's objects + a suggestion
+#   GET  /crm/salesforce/fields/{obj}   -> that object's fields, bucketed by
+#                                          what each one is usable FOR
+#   GET  /crm/salesforce/config         -> {enabled, mappings:[...]}
+#   PUT  /crm/salesforce/config         -> validate against Describe, save
+#
+# The suggestion heuristics only PRE-SELECT; the user always confirms.
+# ---------------------------------------------------------------------------
+
+# Field types that can hold a long block of prose (transcript, summary...).
+# A 40-char Text field would silently truncate a 50KB transcript, so those
+# are not offered as targets for the big fields at all.
+SF_LONG_TEXT_TYPES = frozenset({"textarea", "richtextarea"})
+# Minimum length before a textarea is worth offering for a transcript.
+SF_TRANSCRIPT_MIN_LENGTH = 32_768
+# Types that can identify a record by number/name.
+SF_IDENTIFIER_TYPES = frozenset({"string", "double", "int", "currency",
+                                 "percent", "reference", "id", "textarea",
+                                 "phone", "url", "email"})
+
+# The four optional data targets, in the order the UI shows them. `long`
+# marks the ones that need a genuinely large field.
+CRM_DATA_TARGETS = (
+    ("transcript_field", "Transcript", True),
+    ("summary_field", "Summary", True),
+    ("highlights_field", "Highlights", True),
+    ("action_items_field", "Action Items", True),
+)
+CRM_DATA_TARGET_KEYS = tuple(k for k, _, _ in CRM_DATA_TARGETS)
+
+# How many objects one user may map. A ceiling, not a design limit: each
+# mapping costs a describe call to validate and an extraction call per
+# meeting, so an unbounded list would quietly become expensive.
+CRM_MAX_MAPPINGS = int(os.environ.get("CRM_MAX_MAPPINGS", "10"))
+
+# LEGACY key. The first cut of this feature stored ONE object plus a
+# "site_visit_number_field", because Site Visit was the only object the MVP
+# planned for. That was wrong: a customer maps whatever object they use (Lead,
+# Opportunity, a custom object), so the config is now a LIST of mappings and
+# nothing in this file special-cases site visits. Old rows are read through
+# _mappings_from_config below and rewritten to the new shape on the next save,
+# so existing configurations keep working without a migration.
+LEGACY_SITE_VISIT_KEY = "site_visit_number_field"
+
+# ---------------------------------------------------------------------------
+# Sync status — one vocabulary for every mapping, per meeting.
+#
+# Deliberately object-neutral: the same states describe a site visit, a lead or
+# a custom object. They are also the ONLY thing the UI branches on, so a new
+# Salesforce object needs no new status and no new UI condition.
+#
+#   not_linked      no identifier yet (the common resting state)
+#   lookup_pending  an identifier exists but hasn't been resolved
+#   record_found    resolved to exactly one record, awaiting confirmation
+#   ambiguous       the identifier matched several records; the user must pick
+#   confirmed       the user approved this record for syncing
+#   syncing         a push is in flight
+#   synced          the configured fields were written to Salesforce
+#   failed          the last lookup or push failed; retryable
+#
+# CONFIRMATION IS LOAD-BEARING: nothing transitions record_found -> syncing
+# without an explicit user action, because pushing notes onto the wrong record
+# is worse than not pushing at all.
+# ---------------------------------------------------------------------------
+CRM_STATUS_NOT_LINKED = "not_linked"
+CRM_STATUS_LOOKUP_PENDING = "lookup_pending"
+CRM_STATUS_RECORD_FOUND = "record_found"
+CRM_STATUS_AMBIGUOUS = "ambiguous"
+CRM_STATUS_CONFIRMED = "confirmed"
+CRM_STATUS_SYNCING = "syncing"
+CRM_STATUS_SYNCED = "synced"
+CRM_STATUS_FAILED = "failed"
+CRM_STATUSES = (CRM_STATUS_NOT_LINKED, CRM_STATUS_LOOKUP_PENDING,
+                CRM_STATUS_RECORD_FOUND, CRM_STATUS_AMBIGUOUS,
+                CRM_STATUS_CONFIRMED, CRM_STATUS_SYNCING,
+                CRM_STATUS_SYNCED, CRM_STATUS_FAILED)
+
+# Statuses from which a push may start. Anything else means either "nothing to
+# push" or "the user hasn't approved this record yet".
+CRM_PUSHABLE_STATUSES = frozenset({CRM_STATUS_CONFIRMED, CRM_STATUS_SYNCED,
+                                   CRM_STATUS_FAILED})
+
+# The four optional content targets, as the API exposes them (nested) vs. how
+# they are stored on a mapping (flat `<name>_field`). Nested is what the client
+# reads; flat is what the existing config validation already writes, so both
+# shapes stay in sync without a migration.
+CRM_CONTENT_TARGET_NAMES = ("transcript", "summary", "highlights", "action_items")
+
+# "Nothing matched" is a LOOKUP OUTCOME, not a stored status: a meeting whose
+# identifier resolves to nothing stays lookup_pending (the user fixes the
+# identifier), so this sentinel never reaches DynamoDB or the status enum.
+CRM_LOOKUP_NOT_FOUND = "not_found"
+
+# How many ambiguous candidates to offer. A non-unique identifier is a data
+# problem in the org; showing a handful is enough for the user to recognize the
+# right record, and an unbounded list would be unusable anyway.
+CRM_AMBIGUOUS_LIMIT = int(os.environ.get("CRM_AMBIGUOUS_LIMIT", "10"))
+
+
+def _sf_object_is_selectable(obj: dict) -> bool:
+    """Objects worth showing in the picker.
+
+    A global describe returns ~1000 entries in a real org, most of which are
+    Salesforce internals (share rows, history tables, feed items) that nobody
+    would ever push meeting notes to. Requiring updateable+queryable and
+    dropping the machine-generated suffixes keeps the list navigable.
+    """
+    name = obj.get("name") or ""
+    if not obj.get("updateable") or not obj.get("queryable"):
+        return False
+    if obj.get("deprecatedAndHidden") or obj.get("customSetting"):
+        return False
+    return not name.endswith(("Share", "History", "Feed", "ChangeEvent", "Tag"))
+
+
+def _score_site_visit_object(obj: dict) -> int:
+    """How likely this object is the org's "site visit" record. 0 = not."""
+    haystack = f"{obj.get('label', '')} {obj.get('name', '')}".lower()
+    compact = re.sub(r"[^a-z]", "", haystack)
+    if "sitevisit" in compact:
+        return 100
+    if "site" in haystack and "visit" in haystack:
+        return 90
+    if "visit" in haystack:
+        return 50
+    if "inspection" in haystack or "sitesurvey" in compact:
+        return 30
+    return 0
+
+
+def _score_number_field(field: dict) -> int:
+    """How likely this field holds the human-facing site visit number.
+
+    Scored off the API NAME first, then the label. Orgs routinely leave the
+    standard `Name` field labelled "Site Visit Number" while ALSO having a
+    real `Site_Visit_Number__c` — scoring the label alone makes those tie, and
+    the purpose-built custom field is the better guess: someone created it
+    deliberately for exactly this.
+    """
+    name = (field.get("name") or "")
+    label = (field.get("label") or "")
+    name_compact = re.sub(r"[^a-z]", "", name.lower())
+    label_compact = re.sub(r"[^a-z]", "", label.lower())
+    score = 0
+    if "sitevisitnumber" in name_compact:
+        score = 100
+    elif "visitnumber" in name_compact:
+        score = 92
+    elif "sitevisitnumber" in label_compact:
+        score = 85
+    elif "visitnumber" in label_compact:
+        score = 80
+    elif field.get("nameField"):
+        # The org's own Name field is the usual human identifier, and on an
+        # auto-number object it IS the visit number.
+        score = 70
+    elif "number" in name_compact or "reference" in name_compact:
+        score = 60
+    elif "number" in label_compact or "reference" in label_compact:
+        score = 55
+    if field.get("autoNumber"):
+        score += 6
+    if field.get("unique"):
+        score += 6
+    return score
+
+
+def _score_data_field(field: dict, label: str) -> int:
+    """How likely this long-text field is meant for `label`'s content."""
+    haystack = f"{field.get('label', '')} {field.get('name', '')}".lower()
+    want = label.lower().split()
+    score = 0
+    if all(w in haystack for w in want):
+        score = 80
+    elif want[0] in haystack:
+        score = 50
+    # Prefer a roomier field when names tie — a transcript needs the space.
+    return score + min(int(field.get("length") or 0) // 32_768, 5)
+
+
+def _public_sf_field(field: dict) -> dict:
+    return {
+        "name": field.get("name", ""),
+        "label": field.get("label", "") or field.get("name", ""),
+        "type": field.get("type", ""),
+        "length": int(field.get("length") or 0),
+        "custom": bool(field.get("custom")),
+    }
+
+
+def salesforce_list_objects(event):
+    """GET /crm/salesforce/objects (JWT) -> {objects:[...], suggested}.
+
+    `suggested` is the best guess at the org's site-visit object so the app can
+    pre-select it. null when nothing scored — the user then picks manually.
+    """
+    user_id = _require_auth(event)
+    raw = _sf_call(user_id, lambda url, tok: _salesforce.list_objects(url, tok))
+
+    objects, best, best_score = [], None, 0
+    for obj in raw:
+        if not _sf_object_is_selectable(obj):
+            continue
+        objects.append({
+            "name": obj.get("name", ""),
+            "label": obj.get("label", "") or obj.get("name", ""),
+            "custom": bool(obj.get("custom")),
+        })
+        score = _score_site_visit_object(obj)
+        if score > best_score:
+            best, best_score = obj.get("name", ""), score
+
+    objects.sort(key=lambda o: (not o["custom"], o["label"].lower()))
+    print(f"[salesforce] objects: {len(objects)} selectable, suggested={best!r}")
+    return _resp(200, {"objects": objects, "suggested": best})
+
+
+def salesforce_list_fields(event):
+    """GET /crm/salesforce/fields/{object_name} (JWT).
+
+    -> {object, number_fields, long_text_fields, suggested:{...}}
+
+    Two buckets because the two kinds of target have genuinely different
+    requirements: the number field must be readable/filterable to look a
+    record UP, while the content fields must be big enough to hold a
+    transcript without truncating it.
+    """
+    user_id = _require_auth(event)
+    object_name = (event.get("pathParameters") or {}).get("object_name", "")
+    object_name = _url_unquote(object_name).strip()
+    if not object_name or not re.match(r"^[A-Za-z0-9_]{1,80}$", object_name):
+        raise ApiError(400, "valid object_name required")
+
+    described = _sf_call(user_id, lambda url, tok:
+                         _salesforce.describe_object(url, tok, object_name))
+    fields = described.get("fields") or []
+
+    number_fields, long_text_fields = [], []
+    best_number, best_number_score = None, 0
+    for f in fields:
+        ftype = f.get("type") or ""
+        public = _public_sf_field(f)
+
+        # Lookup key: must be filterable (we SOQL on it) — a field we cannot
+        # filter cannot find a record, no matter how well-named it is.
+        if f.get("filterable") and ftype in SF_IDENTIFIER_TYPES:
+            number_fields.append(public)
+            score = _score_number_field(f)
+            if score > best_number_score:
+                best_number, best_number_score = public["name"], score
+
+        # Content target: must be writable AND long. Formula/auto-number
+        # fields are read-only, so a push to them always fails.
+        if (f.get("updateable") and ftype in SF_LONG_TEXT_TYPES
+                and not f.get("calculated")):
+            long_text_fields.append(public)
+
+    number_fields.sort(key=lambda f: (not f["custom"], f["label"].lower()))
+    long_text_fields.sort(key=lambda f: (-f["length"], f["label"].lower()))
+
+    # Suggest a content target per data field, never reusing one field twice:
+    # writing the transcript and the summary to the same field would mean one
+    # silently overwrites the other.
+    # `lookup_field` is the generic key. The old `site_visit_number_field` is
+    # echoed alongside it so an app build from before this change keeps
+    # pre-selecting correctly (see the compatibility note on the config).
+    suggested = {"lookup_field": best_number,
+                 LEGACY_SITE_VISIT_KEY: best_number}
+    taken = set()
+    for key, label, needs_long in CRM_DATA_TARGETS:
+        pool = [f for f in long_text_fields if f["name"] not in taken
+                and (not needs_long or f["length"] >= 255)]
+        pick, pick_score = None, 0
+        for f in pool:
+            score = _score_data_field(
+                next((x for x in fields if x.get("name") == f["name"]), {}), label)
+            if score > pick_score:
+                pick, pick_score = f["name"], score
+        # Only suggest on a real name match. Guessing "the biggest empty text
+        # field" would put a transcript somewhere arbitrary in the user's CRM.
+        if pick and pick_score >= 50:
+            suggested[key] = pick
+            taken.add(pick)
+        else:
+            suggested[key] = None
+
+    return _resp(200, {
+        "object": object_name,
+        "label": described.get("label") or object_name,
+        "number_fields": number_fields,
+        "long_text_fields": long_text_fields,
+        "suggested": suggested,
+        "transcript_min_length": SF_TRANSCRIPT_MIN_LENGTH,
+    })
+
+
+def _mappings_from_config(cfg: dict) -> list:
+    """The stored config -> a list of mappings, in the generic shape.
+
+    THE compatibility seam. A config written by the first version of this
+    feature is a single object with a `site_visit_number_field`; a config
+    written now is `{"mappings": [...]}`. Everything downstream — the API
+    response, the UI, extraction, lookup, push — reads mappings through here
+    and therefore never needs to know which shape it came from, nor that
+    "site visit" was ever special.
+    """
+    if not isinstance(cfg, dict):
+        return []
+    stored = cfg.get("mappings")
+    if isinstance(stored, list):
+        return [m for m in stored if isinstance(m, dict) and m.get("object")
+                and m.get("lookup_field")]
+    # Legacy single-object shape.
+    obj = cfg.get("object")
+    lookup = cfg.get(LEGACY_SITE_VISIT_KEY)
+    if not obj or not lookup:
+        return []
+    legacy = {
+        "object": obj,
+        "object_label": cfg.get("object_label") or obj,
+        "lookup_field": lookup,
+        # The old shape carried no label for the lookup field. "<Object> Number"
+        # is what the old UI hardcoded, so an upgraded user sees the same words
+        # they saw before.
+        "label": f"{cfg.get('object_label') or obj} Number",
+    }
+    for key in CRM_DATA_TARGET_KEYS:
+        legacy[key] = cfg.get(key) or ""
+    return [legacy]
+
+
+def _public_mapping(m: dict) -> dict:
+    out = {
+        "object": m.get("object") or "",
+        "object_label": m.get("object_label") or m.get("object") or "",
+        "lookup_field": m.get("lookup_field") or "",
+        "lookup_field_label": m.get("lookup_field_label") or "",
+        "lookup_field_type": m.get("lookup_field_type") or "",
+        "label": m.get("label") or "",
+    }
+    for key in CRM_DATA_TARGET_KEYS:
+        out[key] = m.get(key) or None
+    # Also nested, which is the shape the push builds from and the clearer one
+    # to read. Same values as the flat keys above — one source, two views.
+    out["content_targets"] = _content_targets(m)
+    return out
+
+
+def _content_targets(mapping: dict) -> dict:
+    """{"transcript": "Field__c", ...} for the targets this mapping configured.
+
+    ONLY configured targets appear: an unmapped target is absent rather than
+    null, so the push can build its payload by iterating this dict without
+    having to filter empties (and can never send an unconfigured field).
+    """
+    out = {}
+    for name in CRM_CONTENT_TARGET_NAMES:
+        field = (mapping or {}).get(f"{name}_field")
+        if field:
+            out[name] = field
+    return out
+
+
+def _empty_crm_record(mapping: dict) -> dict:
+    """The resting state for a mapping with no identifier yet."""
+    return {
+        "object": mapping.get("object") or "",
+        "label": mapping.get("object_label") or mapping.get("object") or "",
+        "lookup_field": mapping.get("lookup_field") or "",
+        "lookup_value": "",
+        "record_id": "",
+        "status": CRM_STATUS_NOT_LINKED,
+        "source": "",
+    }
+
+
+def _public_crm_record(stored: dict, mapping: dict) -> dict:
+    """One stored crm_records entry -> the client-facing view.
+
+    Normalizes shape drift so the UI only ever sees the current contract:
+      * `lookup_value` is the identifier; the extractor's older `value` key is
+        still read, so a meeting written before this change still displays.
+      * `status` is derived when absent — an entry with a record_id but no
+        status predates status tracking and is at least record_found.
+      * mapping-derived labels are refreshed on read, so renaming an object in
+        Salesforce updates every meeting without a data migration.
+    """
+    stored = stored if isinstance(stored, dict) else {}
+    value = str(stored.get("lookup_value") or stored.get("value") or "")
+    record_id = str(stored.get("record_id") or "")
+    status = str(stored.get("status") or "")
+    if status not in CRM_STATUSES:
+        # Derive from what IS known rather than guessing a terminal state.
+        status = (CRM_STATUS_RECORD_FOUND if record_id
+                  else CRM_STATUS_LOOKUP_PENDING if value
+                  else CRM_STATUS_NOT_LINKED)
+    return {
+        "object": stored.get("object") or mapping.get("object") or "",
+        "label": mapping.get("object_label") or stored.get("label") or "",
+        "lookup_field": (stored.get("lookup_field")
+                         or mapping.get("lookup_field") or ""),
+        "lookup_value": value,
+        "record_id": record_id,
+        "record_label": str(stored.get("record_label") or ""),
+        "status": status,
+        "source": str(stored.get("source") or ""),
+        # Extraction provenance — absent for manual entry. The UI shows the
+        # evidence quote so a wrong AI extraction is catchable before a push.
+        "confidence": str(stored.get("confidence") or ""),
+        "evidence": str(stored.get("evidence") or ""),
+        # What the model extracted before spoken digits were normalized ("SV one
+        # zero zero four" behind the "SV1004" we looked up). Surfaced so the
+        # evidence quote and the identifier shown can be reconciled by eye when
+        # a lookup misses; empty when normalization changed nothing.
+        "lookup_value_raw": (raw_value if (raw_value := str(
+            stored.get("value_raw") or "")) != value else ""),
+        "candidates": [c for c in (stored.get("candidates") or [])
+                       if isinstance(c, dict)],
+        "error": str(stored.get("error") or ""),
+        "synced_at": str(stored.get("synced_at") or ""),
+        "updated_at": str(stored.get("updated_at") or ""),
+    }
+
+
+def _public_crm_config(conn: dict) -> dict:
+    """The client-facing configuration.
+
+    `enabled` + `mappings` is the whole contract the UI renders from: it shows
+    one input per mapping and nothing at all when the list is empty. No object
+    name appears in the app's code as a result.
+    """
+    cfg = (conn or {}).get("config") or {}
+    mappings = _mappings_from_config(cfg)
+    return {
+        "enabled": bool(conn),
+        "mappings": [_public_mapping(m) for m in mappings],
+        "configured": bool(mappings),
+        "updated_at": cfg.get("updated_at") or None,
+    }
+
+
+def salesforce_get_config(event):
+    """GET /crm/salesforce/config (JWT) -> {config:{enabled, mappings:[...]}}."""
+    user_id = _require_auth(event)
+    conn = _get_salesforce_connection(user_id)
+    if not conn:
+        raise ApiError(400, "Salesforce is not connected")
+    return _resp(200, {"config": _public_crm_config(conn)})
+
+
+def _validate_mapping(user_id: str, raw: dict) -> dict:
+    """One requested mapping -> the validated, storable mapping.
+
+    Every name is re-checked against a live Describe. The app only ever sends
+    names it got FROM Describe, so this is not about distrusting the client —
+    it is about the org changing underneath a config that was valid when it
+    was saved (a field deleted, a permission revoked). Failing here with a
+    clear message beats failing later mid-push.
+    """
+    object_name = str(raw.get("object") or "").strip()
+    lookup_field = str(raw.get("lookup_field") or "").strip()
+    if not object_name:
+        raise ApiError(400, "each mapping needs an object")
+    if not lookup_field:
+        raise ApiError(400, f"{object_name}: lookup_field required")
+
+    described = _sf_call(user_id, lambda url, tok:
+                         _salesforce.describe_object(url, tok, object_name))
+    by_name = {f.get("name"): f for f in (described.get("fields") or [])}
+    object_label = described.get("label") or object_name
+
+    lookup = by_name.get(lookup_field)
+    if not lookup:
+        raise ApiError(400, f"{lookup_field} does not exist on {object_name}")
+    if not lookup.get("filterable"):
+        raise ApiError(400, f"{lookup_field} cannot be searched on — pick a "
+                            f"filterable field")
+
+    # The label the UI puts on the input. Defaults to the org's own words for
+    # the field, so "Email" on Lead reads "Lead Email" without anything in our
+    # code knowing what a Lead is.
+    lookup_label = lookup.get("label") or lookup_field
+    label = str(raw.get("label") or "").strip() or f"{object_label} {lookup_label}"
+
+    mapping = {
+        "object": object_name,
+        "object_label": object_label,
+        "lookup_field": lookup_field,
+        "lookup_field_label": lookup_label,
+        "label": label[:100],
+    }
+
+    # The four content targets are OPTIONAL: whatever is left unmapped simply
+    # isn't pushed. A user whose org has nowhere to put Highlights should
+    # still be able to sync a transcript.
+    seen = {}
+    for key, target_label, _needs_long in CRM_DATA_TARGETS:
+        name = str(raw.get(key) or "").strip()
+        if not name:
+            mapping[key] = ""
+            continue
+        f = by_name.get(name)
+        if not f:
+            raise ApiError(400, f"{name} does not exist on {object_name}")
+        if not f.get("updateable") or f.get("calculated"):
+            raise ApiError(400, f"{object_label} {target_label}: {name} is "
+                                f"read-only in Salesforce")
+        if (f.get("type") or "") not in SF_LONG_TEXT_TYPES:
+            raise ApiError(400, f"{object_label} {target_label}: {name} is not "
+                                f"a long text field — it would truncate the content")
+        if name in seen:
+            raise ApiError(400, f"{name} is already used for {seen[name]} — pick "
+                                f"a different field for {target_label}")
+        seen[name] = target_label
+        mapping[key] = name
+    return mapping
+
+
+def salesforce_put_config(event):
+    """PUT /crm/salesforce/config (JWT) -> {config}.
+
+    Body is the generic shape:
+        {"mappings": [{"object", "lookup_field", "label"?, <data targets>?}, ...]}
+
+    An empty list is a legitimate configuration meaning "connected, but don't
+    show me any record fields" — that is exactly what the UI renders nothing
+    for, so it must be storable rather than rejected.
+
+    The legacy single-object body ({"object", "site_visit_number_field"}) is
+    still accepted and normalized into one mapping, so an older app build
+    keeps working against this endpoint without a rebuild.
+    """
+    user_id = _require_auth(event)
+    conn = _get_salesforce_connection(user_id)
+    if not conn:
+        raise ApiError(400, "Salesforce is not connected")
+
+    data = _body(event)
+    requested = data.get("mappings")
+    if requested is None:
+        # Legacy body shape — one object at the top level.
+        if data.get("object"):
+            legacy = dict(data)
+            legacy["lookup_field"] = (data.get("lookup_field")
+                                      or data.get(LEGACY_SITE_VISIT_KEY) or "")
+            requested = [legacy]
+        else:
+            raise ApiError(400, "mappings required (a list, possibly empty)")
+    if not isinstance(requested, list):
+        raise ApiError(400, "mappings must be a list")
+    if len(requested) > CRM_MAX_MAPPINGS:
+        raise ApiError(400, f"at most {CRM_MAX_MAPPINGS} mappings")
+    if any(not isinstance(m, dict) for m in requested):
+        raise ApiError(400, "each mapping must be an object")
+
+    mappings, objects_seen = [], set()
+    for raw in requested:
+        mapping = _validate_mapping(user_id, raw)
+        # One mapping per object: two lookup fields for the same object would
+        # make "which record is this meeting about" ambiguous.
+        if mapping["object"] in objects_seen:
+            raise ApiError(400, f"{mapping['object']} is mapped twice — one "
+                                f"lookup field per object")
+        objects_seen.add(mapping["object"])
+        mappings.append(mapping)
+
+    cfg = {"mappings": mappings, "updated_at": _now_iso()}
+    _crm_connections.update_item(
+        Key={"user_id": user_id, "provider": CRM_PROVIDER_SALESFORCE},
+        UpdateExpression="SET config = :c, updated_at = :now",
+        ConditionExpression="attribute_exists(user_id)",
+        ExpressionAttributeValues={":c": cfg, ":now": _now_iso()},
+    )
+    print(f"[salesforce] config saved for {user_id}: "
+          + (", ".join(f"{m['object']}.{m['lookup_field']}" for m in mappings)
+             or "no mappings"))
+    updated = _get_salesforce_connection(user_id)
+    return _resp(200, {"config": _public_crm_config(updated)})
+
+
+# ---------------------------------------------------------------------------
+# CRM record lookup — identifier -> Salesforce record Id.
+#
+# Generic by construction: the object and the field to match on both come from
+# the user's saved mapping, so this one route resolves a Site Visit number, a
+# Lead email or an Opportunity number without knowing which is which.
+# ---------------------------------------------------------------------------
+def _soql_quote(value: str) -> str:
+    """Escape a string for a SOQL string literal.
+
+    The identifier is user-supplied, so it cannot be interpolated raw: a value
+    containing a quote would otherwise change the query's meaning. Salesforce
+    uses backslash escaping inside single-quoted literals.
+    """
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _find_mapping(cfg: dict, object_name: str) -> dict:
+    for m in _mappings_from_config(cfg):
+        if m.get("object") == object_name:
+            return m
+    raise ApiError(400, f"{object_name} is not configured — set it up in "
+                        f"Salesforce mapping first")
+
+
+def _sf_name_field(user_id: str, object_name: str) -> str:
+    """The object's own "name" field, or "" when it has none.
+
+    Gives the UI something human to confirm against ("Rahul Sharma") beside the
+    raw identifier. Not every object has one, so callers must tolerate "".
+    """
+    described = _sf_call(user_id, lambda url, tok:
+                         _salesforce.describe_object(url, tok, object_name))
+    return next((f.get("name") for f in (described.get("fields") or [])
+                 if f.get("nameField")), "") or ""
+
+
+def _resolve_crm_record(user_id: str, mapping: dict, value: str) -> dict:
+    """Identifier -> {status, record_id?, record_label?, candidates?}.
+
+    The generic resolution step: SOQL against the mapping's own object and
+    lookup field, so the same code resolves a site visit number, a lead email or
+    a custom object's reference. Three outcomes, all of them ORDINARY:
+
+      not_found     nothing matched — the user fixes the identifier
+      record_found  exactly one match — awaits confirmation before any push
+      ambiguous     several matched — the user picks; we never choose for them
+
+    Ambiguity is returned as candidates rather than an error precisely because
+    the caller CAN resolve it (by asking); silently taking the first match is
+    the failure this whole flow exists to prevent.
+    """
+    object_name = mapping["object"]
+    lookup_field = mapping["lookup_field"]
+    name_field = _sf_name_field(user_id, object_name)
+
+    select = ["Id", lookup_field]
+    if name_field and name_field != lookup_field:
+        select.append(name_field)
+    # LIMIT is CRM_AMBIGUOUS_LIMIT + 1 so "more than we can show" is
+    # distinguishable from "exactly this many".
+    soql = (f"SELECT {', '.join(select)} FROM {object_name} "
+            f"WHERE {lookup_field} = '{_soql_quote(value)}' "
+            f"LIMIT {CRM_AMBIGUOUS_LIMIT + 1}")
+
+    result = _sf_call(user_id, lambda url, tok:
+                      _salesforce.query(url, tok, soql))
+    records = [r for r in (result.get("records") or []) if isinstance(r, dict)]
+
+    if not records:
+        print(f"[salesforce] lookup {object_name}.{lookup_field}={value!r}: no match")
+        return {"status": CRM_LOOKUP_NOT_FOUND}
+
+    def _display(rec: dict) -> str:
+        return str((rec.get(name_field) if name_field else "")
+                   or rec.get(lookup_field) or value)
+
+    if len(records) == 1:
+        record = records[0]
+        return {
+            "status": CRM_STATUS_RECORD_FOUND,
+            "record_id": str(record.get("Id") or ""),
+            "record_label": _display(record),
+        }
+
+    print(f"[salesforce] lookup {object_name}.{lookup_field}={value!r}: "
+          f"{len(records)} matches — ambiguous")
+    return {
+        "status": CRM_STATUS_AMBIGUOUS,
+        "candidates": [{"record_id": str(r.get("Id") or ""),
+                        "display_name": _display(r)}
+                       for r in records[:CRM_AMBIGUOUS_LIMIT]],
+        "truncated": len(records) > CRM_AMBIGUOUS_LIMIT,
+    }
+
+
+def salesforce_lookup_record(event):
+    """POST /crm/salesforce/lookup {object, value|lookup_value} (JWT)
+
+    -> {status: "found"|"not_found"|"ambiguous", ...}
+
+    Resolves an identifier to a Salesforce record Id using the configured
+    object + lookup field. Stateless: it only reports what Salesforce says.
+    Persisting the association is a separate, explicit step (see the meeting
+    PATCH), so a lookup can never silently relink a meeting.
+    """
+    user_id = _require_auth(event)
+    conn = _get_salesforce_connection(user_id)
+    if not conn:
+        raise ApiError(400, "Salesforce is not connected")
+
+    data = _body(event)
+    object_name = str(data.get("object") or "").strip()
+    # `lookup_value` is the current name; `value` is accepted for the earlier
+    # shape so a deployed client keeps working.
+    value = str(data.get("lookup_value") or data.get("value") or "").strip()
+    if not object_name:
+        raise ApiError(400, "object required")
+    if not value:
+        raise ApiError(400, "lookup_value required")
+    if len(value) > CRM_IDENTIFIER_MAX:
+        raise ApiError(400, f"lookup_value must be at most "
+                            f"{CRM_IDENTIFIER_MAX} characters")
+
+    mapping = _find_mapping((conn or {}).get("config") or {}, object_name)
+    outcome = _resolve_crm_record(user_id, mapping, value)
+
+    base = {
+        "object": object_name,
+        "label": mapping["object_label"],
+        "lookup_field": mapping["lookup_field"],
+        "lookup_value": value,
+    }
+    if outcome["status"] == CRM_LOOKUP_NOT_FOUND:
+        return _resp(200, {**base, "status": "not_found"})
+    if outcome["status"] == CRM_STATUS_AMBIGUOUS:
+        return _resp(200, {**base, "status": "ambiguous",
+                           "records": outcome["candidates"],
+                           "truncated": outcome.get("truncated", False)})
+    return _resp(200, {**base, "status": "found",
+                       "record_id": outcome["record_id"],
+                       "record_label": outcome["record_label"]})
+
+
+# ---------------------------------------------------------------------------
+# CRM push — write the meeting's content onto the linked Salesforce record.
+#
+# ONE generic update for every object. What gets written is entirely the
+# mapping's configured content targets: only configured targets are sent, and an
+# unconfigured one is omitted rather than blanked (writing "" would erase
+# whatever the customer's own process put there).
+#
+# The push NEVER runs off the back of a lookup. It requires a record the user
+# has confirmed, because notes on the wrong record are worse than no notes.
+# ---------------------------------------------------------------------------
+def _render_highlights(item: dict) -> str:
+    """The meeting's highlights as plain text for a Salesforce long-text field.
+
+    Prefers the flat `highlights` list (the primary user-facing output); falls
+    back to the older structured `meeting_highlights` so a recording processed
+    before that change still pushes something meaningful.
+    """
+    flat = [str(h).strip() for h in (item.get("highlights") or []) if str(h).strip()]
+    if flat:
+        return "\n".join(f"- {h}" for h in flat)
+
+    structured = item.get("meeting_highlights") or {}
+    if not isinstance(structured, dict):
+        return ""
+    lines = []
+    for section in ("decisions", "action_items", "deadlines",
+                    "important_numbers", "open_questions", "risks"):
+        rows = structured.get(section) or []
+        if not rows:
+            continue
+        lines.append(section.replace("_", " ").title())
+        for row in rows:
+            if isinstance(row, dict):
+                text = " — ".join(str(v).strip() for v in row.values() if str(v).strip())
+            else:
+                text = str(row).strip()
+            if text:
+                lines.append(f"- {text}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _render_action_items(item: dict) -> str:
+    """Tasks/action items as plain text, from whichever shape exists.
+
+    `tasks` is the CRUD-managed map the app owns; `ai_tasks` is the pipeline's
+    raw extraction. Preferring the managed map means a user's edits (owner, due
+    date, status) are what reaches Salesforce.
+
+    The analysis's older `action_items` field was removed from the schema, so it
+    is no longer read here — an unreprocessed legacy row pushes no action items
+    rather than pushing a stale extraction, and _crm_push_payload already skips
+    empty content so nothing overwrites a value in Salesforce.
+    """
+    rows = []
+    tasks = item.get("tasks")
+    if isinstance(tasks, dict) and tasks:
+        rows = list(tasks.values())
+    elif isinstance(item.get("ai_tasks"), list):
+        rows = item["ai_tasks"]
+
+    lines = []
+    for row in rows:
+        if not isinstance(row, dict):
+            text = str(row).strip()
+            if text:
+                lines.append(f"- {text}")
+            continue
+        text = str(row.get("task") or row.get("title") or "").strip()
+        if not text:
+            continue
+        owner = str(row.get("assignee") or row.get("owner") or "").strip()
+        if isinstance(row.get("assignee"), dict):
+            owner = str(row["assignee"].get("name") or "").strip()
+        due = str(row.get("due_date") or row.get("due") or "").strip()
+        status = str(row.get("status") or "").strip()
+        extra = " · ".join(p for p in (owner, due, status) if p)
+        lines.append(f"- {text}" + (f" ({extra})" if extra else ""))
+    return "\n".join(lines)
+
+
+def _crm_push_payload(mapping: dict, item: dict) -> dict:
+    """{Salesforce field: content} for exactly the configured content targets.
+
+    Iterates the mapping's targets, so an object with only Summary configured
+    gets a one-field payload and nothing else is touched. Empty content is
+    skipped too: pushing "" over an existing value destroys data the customer
+    may have written themselves.
+    """
+    content = {
+        "transcript": str(item.get("transcript") or ""),
+        "summary": str(item.get("summary") or ""),
+        "highlights": _render_highlights(item),
+        "action_items": _render_action_items(item),
+    }
+    payload = {}
+    for name, field in _content_targets(mapping).items():
+        value = content.get(name) or ""
+        if value.strip():
+            payload[field] = value
+    return payload
+
+
+def _write_crm_record(key: str, object_name: str, entry: dict) -> None:
+    """Persist one crm_records entry. Nested-map update so a concurrent write to
+    a DIFFERENT object's entry cannot be clobbered.
+
+    Same two-step shape as _store_document, for the same two DynamoDB reasons
+    documented there:
+
+      * `SET #cr = if_not_exists(#cr, :empty), #cr.#obj = :entry` is REJECTED at
+        parse time — "Two document paths overlap with each other" — because it
+        writes both a map and a key inside that map in one expression. It fails
+        on EVERY call regardless of the item's contents, which is what made
+        "Sync to Salesforce" return a blanket `internal error`.
+      * A nested SET whose parent map is absent raises ValidationException
+        ("...invalid for update"); DynamoDB does not auto-create the parent.
+
+    So: attempt the nested SET (the steady-state path, one round trip), and only
+    if the map is missing create it — guarded by attribute_not_exists so a
+    racing writer's map is never blanked — then retry.
+    """
+    names = {"#cr": "crm_records", "#obj": object_name}
+
+    def _set_nested():
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET #cr.#obj = :entry, updated_at = :now",
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues={":entry": entry, ":now": _now_iso()},
+        )
+
+    try:
+        _set_nested()
+        return
+    except ClientError as err:
+        # Match the message, not just the code: ValidationException is generic,
+        # and a real expression bug should surface rather than be retried.
+        if err.response.get("Error", {}).get("Code") != "ValidationException" \
+                or "invalid for update" not in str(err):
+            raise
+
+    # The row has no crm_records map yet (the common case: nothing has ever been
+    # linked). Create it, tolerating the race where a concurrent write won.
+    try:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET #cr = :empty",
+            ConditionExpression="attribute_not_exists(#cr)",
+            ExpressionAttributeNames={"#cr": "crm_records"},
+            ExpressionAttributeValues={":empty": {}},
+        )
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                != "ConditionalCheckFailedException":
+            raise
+        # Someone else created it between our two calls — exactly what we want.
+    _set_nested()
+
+
+def crm_sync_record(event):
+    """POST /crm/salesforce/sync/{key+} {object} (JWT) -> {crm_record}
+
+    Pushes the meeting's configured content onto the confirmed Salesforce
+    record. Requires a stored record_id AND a confirmed status: this route is
+    the only one that writes syncing/synced/failed.
+
+    Uses the STORED record_id — no second SOQL lookup. The identifier is the
+    user's visible reference; the record Id is the association, and re-resolving
+    it on every sync would risk drifting onto a different record if the org's
+    data changed.
+
+    A Salesforce failure marks the entry failed and returns the org's message.
+    The meeting's own transcript/summary are never touched by any of this.
+    """
+    user_id, key, item = _owned_recording(event)
+    data = _body(event)
+    object_name = str(data.get("object") or "").strip()
+    if not object_name:
+        raise ApiError(400, "object required")
+
+    mapping = _find_mapping(_user_crm_config(user_id), object_name)
+    stored = (item.get("crm_records") or {}).get(object_name)
+    if not isinstance(stored, dict) or not stored:
+        raise ApiError(400, f"no {mapping['object_label']} is linked to this "
+                            f"meeting yet")
+
+    record = _public_crm_record(stored, mapping)
+    record_id = record["record_id"]
+    if not record_id:
+        raise ApiError(400, f"{mapping['object_label']}: look the record up "
+                            f"before syncing")
+    if record["status"] not in CRM_PUSHABLE_STATUSES:
+        # record_found (not yet confirmed) lands here, which is the point: the
+        # user must approve the record before anything is written to it.
+        raise ApiError(409, f"confirm the {mapping['object_label']} record "
+                            f"before syncing")
+
+    payload = _crm_push_payload(mapping, item)
+    if not payload:
+        raise ApiError(400, f"{mapping['object_label']} has no content fields "
+                            f"configured — set them in Salesforce mapping")
+
+    base = {**stored, "status": CRM_STATUS_SYNCING, "error": "",
+            "updated_at": _now_iso()}
+    _write_crm_record(key, object_name, base)
+
+    try:
+        _sf_call(user_id, lambda url, tok: _salesforce.update_record(
+            url, tok, object_name, record_id, payload))
+    except ApiError as e:
+        failed = {**base, "status": CRM_STATUS_FAILED,
+                  "error": e.message[:500], "updated_at": _now_iso()}
+        # A 404 means the record is gone: drop the stale record_id so the next
+        # attempt re-resolves instead of retrying a write that cannot succeed.
+        if e.status == 404:
+            failed["record_id"] = ""
+            failed["status"] = CRM_STATUS_LOOKUP_PENDING
+        _write_crm_record(key, object_name, failed)
+        print(f"[salesforce] sync {object_name}/{record_id} failed: {e.message}")
+        # This route answers directly rather than re-raising (it must report the
+        # persisted crm_record alongside the error), so it has to carry `code`
+        # itself — otherwise a dead Salesforce credential would reach the app as
+        # a bare 409 and lose its "reconnect Salesforce" identity.
+        body = {"error": e.message,
+                "crm_record": _public_crm_record(failed, mapping)}
+        code = getattr(e, "code", "")
+        if code:
+            body["code"] = code
+        return _resp(e.status, body)
+
+    synced = {**base, "status": CRM_STATUS_SYNCED, "error": "",
+              "synced_at": _now_iso(), "updated_at": _now_iso(),
+              "synced_fields": sorted(payload.keys())}
+    _write_crm_record(key, object_name, synced)
+    print(f"[salesforce] synced {object_name}/{record_id}: "
+          f"{', '.join(sorted(payload))}")
+    return _resp(200, {"crm_record": _public_crm_record(synced, mapping),
+                       "synced_fields": sorted(payload.keys())})
+
+
+# ===========================================================================
+# ELEVENLABS SPEECH-TO-TEXT WEBHOOK
+#
+# The completion half of the asynchronous STT flow. transcribeRecording queues
+# a job with `webhook=true` and exits; ElevenLabs POSTs the transcript here
+# whenever it finishes, minutes or hours later. See that Lambda's module
+# docstring for why the transcription is no longer allowed to happen inside a
+# Lambda invocation at all.
+#
+# THIS IS THE SECOND UNAUTHENTICATED ROUTE IN THIS FILE (the first is
+# /crm/salesforce/callback). It is called by ElevenLabs' servers, which have no
+# MinuteX JWT, so a bearer token is impossible. Identity comes from an HMAC
+# signature over the raw body instead — the same substitution the Salesforce
+# callback makes with its signed `state`.
+#
+# Five independent checks, in this order, each rejecting before anything is
+# written. Order matters: the cheap cryptographic checks run before any
+# DynamoDB read, so an unsigned flood costs no database traffic.
+#
+#   1. SIGNATURE   HMAC-SHA256 over "{timestamp}.{raw_body}" must match the
+#                  v0= element of the ElevenLabs-Signature header. Verified
+#                  against the official SDK's own implementation, not docs
+#                  prose. Without this the endpoint would accept a forged
+#                  transcript for any recording whose key an attacker guessed.
+#   2. TIMESTAMP   Within ELEVENLABS_WEBHOOK_TOLERANCE (30 min, the SDK's
+#                  value). A valid signature replayed weeks later is refused,
+#                  so a captured request can't be used indefinitely.
+#   3. ENVELOPE    webhook_metadata must carry our version and OUR bucket. Two
+#                  environments sharing one ElevenLabs workspace would
+#                  otherwise deliver each other's transcripts onto same-named
+#                  keys.
+#   4. STALENESS   request_id must equal the row's CURRENT stt_request_id. A
+#                  reprocess queues a new job and rewrites that field, so the
+#                  first job's late delivery is recognisably obsolete and is
+#                  dropped instead of overwriting a newer transcript.
+#   5. IDEMPOTENCE A conditional write claims the delivery. ElevenLabs retries
+#                  webhooks, and duplicate AI processing would double-charge
+#                  Groq and could double-push to Salesforce.
+#
+# The handler answers in well under a second: it writes the transcript to S3 and
+# hands the analysis to transcribeRecording as an ASYNC invoke. Running the Groq
+# pipeline inline would exceed API Gateway's 29s ceiling on any real meeting,
+# and a webhook that times out is a webhook ElevenLabs retries — turning one
+# slow analysis into several concurrent ones.
+# ===========================================================================
+ELEVENLABS_WEBHOOK_SECRET_ARN = os.environ.get(
+    "ELEVENLABS_WEBHOOK_SECRET_ARN", "")
+
+# Replay window. 1800s is the tolerance the official ElevenLabs SDK enforces;
+# matching it keeps us from rejecting deliveries the sender considers valid.
+ELEVENLABS_WEBHOOK_TOLERANCE = int(
+    os.environ.get("ELEVENLABS_WEBHOOK_TOLERANCE", "1800"))
+
+# The event type ElevenLabs sends for a finished transcription, and the
+# metadata envelope version transcribeRecording stamps.
+STT_WEBHOOK_EVENT = "speech_to_text_transcription"
+STT_METADATA_VERSION = 1
+
+# The completion event transcribeRecording's second entry point expects.
+STT_COMPLETED_EVENT = "stt.completed"
+
+
+def _stt_completion_payload(key, bucket, request_id, transcript, timestamps,
+                            language):
+    """The stt.completed invoke payload, JSON-encoded.
+
+    `default=str` is REQUIRED, not defensive: timestamp segments carry `start`
+    and `end` as Decimal (stt_result rounds them that way because DynamoDB
+    rejects a Python float), and json.dumps raises TypeError on Decimal. Without
+    it EVERY webhook delivery failed to hand off its analysis — caught by
+    tests/test_async_stt.py before it reached production.
+
+    Decimal -> str is safe for this hop: the receiving Lambda re-serializes the
+    segments through transcript_store, whose own encoder emits them as JSON
+    numbers, and the app does Number(seg.start) for tap-to-seek.
+    """
+    return json.dumps({
+        "type": STT_COMPLETED_EVENT,
+        "audio_s3_key": key,
+        "bucket": bucket,
+        "request_id": request_id,
+        "transcript": transcript,
+        "timestamps": timestamps,
+        "language": language,
+    }, default=str).encode("utf-8")
+
+_elevenlabs_webhook_secret_cache = None
+
+
+def _elevenlabs_webhook_secret():
+    """The webhook signing secret, from Secrets Manager (env fallback).
+
+    Cached per container like the JWT secret. Kept OUT of the Lambda env by
+    default for the same reason the Salesforce client secret is: an env var is
+    visible to anyone who can read the function's configuration, and this
+    secret is what makes a forged transcript impossible.
+    """
+    global _elevenlabs_webhook_secret_cache
+    if _elevenlabs_webhook_secret_cache is not None:
+        return _elevenlabs_webhook_secret_cache
+    if ELEVENLABS_WEBHOOK_SECRET_ARN:
+        sm = boto3.client("secretsmanager", region_name=REGION)
+        _elevenlabs_webhook_secret_cache = sm.get_secret_value(
+            SecretId=ELEVENLABS_WEBHOOK_SECRET_ARN)["SecretString"]
+    else:
+        _elevenlabs_webhook_secret_cache = os.environ.get(
+            "ELEVENLABS_WEBHOOK_SECRET", "")
+    return _elevenlabs_webhook_secret_cache
+
+
+def _raw_body(event):
+    """The body EXACTLY as sent — the bytes the signature covers.
+
+    Must not go through _body(): a parse-then-re-serialize round trip changes
+    key order and whitespace, and the HMAC is over the original text, so a
+    re-serialized body fails verification for every legitimate request.
+    """
+    raw = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        try:
+            raw = base64.b64decode(raw).decode("utf-8")
+        except (ValueError, TypeError):
+            return ""
+    return raw
+
+
+def _verify_elevenlabs_signature(event, raw_body):
+    """Verify the ElevenLabs-Signature header. Raises ApiError(401) on failure.
+
+    Scheme (verified against elevenlabs-js src/wrapper/webhooks.ts):
+        header: "t=<unix_seconds>,v0=<hex_hmac_sha256>"
+        signed: "{t}.{raw_body}"
+    Hex-encoded, compared in constant time.
+    """
+    secret = _elevenlabs_webhook_secret()
+    if not secret:
+        # Fail CLOSED. An unconfigured secret must never mean "accept
+        # everything" — that would leave the endpoint permanently open if a
+        # deploy forgot the secret, which is exactly the kind of silent
+        # misconfiguration nobody notices until it is abused.
+        print("[stt-webhook] rejected: no webhook secret configured")
+        raise ApiError(401, "webhook not configured")
+
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    sig_header = headers.get("elevenlabs-signature", "")
+    if not sig_header:
+        raise ApiError(401, "missing signature")
+
+    timestamp, signature = "", ""
+    for part in sig_header.split(","):
+        part = part.strip()
+        if part.startswith("t="):
+            timestamp = part[2:]
+        elif part.startswith("v0="):
+            signature = part
+    if not timestamp or not signature:
+        raise ApiError(401, "malformed signature header")
+
+    # Reject a replay before spending a HMAC on it.
+    try:
+        sent_at = int(timestamp)
+    except (TypeError, ValueError):
+        raise ApiError(401, "malformed signature timestamp")
+    if abs(int(time.time()) - sent_at) > ELEVENLABS_WEBHOOK_TOLERANCE:
+        raise ApiError(401, "signature timestamp outside tolerance")
+
+    expected = "v0=" + hmac.new(secret.encode("utf-8"),
+                                f"{timestamp}.{raw_body}".encode("utf-8"),
+                                hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise ApiError(401, "signature mismatch")
+
+
+def _stt_webhook_metadata(data):
+    """The validated metadata envelope, or ApiError(400).
+
+    transcribeRecording stamps {audio_s3_key, bucket, v}. audio_s3_key is the
+    AUTHORITATIVE identifier — it is the Recordings partition key — so the
+    lookup uses it and nothing else. recording_id is derivable from the key and
+    is never used to find the row.
+    """
+    meta = data.get("webhook_metadata")
+    # Tolerate a JSON-encoded string: it is sent as one, and a sender that
+    # echoes it back verbatim rather than parsed is a plausible variation.
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (ValueError, TypeError):
+            raise ApiError(400, "unparseable webhook_metadata")
+    if not isinstance(meta, dict):
+        raise ApiError(400, "missing webhook_metadata")
+
+    version = meta.get("v")
+    if version != STT_METADATA_VERSION:
+        # An unrecognised envelope is refused rather than guessed at — the
+        # whole point of versioning it.
+        raise ApiError(400, f"unsupported webhook_metadata version {version!r}")
+
+    key = str(meta.get("audio_s3_key") or "").strip()
+    if not key:
+        raise ApiError(400, "webhook_metadata has no audio_s3_key")
+
+    bucket = str(meta.get("bucket") or "").strip()
+    if not bucket or (BUCKET_NAME and bucket != BUCKET_NAME):
+        # Another environment's delivery. Refused, never applied to a
+        # same-named key in this one.
+        print(f"[stt-webhook] rejected: bucket {bucket!r} is not this "
+              f"environment's ({BUCKET_NAME!r})")
+        raise ApiError(400, "bucket mismatch")
+    return key, bucket
+
+
+def stt_webhook(event):
+    """POST /webhooks/elevenlabs/stt — ElevenLabs delivers a finished transcript.
+
+    Unauthenticated by necessity, signature-verified in fact. Returns quickly;
+    the AI analysis runs as a separate async invocation.
+
+    Always answers 200 once the delivery is genuine and understood — including
+    for a duplicate or a stale job. A non-2xx tells ElevenLabs to RETRY, and
+    retrying is pointless for a delivery we have deliberately decided to ignore.
+    Only a real failure (bad signature, malformed payload, a transcript we
+    failed to store) answers non-2xx.
+    """
+    raw_body = _raw_body(event)
+    # 1. Signature, before anything else is trusted or read.
+    _verify_elevenlabs_signature(event, raw_body)
+
+    try:
+        data = json.loads(raw_body) if raw_body else {}
+    except (ValueError, TypeError):
+        raise ApiError(400, "invalid JSON body")
+    if not isinstance(data, dict):
+        raise ApiError(400, "body must be a JSON object")
+
+    # 2. Payload structure/version.
+    event_type = str(data.get("type") or "")
+    if event_type != STT_WEBHOOK_EVENT:
+        # Another webhook type on the same URL is not an error worth retrying.
+        print(f"[stt-webhook] ignoring event type {event_type!r}")
+        return _resp(200, {"ignored": True, "reason": "unsupported event type"})
+
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        raise ApiError(400, "missing data object")
+
+    key, bucket = _stt_webhook_metadata(payload)
+    request_id = str(payload.get("request_id") or "").strip()
+    if not request_id:
+        raise ApiError(400, "missing request_id")
+
+    transcription = payload.get("transcription")
+    if not isinstance(transcription, dict):
+        # ElevenLabs also reports FAILED transcriptions here. Mark the row
+        # failed so the app stops polling and offers Retry, rather than leaving
+        # it "transcribing" — the exact dead end this phase removes.
+        return _stt_webhook_failure(key, request_id, payload)
+
+    # 3. Locate the row by its PARTITION KEY and check staleness.
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item:
+        print(f"[stt-webhook] no recording for {key}")
+        return _resp(200, {"ignored": True, "reason": "unknown recording"})
+
+    stored = str(item.get("stt_request_id") or "")
+    if stored and stored != request_id:
+        # A LATER job has already been queued for this recording (a reprocess),
+        # so this delivery belongs to a superseded one. Dropping it is the
+        # point: the newer transcript must never be overwritten by the older.
+        print(f"[stt-webhook] STALE for {key}: got {request_id}, "
+              f"row has {stored}")
+        return _resp(200, {"ignored": True, "reason": "stale request_id"})
+    if not stored:
+        # No id on the row at all. Either it predates async STT or the start
+        # write was lost; either way we cannot prove this delivery is current,
+        # and accepting it could overwrite a transcript from a job we know
+        # nothing about.
+        print(f"[stt-webhook] no stt_request_id on {key} — refusing to apply "
+              f"an unverifiable delivery")
+        return _resp(200, {"ignored": True, "reason": "no pending job"})
+
+    # 4. Claim the delivery. A conditional write is what makes a retry a no-op:
+    # only the FIRST delivery of this request_id passes the condition, so the
+    # analysis is invoked exactly once even if ElevenLabs sends it five times.
+    # DynamoDB provides the atomicity — no lock table, no new infrastructure.
+    try:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET stt_completed_request_id = :rid, "
+                             "stt_completed_at = :now",
+            ConditionExpression="stt_request_id = :rid AND "
+                                "(attribute_not_exists(stt_completed_request_id) "
+                                "OR stt_completed_request_id <> :rid)",
+            ExpressionAttributeValues={":rid": request_id, ":now": _now_iso()},
+        )
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") == \
+                "ConditionalCheckFailedException":
+            # Either already claimed (a duplicate delivery) or the row moved on
+            # under us (a reprocess between the read above and here). Both mean
+            # "do nothing", and both are successes from ElevenLabs' side.
+            print(f"[stt-webhook] duplicate/superseded delivery for {key} "
+                  f"({request_id}) — already processed")
+            return _resp(200, {"duplicate": True})
+        raise
+
+    # 5. Build the transcript from the words[] payload, using the SHARED parser
+    # (lambda-shared/stt_result.py) — the same code transcribeRecording uses.
+    # One implementation, deliberately: a second copy here would eventually
+    # disagree about where a speaker's turn ends, and the app's tap-to-seek maps
+    # each timestamp segment onto the diarized line at the same index, so a
+    # divergence surfaces as playback jumping to the wrong sentence.
+    transcript, timestamps, language = stt_result.parse(transcription)
+    if not transcript.strip():
+        print(f"[stt-webhook] empty transcript for {key}")
+
+    # The transcript goes to S3, never into the DynamoDB item (a real 45-minute
+    # meeting's transcript + timestamps was 96% of the 400 KB item limit — see
+    # lambda-shared/transcript_store.py). Written HERE, before the analysis is
+    # invoked, so the transcript is durable even if the analysis never runs:
+    # that is the difference between "reprocess the AI" and "the transcript is
+    # gone and STT must be paid for again".
+    fields = {"language": language}
+    try:
+        fields.update(transcript_store.put(
+            _s3, bucket, key, transcript, timestamps))
+    except Exception as err:  # noqa: BLE001
+        # A 5xx here is CORRECT: we could not persist what we were given, so a
+        # retry from ElevenLabs is genuinely useful. The claim is released so
+        # that retry isn't rejected as a duplicate.
+        print(f"[stt-webhook] transcript_store put FAILED for {key}: {err}")
+        _release_stt_claim(key)
+        raise ApiError(502, "could not store transcript")
+
+    _update_recording_fields(key, fields)
+
+    # 6. Hand off the analysis. ASYNC ("Event"): the Groq pipeline takes far
+    # longer than API Gateway will wait, and a timed-out webhook is one
+    # ElevenLabs retries — which would start a second analysis of the same
+    # meeting. The transcript travels in the payload so the analysis Lambda
+    # doesn't re-read what we just wrote.
+    try:
+        _lambda_client.invoke(
+            FunctionName=TRANSCRIBE_LAMBDA_NAME,
+            InvocationType="Event",
+            Payload=_stt_completion_payload(key, bucket, request_id,
+                                            transcript, timestamps, language),
+        )
+    except Exception as err:  # noqa: BLE001
+        # The transcript IS saved, so this is recoverable without ElevenLabs:
+        # the row keeps status "transcribing" and the user's Retry (or the
+        # reconciler) re-runs the analysis. Answer 502 so the failure is
+        # visible in ElevenLabs' delivery log rather than silently swallowed.
+        print(f"[stt-webhook] analysis invoke FAILED for {key}: {err}")
+        _update_recording_fields(key, {
+            "status": "transcribed",
+            "error": "transcript saved; AI analysis could not be started"})
+        raise ApiError(502, "could not start analysis")
+
+    print(f"[stt-webhook] accepted {key} ({request_id}): {len(transcript)} "
+          f"chars, {len(timestamps)} segments, language={language} — analysis "
+          f"invoked")
+    return _resp(200, {"accepted": True, "audio_s3_key": key,
+                       "transcript_chars": len(transcript)})
+
+
+def _stt_webhook_failure(key, request_id, payload):
+    """ElevenLabs reported a transcription that did NOT produce a transcript.
+
+    Marks the row failed so the app stops polling and offers Retry. Gated on
+    the same staleness rule as a success — an old job's failure must not fail a
+    recording that has since been re-queued and may be transcribing fine.
+    """
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+    stored = str(item.get("stt_request_id") or "")
+    if stored and stored != request_id:
+        print(f"[stt-webhook] stale FAILURE for {key} ignored "
+              f"({request_id} != {stored})")
+        return _resp(200, {"ignored": True, "reason": "stale request_id"})
+
+    detail = (str(payload.get("error") or payload.get("message")
+                  or payload.get("status") or "transcription failed"))[:1000]
+    _update_recording_fields(key, {"status": "failed", "error": detail})
+    print(f"[stt-webhook] transcription FAILED for {key}: {detail}")
+    return _resp(200, {"accepted": True, "failed": True})
+
+
+def _release_stt_claim(key):
+    """Undo the idempotency claim so a genuine retry can be processed.
+
+    Only called when we accepted a delivery and then failed to persist it —
+    without this, ElevenLabs' retry would be rejected as a duplicate and the
+    transcript would be lost for good.
+    """
+    try:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="REMOVE stt_completed_request_id, stt_completed_at",
+        )
+    except Exception as err:  # noqa: BLE001
+        print(f"[stt-webhook] could not release claim for {key}: {err}")
+
+
+# ---------------------------------------------------------------------------
+# RECONCILIATION — the guarantee that "transcribing" is never permanent.
+#
+# A webhook is a delivery, and deliveries can be lost: a bad deploy while
+# ElevenLabs was retrying, a webhook deleted from the workspace, a signature
+# secret rotated mid-flight. Without a way to ask "what happened to job X?", a
+# lost delivery would leave the row at "transcribing" forever — the very
+# failure mode async STT was adopted to remove, reintroduced by a different
+# route.
+#
+# The recovery only exists because the job id is PERSISTED. We can ask
+# ElevenLabs about a specific transcription at any later time, from any
+# container, with nothing held open in between — which is precisely what the
+# old synchronous socket could not survive.
+#
+# Two ways it resolves, both terminal:
+#   * ElevenLabs HAS the transcript -> store it and run the analysis, exactly
+#     as the webhook would have. The user loses nothing but time.
+#   * ElevenLabs has no such job (404) -> the job is genuinely gone, so the row
+#     becomes "failed" and the app offers Retry instead of a dead spinner.
+# ---------------------------------------------------------------------------
+ELEVENLABS_TRANSCRIPT_URL = (
+    "https://api.elevenlabs.io/v1/speech-to-text/transcripts")
+
+# A job younger than this is probably still legitimately running — a 10-hour
+# recording takes a long time — so reconciling it would just add load and could
+# race the real webhook. The webhook's idempotency claim makes that race safe,
+# but not free.
+STT_RECONCILE_MIN_AGE = int(os.environ.get("STT_RECONCILE_MIN_AGE", "900"))
+
+
+def stt_reconcile(event):
+    """POST /recordings/ai/stt-reconcile/{key+} -> {status, ...}.
+
+    Ask ElevenLabs directly what became of this recording's transcription job.
+    JWT-authenticated and owner-scoped (unlike the webhook, this is a user
+    action). 202 when the transcript was recovered and analysis started.
+    """
+    _, key, item = _owned_recording(event, hydrate=False)
+
+    request_id = str(item.get("stt_request_id") or "")
+    transcription_id = str(item.get("stt_transcription_id") or "")
+    status = (item.get("status") or "").strip()
+
+    if status not in ("transcribing", "generating_ai"):
+        raise ApiError(409, f"a recording with status '{status}' has nothing "
+                            "to reconcile")
+    if not request_id:
+        # Predates async STT, or the start write was lost. Reprocess is the
+        # right tool — it queues a brand-new job rather than chasing a
+        # phantom one.
+        raise ApiError(409, "no transcription job recorded for this recording "
+                            "— use Reprocess instead")
+    if item.get("stt_completed_request_id") == request_id:
+        # The webhook already landed; the analysis is running or done.
+        return _resp(200, {"status": status, "reconciled": False,
+                           "reason": "already delivered"})
+
+    started = item.get("stt_started_at")
+    if started:
+        try:
+            age = time.time() - datetime.fromisoformat(
+                str(started).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            age = None
+        if age is not None and 0 <= age < STT_RECONCILE_MIN_AGE:
+            wait = int(STT_RECONCILE_MIN_AGE - age)
+            raise ApiError(429, "transcription is still in progress — check "
+                                f"again in {wait}s")
+
+    if not transcription_id:
+        # ElevenLabs' transcript endpoint is keyed by transcription_id, which is
+        # optional in the queue response. Without it there is nothing to fetch,
+        # so the honest move is to let the user re-queue rather than to guess.
+        raise ApiError(409, "this job has no transcription id to look up — use "
+                            "Reprocess to start a new transcription")
+
+    api_key = os.environ.get("ELEVENLABS_API_KEY", "")
+    if not api_key:
+        raise ApiError(500, "server is missing ELEVENLABS_API_KEY")
+
+    url = f"{ELEVENLABS_TRANSCRIPT_URL}/{urllib.parse.quote(transcription_id)}"
+    req = urllib.request.Request(
+        url, headers={"xi-api-key": api_key, "User-Agent": "minutex-ai/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        body = err.read().decode("utf-8", "replace")[:300]
+        if err.code == 404:
+            # Genuinely gone. Make the row terminal so the app stops polling.
+            _update_recording_fields(key, {
+                "status": "failed",
+                "error": "the transcription job no longer exists at the "
+                         "provider; please retry"})
+            print(f"[stt-reconcile] {key}: job {transcription_id} is gone (404)")
+            return _resp(200, {"status": "failed", "reconciled": True,
+                               "reason": "job not found at provider"})
+        print(f"[stt-reconcile] {key}: provider {err.code}: {body}")
+        raise ApiError(502, f"transcription provider returned {err.code}")
+    except (urllib.error.URLError, TimeoutError, OSError) as err:
+        print(f"[stt-reconcile] {key}: transport error: {err}")
+        raise ApiError(502, "could not reach the transcription provider")
+
+    transcript, timestamps, language = stt_result.parse(result)
+    if not transcript.strip():
+        # Reachable but with nothing usable in it — still in progress, or a
+        # result with no speech. Leave the row alone rather than writing an
+        # empty transcript over a job that may yet complete.
+        return _resp(200, {"status": status, "reconciled": False,
+                           "reason": "no transcript available yet"})
+
+    # From here it is the webhook's own path: claim, store, invoke. The claim
+    # keeps a late webhook from re-running the analysis we are about to start.
+    try:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression="SET stt_completed_request_id = :rid, "
+                             "stt_completed_at = :now",
+            ConditionExpression="stt_request_id = :rid AND "
+                                "(attribute_not_exists(stt_completed_request_id) "
+                                "OR stt_completed_request_id <> :rid)",
+            ExpressionAttributeValues={":rid": request_id, ":now": _now_iso()},
+        )
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") == \
+                "ConditionalCheckFailedException":
+            return _resp(200, {"status": status, "reconciled": False,
+                               "reason": "already claimed"})
+        raise
+
+    fields = {"language": language}
+    try:
+        fields.update(transcript_store.put(
+            _s3, BUCKET_NAME, key, transcript, timestamps))
+    except Exception as err:  # noqa: BLE001
+        print(f"[stt-reconcile] transcript_store put FAILED for {key}: {err}")
+        _release_stt_claim(key)
+        raise ApiError(502, "could not store the recovered transcript")
+    _update_recording_fields(key, fields)
+
+    try:
+        _lambda_client.invoke(
+            FunctionName=TRANSCRIBE_LAMBDA_NAME,
+            InvocationType="Event",
+            Payload=_stt_completion_payload(key, BUCKET_NAME, request_id,
+                                            transcript, timestamps, language),
+        )
+    except Exception as err:  # noqa: BLE001
+        print(f"[stt-reconcile] analysis invoke FAILED for {key}: {err}")
+        _update_recording_fields(key, {
+            "status": "transcribed",
+            "error": "transcript recovered; AI analysis could not be started"})
+        raise ApiError(502, "recovered the transcript but could not start "
+                            "analysis — please retry")
+
+    print(f"[stt-reconcile] {key}: recovered {len(transcript)} chars from "
+          f"{transcription_id} — analysis invoked")
+    return _resp(202, {"status": "generating_ai", "reconciled": True,
+                       "transcript_chars": len(transcript)})
+
+
+def _update_recording_fields(key, fields):
+    """SET `fields` on a recording row. Small helper mirroring the transcribe
+    Lambda's _upsert, kept local so the webhook never reaches for a hydrated
+    item or writes the transcript back inline."""
+    if not fields:
+        return
+    safe = transcript_store.strip_for_write(fields)
+    names, values, sets = {}, {}, []
+    for i, (k, v) in enumerate(safe.items()):
+        names[f"#f{i}"] = k
+        values[f":v{i}"] = v
+        sets.append(f"#f{i} = :v{i}")
+    if not sets:
+        return
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET " + ", ".join(sets),
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+_ROUTES = {
+    ("POST", "/signup"): signup,
+    ("POST", "/login"): login,
+    ("GET", "/me"): get_me,
+    ("PATCH", "/me"): patch_me,
+    ("POST", "/me/password"): change_password,
+    ("POST", "/devices/pair-request"): pair_request,
+    ("POST", "/devices/pair"): pair_device,
+    ("POST", "/devices/claim"): claim_device,   # legacy — see claim_device()
+    ("GET", "/devices"): list_devices,
+    ("GET", "/devices/{device_id}"): get_device_detail,
+    ("PATCH", "/devices/{device_id}"): rename_device,
+    ("DELETE", "/devices/{device_id}"): unpair_device,
+    ("POST", "/devices/{device_id}/factory-reset"): factory_reset_device,
+    ("GET", "/recordings"): list_recordings,
+    ("POST", "/recordings/upload-request"): request_upload,
+    ("POST", "/recordings/upload-complete"): complete_upload,
+    # AI Meeting Workspace.
+    #
+    # The action is a LITERAL PREFIX and the recording key stays LAST, i.e.
+    # /recordings/ai/chat/{key+} rather than the more natural-looking
+    # /recordings/{key+}/chat. That is not a style choice: API Gateway rejects
+    # a greedy variable anywhere but the final position —
+    #   BadRequestException: Greedy variables may only be in last position
+    # — so a sub-resource route under {key+} cannot be created at all. Verified
+    # against live AWS while designing these routes.
+    #
+    # The "ai/" segment keeps the action namespace from ever colliding with a
+    # real recording key: keys always begin "recordings/{user_id}/..." (or a
+    # legacy "{device_id}/..."), so no key can be mistaken for an action.
+    ("GET", "/recordings/ai/documents/{key+}"): list_documents,
+    ("POST", "/recordings/ai/documents/{key+}"): generate_document,
+    ("PATCH", "/recordings/ai/documents/{key+}"): update_document,
+    ("DELETE", "/recordings/ai/documents/{key+}"): delete_document,
+    ("POST", "/recordings/ai/custom-document/{key+}"): generate_custom_document,
+    ("POST", "/recordings/ai/update-documents/{key+}"): update_stale_documents,
+    ("POST", "/recordings/ai/reprocess/{key+}"): reprocess_recording,
+    ("POST", "/recordings/ai/quick/{key+}"): quick_action,
+    ("POST", "/recordings/ai/highlights/{key+}"): regenerate_highlights,
+    ("GET", "/recordings/ai/chat/{key+}"): get_chat,
+    ("POST", "/recordings/ai/chat/{key+}"): chat,
+    ("DELETE", "/recordings/ai/chat/{key+}"): clear_chat,
+    # Tasks. Same four route templates the app has always called, now served
+    # from the first-class Tasks table instead of the recording row's embedded
+    # map — see the Tasks section. The legacy handlers (list_tasks/create_task/
+    # update_task/delete_task) are kept in this file as the mirror-writer and
+    # the migration source; they are no longer reachable over HTTP.
+    ("GET", "/recordings/ai/tasks/{key+}"): list_meeting_tasks,
+    ("POST", "/recordings/ai/tasks/{key+}"): create_meeting_task,
+    ("PATCH", "/recordings/ai/tasks/{key+}"): update_meeting_task,
+    ("DELETE", "/recordings/ai/tasks/{key+}"): delete_meeting_task,
+    # Speaker -> Contact mapping and the meeting's folder. Both put the action
+    # first and {key+} last for the same API Gateway reason as the AI routes.
+    ("GET", "/recordings/participants/{key+}"): list_participants,
+    ("PUT", "/recordings/participants/{key+}"): set_participant,
+    ("PATCH", "/recordings/folder/{key+}"): move_recording_to_folder,
+    ("GET", "/recordings/{key+}"): get_recording,
+    ("PATCH", "/recordings/{key+}"): patch_recording,
+    # Trash. DELETE /recordings/{key+} is a SOFT delete (see the Trash
+    # section); only /recordings/permanent/{key+} destroys anything.
+    #
+    # The two sub-actions put the action FIRST and the key LAST, exactly
+    # like the AI routes and for the same hard reason: API Gateway rejects
+    # a greedy variable in any but the final position, and a recording key
+    # contains slashes so it MUST be greedy. "/recordings/{key+}/restore"
+    # cannot be created at all. The literal prefix cannot collide with a
+    # real key either — keys always begin "recordings/{user_id}/..." or a
+    # legacy device id, never "restore/" or "permanent/".
+    ("DELETE", "/recordings/{key+}"): delete_recording,
+    ("POST", "/recordings/restore/{key+}"): restore_recording,
+    ("DELETE", "/recordings/permanent/{key+}"): permanently_delete_recording,
+    ("GET", "/trash"): list_trash,
+    # Folders — organizational views over the ONE master meeting collection.
+    ("POST", "/folders"): create_folder,
+    ("GET", "/folders"): list_folders,
+    ("GET", "/folders/{folder_id}"): get_folder,
+    ("PATCH", "/folders/{folder_id}"): update_folder,
+    ("DELETE", "/folders/{folder_id}"): delete_folder,
+    ("GET", "/folders/{folder_id}/contacts"): list_folder_contacts,
+    ("POST", "/folders/{folder_id}/contacts/{contact_id}"): add_folder_contact,
+    ("DELETE", "/folders/{folder_id}/contacts/{contact_id}"): remove_folder_contact,
+    # Contacts — global per owner, never owned by a folder.
+    ("POST", "/contacts"): create_contact,
+    ("GET", "/contacts"): list_contacts,
+    ("GET", "/contacts/{contact_id}"): get_contact,
+    ("PATCH", "/contacts/{contact_id}"): update_contact,
+    ("DELETE", "/contacts/{contact_id}"): delete_contact,
+    # Cross-meeting task queries — the Task Tracker's read side.
+    ("GET", "/tasks"): list_all_tasks,
+    ("GET", "/tasks/{task_id}"): get_task,
+    ("PATCH", "/tasks/{task_id}"): update_task_v2,
+    ("POST", "/tasks/{task_id}/resolve"): resolve_task_assignee,
+    ("GET", "/tasks/{task_id}/assignee-candidates"): suggest_task_assignees,
+    # CRM — Salesforce connect (Phase 1). /callback is the one route in this
+    # file Salesforce's browser redirect calls directly — no JWT, verified
+    # via `state` instead. See the section above for the full flow.
+    ("GET", "/crm/salesforce/connect"): salesforce_connect,
+    ("GET", "/crm/salesforce/callback"): salesforce_callback,
+    ("GET", "/crm/salesforce/status"): salesforce_status,
+    ("DELETE", "/crm/salesforce"): salesforce_disconnect,
+    # CRM configuration — the user maps their OWN org's object/fields; no
+    # object or field API name is ever hardcoded (see the section above).
+    ("GET", "/crm/salesforce/objects"): salesforce_list_objects,
+    ("GET", "/crm/salesforce/fields/{object_name}"): salesforce_list_fields,
+    ("GET", "/crm/salesforce/config"): salesforce_get_config,
+    ("PUT", "/crm/salesforce/config"): salesforce_put_config,
+    # Identifier -> Salesforce record Id, using the configured object + field.
+    ("POST", "/crm/salesforce/lookup"): salesforce_lookup_record,
+    # Push the meeting's configured content onto the confirmed record. The
+    # recording key comes LAST for the same API Gateway reason as the AI routes
+    # (a greedy {key+} is only legal in the final position).
+    ("POST", "/crm/salesforce/sync/{key+}"): crm_sync_record,
+    # ElevenLabs' asynchronous STT completion callback. The SECOND
+    # unauthenticated route in this file (after /crm/salesforce/callback):
+    # ElevenLabs has no MinuteX JWT, so identity is proven by an HMAC signature
+    # over the raw body instead. See the section above for all five checks.
+    ("POST", "/webhooks/elevenlabs/stt"): stt_webhook,
+    # Recover a job whose webhook never arrived, by asking ElevenLabs directly.
+    # JWT-authenticated and owner-scoped — this one is for the user/operator,
+    # not for ElevenLabs.
+    ("POST", "/recordings/ai/stt-reconcile/{key+}"): stt_reconcile,
+}
+
+
+def lambda_handler(event, context):
+    # HTTP API v2.0: method + matched route template live under requestContext.
+    rc = (event.get("requestContext") or {}).get("http") or {}
+    method = rc.get("method", "")
+    route = event.get("routeKey", "")  # e.g. "GET /recordings/{key}"
+    # routeKey is "METHOD /path"; split once.
+    path = route.split(" ", 1)[1] if " " in route else rc.get("path", "")
+
+    handler = _ROUTES.get((method, path))
+    if handler is None:
+        return _resp(404, {"error": "not found", "method": method, "path": path})
+    try:
+        return handler(event)
+    except ApiError as e:
+        # `code` is only present on errors that carry a stable machine-readable
+        # identity (SalesforceReconnectRequired). Clients branch on it; every
+        # other error keeps the plain {"error": ...} shape it has always had.
+        body = {"error": e.message}
+        code = getattr(e, "code", "")
+        if code:
+            body["code"] = code
+        # AmbiguousContact carries the candidate list with it: the whole point
+        # of that 409 is that the client can render "which Rahul?" instead of a
+        # dead end, which needs the candidates in the body.
+        candidates = getattr(e, "candidates", None)
+        if candidates is not None:
+            body["candidates"] = candidates
+        return _resp(e.status, body)
+    except Exception as e:  # noqa: BLE001
+        # The RESPONSE stays generic on purpose — an unexpected exception's text
+        # is not vetted for secrets, so it must never reach the client. The LOG
+        # gets the full traceback: this handler previously printed only
+        # "TypeName: message" on one line, which is how a hard-failing
+        # UpdateExpression in _write_crm_record surfaced to the user as a
+        # blanket "internal error" with no file or line to chase.
+        print(f"[error] {method} {path}: {type(e).__name__}: {e}\n"
+              f"{traceback.format_exc()}")
+        return _resp(500, {"error": "internal error"})

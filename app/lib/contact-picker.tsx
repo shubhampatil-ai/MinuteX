@@ -42,6 +42,18 @@ type Section =
   | { kind: "heading"; label: string; hint?: string }
   | { kind: "contact"; contact: ApiContact; inFolder: boolean };
 
+// One row per PERSON, keeping first appearance. Callers pass speaker→contact
+// mappings, where the same person legitimately appears more than once (one
+// contact tagged as several speakers), and every list here keys on contact.id.
+function dedupById(contacts: ApiContact[]): ApiContact[] {
+  const seen = new Set<string>();
+  return contacts.filter((c) => {
+    if (seen.has(c.id)) return false;
+    seen.add(c.id);
+    return true;
+  });
+}
+
 export type ContactPickerProps = {
   visible: boolean;
   onClose: () => void;
@@ -111,6 +123,17 @@ export function ContactPicker({
     };
   }, [query, debounced]);
 
+  // `onClose` is an inline arrow at every call site, so it is a NEW function
+  // on every parent render. Depending on it directly made `load` unstable,
+  // which re-fired the load effect below, which setState'd, which re-rendered
+  // the parent — an unbounded render loop that fired at mount, because this
+  // sheet is always mounted and only `visible` toggles. Reading it through a
+  // ref keeps the latest callback without making it a render-loop input.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   const load = useCallback(
     async (search: string) => {
       setLoading(true);
@@ -126,7 +149,7 @@ export function ContactPicker({
         // of retrying inside a modal can fix that. Close and send them to
         // login, the same thing every full screen in the app does.
         if (e instanceof ApiError && e.status === 401) {
-          onClose();
+          onCloseRef.current();
           router.replace("/login");
           return;
         }
@@ -137,7 +160,7 @@ export function ContactPicker({
         setLoading(false);
       }
     },
-    [onClose, router]
+    [router]
   );
 
   useEffect(() => {
@@ -202,7 +225,12 @@ export function ContactPicker({
     const out: Section[] = [];
     const seen = new Set<string>();
 
-    const meetingMatches = meetingContacts.filter(matches);
+    // Dedup WITHIN this tier too, not just against later ones. The meeting's
+    // participants are speaker→contact MAPPINGS, so one person tagged as two
+    // speakers (Speaker 0 and Speaker 2 are both Priya — routine in a diarized
+    // meeting) arrives here twice. Both rows would key on contact.id and React
+    // would warn about duplicate keys and may drop one of them.
+    const meetingMatches = dedupById(meetingContacts.filter(matches));
     if (meetingMatches.length) {
       out.push({
         kind: "heading", label: "In this meeting", hint: "Tagged here",
@@ -213,8 +241,8 @@ export function ContactPicker({
       });
     }
 
-    const folderMatches = folderContacts.filter(
-      (c) => matches(c) && !seen.has(c.id)
+    const folderMatches = dedupById(
+      folderContacts.filter((c) => matches(c) && !seen.has(c.id))
     );
     if (folderMatches.length) {
       out.push({
@@ -228,7 +256,11 @@ export function ContactPicker({
       });
     }
 
-    const rest = all.filter((c) => !seen.has(c.id) && !folderIds.has(c.id));
+    // `all` is paginated, so a contact can arrive twice if the underlying set
+    // shifts between page fetches.
+    const rest = dedupById(
+      all.filter((c) => !seen.has(c.id) && !folderIds.has(c.id))
+    );
     if (rest.length) {
       out.push({ kind: "heading", label: "All Contacts" });
       rest.forEach((c) =>
@@ -443,11 +475,6 @@ export function ContactPicker({
                       />
                     ) : (
                       <FlatList
-                        // Same constraint as the contacts list below: the sheet
-                        // is height-capped, so this list needs an explicit
-                        // shrinkable, zero-floor height or it has no bounded
-                        // viewport to virtualize against.
-                        style={{ flexShrink: 1, minHeight: 0 }}
                         data={phoneRows}
                         keyExtractor={(c, i) => `${c.name}-${c.email ?? c.phone ?? i}`}
                         keyboardShouldPersistTaps="handled"

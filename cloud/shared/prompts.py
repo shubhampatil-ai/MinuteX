@@ -17,6 +17,7 @@ Two contracts callers rely on:
   * Prose templates (documents, quick actions, chat) return MARKDOWN, because
     that is what the app renders, copies, shares and exports.
 """
+import re
 
 # ---------------------------------------------------------------------------
 # The shared foundation. Every prompt below opens with this.
@@ -1268,6 +1269,49 @@ def _fmt_list(title, items, bullet="-"):
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# Speaker labels inside stored AI output.
+#
+# The row's AI attributes were written when the speakers were still anonymous,
+# so `ai_tasks[].assignee`, `participants[].speaker` and highlight owners hold
+# strings like "Speaker 2". analysis_context feeds all of them back into every
+# LATER generation as prior context — which means a document generated AFTER a
+# rename was still being shown the old label alongside the new mapping, and
+# would sometimes echo it back. Remapping here fixes it at the one place those
+# strings enter a prompt, rather than rewriting the stored attributes (which
+# are the verbatim record of what the extraction found).
+#
+# Only a whole label is replaced. A partial match would corrupt real prose —
+# "Speaker 1" must not rewrite the "Speaker 12" beside it, which is why the
+# pattern anchors both ends.
+# ---------------------------------------------------------------------------
+
+_SPEAKER_LABEL_RE = re.compile(r"^\s*speaker[\s_-]*(.+?)\s*$", re.IGNORECASE)
+
+
+def resolve_speaker_text(text, speaker_names):
+    """A stored "Speaker N" string rendered with the user's name for N.
+
+    Anything that is not a bare speaker label — a real name the AI heard, a
+    team name, an empty value — is returned UNCHANGED. That is the point: this
+    only ever upgrades a label to a name, never reinterprets prose.
+    """
+    raw = str(text or "").strip()
+    if not raw or not isinstance(speaker_names, dict) or not speaker_names:
+        return raw
+    # An exact key hit covers non-numeric labels ("agent") and any label the
+    # map stores verbatim.
+    if raw in speaker_names and speaker_names[raw]:
+        return str(speaker_names[raw])
+    m = _SPEAKER_LABEL_RE.match(raw)
+    if m:
+        label = m.group(1).strip()
+        named = speaker_names.get(label)
+        if named:
+            return str(named)
+    return raw
+
+
 def analysis_context(rec, meeting_highlights=None):
     """Compact text digest of a recording's stored AI analysis.
 
@@ -1312,6 +1356,13 @@ def analysis_context(rec, meeting_highlights=None):
 
     parts.append(_fmt_list("HIGHLIGHTS", rec.get("highlights") or []))
 
+    # Read BEFORE the blocks below, which resolve stored "Speaker N" strings
+    # through it (see resolve_speaker_text). The map itself is emitted further
+    # down, after the analysis it explains.
+    names = rec.get("speaker_names") or {}
+    if not isinstance(names, dict):
+        names = {}
+
     ai_tasks = rec.get("ai_tasks") or []
     if ai_tasks:
         lines = ["TASKS:"]
@@ -1319,8 +1370,11 @@ def analysis_context(rec, meeting_highlights=None):
             if not isinstance(t, dict):
                 continue
             bits = [t.get("task") or ""]
-            if t.get("assignee"):
-                bits.append(f"assignee: {t['assignee']}")
+            # The assignee may be a stored "Speaker 2" — show the model who
+            # that is now, not who they were at extraction time.
+            assignee = resolve_speaker_text(t.get("assignee"), names)
+            if assignee:
+                bits.append(f"assignee: {assignee}")
             if t.get("due_date"):
                 bits.append(f"due: {t['due_date']}")
             if t.get("priority"):
@@ -1334,26 +1388,34 @@ def analysis_context(rec, meeting_highlights=None):
         for p in people:
             if not isinstance(p, dict):
                 continue
-            who = p.get("speaker") or ""
+            who = resolve_speaker_text(p.get("speaker"), names)
             what = p.get("summary") or ""
             lines.append(f"- {who}: {what}" if what else f"- {who}")
         parts.append("\n".join(lines) + "\n")
 
     # Speaker names the USER supplied. Given to the model so a document says
-    # "Ravi" where the transcript only ever says "Speaker 0".
-    names = rec.get("speaker_names") or {}
-    if isinstance(names, dict) and names:
+    # "Ravi" where the transcript only ever says "Speaker 0". Still emitted
+    # even though the blocks above are already resolved: the TRANSCRIPT below
+    # is verbatim and does say "Speaker 0", so the model needs the mapping to
+    # read it.
+    if names:
         mapped = ", ".join(f"Speaker {k} is {v}" for k, v in names.items())
         parts.append(f"SPEAKER NAMES (user-provided): {mapped}\n")
 
     if meeting_highlights:
-        parts.append(highlights_context(meeting_highlights))
+        parts.append(highlights_context(meeting_highlights, names))
 
     return "\n".join(p for p in parts if p)
 
 
-def highlights_context(h):
-    """Text digest of stored meeting_highlights."""
+def highlights_context(h, speaker_names=None):
+    """Text digest of stored meeting_highlights.
+
+    `speaker_names` resolves a stored "Speaker N" owner to the user's name,
+    for the same reason analysis_context does it for ai_tasks assignees — this
+    text is prior context for later generations, so a stale label here becomes
+    a stale label in a freshly generated document.
+    """
     if not isinstance(h, dict):
         return ""
     parts = []
@@ -1366,8 +1428,9 @@ def highlights_context(h):
         if not isinstance(a, dict) or not a.get("task"):
             continue
         bits = [a["task"]]
-        if a.get("owner"):
-            bits.append(f"owner: {a['owner']}")
+        owner = resolve_speaker_text(a.get("owner"), speaker_names)
+        if owner:
+            bits.append(f"owner: {owner}")
         if a.get("deadline"):
             bits.append(f"deadline: {a['deadline']}")
         acts.append(" | ".join(bits))

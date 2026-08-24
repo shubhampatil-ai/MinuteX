@@ -1128,6 +1128,12 @@ export type ApiTask = {
   assignee_name?: string;
   assignee_name_legacy?: string;
   assignee_speaker_id?: string;
+  // The speaker this task came from, rendered through the meeting's CURRENT
+  // speaker_names — "Speaker 2" while unnamed, "Siddhesh Gawade" after a
+  // rename. Resolved SERVER-side (lambda-userapi's _public_task_v2) because
+  // the cross-meeting Task Tracker has no recording loaded and so cannot map
+  // the label itself. Empty when the task never came from a speaker.
+  speaker_name?: string;
   resolution_status?: TaskResolutionStatus;
   folder_id?: string;
   source_recording_id?: string;
@@ -1145,11 +1151,25 @@ export function needsAssigneeResolution(t: ApiTask): boolean {
   );
 }
 
-/** The best label for a task's assignee, and whether it is a real identity. */
+/** The best label for a task's assignee, and whether it is a real identity.
+ *
+ * `speaker_name` outranks `assignee_name_legacy` because the legacy field is
+ * the VERBATIM AI extraction ("Speaker 2") — kept for provenance, not for
+ * display — while speaker_name is that same speaker read through the
+ * meeting's current names. This is what makes a rename reach every task with
+ * no writes: the backend recomputes it per request (see ApiTask.speaker_name).
+ *
+ * `assignee_name` still wins over both: it is only set once a real Contact is
+ * attached, and renaming the speaker who happened to say the sentence must
+ * never re-point a task someone assigned by hand. */
 export function assigneeLabel(t: ApiTask): { name: string; confirmed: boolean } {
   const confirmed = t.resolution_status === "RESOLVED";
   const name =
-    t.assignee_name || t.assignee_name_legacy || t.assignee?.name || "";
+    t.assignee_name ||
+    (t.assignee_contact_id ? "" : t.speaker_name) ||
+    t.assignee_name_legacy ||
+    t.assignee?.name ||
+    "";
   return { name, confirmed: confirmed && !!name };
 }
 
@@ -1565,6 +1585,9 @@ export type TaskDetail = {
     title: string;
     recorded_at: string;
     folder_id: string;
+    // The meeting's speaker_names, so the detail screen can name the speaker
+    // a task came from without a second call to getParticipants.
+    speaker_names?: Record<string, string>;
   };
 };
 

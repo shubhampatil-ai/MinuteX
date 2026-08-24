@@ -4702,14 +4702,125 @@ def _task_fingerprint(recording_key, text, assignee_hint=""):
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:32]
 
 
-def _public_task_v2(row):
+# ---------------------------------------------------------------------------
+# Live speaker-name resolution for tasks.
+#
+# WHY THIS EXISTS. An AI-extracted task records WHICH SPEAKER owed the work
+# (`assignee_speaker_id`) and, until someone says who that speaker is, the
+# only name it can show is the label the transcript carried: "Speaker 2".
+# `_resolve_tasks_for_speaker` writes a real identity onto the row, but it
+# only ever fires from set_participant — mapping a speaker to a CONTACT. A
+# plain rename (patch_recording's speaker_names) went nowhere near tasks, so
+# a renamed speaker kept saying "Speaker 2" on every task forever while the
+# transcript, participants list and documents all updated.
+#
+# RESOLVED AT READ TIME, NOT WRITTEN. The rename already lands in exactly one
+# authoritative place — `speaker_names` on the recording — and the task
+# already stores the join key. So the display name is DERIVED here, the same
+# way the transcript view derives it (lib/sources.ts' speakerName) and the
+# same way _is_overdue derives overdue-ness rather than storing it. A rename
+# therefore needs no writes to any task: every task the speaker owns reads
+# correctly on the very next request, including ones in other folders and the
+# cross-meeting Task Tracker.
+#
+# Writing the name onto each task instead would mean N extra DynamoDB writes
+# per rename (unbounded — a speaker can own tasks across a whole meeting),
+# would clobber the verbatim AI-extracted string in `assignee_name_legacy`,
+# and would leave any task written between the rename and the sweep stale.
+#
+# THIS IS DISPLAY ONLY, AND ONLY FOR UNRESOLVED TASKS. A task with a real
+# Contact behind it (RESOLUTION_RESOLVED / `assignee_contact_id`) is left
+# exactly as it is — the same guard `_resolve_tasks_for_speaker` applies:
+# a user who hand-assigned a task keeps their choice, and a rename of the
+# speaker who happened to say the sentence must never re-point it at someone
+# else. `assignee_name_legacy` also keeps its stored value in the response,
+# so the AI's original extraction stays inspectable.
+# ---------------------------------------------------------------------------
+
+
+def _speaker_display_name(label, speaker_names):
+    """A speaker label rendered for a human, or "" when there is nothing to
+    render. Mirrors lib/sources.ts' speakerName so the app and the API never
+    disagree about what one label is called.
+
+    Numeric labels read as "Speaker 2"; named ones ("agent") stand alone.
+    """
+    raw = str(label or "").strip()
+    if not raw:
+        return ""
+    named = (speaker_names or {}).get(raw)
+    if named:
+        return str(named)
+    return f"Speaker {raw}" if raw.isdigit() else raw
+
+
+def _speaker_names_for_recording(key, cache=None):
+    """The `speaker_names` map for one recording, read straight from the row.
+
+    `cache` is a per-REQUEST dict, not module state: list_all_tasks can return
+    a page of tasks drawn from many meetings, and without it that page would
+    re-read the same recording once per task. Deliberately not cached across
+    invocations — a warm Lambda container would then serve the name from
+    before the rename, which is the exact bug this whole section fixes.
+
+    Ownership is NOT checked here. Every caller has already established that
+    the task is the caller's, and a task's `source_recording_id` is written by
+    the pipeline, never by a client — so this can only ever read the map of a
+    recording the caller's own task came from.
+    """
+    key = str(key or "")
+    if not key:
+        return {}
+    if cache is not None and key in cache:
+        return cache[key]
+    names = {}
+    try:
+        row = _recordings.get_item(
+            Key={"audio_s3_key": key},
+            ProjectionExpression="speaker_names",
+        ).get("Item") or {}
+        got = row.get("speaker_names")
+        if isinstance(got, dict):
+            names = got
+    except ClientError as e:
+        # A task must still render if the recording read fails — the assignee
+        # falls back to whatever is stored on the row, which is what every
+        # build before this change showed anyway.
+        print(f"[warn] speaker_names read failed for {key}: "
+              f"{type(e).__name__}: {e}")
+    if cache is not None:
+        cache[key] = names
+    return names
+
+
+def _public_task_v2(row, speaker_names=None):
     """A first-class Task in API shape.
 
     `is_overdue` is COMPUTED, never stored (section 14): a stored flag would be
     wrong the moment the clock passed midnight with nothing writing to the row.
+
+    `speaker_name` and the display half of `assignee` are computed the same
+    way and for the same reason — see the live-resolution section above.
+    Callers pass the source recording's `speaker_names` map; omitting it keeps
+    the pre-rename behaviour (the stored string), so a call site that has no
+    recording in hand still returns a valid task.
     """
     due = row.get("due_date") or ""
     status = row.get("status") or TASK_STATUS_OPEN
+
+    # The name a rename should move. Only meaningful while the task is still
+    # pinned to a speaker rather than a person: once a Contact is attached,
+    # `assignee_name` is that person's name and is not the speaker's to change.
+    speaker_id = str(row.get("assignee_speaker_id") or "")
+    resolved_by_contact = bool(row.get("assignee_contact_id"))
+    speaker_name = ("" if not speaker_id
+                    else _speaker_display_name(speaker_id, speaker_names))
+    # What the assignee should READ as. The renamed speaker wins over the
+    # AI's stored string, but only for a task no human has assigned.
+    display_name = (row.get("assignee_name")
+                    or (speaker_name if not resolved_by_contact else "")
+                    or row.get("assignee_name_legacy") or "")
+
     return {
         "id": row.get("task_id", ""),
         "task": row.get("title", ""),
@@ -4724,7 +4835,12 @@ def _public_task_v2(row):
         "assignee_user_id": row.get("assignee_user_id", ""),
         "assignee_name": row.get("assignee_name", ""),
         "assignee_name_legacy": row.get("assignee_name_legacy", ""),
-        "assignee_speaker_id": row.get("assignee_speaker_id", ""),
+        "assignee_speaker_id": speaker_id,
+        # The speaker label rendered through the meeting's CURRENT
+        # speaker_names — "Speaker 2" before anyone names them, "Ravi" after.
+        # Present whenever the task came from a speaker, even once a Contact
+        # has been attached, so the app can still say where it came from.
+        "speaker_name": speaker_name,
         "resolution_status": row.get("resolution_status", RESOLUTION_NONE),
         "folder_id": row.get("folder_id", ""),
         "source_recording_id": row.get("source_recording_id", ""),
@@ -4738,13 +4854,11 @@ def _public_task_v2(row):
         "from_action_item": row.get("source_type") == TASK_SOURCE_AI,
         # The legacy API's assignee shape, so a client build written against
         # the embedded-map API keeps rendering an assignee without changes.
-        "assignee": ({"name": row.get("assignee_name")
-                              or row.get("assignee_name_legacy") or "",
+        "assignee": ({"name": display_name,
                       "email": row.get("assignee_email", ""),
                       "phone": row.get("assignee_phone", ""),
                       "source": "manual"}
-                     if (row.get("assignee_name")
-                         or row.get("assignee_name_legacy")) else None),
+                     if display_name else None),
     }
 
 
@@ -5200,7 +5314,9 @@ def list_meeting_tasks(event):
     rows = [r for r in _tasks_for_recording(key)
             if r.get("owner_user_id") == user_id]
     rows.sort(key=lambda r: r.get("created_at", ""))
-    return _resp(200, {"tasks": [_public_task_v2(r) for r in rows],
+    # The recording row is already loaded, so speaker names cost no extra read.
+    names = item.get("speaker_names") or {}
+    return _resp(200, {"tasks": [_public_task_v2(r, names) for r in rows],
                        "count": len(rows)})
 
 
@@ -5249,7 +5365,8 @@ def create_meeting_task(event):
     _write_task(row)
     _mirror_task_to_recording(key, row)
     _audit("task.created", user_id, row["task_id"], recording_key=key)
-    return _resp(201, {"task": _public_task_v2(row)})
+    return _resp(201, {"task": _public_task_v2(row,
+                                               item.get("speaker_names") or {})})
 
 
 def update_meeting_task(event):
@@ -5355,7 +5472,8 @@ def update_meeting_task(event):
     _mirror_task_to_recording(key, fresh)
     _audit("task.updated", user_id, row["task_id"],
            fields=sorted(set(updates) | set(removes)))
-    return _resp(200, {"task": _public_task_v2(fresh)})
+    return _resp(200, {"task": _public_task_v2(fresh,
+                                               item.get("speaker_names") or {})})
 
 
 def _find_task_for_update(user_id, key, task_id):
@@ -5517,8 +5635,16 @@ def list_all_tasks(event):
         next_cursor = _encode_cursor(cursor_key)
     elif last_key:
         next_cursor = _encode_cursor(last_key)
-    return _resp(200, {"tasks": [_public_task_v2(r) for r in out],
-                       "count": len(out), "next_cursor": next_cursor})
+    # One recording read per DISTINCT meeting on this page, not per task —
+    # a page of 50 tasks from 3 meetings costs 3 reads (see
+    # _speaker_names_for_recording on why the cache is per-request).
+    names_cache = {}
+    return _resp(200, {
+        "tasks": [_public_task_v2(
+                      r, _speaker_names_for_recording(
+                          r.get("source_recording_id"), names_cache))
+                  for r in out],
+        "count": len(out), "next_cursor": next_cursor})
 
 
 def get_task(event):
@@ -5530,7 +5656,7 @@ def get_task(event):
     user_id = _require_auth(event)
     task_id = (event.get("pathParameters") or {}).get("task_id", "")
     row = _owned_task(user_id, task_id)
-    out = {"task": _public_task_v2(row)}
+    out = {}
 
     cid = row.get("assignee_contact_id")
     if cid:
@@ -5542,15 +5668,24 @@ def get_task(event):
         f = _folders.get_item(Key={"folder_id": fid}).get("Item")
         if f and f.get("owner_user_id") == user_id:
             out["folder"] = _public_folder(f)
+    # The recording is read for the `recording` block anyway, so its
+    # speaker_names come along free — no second read to resolve the assignee.
+    # `speaker_names` is also returned so the detail screen can render the
+    # "this came from <name>" line without a separate participants call.
+    speaker_names = {}
     key = row.get("source_recording_id")
     if key:
         rec = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
         if rec and (rec.get("user_id") == user_id
                     or rec.get("device_id") in _owned_devices(user_id)):
+            got = rec.get("speaker_names")
+            speaker_names = got if isinstance(got, dict) else {}
             out["recording"] = {"audio_s3_key": key,
                                 "title": rec.get("title", ""),
                                 "recorded_at": rec.get("recorded_at", ""),
-                                "folder_id": str(rec.get("folder_id") or "")}
+                                "folder_id": str(rec.get("folder_id") or ""),
+                                "speaker_names": speaker_names}
+    out["task"] = _public_task_v2(row, speaker_names)
     return _resp(200, {**out})
 
 
@@ -5613,7 +5748,8 @@ def resolve_task_assignee(event):
         _mirror_task_to_recording(fresh["source_recording_id"], fresh)
     _audit("task.assignee_resolved", user_id, row["task_id"],
            contact_id=contact["contact_id"])
-    return _resp(200, {"task": _public_task_v2(fresh)})
+    return _resp(200, {"task": _public_task_v2(
+        fresh, _speaker_names_for_recording(fresh.get("source_recording_id")))})
 
 
 def suggest_task_assignees(event):

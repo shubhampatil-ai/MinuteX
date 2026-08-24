@@ -335,7 +335,11 @@ export default function TaskDetailScreen() {
                 accessibilityLabel="Map speakers for this meeting"
               >
                 <Text style={st.altLink}>
-                  This came from Speaker {task.assignee_speaker_id}. Mapping
+                  {/* Named through the meeting's current speaker_names when
+                      there is a name — a renamed speaker reads as their name
+                      here too, not the raw label the AI extracted. */}
+                  This came from {task.speaker_name
+                    || `Speaker ${task.assignee_speaker_id}`}. Mapping
                   that speaker resolves every task they own →
                 </Text>
               </Pressable>

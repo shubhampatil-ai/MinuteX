@@ -529,6 +529,58 @@ class TestContextAssembly(unittest.TestCase):
         self.assertIn("Ravi", ctx)
         self.assertIn("Priya", ctx)
 
+    def test_stored_speaker_labels_are_resolved_before_reaching_the_model(self):
+        """The stored analysis was written while the speakers were anonymous,
+        and analysis_context feeds it back into every LATER generation. Left
+        raw, a document generated AFTER a rename was still shown "Speaker 0"
+        beside the new mapping and would sometimes echo the label back."""
+        ctx = prompts.analysis_context(RECORDING, HIGHLIGHTS)
+        # ai_tasks[].assignee and participants[].speaker are both "Speaker 0"
+        # on the fixture row; neither may survive into the prompt as a label.
+        self.assertIn("assignee: Ravi", ctx)
+        self.assertIn("- Ravi: Presented the quotation", ctx)
+        self.assertNotIn("assignee: Speaker 0", ctx)
+        self.assertNotIn("- Speaker 0:", ctx)
+        # The MAP itself is still emitted — the verbatim transcript below it
+        # really does say "Speaker 0", so the model needs it to read that.
+        self.assertIn("SPEAKER NAMES (user-provided)", ctx)
+
+    def test_a_highlighted_action_items_owner_resolves_too(self):
+        rec = {**RECORDING, "speaker_names": {"0": "Ravi"}}
+        highlights = {"action_items": [{"task": "Send revised quote",
+                                        "owner": "Speaker 0"}]}
+        ctx = prompts.analysis_context(rec, highlights)
+        self.assertIn("owner: Ravi", ctx)
+        self.assertNotIn("owner: Speaker 0", ctx)
+
+    def test_a_real_spoken_name_is_never_reinterpreted(self):
+        """resolve_speaker_text only ever upgrades a LABEL to a name. A name
+        the AI actually heard must pass through untouched."""
+        rec = {**RECORDING, "speaker_names": {"0": "Ravi"},
+               "ai_tasks": [{"task": "Call the vendor", "assignee": "Sunita"}]}
+        self.assertIn("assignee: Sunita", prompts.analysis_context(rec))
+
+    def test_an_unmapped_label_is_left_as_it_is(self):
+        """No name for that speaker yet — the label is the honest answer, and
+        inventing one would be exactly the hallucination the base rules ban."""
+        rec = {**RECORDING, "speaker_names": {"0": "Ravi"},
+               "ai_tasks": [{"task": "Book the room", "assignee": "Speaker 4"}]}
+        self.assertIn("assignee: Speaker 4", prompts.analysis_context(rec))
+
+    def test_a_longer_label_is_not_partially_matched(self):
+        """"Speaker 1" must not rewrite the "Speaker 12" beside it — the whole
+        label is matched or nothing is."""
+        names = {"1": "Ravi"}
+        self.assertEqual(
+            prompts.resolve_speaker_text("Speaker 12", names), "Speaker 12")
+        self.assertEqual(
+            prompts.resolve_speaker_text("Speaker 1", names), "Ravi")
+
+    def test_resolution_is_a_no_op_without_a_map(self):
+        for empty in ({}, None):
+            self.assertEqual(
+                prompts.resolve_speaker_text("Speaker 0", empty), "Speaker 0")
+
     def test_empty_sections_are_omitted_not_labelled_empty(self):
         """An empty "HIGHLIGHTS:" heading would read to the model as "nothing
         was worth highlighting" — a claim we must not make on its behalf."""
@@ -2527,6 +2579,98 @@ class TestUpdateStaleDocuments(AiTestCase):
             status, _ = parse(call(api.update_stale_documents,
                 self._event()))
         self.assertEqual(status, 401)
+
+
+# ===========================================================================
+# Speaker rename reaching TASKS — live resolution, no writes.
+#
+# A rename lands in exactly one place (speaker_names on the recording). Tasks
+# store the join key (assignee_speaker_id) and resolve the display name at
+# READ time, so every task the speaker owns reads correctly on the next
+# request without the rename writing to a single task row. These tests pin
+# both halves of that: the name does move for an unresolved AI task, and it
+# does NOT move for one a human assigned to a Contact.
+# ===========================================================================
+class TestSpeakerNameResolvesOnTasks(unittest.TestCase):
+    """_public_task_v2 / _speaker_display_name — pure shaping, no AWS."""
+
+    AI_TASK = {
+        "task_id": "t1", "title": "Send revised quote", "status": "Open",
+        "source_type": "ai", "assignee_speaker_id": "0",
+        "assignee_name_legacy": "Speaker 0",
+        "resolution_status": api.RESOLUTION_UNRESOLVED,
+    }
+
+    def test_unnamed_speaker_reads_as_its_label(self):
+        t = api._public_task_v2(self.AI_TASK, {})
+        self.assertEqual(t["assignee"]["name"], "Speaker 0")
+        self.assertEqual(t["speaker_name"], "Speaker 0")
+
+    def test_rename_moves_the_assignee_with_no_write(self):
+        """The whole point: the same stored row, a different names map, and the
+        task now names the person."""
+        t = api._public_task_v2(self.AI_TASK, {"0": "Ravi"})
+        self.assertEqual(t["assignee"]["name"], "Ravi")
+        self.assertEqual(t["speaker_name"], "Ravi")
+
+    def test_the_verbatim_ai_extraction_is_still_returned(self):
+        """Resolution is DISPLAY only — the string the AI actually produced
+        stays inspectable, which is why nothing is rewritten on the row."""
+        t = api._public_task_v2(self.AI_TASK, {"0": "Ravi"})
+        self.assertEqual(t["assignee_name_legacy"], "Speaker 0")
+        self.assertEqual(t["assignee_speaker_id"], "0")
+
+    def test_a_contact_assigned_task_is_never_repointed_by_a_rename(self):
+        """The guard that matters. Renaming the speaker who happened to say the
+        sentence must not overwrite a person a human chose — the same rule
+        _resolve_tasks_for_speaker applies when it skips resolved tasks."""
+        row = {**self.AI_TASK, "assignee_contact_id": "c9",
+               "assignee_name": "Priya Sharma",
+               "resolution_status": api.RESOLUTION_RESOLVED}
+        t = api._public_task_v2(row, {"0": "Ravi"})
+        self.assertEqual(t["assignee"]["name"], "Priya Sharma")
+        # Provenance is still reported, so the UI can say where it came from.
+        self.assertEqual(t["speaker_name"], "Ravi")
+
+    def test_a_contact_with_no_stored_name_does_not_fall_back_to_the_speaker(self):
+        """Guards the precedence order itself: `assignee_contact_id` alone is
+        enough to stop the speaker name being adopted, so a contact row that
+        somehow carries no name reads as unassigned rather than as the
+        speaker."""
+        row = {**self.AI_TASK, "assignee_contact_id": "c9",
+               "assignee_name": "", "assignee_name_legacy": "",
+               "resolution_status": api.RESOLUTION_RESOLVED}
+        self.assertIsNone(api._public_task_v2(row, {"0": "Ravi"})["assignee"])
+
+    def test_a_manual_task_has_no_speaker_at_all(self):
+        row = {"task_id": "t2", "title": "Buy cables", "status": "Open",
+               "source_type": "manual"}
+        t = api._public_task_v2(row, {"0": "Ravi"})
+        self.assertIsNone(t["assignee"])
+        self.assertEqual(t["speaker_name"], "")
+
+    def test_omitting_the_map_keeps_the_pre_rename_behaviour(self):
+        """A call site with no recording in hand must still return a valid
+        task — the stored string, exactly as before this existed."""
+        t = api._public_task_v2(self.AI_TASK)
+        self.assertEqual(t["assignee"]["name"], "Speaker 0")
+
+    def test_an_unmapped_speaker_still_renders_its_label(self):
+        t = api._public_task_v2(
+            {**self.AI_TASK, "assignee_speaker_id": "7",
+             "assignee_name_legacy": ""}, {"0": "Ravi"})
+        self.assertEqual(t["assignee"]["name"], "Speaker 7")
+
+    def test_a_non_numeric_label_stands_alone(self):
+        """"agent" is a real diarization label; "Speaker agent" would be wrong.
+        Mirrors lib/sources.ts' speakerName."""
+        self.assertEqual(api._speaker_display_name("agent", {}), "agent")
+        self.assertEqual(
+            api._speaker_display_name("agent", {"agent": "Support Bot"}),
+            "Support Bot")
+
+    def test_no_speaker_id_resolves_to_nothing(self):
+        self.assertEqual(api._speaker_display_name("", {"0": "Ravi"}), "")
 
 
 # ===========================================================================

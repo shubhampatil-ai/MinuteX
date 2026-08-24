@@ -1,0 +1,12 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <application>
+    <!-- Microphone foreground service for the experimental WAV recorder.
+         Declared in the library manifest so it merges into the app without a
+         config plugin. foregroundServiceType is required from Android 14. -->
+    <service
+      android:name="expo.modules.minutexaudiorecorder.WavRecordingService"
+      android:enabled="true"
+      android:exported="false"
+      android:foregroundServiceType="microphone" />
+  </application>
+</manifest>

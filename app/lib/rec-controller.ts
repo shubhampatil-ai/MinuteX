@@ -72,6 +72,8 @@ import {
   type RecSession,
   type RecState,
 } from "./rec-store";
+import { formatForEngine, getRecEngine } from "./rec-engine";
+import { WavEngineRecorder, validateWavForUpload } from "./rec-engine-wav";
 
 // ---------------------------------------------------------------------------
 // Recording format
@@ -214,6 +216,20 @@ const IDLE_SNAPSHOT: RecSnapshot = {
 
 let recorder: AudioRecorder | null = null;
 let session: RecSession | null = null;
+
+/**
+ * The experimental WAV recorder, when this recording uses the "wav" engine.
+ *
+ * Mutually exclusive with `recorder`: exactly one of the two is non-null while
+ * a recording is live. Keeping them in separate variables rather than a union
+ * means the AAC path's type is unchanged and every existing `recorder?.` call
+ * site keeps working untouched — the WAV engine is additive, not a rewrite.
+ *
+ * The engine for a recording is decided once in start() and stored on the
+ * session, so flipping the preference mid-recording cannot change the format of
+ * a file already being written.
+ */
+let wavRecorder: WavEngineRecorder | null = null;
 let snapshot: RecSnapshot = IDLE_SNAPSHOT;
 let permission: MicPermission = "unknown";
 let busy = false;
@@ -681,16 +697,44 @@ async function enterInterruption(
   }
 }
 
+/**
+ * The live recorder's status, whichever engine is running.
+ *
+ * Returns the narrow shape reconcile() actually reads, so one monitoring loop
+ * serves both engines. The WAV adapter converts its peak level to the same
+ * dBFS scale expo-audio reports, which is what keeps SILENCE_DB_FLOOR — and
+ * therefore mic-theft detection — working identically for both.
+ */
+function engineStatus(): Pick<
+  RecorderState,
+  "isRecording" | "metering" | "mediaServicesDidReset" | "durationMillis"
+> | null {
+  try {
+    if (wavRecorder) {
+      const st = wavRecorder.getStatus();
+      return {
+        isRecording: st.isRecording,
+        metering: st.metering,
+        mediaServicesDidReset: st.mediaServicesDidReset,
+        durationMillis: st.durationMillis,
+      } as RecorderState;
+    }
+    return recorder ? recorder.getStatus() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether a recorder of either engine is live. */
+function hasLiveRecorder(): boolean {
+  return recorder != null || wavRecorder != null;
+}
+
 function reconcile(): void {
-  if (!session || !recorder) return;
+  if (!session || !hasLiveRecorder()) return;
   const s = session;
 
-  let status: RecorderState | null = null;
-  try {
-    status = recorder.getStatus();
-  } catch {
-    status = null;
-  }
+  const status = engineStatus();
 
   if (status?.metering != null) {
     // Metering is dBFS (roughly -160..0). Map to 0..1 over the top 60 dB,
@@ -816,7 +860,7 @@ let resumeCooldown = 0;
 
 async function attemptResume(): Promise<void> {
   if (resumeCooldown > 0) { resumeCooldown -= 1; return; }
-  if (!recorder || !session || busy) return;
+  if (!hasLiveRecorder() || !session || busy) return;
   if (!userWantsRecording) return;
 
   // Don't even try while the interruption is demonstrably still up. Without
@@ -839,6 +883,40 @@ async function attemptResume(): Promise<void> {
   busy = true;
   try {
     await configureSession();
+
+    // The WAV engine rolls to a new segment natively instead of rebuilding a
+    // recorder object. Same principle as the AAC path below — a fresh
+    // AudioRecord is the only way back to real audio once the telephony stack
+    // has had the mic — but the native side owns the file handoff, so the
+    // segment list stays in one place rather than being mirrored onto
+    // `extraFiles`. The merge at finalize reads it from there.
+    if (wavRecorder) {
+      const rolled = await wavRecorder.rollSegment();
+      if (!rolled) throw new Error("could not open a new WAV segment");
+
+      // Same silence proof the AAC path demands: a segment opened against a
+      // still-busy mic reports success and records digital zero, which would
+      // recreate the original bug one segment later.
+      await new Promise((res) => setTimeout(res, 350));
+      const lvl = wavRecorder.getStatus().metering;
+      if (lvl != null && lvl <= SILENCE_DB_FLOOR) {
+        throw new Error("resumed recorder is capturing silence");
+      }
+
+      resumeCooldown = 0;
+      silenceCount = 0;
+      stallCount = 0;
+      transition("RECORDING", undefined, "auto-resumed after interruption");
+      recLog("interruption.ended", {
+        autoResumed: true,
+        engine: "wav",
+        segments: wavRecorder.segmentCount(),
+      }, session.id);
+      return;
+    }
+
+    // From here on this is the AAC path only — the WAV branch above returned.
+    if (!recorder) return;
 
     // REBUILD, don't just record() again.
     //
@@ -1334,31 +1412,64 @@ export async function start(): Promise<StartResult> {
     await configureSession();
 
     // 5. A session record and a recorder writing into our own directory.
-    ensureDir();
-    const s = createSession(REC_FORMAT);
-    // Constructed directly (not via useAudioRecorder) so the recorder outlives
-    // any screen — see the header. That means doing the options transform
-    // ourselves; prepareToRecordAsync is patched upstream and takes the
-    // un-flattened form.
-    const r = new AudioRecorderCtor(platformRecordingOptions(REC_OPTIONS));
-    attachStatusListener(r);
-    await r.prepareToRecordAsync(REC_OPTIONS);
+    //
+    // The engine is chosen ONCE here and recorded on the session. Everything
+    // downstream (resume, finalize, upload format) reads it from the session
+    // rather than the preference, so a toggle flipped mid-recording cannot
+    // change the format of a file already being written.
+    const dir = ensureDir();
+    const engine = getRecEngine();
+    const s = { ...createSession(formatForEngine(engine)), engine };
 
-    recorder = r;
-    session = s;
-    userWantsRecording = true;
-    stallCount = 0;
-    resumeCooldown = 0;
+    if (engine === "wav") {
+      // AudioRecord writes segments itself; there is no prepare step and no
+      // options transform. The native module owns the mic, the files and the
+      // foreground service for the duration.
+      const w = await WavEngineRecorder.begin(s.id, dir.uri);
+      wavRecorder = w;
+      session = s;
+      userWantsRecording = true;
+      stallCount = 0;
+      resumeCooldown = 0;
 
-    r.record();
-    const st = r.getStatus();
-    if (!st.isRecording) {
-      throw new Error("the recorder did not start");
+      const st = w.getStatus();
+      if (!st.isRecording) {
+        throw new Error("the recorder did not start");
+      }
+      // fileUri stays null until finalize: with WAV the uploadable file is the
+      // MERGED one, which does not exist yet. hasUsableAudio() is only
+      // consulted at finalize, by which point it is set.
+      session = { ...s, fileUri: null };
+      saveSession(session);
+      recLog("recording.started", {
+        engine: "wav",
+        note: "native AudioRecord — 16 kHz/16-bit/mono PCM",
+      }, session.id);
+    } else {
+      // Constructed directly (not via useAudioRecorder) so the recorder outlives
+      // any screen — see the header. That means doing the options transform
+      // ourselves; prepareToRecordAsync is patched upstream and takes the
+      // un-flattened form.
+      const r = new AudioRecorderCtor(platformRecordingOptions(REC_OPTIONS));
+      attachStatusListener(r);
+      await r.prepareToRecordAsync(REC_OPTIONS);
+
+      recorder = r;
+      session = s;
+      userWantsRecording = true;
+      stallCount = 0;
+      resumeCooldown = 0;
+
+      r.record();
+      const st = r.getStatus();
+      if (!st.isRecording) {
+        throw new Error("the recorder did not start");
+      }
+
+      session = { ...s, fileUri: st.url ?? r.uri ?? null };
+      saveSession(session);
+      if (session.fileUri) recLog("file.created", { uri: session.fileUri }, session.id);
     }
-
-    session = { ...s, fileUri: st.url ?? r.uri ?? null };
-    saveSession(session);
-    if (session.fileUri) recLog("file.created", { uri: session.fileUri }, session.id);
 
     transition("RECORDING");
     pollInput();
@@ -1418,10 +1529,16 @@ function friendlyStartError(msg: string): string {
 
 /** The USER asking to pause. Sets intent false — nothing will auto-resume. */
 export function pauseByUser(): void {
-  if (!recorder || !session || session.state !== "RECORDING") return;
+  if (!hasLiveRecorder() || !session || session.state !== "RECORDING") return;
   userWantsRecording = false;
   try {
-    recorder.pause();
+    if (wavRecorder) {
+      // Fire-and-forget: the native pause is synchronous under its own lock,
+      // and this function is sync so the UI can transition immediately.
+      void wavRecorder.pause();
+    } else {
+      recorder?.pause();
+    }
   } catch (e: any) {
     recLog("recording.error", { phase: "pause", message: String(e?.message ?? e) }, session.id);
   }
@@ -1433,7 +1550,7 @@ export function pauseByUser(): void {
 
 /** The USER asking to resume, from any paused state. */
 export async function resumeByUser(): Promise<void> {
-  if (!recorder || !session || !isPaused(session.state)) return;
+  if (!hasLiveRecorder() || !session || !isPaused(session.state)) return;
   const wasInvoluntary = isInvoluntaryPause(session.state);
   userWantsRecording = true;
 
@@ -1469,9 +1586,16 @@ export async function resumeByUser(): Promise<void> {
   emit();
   try {
     await configureSession();
-    recorder.record();
-    const st = recorder.getStatus();
-    if (!st.isRecording) throw new Error("recorder did not resume");
+    if (wavRecorder) {
+      // A user pause left the AudioRecord object alive and the segment file
+      // open, so this resumes into the SAME file — no new segment, nothing to
+      // merge. Only an interruption (handled above) needs a roll.
+      await wavRecorder.resume();
+    } else {
+      recorder!.record();
+    }
+    const st = engineStatus();
+    if (!st?.isRecording) throw new Error("recorder did not resume");
     resumeCooldown = 0;
     silenceCount = 0;
     transition("RECORDING", undefined, "resumed by user");
@@ -1531,11 +1655,64 @@ async function runFinalize(cause: "user" | "error" | "interrupted"): Promise<Rec
   // Prefer the recorder's own duration, cross-checked against our segments.
   let recorderSeconds: number | null = null;
   try {
-    recorderSeconds = recorder?.getStatus()?.durationMillis != null
-      ? (recorder.getStatus().durationMillis as number) / 1000
-      : null;
+    const st = engineStatus();
+    recorderSeconds = st?.durationMillis != null ? st.durationMillis / 1000 : null;
   } catch {
     recorderSeconds = null;
+  }
+
+  // ---- WAV engine: stop, merge natively, validate, then rejoin the common
+  // path. Kept as its own block rather than interleaved because the native
+  // module does the segment merge itself — concatSegments() below is the AAC
+  // byte-join and must never run on WAV (it refuses non-aac formats by design).
+  if (wavRecorder) {
+    const w = wavRecorder;
+    let uri: string | null = null;
+    let wavSeconds: number | null = null;
+    try {
+      const result = await w.stop();
+      if (result) {
+        uri = result.uri;
+        wavSeconds = result.durationSeconds;
+        if (result.warning) {
+          // A merge that partially failed, or skipped segments. Surfaced rather
+          // than swallowed — an incomplete recording must not look whole.
+          lastError = result.warning;
+        }
+        recLog(result.merged ? "file.finalized" : "recording.stopped", {
+          engine: "wav",
+          segments: result.segmentCount,
+          merged: result.merged,
+          size: result.sizeBytes,
+          warning: result.warning ?? undefined,
+        }, s0.id);
+      }
+    } catch (e: any) {
+      recLog("recording.error", {
+        phase: "stop",
+        engine: "wav",
+        message: String(e?.message ?? e),
+      }, s0.id);
+    }
+
+    // Structural check: a WAV whose header was never patched is a valid file
+    // declaring zero audio, which a size check alone would pass and which would
+    // transcribe as empty. Catch it before the session is called COMPLETED.
+    if (uri) {
+      const check = validateWavForUpload(uri);
+      if (!check.ok) {
+        lastError = `The recording could not be verified (${check.reason}).`;
+        uri = null;
+      } else if (check.durationSeconds != null) {
+        wavSeconds = check.durationSeconds;
+      }
+    }
+
+    // Byte count is authoritative for PCM — no wall-clock drift to reconcile.
+    if (wavSeconds != null) recorderSeconds = wavSeconds;
+
+    wavRecorder = null;
+    return finishSession(s0, uri, recorderSeconds, cause);
   }
 
   try {
@@ -1568,7 +1745,30 @@ async function runFinalize(cause: "user" | "error" | "interrupted"): Promise<Rec
       }
     }
 
-    let final: RecSession = {
+    return finishSession(s0, uri, recorderSeconds, cause);
+  } finally {
+    busy = false;
+    emit();
+  }
+}
+
+/**
+ * The common tail of finalize: measure, verify, land on COMPLETED or ERROR.
+ *
+ * Extracted so both engines share ONE definition of what a finished recording
+ * is. The engines differ only in how they produce the single file (`uri`) and
+ * its duration; everything after that — closing segments, reconciling the
+ * duration, refusing to call an empty file COMPLETED, teardown — must be
+ * identical, and duplicating it per engine is how those would drift.
+ */
+async function finishSession(
+  s0: RecSession,
+  uri: string | null,
+  recorderSeconds: number | null,
+  cause: "user" | "error" | "interrupted"
+): Promise<RecSession | null> {
+  try {
+    const final: RecSession = {
       ...(session as RecSession),
       fileUri: uri,
       state: "FINALIZING",
@@ -1653,6 +1853,11 @@ async function teardown(): Promise<void> {
   statusSub?.remove();
   statusSub = null;
   releaseRecorder();
+  // The WAV engine frees the mic and stops its foreground service inside
+  // stop()/discard(); this only drops our reference so a stale object cannot be
+  // driven after teardown.
+  wavRecorder?.release();
+  wavRecorder = null;
   level = null;
   stallCount = 0;
   resumeCooldown = 0;
@@ -1669,6 +1874,10 @@ export async function discard(): Promise<void> {
   const s = session;
   if (!s) return;
   userWantsRecording = false;
+  // WAV segments live in the native module's list, not on session.fileUri, so
+  // the native discard is what actually deletes them. Done BEFORE teardown,
+  // which drops our reference to the recorder.
+  try { await wavRecorder?.discard(); } catch { /* best effort */ }
   try { await recorder?.stop(); } catch { /* fine */ }
   await teardown();
   try {

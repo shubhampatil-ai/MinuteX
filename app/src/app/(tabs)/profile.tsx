@@ -13,8 +13,11 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { S, R, ELEV, CAPS, FONT, TABULAR, useTheme, ColorScale } from "../../../lib/theme";
 import {
   Button, ComingSoonRow, ErrorText, ListRow, Loading, Masthead, SectionRule,
-  SoonBadge, TextField, Toast, KeyboardAware, scrollFormProps,
+  SoonBadge, SwitchRow, TextField, Toast, KeyboardAware, scrollFormProps,
 } from "../../../lib/ui";
+import {
+  canUseWavEngine, getRecEngine, loadRecEngine, setRecEngine,
+} from "../../../lib/rec-engine";
 import { useDevice } from "../../../lib/device-context";
 import { getRecordings, RecordingSummary } from "../../../lib/api";
 import {
@@ -59,6 +62,13 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
 }
 
 export default function ProfileScreen() {
+  // Experimental recording engine. Android-only and only in a build that
+  // bundled the native module, so the row is hidden entirely elsewhere rather
+  // than shown disabled — a toggle that cannot do anything is worse than none.
+  const [wavEngine, setWavEngine] = useState(false);
+  useEffect(() => {
+    void loadRecEngine().then(() => setWavEngine(getRecEngine() === "wav"));
+  }, []);
   const router = useRouter();
   const { C, T } = useTheme();
   const insets = useSafeAreaInsets();
@@ -244,6 +254,18 @@ export default function ProfileScreen() {
         <ListRow icon="person.2.fill" label="Contacts"
           sub="The people you meet with" onPress={() => router.push("/contacts")} />
         <ListRow icon="gearshape.fill" label="Appearance" sub="Theme, sync, notifications" onPress={() => router.push("/settings")} />
+        {canUseWavEngine() ? (
+          <SwitchRow
+            label="High-quality WAV recording"
+            sub="Experimental · 16 kHz mono PCM, ~1.9 MB/min (AAC is ~1 MB/min). Applies to the next recording."
+            value={wavEngine}
+            onValueChange={(v) => {
+              setWavEngine(v);
+              void setRecEngine(v ? "wav" : "aac");
+              showToast(v ? "Next recording will use WAV" : "Next recording will use AAC");
+            }}
+          />
+        ) : null}
         <ListRow icon="cpu.fill" label="Your device" sub="Battery, Wi-Fi, pairing" onPress={() => router.push("/devices")} />
         <ListRow icon="questionmark.circle" label="Help & support"
           right={<SoonBadge />} onPress={() => showToast("Help centre is coming soon")} />

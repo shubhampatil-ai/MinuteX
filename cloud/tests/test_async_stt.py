@@ -100,9 +100,19 @@ class _ClientError(Exception):
 
 
 _botocore_exc = mock.MagicMock()
-_botocore_exc.ClientError = _ClientError
-sys.modules["botocore"] = mock.MagicMock()
-sys.modules["botocore.exceptions"] = _botocore_exc
+# Adopt an already-installed ClientError when there is one (conftest.py
+# installs the canonical stub under pytest). Overwriting it here would
+# give this file a ClientError that the Lambda's `except ClientError`
+# cannot catch, which is precisely the cross-file collision conftest.py
+# exists to prevent. Standalone runs still install this file's own.
+_installed = sys.modules.get("botocore.exceptions")
+if _installed is not None and getattr(_installed, "ClientError", None):
+    _ClientError = _installed.ClientError
+    _botocore_exc = _installed
+else:
+    _botocore_exc.ClientError = _ClientError
+    sys.modules["botocore"] = mock.MagicMock()
+    sys.modules["botocore.exceptions"] = _botocore_exc
 sys.modules["botocore.config"] = mock.MagicMock()
 
 import ai_schema          # noqa: E402
@@ -785,12 +795,25 @@ class ReprocessInvalidationTests(unittest.TestCase):
 # ===========================================================================
 # UNIFIED ANALYSIS — one call, all fields
 # ===========================================================================
+# One reply from the unified call. The section TITLES here are deliberately
+# specific to this meeting ("Quotation", "Cost Reduction") rather than generic
+# template headings — the fixture doubles as documentation of what the dynamic
+# overview is supposed to look like.
 UNIFIED_REPLY = {
     "title": "Fit-out quotation review",
-    "summary": "The 4.2 lakh quotation was over the approved 3.8 lakh budget.",
-    "highlights": ["Quote came in at 4.2 lakh, over the 3.8 lakh approved"],
+    "overview": {"sections": [
+        {"title": "Quotation", "kind": "text",
+         "content": "The 4.2 lakh quotation was over the approved 3.8 lakh "
+                    "budget.",
+         "items": [], "evidence_segment_ids": ["seg_0"]},
+        {"title": "Cost Reduction", "kind": "list", "content": "",
+         "items": ["Drop imported fittings to reach 3.9 lakh",
+                   "Six-week lead time pushes past handover"],
+         "evidence_segment_ids": ["seg_1", "seg_2"]},
+    ]},
     "tasks": [{"task": "Send the revised quote", "assignee": "Rakesh",
-               "due_date": "Friday", "priority": "High"}],
+               "due_date": "Friday", "priority": "High",
+               "evidence_segment_ids": ["seg_0"]}],
     "participants": [
         {"speaker": "Speaker 0", "summary": "Presented the quotation"},
         {"speaker": "Speaker 1", "summary": "Held the budget line"},
@@ -801,14 +824,7 @@ UNIFIED_REPLY = {
         "action_items": [{"task": "Send revised quote", "owner": "Rakesh",
                           "deadline": "Friday"}],
         "deadlines": [{"what": "Site visit", "when": "15th March"}],
-        "important_numbers": [{"label": "Quote", "value": "4.2 lakh",
-                               "kind": "money"}],
         "open_questions": ["Who chases the fittings lead time?"],
-        "risks": ["Six-week lead time pushes past handover"],
-    },
-    "crm_identifiers": {
-        "Site_Visit__c": {"value": "SV-10245", "confidence": "explicit",
-                          "evidence": "today's site visit is SV-10245"},
     },
 }
 
@@ -837,65 +853,64 @@ class UnifiedAnalysisTests(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
 
     def test_one_groq_call_produces_everything(self):
-        """The headline of Phase 3: three transcript sends become one."""
-        out = transcribe.analyze_meeting(DIARIZED, MAPPINGS)
+        """The headline: several transcript sends become one."""
+        out = transcribe.analyze_meeting(DIARIZED)
         self.assertEqual(len(self.calls), 1)
         self.assertTrue(out["title"])
-        self.assertTrue(out["summary"])
-        self.assertTrue(out["highlights"])
+        self.assertFalse(ai_schema.overview_empty(out["overview"]))
         self.assertTrue(out["tasks"])
         self.assertTrue(out["participants"])
         self.assertFalse(ai_schema.highlights_empty(out["meeting_highlights"]))
-        self.assertTrue(out["crm_identifiers"])
 
     def test_transcript_is_sent_exactly_once(self):
-        transcribe.analyze_meeting(DIARIZED, MAPPINGS)
+        transcribe.analyze_meeting(DIARIZED)
         sent = [c for c in self.calls if DIARIZED in c["user"]]
         self.assertEqual(len(sent), 1)
 
-    def test_all_seven_outputs_in_one_reply(self):
-        out = transcribe.analyze_meeting(DIARIZED, MAPPINGS)
+    def test_every_output_arrives_in_one_reply(self):
+        out = transcribe.analyze_meeting(DIARIZED)
         self.assertEqual(out["title"], "Fit-out quotation review")
-        self.assertIn("4.2 lakh", out["summary"])
-        self.assertEqual(len(out["highlights"]), 1)
+        sections = out["overview"]["sections"]
+        self.assertEqual([s["title"] for s in sections],
+                         ["Quotation", "Cost Reduction"])
+        self.assertIn("4.2 lakh", sections[0]["content"])
         self.assertEqual(out["tasks"][0]["assignee"], "Rakesh")
-        self.assertEqual(out["meeting_highlights"]["important_numbers"][0]
-                         ["value"], "4.2 lakh")
-        self.assertEqual(out["crm_identifiers"]["Site_Visit__c"]["value"],
-                         "SV-10245")
+        self.assertEqual(out["meeting_highlights"]["deadlines"][0]["when"],
+                         "15th March")
 
-    def test_crm_section_absent_when_user_has_no_mappings(self):
-        """An unconfigured user must pay nothing for a feature they don't use."""
-        transcribe.analyze_meeting(DIARIZED, [])
+    def test_the_prompt_never_asks_for_crm_identifiers(self):
+        """CRM extraction left the analysis path: it made every meeting carry
+        per-mapping rules for a feature that is not built out, and it is the one
+        output whose failure mode is writing a customer's notes onto a
+        stranger's record."""
+        transcribe.analyze_meeting(DIARIZED)
         self.assertNotIn("crm_identifiers", self.calls[0]["system"])
 
-    def test_crm_identifier_carries_ai_provenance(self):
-        out = transcribe.analyze_meeting(DIARIZED, MAPPINGS)
-        self.assertEqual(out["crm_identifiers"]["Site_Visit__c"]["source"],
-                         "ai")
+    def test_no_crm_identifiers_in_the_result(self):
+        out = transcribe.analyze_meeting(DIARIZED)
+        self.assertNotIn("crm_identifiers", out)
 
-    def test_ungrounded_identifier_is_dropped(self):
-        """A value the model cannot quote from the transcript is a hallucination
-        — and this one decides which Salesforce record gets the notes."""
-        reply = json.loads(json.dumps(UNIFIED_REPLY))
-        reply["crm_identifiers"]["Site_Visit__c"] = {
-            "value": "SV-99999", "confidence": "explicit",
-            "evidence": "nothing about that number here"}
-        with mock.patch.object(groq_client, "complete",
-                               return_value=json.dumps(reply)):
-            out = transcribe.analyze_meeting(DIARIZED, MAPPINGS)
-        self.assertEqual(out["crm_identifiers"], {})
+    def test_evidence_ids_are_validated_against_the_transcript(self):
+        """The model's segment references are checked against the ids the app
+        will actually resolve; an unresolvable one is dropped rather than
+        offered as a jump-to-moment that goes nowhere."""
+        out = transcribe.analyze_meeting(DIARIZED, valid_ids={"seg_0", "seg_1"})
+        sections = out["overview"]["sections"]
+        self.assertEqual(sections[0]["evidence_segment_ids"], ["seg_0"])
+        # seg_2 is not in the valid set, so it goes.
+        self.assertEqual(sections[1]["evidence_segment_ids"], ["seg_1"])
+        # ...and the sections themselves survive regardless.
+        self.assertEqual(len(sections), 2)
 
     def test_deadline_is_the_whole_budget_not_a_split(self):
-        transcribe.analyze_meeting(DIARIZED, MAPPINGS)
+        transcribe.analyze_meeting(DIARIZED)
         # complete() receives an absolute deadline; just assert the call was
         # given one derived from the full budget rather than 60% of it.
         self.assertIsNotNone(self.calls[0]["kwargs"].get("deadline"))
 
     def test_empty_transcript_returns_the_empty_unified_shape(self):
-        out = transcribe.analyze_meeting("   ", MAPPINGS)
-        self.assertEqual(out["summary"], "")
-        self.assertEqual(out["crm_identifiers"], {})
+        out = transcribe.analyze_meeting("   ")
+        self.assertTrue(ai_schema.overview_empty(out["overview"]))
         self.assertTrue(ai_schema.highlights_empty(out["meeting_highlights"]))
         self.assertEqual(self.calls, [])
 
@@ -910,12 +925,12 @@ class ParticipantTests(unittest.TestCase):
         roster = ai_schema.speaker_roster(DIARIZED)
         self.assertEqual(roster, ["Speaker 0", "Speaker 1", "Speaker 2",
                                   "Speaker 3"])
-        out = ai_schema.coerce_unified(UNIFIED_REPLY, roster, MAPPINGS)
+        out = ai_schema.coerce_unified(UNIFIED_REPLY, roster)
         self.assertEqual([p["speaker"] for p in out["participants"]], roster)
 
     def test_speaker_the_model_skipped_is_added_back(self):
         roster = ai_schema.speaker_roster(DIARIZED)
-        out = ai_schema.coerce_unified(UNIFIED_REPLY, roster, MAPPINGS)
+        out = ai_schema.coerce_unified(UNIFIED_REPLY, roster)
         by_label = {p["speaker"]: p for p in out["participants"]}
         self.assertIn("Speaker 2", by_label)
         self.assertEqual(by_label["Speaker 2"]["summary"], "")
@@ -926,7 +941,7 @@ class ParticipantTests(unittest.TestCase):
         this meeting", so an invented attendee is indistinguishable from a real
         one."""
         roster = ai_schema.speaker_roster(DIARIZED)
-        out = ai_schema.coerce_unified(UNIFIED_REPLY, roster, MAPPINGS)
+        out = ai_schema.coerce_unified(UNIFIED_REPLY, roster)
         labels = [p["speaker"] for p in out["participants"]]
         self.assertNotIn("Rakesh", labels)
         self.assertEqual(out["tasks"][0]["assignee"], "Rakesh")
@@ -936,13 +951,13 @@ class ParticipantTests(unittest.TestCase):
         reply["participants"].append({"speaker": "Rakesh",
                                      "summary": "will send the quote"})
         roster = ai_schema.speaker_roster(DIARIZED)
-        out = ai_schema.coerce_unified(reply, roster, MAPPINGS)
+        out = ai_schema.coerce_unified(reply, roster)
         self.assertNotIn("Rakesh", [p["speaker"] for p in out["participants"]])
 
     def test_non_diarized_transcript_keeps_the_models_list(self):
         """With no speaker labels there is no structural evidence to enforce, and
         dropping every participant would be worse than trusting the prompt."""
-        out = ai_schema.coerce_unified(UNIFIED_REPLY, [], MAPPINGS)
+        out = ai_schema.coerce_unified(UNIFIED_REPLY, [])
         self.assertEqual([p["speaker"] for p in out["participants"]],
                          ["Speaker 0", "Speaker 1"])
 
@@ -964,20 +979,20 @@ class ContextRoutingTests(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
 
     def test_transcript_within_budget_takes_a_single_pass(self):
-        prompt = prompts.unified_analysis_system(("Speaker 0",), MAPPINGS)
+        prompt = prompts.unified_analysis_system(("Speaker 0",))
         budget = groq_client.single_pass_budget_chars(prompt)
         self.assertLess(len(DIARIZED), budget)
-        transcribe.analyze_meeting(DIARIZED, MAPPINGS)
+        transcribe.analyze_meeting(DIARIZED)
         self.assertEqual(len(self.labels), 1)
         self.assertTrue(all("chunk" not in lbl for lbl in self.labels))
 
     def test_oversized_transcript_falls_back_to_map_reduce(self):
         """The ONLY path that reaches the reduce prompt."""
-        prompt = prompts.unified_analysis_system((), MAPPINGS)
+        prompt = prompts.unified_analysis_system(())
         budget = groq_client.single_pass_budget_chars(prompt)
         huge = "Speaker 0: over budget again.\n" * (budget // 20)
         self.assertGreater(len(huge), budget)
-        transcribe.analyze_meeting(huge, MAPPINGS)
+        transcribe.analyze_meeting(huge)
         self.assertTrue(any("chunk" in lbl for lbl in self.labels),
                         f"expected chunked labels, got {self.labels}")
 
@@ -989,30 +1004,48 @@ class ContextRoutingTests(unittest.TestCase):
                       prompts.unified_reduce_system())
 
     def test_reduce_prompt_covers_the_unified_sections(self):
-        body = prompts.unified_reduce_system(MAPPINGS)
+        body = prompts.unified_reduce_system()
         self.assertIn("meeting_highlights", body)
-        self.assertIn("crm_identifiers", body)
+        self.assertIn("overview", body)
+        self.assertNotIn("crm_identifiers", body)
+
+    def test_reduce_prompt_redecides_sections_rather_than_concatenating(self):
+        """Chunks are split by LENGTH, not by subject, so one subject is spread
+        across several of them. Concatenating each chunk's sections would give a
+        stack of partial overviews instead of one meeting's overview."""
+        body = prompts.unified_reduce_system()
+        self.assertIn("Re-decide the sections for the WHOLE meeting", body)
+        self.assertIn("split by LENGTH, not by subject", body)
 
     def test_merge_unified_folds_every_section(self):
         partials = [
-            {**UNIFIED_REPLY, "crm_identifiers": {}},
-            {"title": "", "summary": "Second half.", "highlights": ["Another"],
+            UNIFIED_REPLY,
+            {"title": "",
+             "overview": {"sections": [
+                 # Same subject as chunk 1 -> folds into it.
+                 {"title": "Quotation", "kind": "text",
+                  "content": "Second half.", "items": [],
+                  "evidence_segment_ids": []},
+                 # A subject only this chunk saw -> survives on its own.
+                 {"title": "Handover", "kind": "text",
+                  "content": "Slips to April.", "items": [],
+                  "evidence_segment_ids": []},
+             ]},
              "tasks": [], "participants": [{"speaker": "Speaker 2",
                                             "summary": "raised lead time"}],
-             "meeting_highlights": {**ai_schema.empty_highlights(),
-                                    "risks": ["A different risk"]},
-             "crm_identifiers": {"Site_Visit__c": {
-                 "value": "SV-10245", "confidence": "explicit",
-                 "evidence": "site visit is SV-10245"}}},
+             "meeting_highlights": {
+                 **ai_schema.empty_highlights(),
+                 "open_questions": ["A different question"]}},
         ]
         roster = ai_schema.speaker_roster(DIARIZED)
-        merged = ai_schema.merge_unified(partials, roster, MAPPINGS)
-        self.assertIn("Second half.", merged["summary"])
-        self.assertEqual(len(merged["highlights"]), 2)
+        merged = ai_schema.merge_unified(partials, roster)
+        titles = [s["title"] for s in merged["overview"]["sections"]]
+        self.assertEqual(titles, ["Quotation", "Cost Reduction", "Handover"])
+        self.assertIn("Second half.", merged["overview"]["sections"][0]["content"])
         self.assertEqual([p["speaker"] for p in merged["participants"]], roster)
-        self.assertIn("A different risk", merged["meeting_highlights"]["risks"])
-        self.assertEqual(merged["crm_identifiers"]["Site_Visit__c"]["value"],
-                         "SV-10245")
+        self.assertIn("A different question",
+                      merged["meeting_highlights"]["open_questions"])
+        self.assertNotIn("crm_identifiers", merged)
 
 
 # ===========================================================================
@@ -1172,10 +1205,7 @@ class BackwardCompatibilityTests(unittest.TestCase):
         mock.patch.object(transcribe, "analyze_meeting",
                           return_value=ai_schema.coerce_unified(
                               UNIFIED_REPLY,
-                              ai_schema.speaker_roster(DIARIZED),
-                              MAPPINGS)).start()
-        mock.patch.object(transcribe, "_crm_mappings_for_user",
-                          return_value=MAPPINGS).start()
+                              ai_schema.speaker_roster(DIARIZED))).start()
         table = mock.MagicMock()
         table.get_item.return_value = {"Item": {}}
         mock.patch.object(transcribe, "_table", table).start()
@@ -1189,12 +1219,39 @@ class BackwardCompatibilityTests(unittest.TestCase):
               "text": "hi"}], "en")
 
     def test_every_attribute_userapi_reads_is_still_written(self):
-        for attr in ("summary", "highlights", "ai_tasks", "participants",
+        for attr in ("overview", "summary", "ai_tasks", "participants",
                      "language", "status", "meeting_highlights",
-                     "transcript_fingerprint", "ai_version", "crm_records",
+                     "transcript_fingerprint", "ai_version",
                      "source", "meeting_id", "recorded_at", "recording_id",
                      "s3_key", "created_at"):
             self.assertIn(attr, self.written, f"{attr} is no longer written")
+
+    def test_the_overview_is_what_gets_written(self):
+        sections = self.written["overview"]["sections"]
+        self.assertEqual([s["title"] for s in sections],
+                         ["Quotation", "Cost Reduction"])
+
+    def test_the_flat_highlights_list_is_no_longer_written(self):
+        """Superseded by the overview. Still REMOVED from old rows so a
+        reprocessed recording does not keep a stale copy forever."""
+        self.assertNotIn("highlights", self.written)
+        self.assertIn("highlights", self.removed)
+
+    def test_summary_is_derived_from_the_overview_not_generated(self):
+        """`summary` survives as a flattened PREVIEW because the meetings list
+        renders a snippet per row and the Salesforce push writes one long-text
+        field. It costs no extra tokens and makes no claim the overview does
+        not already make."""
+        summary = self.written["summary"]
+        self.assertIn("Quotation", summary)
+        self.assertIn("4.2 lakh", summary)
+        self.assertLessEqual(len(summary), transcribe.SUMMARY_PREVIEW_CHARS)
+
+    def test_crm_records_is_not_written_by_the_analysis(self):
+        """Extraction left this path. A stored value may be the user's own
+        confirmed link, so it is neither written nor removed here."""
+        self.assertNotIn("crm_records", self.written)
+        self.assertNotIn("crm_records", self.removed)
 
     def test_ai_tasks_is_a_list_not_the_tasks_map(self):
         """`tasks` is a DIFFERENT, user-editable attribute behind Task
@@ -1202,24 +1259,13 @@ class BackwardCompatibilityTests(unittest.TestCase):
         self.assertIsInstance(self.written["ai_tasks"], list)
         self.assertNotIn("tasks", self.written)
 
-    def test_highlights_stays_a_flat_string_list(self):
-        self.assertIsInstance(self.written["highlights"], list)
-        self.assertTrue(all(isinstance(h, str)
-                            for h in self.written["highlights"]))
-
-    def test_meeting_highlights_keeps_all_six_sections(self):
+    def test_meeting_highlights_keeps_all_its_sections(self):
         self.assertEqual(set(self.written["meeting_highlights"]),
                          set(ai_schema.HIGHLIGHT_SECTIONS))
 
     def test_participants_keep_speaker_and_summary_keys(self):
         for p in self.written["participants"]:
             self.assertEqual(set(p), {"speaker", "summary"})
-
-    def test_crm_records_entries_keep_their_stored_shape(self):
-        entry = self.written["crm_records"]["Site_Visit__c"]
-        for field in ("value", "confidence", "confidence_score", "evidence",
-                      "source"):
-            self.assertIn(field, entry)
 
     def test_retired_attributes_are_still_removed(self):
         """A row written under the old shape must have them cleared, or the

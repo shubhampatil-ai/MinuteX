@@ -8,6 +8,8 @@ Routes (HTTP API, payload format v2.0):
   POST   /login                {email, password}          -> {token, user_id, email}
   GET    /me                   (JWT)                       -> {user:{...}}
   PATCH  /me                   {name?, avatar_url?} (JWT)  -> {user:{...}}
+  POST   /avatars/upload-request {format, scope?, contact_id?, size?} (JWT)
+                                                          -> {upload_url, key}
   POST   /me/password          {current_password, new_password} (JWT) -> {changed}
   POST   /devices/pair-request {device_id}       (JWT)    -> {pairing_code, expires_in}
   POST   /devices/pair         {device_id, pairing_code} (JWT) -> {device:{...}}
@@ -170,7 +172,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 import boto3
@@ -181,6 +183,8 @@ from botocore.exceptions import ClientError
 # into this function's zip (see scripts/21_deploy_ai_workspace.sh).
 import ai_schema
 import groq_client
+import mom_schema
+import spoken_dates
 import prompts
 import stt_result
 import transcript_store
@@ -321,6 +325,43 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(3 * 1000 * 1000 * 
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", str(10 * 3600)))
 UPLOAD_URL_EXPIRY = int(os.environ.get("UPLOAD_URL_EXPIRY", "900"))  # seconds
 
+# ---------------------------------------------------------------------------
+# Avatars (profile + contact photos).
+#
+# Stored in the SAME bucket as recordings, under a separate `avatars/` prefix.
+# Two properties of that prefix are load-bearing:
+#
+#   * The S3 ObjectCreated trigger that starts transcription is filtered to the
+#     ".wav" SUFFIX (see scripts/13_wire_s3_trigger.sh), so an image dropped in
+#     this bucket never enters the audio pipeline. The allowed extensions below
+#     deliberately exclude .wav for the same reason, from the other direction.
+#   * The key always begins "avatars/{owner_user_id}/", which is what makes
+#     ownership checkable from the key alone — the same property the recordings
+#     layout relies on.
+#
+# Images are never served as a public object URL. S3 objects here stay private
+# and the API hands out a short-lived presigned GET (_avatar_view_url) on every
+# read, exactly like recording playback. That is why `avatar_url` is stored as
+# an S3 KEY, not a URL: a stored URL would expire, and re-signing needs the key
+# anyway. `avatar_url` keeps its historical attribute name (it is already on
+# every Users row and in the PATCH /me contract); what changed is that the app
+# now reads the presigned `avatar_view_url` the API derives from it.
+AVATAR_FORMATS = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+    "heic": "image/heic",
+}
+# A profile photo is displayed at most ~72pt. 8 MB is far above any sensibly
+# compressed image at that size and still small enough that a mistaken pick
+# (a full-resolution burst photo) fails fast instead of costing an upload.
+MAX_AVATAR_BYTES = int(os.environ.get("MAX_AVATAR_BYTES", str(8 * 1024 * 1024)))
+# Longer than a recording's playback URL: avatars are rendered in lists that a
+# user can sit on for a while, and a re-signed URL means a re-fetch of an image
+# that has not changed.
+AVATAR_URL_EXPIRY = int(os.environ.get("AVATAR_URL_EXPIRY", "21600"))  # 6h
+
 # Recording processing statuses (the Recordings 'status' attribute). The
 # userApi only ever writes the first two; the transcription pipeline owns the
 # rest. "transcribed" is the legacy value for "transcript ok, AI step failed".
@@ -328,7 +369,7 @@ STATUS_UPLOADING = "uploading"
 STATUS_UPLOADED = "uploaded"
 
 # Fields returned in the LIST view (lightweight — no transcript/timestamps).
-# `folder_id` rides along so the Desk and the folder views can filter the ONE
+# `folder_id` rides along so MinuteX and the folder views can filter the ONE
 # master list client-side without a second request per meeting. Absent on rows
 # with no folder, which is what "General" means.
 LIST_FIELDS = ("audio_s3_key", "recording_id", "user_id", "device_id",
@@ -545,15 +586,158 @@ def login(event):
 
 
 # ---------------------------------------------------------------------------
+# Avatar storage — shared by the profile photo and contact photos.
+# ---------------------------------------------------------------------------
+def _avatar_key(owner_user_id, scope, subject_id, ext):
+    """The S3 key for one avatar image.
+
+    "avatars/{owner}/{scope}/{subject}-{nonce}.{ext}". The owner segment comes
+    FIRST so ownership is decidable from the key alone (see _owns_avatar_key),
+    and the nonce makes every upload a new object rather than an overwrite:
+    replacing a photo in place would be served stale from any presigned URL
+    still in flight, and would leave no way to tell a failed upload from a
+    successful one.
+    """
+    nonce = uuid.uuid4().hex[:12]
+    return f"avatars/{owner_user_id}/{scope}/{subject_id}-{nonce}.{ext}"
+
+
+def _owns_avatar_key(user_id, key):
+    """True when `key` is an avatar the caller uploaded.
+
+    Checked before an avatar_url written by the CLIENT is stored, because
+    PATCH /me and PATCH /contacts take that key from the request body. Without
+    this a caller could point their own profile at another account's image key
+    and have the API presign it for them on every read — a cross-tenant read
+    granted by the server, which is exactly what section-level ownership
+    checks exist to prevent.
+    """
+    return bool(key) and str(key).startswith(f"avatars/{user_id}/")
+
+
+def _avatar_view_url(key):
+    """A short-lived presigned GET for an avatar key, or "".
+
+    Best-effort by design: a bucket or credentials problem must degrade to
+    "renders initials" and never fail the profile/contact/list route that
+    embeds it. Every caller treats "" as "no photo".
+    """
+    key = str(key or "").strip()
+    if not key or not BUCKET_NAME:
+        return ""
+    try:
+        return _s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET_NAME, "Key": key},
+            ExpiresIn=AVATAR_URL_EXPIRY,
+        )
+    except Exception:
+        return ""
+
+
+def _delete_avatar_object(key):
+    """Best-effort removal of a replaced/cleared avatar object.
+
+    Never raises: the row has already stopped pointing at this key by the time
+    we get here, so a failed delete leaves an orphaned object, not a broken
+    profile. Guarded on the avatars/ prefix so a malformed stored value can
+    never be turned into a delete of a recording.
+    """
+    key = str(key or "").strip()
+    if not key or not BUCKET_NAME or not key.startswith("avatars/"):
+        return
+    try:
+        _s3.delete_object(Bucket=BUCKET_NAME, Key=key)
+    except Exception:
+        pass
+
+
+def request_avatar_upload(event):
+    """POST /avatars/upload-request {format, scope?, contact_id?, size?}
+       -> {upload_url, key, expires_in, content_type}
+
+    Presigns the PUT only. The key is NOT written to any row here — the client
+    stores it by calling PATCH /me or PATCH /contacts/{id} after the upload
+    succeeds. Splitting it that way means an abandoned upload leaves an
+    unreferenced S3 object rather than a profile pointing at bytes that never
+    arrived.
+    """
+    user_id = _require_auth(event)
+    if not BUCKET_NAME:
+        raise ApiError(500, "server misconfigured (no bucket)")
+    data = _body(event)
+
+    ext = str(data.get("format") or "jpg").strip().lower().lstrip(".")
+    if ext not in AVATAR_FORMATS:
+        raise ApiError(400, "unsupported image format — use one of: "
+                            + ", ".join(sorted(AVATAR_FORMATS)))
+
+    size = data.get("size")
+    if size is not None:
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            raise ApiError(400, "size must be a number of bytes")
+        if size > MAX_AVATAR_BYTES:
+            raise ApiError(413, f"image too large — max "
+                                f"{MAX_AVATAR_BYTES // (1024 * 1024)} MB")
+
+    scope = str(data.get("scope") or "user").strip().lower()
+    if scope not in ("user", "contact"):
+        raise ApiError(400, "scope must be 'user' or 'contact'")
+
+    if scope == "contact":
+        # contact_id is OPTIONAL here, and its absence is a real case rather
+        # than a sloppy client: the phone-import flow uploads the address-book
+        # photo BEFORE the contact exists, then passes the key to POST
+        # /contacts. There is nothing to own-check yet, and nothing is weakened
+        # by that — the key is still written under avatars/{caller}/, which is
+        # the only thing _owns_avatar_key consults when the key later comes
+        # back on a create or patch.
+        #
+        # When an id IS given (replacing an existing contact's photo) it is
+        # own-checked up front, because presigning a write for someone else's
+        # contact would hand out a usable PUT even though the follow-up PATCH
+        # would be rejected.
+        subject = str(data.get("contact_id") or "").strip()
+        if subject:
+            _owned_contact(user_id, subject)
+        else:
+            subject = "new"
+    else:
+        subject = user_id
+
+    key = _avatar_key(user_id, scope, subject, ext)
+    # ContentType deliberately unsigned — same React Native fetch() Blob
+    # behaviour documented on request_upload: signing it produces
+    # SignatureDoesNotMatch on every phone upload.
+    upload_url = _s3.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": BUCKET_NAME, "Key": key},
+        ExpiresIn=UPLOAD_URL_EXPIRY,
+    )
+    return _resp(200, {"upload_url": upload_url, "key": key,
+                       "expires_in": UPLOAD_URL_EXPIRY,
+                       "content_type": AVATAR_FORMATS[ext]})
+
+
+# ---------------------------------------------------------------------------
 # Profile (the logged-in user's own account).
 # ---------------------------------------------------------------------------
 def _public_user(item):
-    """The safe, client-facing view of a Users row (never salt/hash)."""
+    """The safe, client-facing view of a Users row (never salt/hash).
+
+    `avatar_url` is the stored S3 KEY and `avatar_view_url` is a presigned GET
+    derived from it at read time — see the AVATAR_FORMATS block for why the
+    stored value is a key rather than a URL. Clients render
+    `avatar_view_url` and treat "" as "no photo, fall back to initials".
+    """
     return {
         "user_id": item.get("user_id", ""),
         "email": item.get("email", ""),
         "name": item.get("name", ""),
         "avatar_url": item.get("avatar_url", ""),
+        "avatar_view_url": _avatar_view_url(item.get("avatar_url", "")),
         "created_at": item.get("created_at", ""),
     }
 
@@ -575,12 +759,30 @@ def patch_me(event):
         names["#name"] = "name"
         values[":name"] = (data.get("name") or "").strip()[:100]
         sets.append("#name = :name")
+    # avatar_url is the S3 key returned by POST /avatars/upload-request. It is
+    # validated against the caller's own prefix rather than trusted: the value
+    # arrives from the client and is later presigned by the server on every
+    # read, so an unchecked key would let one account have the API sign reads
+    # of another account's image. "" is the legitimate "remove my photo".
+    new_avatar = None
     if "avatar_url" in data:
+        new_avatar = (data.get("avatar_url") or "").strip()[:1000]
+        if new_avatar and not _owns_avatar_key(user_id, new_avatar):
+            raise ApiError(400, "avatar_url must be a key from "
+                                "POST /avatars/upload-request")
         names["#a"] = "avatar_url"
-        values[":a"] = (data.get("avatar_url") or "").strip()[:1000]
+        values[":a"] = new_avatar
         sets.append("#a = :a")
     if not sets:
         raise ApiError(400, "nothing to update (name or avatar_url)")
+
+    # Read the outgoing key BEFORE the write, so the object it points at can be
+    # cleaned up once nothing references it any more.
+    prev_avatar = ""
+    if new_avatar is not None:
+        prev = _users.get_item(Key={"user_id": user_id}).get("Item") or {}
+        prev_avatar = str(prev.get("avatar_url") or "")
+
     _users.update_item(
         Key={"user_id": user_id},
         UpdateExpression="SET " + ", ".join(sets),
@@ -588,6 +790,8 @@ def patch_me(event):
         ExpressionAttributeValues=values,
         ConditionExpression="attribute_exists(user_id)",
     )
+    if prev_avatar and prev_avatar != new_avatar:
+        _delete_avatar_object(prev_avatar)
     item = _users.get_item(Key={"user_id": user_id}).get("Item")
     return _resp(200, {"user": _public_user(item)})
 
@@ -1298,7 +1502,7 @@ def list_recordings(event):
             key = item.get("audio_s3_key", "")
             if key in seen:
                 continue
-            # Trashed rows belong to GET /trash, not the Desk. This is the ONLY
+            # Trashed rows belong to GET /trash, not MinuteX. This is the ONLY
             # thing filtered here: _is_trashed tests one exact string, so every
             # other lifecycle — complete, failed, uploading, transcribing,
             # generating_ai, and legacy rows carrying no recording_status at
@@ -1663,7 +1867,7 @@ def delete_recording(event):
 def restore_recording(event):
     """POST /recordings/restore/{key+} -> {restored, key, status}.
 
-    Takes the recording out of Trash and returns it to the Desk with its
+    Takes the recording out of Trash and returns it to MinuteX with its
     transcript and every AI artifact exactly as they were — nothing is
     re-transcribed and no AI call is made, because nothing was ever removed.
 
@@ -2634,8 +2838,21 @@ def reprocess_recording(event):
         except (TypeError, ValueError):
             started = None
         if started is not None:
+            # NO lower bound on `elapsed`. It is derived from two INDEPENDENT
+            # clock reads — datetime.now() when the stamp was written, and
+            # time.time() here — so it comes out very slightly NEGATIVE for a
+            # repeat that lands in the same instant (measured at ~0.8% of
+            # same-moment calls, on the order of -2e-07s). An earlier
+            # `0 <= elapsed` guard treated exactly that case as "outside the
+            # window" and let the second call through with a 202, which is the
+            # precise double-charge this cooldown exists to prevent — the two
+            # taps closest together were the ones it failed to catch.
+            #
+            # A negative elapsed means the stamp is at-or-after now, i.e. the
+            # attempt is as fresh as it can possibly be. That is the deepest
+            # part of the window, not outside it.
             elapsed = time.time() - started.timestamp()
-            if 0 <= elapsed < REPROCESS_COOLDOWN_SECONDS:
+            if elapsed < REPROCESS_COOLDOWN_SECONDS:
                 wait = int(REPROCESS_COOLDOWN_SECONDS - elapsed)
                 raise ApiError(429, "already reprocessing — try again in "
                                     f"{wait}s if it still looks stuck")
@@ -2951,6 +3168,270 @@ CHAT_SUGGESTIONS = [
         "Draft a reminder message",
     ]},
 ]
+
+
+# ===========================================================================
+# MINUTES OF MEETING — the structured, editable MoM.
+#
+# WHAT THIS ADDS, AND WHAT IT DELIBERATELY DOES NOT REPLACE.
+#
+# `documents.minutes_of_meeting` already existed as a Markdown blob generated
+# by prompts.DOCUMENTS. That is fine to read and impossible to EDIT
+# structurally — "delete the Highlights section", "move Action Items above
+# Decisions", "add a Deadline column" and "keep MY wording for this line when
+# the AI regenerates the rest" are all unanswerable against a blob.
+#
+# So the MoM gains a structured representation in the `mom` attribute, and the
+# Markdown document becomes a derived MIRROR of it, rewritten by
+# _persist_mom on every structured write. Every existing consumer — the
+# Documents list, DOCX/PDF export, Share, the Assistant's context — keeps
+# reading `documents.minutes_of_meeting` and keeps working, unchanged. There
+# is exactly ONE MoM in the product, not two.
+#
+# NO GROQ CALL. mom_schema.build_sections arranges data the pipeline already
+# produced (participants, meeting_highlights, tasks, summary, highlights), so
+# generating a MoM costs no tokens and cannot fail on a rate limit. That is
+# also why there is no `regenerate` cache check here: rebuilding is cheap, and
+# the merge in mom_schema keeps user edits regardless.
+#
+# Routes (action first, key LAST — the same API Gateway constraint that shapes
+# every other AI route in this file):
+#   GET    /recordings/ai/mom/{key+}                  -> {mom, document}
+#   POST   /recordings/ai/mom/{key+}   {}             -> {mom, document}
+#   PUT    /recordings/ai/mom/{key+}   {mom}          -> {mom, document}
+#   DELETE /recordings/ai/mom/{key+}                  -> {deleted}
+# ===========================================================================
+
+# Same storage reasoning as DOCUMENTS_ATTR/TASKS_ATTR: one attribute on the
+# recording row, always read with the recording, never queried independently.
+MOM_ATTR = "mom"
+
+# The document slot the structured MoM mirrors into. Deliberately the EXISTING
+# minutes_of_meeting type rather than a new one, so the app's Documents list
+# shows one MoM, not a structured one beside a legacy one.
+MOM_DOC_TYPE = "minutes_of_meeting"
+
+# A structured MoM whose rendered Markdown exceeds MAX_DOCUMENT_CHARS cannot
+# be mirrored into the document slot. The structure is still stored (it is the
+# source of truth); the mirror is truncated exactly as _generate_document
+# truncates a runaway model, so the two paths behave identically.
+
+
+def _stored_mom(item):
+    got = item.get(MOM_ATTR)
+    return got if isinstance(got, dict) else None
+
+
+def _mom_tasks(user_id, key):
+    """The meeting's real tasks, in API shape, for the Action Items section.
+
+    Reuses the Tasks table read that list_meeting_tasks uses, so the MoM
+    states the same owners and due dates the Tasks screen does. Never seeds or
+    migrates — that is list_meeting_tasks' job and doing it here would make a
+    read route write.
+    """
+    try:
+        rows = [r for r in _tasks_for_recording(key)
+                if r.get("owner_user_id") == user_id]
+    except ClientError as err:
+        # A MoM without its Action Items table beats no MoM at all; the
+        # builder falls back to the highlights extraction.
+        print(f"[mom] task read failed for {key}: {type(err).__name__}: {err}")
+        return []
+    rows.sort(key=lambda r: r.get("created_at", ""))
+    return rows
+
+
+def _build_fresh_sections(user_id, key, item):
+    names = item.get("speaker_names") or {}
+    tasks = [_public_task_v2(r, names) for r in _mom_tasks(user_id, key)]
+    return mom_schema.build_sections(item, tasks=tasks, speaker_names=names)
+
+
+def _persist_mom(key, item, mom, regenerated=False):
+    """Write the structure AND refresh its Markdown mirror. One place.
+
+    Both writes always happen together — a structure whose mirror is stale
+    would show one MoM in the editor and a different one in the exported DOCX,
+    which is the single worst failure this feature could have. They are two
+    UpdateItems rather than one because _save_document's nested-path write is
+    what keeps concurrent document writes from clobbering each other, and that
+    reasoning applies here too.
+    """
+    mom = mom_schema.coerce_mom(mom)
+    now = _now_iso()
+    mom["updated_at"] = now
+    if regenerated or not mom.get("generated_at"):
+        mom["generated_at"] = now
+    mom["transcript_fingerprint"] = _row_fingerprint(item)
+    mom["speaker_mapping_version"] = item.get("speaker_mapping_version") or 0
+    mom["mom_version"] = mom_schema.MOM_VERSION
+
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET #mom = :mom, updated_at = :now",
+        ExpressionAttributeNames={"#mom": MOM_ATTR},
+        ExpressionAttributeValues={":mom": mom, ":now": now},
+    )
+
+    document = _mirror_document(key, item, mom)
+    return mom, document
+
+
+def _mirror_document(key, item, mom):
+    """Render the structure into documents.minutes_of_meeting.
+
+    The mirror is marked `edited: True` on purpose. It is not AI output any
+    more — it is whatever the user's structured MoM currently says — and
+    `edited` is exactly the flag the existing _is_fresh/_needs_speaker_update
+    rules read to mean "never silently overwrite this". Without it, a
+    Regenerate on the Documents screen would replace a hand-built MoM with a
+    fresh prompt-generated blob and the structure would silently diverge from
+    the document.
+    """
+    content = mom_schema.render_markdown(mom)
+    if len(content) > MAX_DOCUMENT_CHARS:
+        content = content[:MAX_DOCUMENT_CHARS].rstrip() + "\n\n[Output truncated.]"
+
+    existing = _stored_documents(item).get(MOM_DOC_TYPE) or {}
+    doc = dict(existing)
+    doc.update({
+        "content": content,
+        "format": "markdown",
+        "edited": True,
+        "structured": True,
+        "generated_at": existing.get("generated_at") or mom.get("generated_at") or _now_iso(),
+        "edited_at": _now_iso(),
+        "transcript_fingerprint": mom.get("transcript_fingerprint") or _row_fingerprint(item),
+        "ai_version": existing.get("ai_version") or ai_schema.AI_VERSION,
+        "speaker_mapping_version": item.get("speaker_mapping_version") or 0,
+    })
+    _save_document(key, MOM_DOC_TYPE, doc)
+    return _public_document(MOM_DOC_TYPE, doc,
+                            item.get("speaker_mapping_version") or 0)
+
+
+def _mom_response(mom, document, **extra):
+    payload = {"mom": mom, "document": document}
+    payload.update(extra)
+    return _resp(200, payload)
+
+
+def get_mom(event):
+    """GET /recordings/ai/mom/{key+} -> {mom, document, exists}.
+
+    A pure read: a recording with no MoM yet returns exists=false and an empty
+    structure rather than generating one. Generation is POST, so opening the
+    editor can never cost a write on a recording the user was only browsing.
+    """
+    _, key, item = _owned_recording(event, hydrate=False)
+    stored = _stored_mom(item)
+    if stored is None:
+        return _resp(200, {"mom": mom_schema.empty_mom(), "document": None,
+                           "exists": False})
+    mom = mom_schema.coerce_mom(stored)
+    documents = _stored_documents(item)
+    document = None
+    if MOM_DOC_TYPE in documents:
+        document = _public_document(MOM_DOC_TYPE, documents[MOM_DOC_TYPE],
+                                    item.get("speaker_mapping_version") or 0)
+    return _mom_response(mom, document, exists=True)
+
+
+def generate_mom(event):
+    """POST /recordings/ai/mom/{key+} {} -> {mom, document}.
+
+    First call builds the MoM from the existing analysis. A later call
+    REGENERATES: fresh AI content is merged into the stored structure, so
+    `ai` items refresh while `user_edited`/`user_added` items and the user's
+    ordering, deletions and hidden flags all survive (see
+    mom_schema.merge_generated).
+
+    Requires a transcript for the same reason every other AI route does — a
+    MoM built from an empty analysis would be an empty document.
+    """
+    user_id, key, item = _owned_recording(event)
+    _require_transcript(item)
+
+    fresh = _build_fresh_sections(user_id, key, item)
+    stored = _stored_mom(item)
+
+    if stored is None:
+        mom = mom_schema.coerce_mom({
+            "title": "Minutes of Meeting",
+            "subtitle": item.get("title") or "",
+            "sections": fresh,
+        })
+    else:
+        mom = mom_schema.merge_generated(stored, fresh)
+        # A subtitle follows the meeting title unless the user retitled it.
+        if not mom.get("subtitle"):
+            mom["subtitle"] = item.get("title") or ""
+
+    if mom_schema.is_empty(mom):
+        raise ApiError(409, "there isn't enough analysed content in this "
+                            "meeting to build minutes yet")
+
+    mom, document = _persist_mom(key, item, mom, regenerated=True)
+    return _mom_response(mom, document, regenerated=stored is not None)
+
+
+def save_mom(event):
+    """PUT /recordings/ai/mom/{key+} {mom} -> {mom, document}.
+
+    The ONE write path for every edit the editor makes — add/edit/delete a
+    section, field, row, column or list item, and reordering. A whole-document
+    PUT rather than a route per operation because the editor holds the entire
+    structure in memory anyway (it has to, to render it), the document is
+    small, and fifteen granular routes would each need their own ownership
+    check, coercion and mirror refresh — fifteen chances to forget one.
+
+    Concurrency is last-write-wins, which is correct for a single-user editor
+    and is what the rest of this file already does for a document edit.
+
+    Deletions arrive as `deleted_ids`, not as absences: a section simply
+    missing from the payload could equally mean "an older client didn't send
+    it", and treating that as a delete would lose content. The client sends
+    the tombstone explicitly, and mom_schema.merge_generated honours it on
+    every later regeneration.
+    """
+    _, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+
+    raw = data.get("mom")
+    if not isinstance(raw, dict):
+        raise ApiError(400, "mom object required")
+
+    mom = mom_schema.coerce_mom(raw)
+    if not mom["sections"]:
+        raise ApiError(400, "a MoM needs at least one section")
+
+    # Preserve provenance the client has no business rewriting.
+    stored = _stored_mom(item) or {}
+    mom["generated_at"] = mom_schema.coerce_mom(stored).get("generated_at") or ""
+
+    mom, document = _persist_mom(key, item, mom)
+    return _mom_response(mom, document)
+
+
+def delete_mom(event):
+    """DELETE /recordings/ai/mom/{key+} -> {deleted}.
+
+    Removes the STRUCTURE only. The mirrored Markdown document is left alone
+    and stays deletable through the existing DELETE .../ai/documents route —
+    deleting both here would make "reset the editor" also destroy a document
+    the user may have exported and still wants listed.
+    """
+    _, key, item = _owned_recording(event, hydrate=False)
+    if _stored_mom(item) is None:
+        raise ApiError(404, "no minutes for this recording")
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression="SET updated_at = :now REMOVE #mom",
+        ExpressionAttributeNames={"#mom": MOM_ATTR},
+        ExpressionAttributeValues={":now": _now_iso()},
+    )
+    return _resp(200, {"deleted": True})
 
 
 # ===========================================================================
@@ -3522,7 +4003,7 @@ def _norm_folder_name(raw):
 # ---------------------------------------------------------------------------
 # Contacts — public shape + ownership
 # ---------------------------------------------------------------------------
-def _public_contact(item):
+def _public_contact(item, linked_avatars=None):
     """One Contact row in API shape.
 
     `minutex_user_id` is present only when this contact has been matched to a
@@ -3530,8 +4011,11 @@ def _public_contact(item):
     notification-ready, so it is never fabricated: absent means "we have no
     account for this person", which the app must treat as "cannot notify
     in-app", not as "not yet looked up".
+
+    For a LIST of contacts call _public_contacts() rather than mapping this
+    over them — it batches the linked-avatar lookup into one read.
     """
-    return {
+    out = {
         "id": item.get("contact_id", ""),
         "name": item.get("name", ""),
         "email": item.get("email", ""),
@@ -3543,6 +4027,108 @@ def _public_contact(item):
         "created_at": item.get("created_at", ""),
         "updated_at": item.get("updated_at", ""),
     }
+    out.update(_contact_avatar_fields(item, linked_avatars))
+    return out
+
+
+# Which photo a contact shows, and where it came from. Precedence is
+# deliberate and is the answer to "whose picture is this really":
+#
+#   1. The OWN photo on the contact row — set by the owner, either imported
+#      from their phone's address book or picked by hand. It is the one the
+#      owner chose, so it wins.
+#   2. The linked MinuteX user's own profile photo, when this contact has a
+#      minutex_user_id and no photo of its own. That person maintains it, so
+#      it is fresher than anything cached here and updates itself.
+#   3. Nothing — the app falls back to coloured initials, as it always has.
+#
+# `avatar_source` is returned alongside the URL rather than left implicit
+# because the two cases are not interchangeable to a user: "the photo you
+# saved" and "their MinuteX profile photo" differ in who can change it, and
+# the contact screen says so.
+AVATAR_SOURCE_NONE = ""
+AVATAR_SOURCE_OWN = "own"
+AVATAR_SOURCE_MINUTEX = "minutex"
+
+
+def _contact_avatar_fields(item, linked_avatars=None):
+    """The avatar_* fields for one contact, applying the precedence above.
+
+    `linked_avatars` maps minutex_user_id -> that user's stored avatar key, and
+    is what keeps a 50-contact page from doing 50 Users reads. Callers that
+    render a list build it once with _linked_avatar_map; single-contact callers
+    pass nothing and take the one lookup.
+    """
+    own = str(item.get("avatar_url") or "").strip()
+    if own:
+        return {"avatar_url": own,
+                "avatar_view_url": _avatar_view_url(own),
+                "avatar_source": AVATAR_SOURCE_OWN}
+
+    linked_id = str(item.get("minutex_user_id") or "").strip()
+    if linked_id:
+        if linked_avatars is None:
+            linked_avatars = _linked_avatar_map([linked_id])
+        linked_key = str(linked_avatars.get(linked_id) or "").strip()
+        if linked_key:
+            return {"avatar_url": "",
+                    "avatar_view_url": _avatar_view_url(linked_key),
+                    "avatar_source": AVATAR_SOURCE_MINUTEX}
+
+    return {"avatar_url": "", "avatar_view_url": "",
+            "avatar_source": AVATAR_SOURCE_NONE}
+
+
+def _linked_avatar_map(user_ids):
+    """{user_id: avatar_url key} for MinuteX users linked to these contacts.
+
+    This is a deliberate CROSS-ACCOUNT read: the rows belong to other users,
+    not to the caller. It is narrow on purpose — it projects `avatar_url` and
+    `user_id` and nothing else, so no name, email or account state of another
+    user can leak through this path, and it is only ever reached for a user id
+    that the owner's own contact row already carries (i.e. someone they have
+    already matched by email). Showing a MinuteX user's profile photo to
+    someone who has them as a contact is the point of the feature; anything
+    beyond the photo is not.
+
+    Best-effort: any failure yields {} and every contact falls back to
+    initials rather than failing the list route.
+    """
+    ids = {str(u).strip() for u in (user_ids or []) if str(u or "").strip()}
+    if not ids or not USERS_TABLE:
+        return {}
+    out = {}
+    try:
+        ids = list(ids)
+        # BatchGetItem caps at 100 keys per call.
+        for start in range(0, len(ids), 100):
+            chunk = ids[start:start + 100]
+            resp = _ddb.batch_get_item(RequestItems={USERS_TABLE: {
+                "Keys": [{"user_id": u} for u in chunk],
+                "ProjectionExpression": "user_id, avatar_url",
+            }})
+            for row in resp.get("Responses", {}).get(USERS_TABLE, []):
+                key = str(row.get("avatar_url") or "").strip()
+                if key:
+                    out[row.get("user_id")] = key
+    except Exception:
+        return out
+    return out
+
+
+def _public_contacts(items):
+    """Many contacts in API shape, with ONE batched lookup for linked photos.
+
+    Use this instead of a [_public_contact(c) for c in ...] comprehension on
+    any route that returns a list — the comprehension would do a Users read per
+    contact that has a linked account.
+    """
+    items = list(items or [])
+    linked = _linked_avatar_map([
+        c.get("minutex_user_id") for c in items
+        if not str(c.get("avatar_url") or "").strip()
+    ])
+    return [_public_contact(c, linked) for c in items]
 
 
 def _owned_contact(user_id, contact_id):
@@ -3662,11 +4248,16 @@ def _match_contacts(user_id, name="", email="", phone=""):
 
 
 def _contact_item(user_id, name, email="", phone="", company="", role="",
-                  notes=""):
+                  notes="", avatar_url=""):
     """Build a Contact row. Optional GSI key attributes (email_lc, phone_e164)
     are OMITTED when empty rather than written as "" — DynamoDB rejects an
     empty-string index key outright, so writing one would fail the whole put.
-    Same rule the Recordings/Devices tables already follow."""
+    Same rule the Recordings/Devices tables already follow.
+
+    `avatar_url` is an S3 key the CALLER must already have validated as their
+    own (create_contact does). It exists here mainly for the phone-import path,
+    which uploads the device address-book photo and creates the contact
+    carrying it in one flow."""
     now = _now_iso()
     email_lc = _norm_email(email)
     phone_e164 = _norm_phone(phone)
@@ -3679,6 +4270,7 @@ def _contact_item(user_id, name, email="", phone="", company="", role="",
         "company": str(company or "").strip()[:CONTACT_COMPANY_MAX],
         "role": str(role or "").strip()[:CONTACT_ROLE_MAX],
         "notes": str(notes or "").strip()[:CONTACT_NOTES_MAX],
+        "avatar_url": str(avatar_url or "").strip()[:1000],
         "name_lc": _norm_name(name),
         "created_at": now,
         "updated_at": now,
@@ -3723,6 +4315,14 @@ def create_contact(event):
     if raw_phone and not _norm_phone(raw_phone):
         raise ApiError(400, "phone is not a usable number")
 
+    # Optional photo, uploaded before this call (phone import carries the
+    # device address-book picture here). Ownership-checked like every other
+    # client-supplied avatar key — see _owns_avatar_key.
+    avatar_url = str(data.get("avatar_url") or "").strip()[:1000]
+    if avatar_url and not _owns_avatar_key(user_id, avatar_url):
+        raise ApiError(400, "avatar_url must be a key from "
+                            "POST /avatars/upload-request")
+
     # A folder_id, if given, must be the caller's before anything is written —
     # otherwise a failed association would leave an orphaned contact behind.
     folder_id = str(data.get("folder_id") or "").strip()
@@ -3734,6 +4334,21 @@ def create_contact(event):
         existing = matches[0]
         if folder_id:
             _link_folder_contact(folder_id, existing["contact_id"])
+        # A photo offered for someone we already know FILLS A GAP, it never
+        # overwrites. The phone-import path reaches here whenever the person is
+        # already a contact, and dropping their address-book picture would mean
+        # importing the same person twice gives a photo the first time and not
+        # the second. Replacing an existing one is the owner's explicit call,
+        # made on the contact screen — not a side effect of an import.
+        if avatar_url and not str(existing.get("avatar_url") or "").strip():
+            _apply_update(_contacts, {"contact_id": existing["contact_id"]},
+                          {"avatar_url": avatar_url,
+                           "updated_at": _now_iso()}, [])
+            existing = _contacts.get_item(
+                Key={"contact_id": existing["contact_id"]}).get("Item") or existing
+        elif avatar_url:
+            # Not stored — do not leave the uploaded object orphaned in S3.
+            _delete_avatar_object(avatar_url)
         return _resp(200, {"contact": _public_contact(existing),
                            "existing": True,
                            "reason": "a contact with this email or phone "
@@ -3743,7 +4358,7 @@ def create_contact(event):
 
     item = _contact_item(user_id, name, raw_email, raw_phone,
                          data.get("company"), data.get("role"),
-                         data.get("notes"))
+                         data.get("notes"), avatar_url)
     # attribute_not_exists on the PK: a uuid collision is astronomically
     # unlikely, but "astronomically unlikely" is not "cannot silently
     # overwrite a real person's record".
@@ -3773,7 +4388,7 @@ class AmbiguousContact(ApiError):
         super().__init__(409, "more than one contact could match — choose one "
                               "or send force:true to create a new person")
         self.code = "contact_ambiguous"
-        self.candidates = [_public_contact(m) for m in matches]
+        self.candidates = _public_contacts(matches)
 
 
 def list_contacts(event):
@@ -3828,7 +4443,7 @@ def list_contacts(event):
                                       "contact_id": out[-1]["contact_id"]})
     elif last_key:
         next_cursor = _encode_cursor(last_key)
-    return _resp(200, {"contacts": [_public_contact(c) for c in out],
+    return _resp(200, {"contacts": _public_contacts(out),
                        "count": len(out),
                        "next_cursor": next_cursor})
 
@@ -3927,12 +4542,31 @@ def update_contact(event):
         if field in data:
             updates[field] = str(data.get(field) or "").strip()[:cap]
 
+    # The contact's OWN photo — an S3 key from POST /avatars/upload-request,
+    # validated against the caller's prefix for the same reason patch_me does
+    # (the value is client-supplied and the server presigns reads of it). ""
+    # clears it, after which the contact falls back to the linked MinuteX
+    # user's photo if there is one, then to initials.
+    prev_avatar = ""
+    if "avatar_url" in data:
+        raw = str(data.get("avatar_url") or "").strip()[:1000]
+        if raw and not _owns_avatar_key(user_id, raw):
+            raise ApiError(400, "avatar_url must be a key from "
+                                "POST /avatars/upload-request")
+        prev_avatar = str(item.get("avatar_url") or "")
+        if raw:
+            updates["avatar_url"] = raw
+        else:
+            updates["avatar_url"] = ""
+
     if not updates and not removes:
         raise ApiError(400, "nothing to update")
 
     updates["updated_at"] = _now_iso()
     _apply_update(_contacts, {"contact_id": item["contact_id"]},
                   updates, removes)
+    if prev_avatar and prev_avatar != updates.get("avatar_url"):
+        _delete_avatar_object(prev_avatar)
     fresh = _contacts.get_item(
         Key={"contact_id": item["contact_id"]}).get("Item") or {}
     _audit("contact.updated", user_id, item["contact_id"],
@@ -3991,6 +4625,11 @@ def delete_contact(event):
         unassigned += 1
 
     _contacts.delete_item(Key={"contact_id": cid})
+    # The row is gone, so nothing can reference its photo any more. Deleting a
+    # linked MinuteX user's avatar is impossible here by construction: only the
+    # contact's OWN key is ever stored on the row (see _contact_avatar_fields),
+    # and _delete_avatar_object refuses anything outside avatars/.
+    _delete_avatar_object(item.get("avatar_url"))
     _audit("contact.deleted", user_id, cid, unlinked_folders=unlinked,
            unassigned_tasks=unassigned)
     return _resp(200, {"deleted": True, "id": cid,
@@ -4185,7 +4824,7 @@ def get_folder(event):
     return _resp(200, {
         "folder": _public_folder(item,
                                  meeting_count=counts.get(item["folder_id"], 0)),
-        "contacts": [_public_contact(c) for c in contacts],
+        "contacts": _public_contacts(contacts),
     })
 
 
@@ -4424,7 +5063,7 @@ def list_folder_contacts(event):
     folder_id = (event.get("pathParameters") or {}).get("folder_id", "")
     folder = _owned_folder(user_id, folder_id)
     rows = _folder_contact_rows(user_id, folder["folder_id"])
-    return _resp(200, {"contacts": [_public_contact(c) for c in rows],
+    return _resp(200, {"contacts": _public_contacts(rows),
                        "count": len(rows)})
 
 
@@ -4541,8 +5180,8 @@ def list_participants(event):
     if folder_id:
         folder = _folders.get_item(Key={"folder_id": folder_id}).get("Item")
         if folder and folder.get("owner_user_id") == user_id:
-            folder_contacts = [_public_contact(c)
-                               for c in _folder_contact_rows(user_id, folder_id)]
+            folder_contacts = _public_contacts(
+                _folder_contact_rows(user_id, folder_id))
 
     return _resp(200, {
         "participants": participants,
@@ -4830,7 +5469,8 @@ def _public_task_v2(row, speaker_names=None):
         "priority": row.get("priority", "Medium"),
         "due": due,
         "due_date": due,
-        "is_overdue": _is_overdue(due, status),
+        "is_overdue": _is_overdue(due, status,
+                                  row.get("due_date_normalized", "")),
         "assignee_contact_id": row.get("assignee_contact_id", ""),
         "assignee_user_id": row.get("assignee_user_id", ""),
         "assignee_name": row.get("assignee_name", ""),
@@ -4862,7 +5502,7 @@ def _public_task_v2(row, speaker_names=None):
     }
 
 
-def _is_overdue(due, status):
+def _is_overdue(due, status, due_normalized=""):
     """True when a non-terminal task's due date is in the past.
 
     Timezone-safe: the stored value may be a full ISO timestamp or a bare
@@ -4870,10 +5510,18 @@ def _is_overdue(due, status):
     "2026-08-20" is not overdue at 00:01 on the 20th. Anything unparseable
     (the AI can emit "next Friday", which is real data we must not crash on)
     is simply not overdue — it cannot be compared, so it is not claimed.
+
+    `due_normalized` is the resolved calendar day for a SPOKEN due date, and
+    is preferred when present: without it a task due "Friday" could never be
+    overdue at all, because the raw phrase does not parse. Rows written before
+    normalization existed simply do not have it and fall back to `due` — the
+    same not-claimed behaviour as before, never a wrong claim.
     """
-    if not due or status in TASK_TERMINAL_STATUSES:
+    if status in TASK_TERMINAL_STATUSES:
         return False
-    text = str(due).strip()
+    text = str(due_normalized or "").strip() or str(due or "").strip()
+    if not text:
+        return False
     try:
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
             when = datetime.fromisoformat(text).replace(
@@ -5011,7 +5659,7 @@ def _new_task_row(user_id, title, *, recording_key="", folder_id="",
                   status=TASK_STATUS_OPEN, source_type=TASK_SOURCE_MANUAL,
                   assignee_contact=None, assignee_name="",
                   assignee_speaker_id="", ai_confidence="", ai_evidence="",
-                  fingerprint="", notified_via=None):
+                  fingerprint="", notified_via=None, due_normalized=""):
     """Assemble a Task row, deriving the identity fields consistently.
 
     The resolution_status logic is the important part and lives ONLY here:
@@ -5031,6 +5679,11 @@ def _new_task_row(user_id, title, *, recording_key="", folder_id="",
         "status": status,
         "priority": priority,
         "due_date": str(due or "").strip()[:100],
+        # The spoken date resolved to a calendar day, or "" when the
+        # phrase is not placeable ("end of Q3"). `due_date` keeps what was
+        # actually said; every comparison uses this. Storing both is the
+        # point: the record stays faithful AND the machinery can compare.
+        "due_date_normalized": str(due_normalized or "").strip()[:10],
         "folder_id": folder_id or "",
         "source_recording_id": recording_key or "",
         "source_type": source_type,
@@ -5213,6 +5866,13 @@ def _seed_ai_tasks(user_id, key, item):
         if c and c.get("owner_user_id") == user_id:
             by_speaker[str(row.get("speaker_id"))] = c
 
+    # The meeting's own day is the only correct anchor for "Friday" or
+    # "tomorrow". Resolving against NOW would silently re-point an old
+    # meeting's deadlines every time this seeder ran. None (no usable
+    # timestamp) leaves every date unresolved rather than guessing.
+    anchor = spoken_dates.anchor_date(item.get("recorded_at"),
+                                      item.get("created_at"))
+
     tombstoned = set(_deleted_fingerprints(item))
     created = 0
     for raw in source[:MAX_TASKS]:
@@ -5233,10 +5893,13 @@ def _seed_ai_tasks(user_id, key, item):
         priority = raw.get("priority") or "Medium"
         if priority not in TASK_PRIORITIES:
             priority = "Medium"
+        spoken_due = raw.get("due_date") or ""
         row = _new_task_row(
             user_id, title,
             recording_key=key, folder_id=folder_id,
-            due=raw.get("due_date") or "",
+            due=spoken_due,
+            due_normalized=spoken_dates.normalize_spoken_date(
+                spoken_due, anchor),
             priority=priority,
             source_type=TASK_SOURCE_AI,
             assignee_contact=contact,
@@ -5320,6 +5983,12 @@ def list_meeting_tasks(event):
                        "count": len(rows)})
 
 
+def _manual_due(data):
+    """The due value a client sent, under either key it may use."""
+    return str(data.get("due") if "due" in data
+               else data.get("due_date") or "").strip()
+
+
 def create_meeting_task(event):
     """POST /recordings/ai/tasks/{key+} {task, due?, priority?, status?,
     assignee_contact_id?, assignee?} -> 201 {task}
@@ -5353,7 +6022,11 @@ def create_meeting_task(event):
         recording_key=key,
         folder_id=str(item.get("folder_id") or ""),
         description=data.get("description") or "",
-        due=data.get("due") or data.get("due_date") or "",
+        due=_manual_due(data),
+        due_normalized=spoken_dates.normalize_spoken_date(
+            _manual_due(data),
+            spoken_dates.anchor_date(item.get("recorded_at"),
+                                     item.get("created_at"))),
         priority=(_clean_task_priority(data["priority"])
                   if data.get("priority") else "Medium"),
         status=(_clean_task_status(data["status"])
@@ -5399,6 +6072,13 @@ def update_meeting_task(event):
     if "due" in data or "due_date" in data:
         raw = data.get("due") if "due" in data else data.get("due_date")
         updates["due_date"] = str(raw or "").strip()[:100]
+        # Re-resolve rather than leaving a stale day behind: an edited due
+        # date whose normalized twin still pointed at the old one would make
+        # overdue/due_before disagree with what the user just typed.
+        updates["due_date_normalized"] = spoken_dates.normalize_spoken_date(
+            updates["due_date"],
+            spoken_dates.anchor_date(item.get("recorded_at"),
+                                     item.get("created_at")))
     if "priority" in data:
         updates["priority"] = _clean_task_priority(data["priority"])
     if "status" in data:
@@ -5597,11 +6277,17 @@ def list_all_tasks(event):
                 continue
             if assigned_to_me and row.get("assignee_user_id") != user_id:
                 continue
-            if overdue_only and not _is_overdue(row.get("due_date"),
-                                                row.get("status")):
+            if overdue_only and not _is_overdue(
+                    row.get("due_date"), row.get("status"),
+                    row.get("due_date_normalized", "")):
                 continue
             if due_before:
-                due = str(row.get("due_date") or "")
+                # Compare on the RESOLVED day; a spoken "Friday" is a real
+                # deadline and belongs in a due_before window. Falling back to
+                # the raw value keeps pre-normalization rows behaving as
+                # before rather than dropping out of the filter entirely.
+                due = (str(row.get("due_date_normalized") or "").strip()
+                       or str(row.get("due_date") or ""))
                 if not due or due > due_before:
                     continue
             out.append(row)
@@ -5781,9 +6467,10 @@ def suggest_task_assignees(event):
     return _resp(200, {
         "status": status,
         "searched_name": name,
-        "candidates": [{**_public_contact(c),
-                        "in_folder": c["contact_id"] in in_folder}
-                       for c in candidates],
+        "candidates": [{**pub,
+                        "in_folder": raw["contact_id"] in in_folder}
+                       for raw, pub in zip(candidates,
+                                           _public_contacts(candidates))],
     })
 
 
@@ -7315,10 +8002,23 @@ def salesforce_lookup_record(event):
 def _render_highlights(item: dict) -> str:
     """The meeting's highlights as plain text for a Salesforce long-text field.
 
-    Prefers the flat `highlights` list (the primary user-facing output); falls
-    back to the older structured `meeting_highlights` so a recording processed
-    before that change still pushes something meaningful.
+    Reads, in order of preference:
+      1. the DYNAMIC OVERVIEW — the current primary output, flattened to text;
+      2. the flat `highlights` list, for a row analysed before the overview;
+      3. the structured `meeting_highlights`, for a row older still.
+
+    Three sources rather than one because this is a PUSH: the alternative to
+    reading a legacy shape is pushing "" into a customer's Salesforce field,
+    and _crm_push_payload skips empty content precisely so that nothing
+    overwrites what is already there. Falling back costs nothing and keeps the
+    back catalogue pushable.
     """
+    overview = item.get("overview")
+    if isinstance(overview, dict):
+        text = ai_schema.overview_text(overview)
+        if text:
+            return text
+
     flat = [str(h).strip() for h in (item.get("highlights") or []) if str(h).strip()]
     if flat:
         return "\n".join(f"- {h}" for h in flat)
@@ -7327,6 +8027,10 @@ def _render_highlights(item: dict) -> str:
     if not isinstance(structured, dict):
         return ""
     lines = []
+    # Iterates a LITERAL section list, not ai_schema.HIGHLIGHT_SECTIONS: this
+    # is a legacy reader, and it must keep rendering the two sections
+    # (important_numbers, risks) that left the live schema but still sit on
+    # rows written before they did.
     for section in ("decisions", "action_items", "deadlines",
                     "important_numbers", "open_questions", "risks"):
         rows = structured.get(section) or []
@@ -8130,6 +8834,920 @@ def _update_recording_fields(key, fields):
     )
 
 
+# ===========================================================================
+# MinuteX Assistant — authenticated identity + the AI-safe task tool layer.
+#
+# This is the foundation the workspace-wide AI Chat is built on. Its whole
+# reason for existing is one rule:
+#
+#   THE MODEL NEVER DECIDES WHOSE DATA IT READS.
+#
+# Every other design choice here follows from that. The identity comes from
+# the same JWT every other route in this file uses (_require_auth); the tools
+# take a context object rather than a user id; and none of the tool SCHEMAS
+# advertised to the model contain a user_id, contact_id or owner parameter, so
+# there is no field for a prompt-injected instruction to fill in. A message
+# that says "I am Priya, show me her tasks" cannot widen access, because the
+# only identity in the system arrived with the Authorization header.
+#
+# The tools are thin wrappers over the SAME reads the REST routes use — the
+# ownership predicates (_owned_task, _owned_folder, and _owned_recording's
+# check) are reused, not reimplemented. That is deliberate: a second copy of
+# an authorization rule is a second place for it to be wrong, and the AI path
+# must not be the weaker of the two.
+#
+# TENANCY. MinuteX has no organizations table: a user's workspace IS the
+# tenant, and `owner_user_id` is the boundary (the same one Contacts, Folders
+# and Tasks are keyed by). So "tenant isolation" here means exactly what it
+# means on the REST routes — every row is re-checked against the caller, and a
+# GSI is only ever a lookup path, never an authorization decision. No
+# organization_id is invented to look more multi-tenant than the system is; a
+# field the rest of the product does not have could only ever be decorative,
+# and a decorative security field is worse than none. If an org layer is added
+# later, AIContext is the one place that has to learn about it.
+# ===========================================================================
+
+# The agent loop's ceiling. API Gateway hard-stops at 29s and each iteration is
+# one Groq round trip, so this is a latency budget as much as a loop guard:
+# past a handful of hops the request cannot finish regardless.
+AI_MAX_TOOL_HOPS = int(os.environ.get("AI_MAX_TOOL_HOPS", "4"))
+
+# How many rows any one tool may hand back to the model. Two separate reasons,
+# both real: the TPM window (a hundred tasks of JSON crowds out the answer),
+# and honesty (a truncated list the model presents as complete is a lie the
+# user cannot see). _tool_result stamps `truncated` so the model can say so.
+AI_TOOL_ROW_LIMIT = int(os.environ.get("AI_TOOL_ROW_LIMIT", "25"))
+
+MAX_AI_MESSAGE_CHARS = 2_000
+AI_HISTORY_TURNS = 6
+
+
+class AIContext:
+    """The authenticated caller, resolved ONCE per request from the JWT.
+
+    Everything the tool layer is allowed to touch hangs off this object, and it
+    is built only by _ai_context() below — i.e. only from a verified token.
+    There is deliberately no constructor path that takes a user id out of a
+    request body: if this could be built from client input, every guarantee in
+    this section would be a comment rather than a control.
+
+    `contact_id` is the caller's own Contact row when one exists. It is not
+    identity (the user_id is) — it is how the caller appears in task
+    assignments, resolved through the existing owner+email index rather than
+    invented.
+    """
+
+    __slots__ = ("user_id", "email", "display_name", "contact_id",
+                 "request_id", "_devices")
+
+    def __init__(self, user_id, email="", display_name="", contact_id="",
+                 request_id=""):
+        self.user_id = user_id
+        self.email = email
+        self.display_name = display_name
+        self.contact_id = contact_id
+        self.request_id = request_id
+        self._devices = None
+
+    @property
+    def devices(self):
+        """Owned device ids, for the legacy recording-ownership path. Read at
+        most once per request — list_recordings pays this cost too."""
+        if self._devices is None:
+            self._devices = _owned_devices(self.user_id)
+        return self._devices
+
+    def owns_recording(self, item):
+        """The SAME predicate _owned_recording enforces, applied to a row we
+        already hold. Kept as one expression so the AI path and the REST path
+        cannot drift apart on what "my meeting" means."""
+        if not item:
+            return False
+        return (item.get("user_id") == self.user_id
+                or item.get("device_id") in self.devices)
+
+
+def _self_contact_id(user_id, email_lc):
+    """The caller's OWN contact row in their own workspace, or "".
+
+    Task assignment in MinuteX is contact-based as well as user-based (a task
+    can carry assignee_contact_id, assignee_user_id, or a bare speaker), so
+    "assigned to me" has to consider both. This resolves the contact half
+    through the existing owner+email index — the same lookup create_contact
+    uses — rather than adding a second notion of "who am I".
+    """
+    email_lc = (email_lc or "").strip().lower()
+    if not email_lc:
+        return ""
+    try:
+        row = _find_contact_by_email(user_id, email_lc)
+    except ClientError as err:
+        print(f"[warn] ai: self-contact lookup failed for {user_id}: {err}")
+        return ""
+    return str((row or {}).get("contact_id") or "")
+
+
+def _ai_context(event):
+    """Build the AIContext for this request from the Authorization header.
+
+    The ONLY entry point into the tool layer's identity. Note what is NOT read
+    here: the request body. A client may send user_id/contact_id/
+    organization_id and it changes nothing — those keys are never looked at,
+    which is the point of section 5.
+    """
+    user_id = _require_auth(event)
+
+    email, display_name = "", ""
+    try:
+        row = _users.get_item(Key={"user_id": user_id}).get("Item") or {}
+        email = str(row.get("email") or "")
+        display_name = str(row.get("name") or "")
+    except ClientError as err:
+        # A profile read failure must not deny access to your own tasks: the
+        # JWT already proved who you are, and name/email are only used to
+        # address the user politely in the prompt.
+        print(f"[warn] ai: profile read failed for {user_id}: {err}")
+
+    rc = event.get("requestContext") or {}
+    return AIContext(
+        user_id=user_id,
+        email=email,
+        display_name=display_name,
+        contact_id=_self_contact_id(user_id, email),
+        request_id=str(rc.get("requestId") or ""),
+    )
+
+
+def _assigned_to_me(row, ctx):
+    """Is this task the CALLER's own work?
+
+    Three signals, in descending strength, all of them already in the task
+    model (section 9) — this adds no fourth concept of ownership:
+      1. assignee_user_id == me — an explicit link to my account.
+      2. assignee_contact_id == my own contact row.
+      3. nobody is assigned at all — an unassigned task in MY workspace is
+         mine by default; it is work I captured and nobody else can see it.
+    A task assigned to SOMEONE ELSE is excluded even though I own the row:
+    "my tasks" means my commitments, not everything I can read.
+    """
+    if row.get("assignee_user_id") == ctx.user_id:
+        return True
+    cid = str(row.get("assignee_contact_id") or "")
+    if cid and cid == ctx.contact_id:
+        return True
+    if cid or row.get("assignee_user_id"):
+        return False
+    # No contact and no user link. A bare speaker/name string means the task
+    # was attributed to someone in a meeting, so it is not unassigned.
+    return not str(row.get("assignee_name")
+                   or row.get("assignee_speaker_id") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Tool output shaping
+# ---------------------------------------------------------------------------
+def _ai_task_view(row, ctx, speaker_names=None):
+    """What a task looks like TO THE MODEL.
+
+    Deliberately narrower than _public_task_v2 (section 8: "do not expose
+    unnecessary internal database fields"): no fingerprints, no notified_via,
+    no legacy assignee shapes, no internal ids beyond the task id the user may
+    legitimately be given. Fewer fields also means more tasks fit the TPM
+    window.
+    """
+    pub = _public_task_v2(row, speaker_names)
+    view = {
+        "id": pub["id"],
+        "title": pub["title"],
+        "status": pub["status"],
+        "priority": pub["priority"],
+        "due_date": pub["due_date"],
+        "is_overdue": pub["is_overdue"],
+        "assigned_to_me": _assigned_to_me(row, ctx),
+        "source": "meeting" if row.get("source_recording_id") else "manual",
+    }
+    if pub.get("description"):
+        view["description"] = pub["description"][:500]
+    # The display name only — never the assignee's contact id, which the model
+    # has no use for and could only echo into an answer.
+    name = (pub.get("assignee") or {}).get("name") or ""
+    if name:
+        view["assignee_name"] = name
+    if pub.get("resolution_status") and \
+            pub["resolution_status"] != RESOLUTION_NONE:
+        view["assignee_resolution"] = pub["resolution_status"]
+    # The evidence sentence from the transcript is the whole point of "what did
+    # I commit to" (section 14) — it is what lets the assistant show WHY a task
+    # exists instead of asserting it.
+    if row.get("ai_evidence"):
+        view["evidence"] = str(row["ai_evidence"])[:300]
+    return view
+
+
+def _ai_meeting_view(item):
+    """A meeting as the model sees it: enough to name it and date it, never
+    the transcript (which is what the per-meeting chat route is for)."""
+    return {
+        "recording_key": item.get("audio_s3_key", ""),
+        "title": item.get("title", "") or "Untitled meeting",
+        "date": item.get("recorded_at", "") or item.get("created_at", ""),
+        "folder_id": str(item.get("folder_id") or ""),
+    }
+
+
+def _tool_result(rows, key, **extra):
+    """Uniform tool envelope: the rows, a count, and an explicit truncation
+    flag. `count` always equals the number of rows actually returned — a count
+    that disagreed with the list is exactly the kind of detail a model will
+    confidently repeat."""
+    shown = rows[:AI_TOOL_ROW_LIMIT]
+    out = {key: shown, "count": len(shown)}
+    if len(rows) > AI_TOOL_ROW_LIMIT:
+        out["truncated"] = True
+        out["note"] = (f"Showing the first {AI_TOOL_ROW_LIMIT} of "
+                       f"{len(rows)}. Tell the user the list is partial.")
+    out.update(extra)
+    return out
+
+# ---------------------------------------------------------------------------
+# The tools themselves.
+#
+# Every one of them takes (ctx, **model_args). The context is NOT a model
+# argument — it is closed over by the dispatcher from the verified session, so
+# no amount of prompt injection can supply or override it. The **model_args a
+# tool does accept are all NON-identity: dates, statuses, search text, a task
+# id. Each is validated here before it reaches DynamoDB, and the ones that
+# name an entity (task_id, recording_key) are ownership-checked against ctx
+# rather than trusted (section 10).
+# ---------------------------------------------------------------------------
+class AIToolError(Exception):
+    """A tool failure the MODEL is allowed to see and explain.
+
+    Distinct from ApiError on purpose: an ApiError aborts the HTTP request,
+    which is right for a REST route but wrong here — "that task does not
+    exist" is information the assistant should relay, not a 404 for the whole
+    conversation. The message is written to be safe to show a user, and says
+    "not found" for both missing AND unauthorized, exactly as _owned_task does
+    (never confirm another tenant's row exists by 403-ing it).
+    """
+
+
+def _ai_owner_tasks(ctx):
+    """Every task in the caller's workspace, newest first.
+
+    Uses the owner-index, whose hash key IS owner_user_id, and then re-checks
+    owner_user_id on every row anyway. That is not redundant paranoia — it is
+    the same rule list_all_tasks documents: the index is a lookup path, never
+    an authorization decision. If this query is ever re-pointed at another
+    index the check is already in the right place.
+    """
+    rows, start = [], None
+    for _ in range(_SEARCH_MAX_PAGES):
+        kwargs = {
+            "IndexName": TASKS_OWNER_INDEX,
+            "KeyConditionExpression": Key("owner_user_id").eq(ctx.user_id),
+            "ScanIndexForward": False,
+        }
+        if start:
+            kwargs["ExclusiveStartKey"] = start
+        res = _tasks.query(**kwargs)
+        rows.extend(r for r in res.get("Items", [])
+                    if r.get("owner_user_id") == ctx.user_id)
+        start = res.get("LastEvaluatedKey")
+        if not start:
+            break
+    return rows
+
+
+def _ai_render_tasks(rows, ctx):
+    """Task rows -> model views, with ONE recording read per distinct meeting
+    (the names cache), matching list_all_tasks' cost profile."""
+    cache = {}
+    return [_ai_task_view(
+                r, ctx,
+                _speaker_names_for_recording(r.get("source_recording_id"), cache))
+            for r in rows]
+
+
+def _ai_sort_by_due(rows):
+    """Soonest due first, undated last. Undated tasks sort last rather than
+    first because a task with no date is not urgent — putting it at the top of
+    "what is due" would be actively misleading."""
+    return sorted(rows, key=lambda r: (not str(r.get("due_date") or ""),
+                                       str(r.get("due_date") or "")))
+
+
+def _ai_clean_status(raw):
+    """A model-supplied status, or "" — never an ApiError.
+
+    The REST layer 400s on a bad status because a client sent it and should be
+    fixed. Here the "client" is a language model that may well say "done", so
+    an unrecognized value is treated as no filter and the model sees the full
+    list rather than an error it cannot act on.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    return _TASK_STATUS_ALIASES.get(text.casefold(), "")
+
+
+def _ai_clean_date(raw, field):
+    """A bare YYYY-MM-DD, validated. Anything else is rejected loudly.
+
+    Dates are the one model-supplied argument where silently ignoring a bad
+    value would be dangerous: "what is due before next Friday" answered
+    without the filter returns EVERYTHING, and the model would present that as
+    the answer to the narrower question.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise AIToolError(f"{field} must be a date in YYYY-MM-DD form")
+    try:
+        datetime.fromisoformat(text)
+    except ValueError:
+        raise AIToolError(f"{field} is not a real date")
+    return text
+
+
+def _ai_today():
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+# -- the six read tools -----------------------------------------------------
+def tool_get_my_tasks(ctx, status="", include_assigned_to_others=False,
+                      limit=None):
+    """Open work that belongs to the signed-in user."""
+    rows = _ai_owner_tasks(ctx)
+    if not include_assigned_to_others:
+        rows = [r for r in rows if _assigned_to_me(r, ctx)]
+    want = _ai_clean_status(status)
+    if want:
+        rows = [r for r in rows if r.get("status") == want]
+    else:
+        # With no status asked for, "my tasks" means outstanding work. A
+        # completed task is not something the user still has to do, and
+        # including it would pad every answer with finished work.
+        rows = [r for r in rows if r.get("status") not in TASK_TERMINAL_STATUSES]
+    rows = _ai_sort_by_due(rows)
+    if limit:
+        rows = rows[:max(1, min(int(limit), AI_TOOL_ROW_LIMIT))]
+    return _tool_result(_ai_render_tasks(rows, ctx), "tasks",
+                        filter=("all_statuses" if want else "outstanding_only"))
+
+
+def tool_get_overdue_tasks(ctx):
+    """Past their due date and not finished. Overdue is COMPUTED from the
+    clock by the same _is_overdue the REST layer uses, never read from a
+    stored flag that nothing updates at midnight."""
+    rows = [r for r in _ai_owner_tasks(ctx)
+            if _assigned_to_me(r, ctx)
+            and _is_overdue(r.get("due_date"), r.get("status"),
+                            r.get("due_date_normalized", ""))]
+    rows = _ai_sort_by_due(rows)
+    return _tool_result(_ai_render_tasks(rows, ctx), "tasks",
+                        as_of=_ai_today())
+
+
+def tool_get_upcoming_tasks(ctx, due_before="", days=7):
+    """Due between today and a horizon — "what do I need to finish this week".
+
+    Already-overdue tasks are excluded: they are what get_overdue_tasks is
+    for, and mixing them in makes "this week" quietly mean "this week plus
+    everything I am already late on".
+    """
+    horizon = _ai_clean_date(due_before, "due_before")
+    if not horizon:
+        try:
+            span = max(1, min(int(days), 365))
+        except (TypeError, ValueError):
+            span = 7
+        horizon = (datetime.now(timezone.utc).date()
+                   + timedelta(days=span)).isoformat()
+
+    today = _ai_today()
+    rows = []
+    for r in _ai_owner_tasks(ctx):
+        if not _assigned_to_me(r, ctx):
+            continue
+        if r.get("status") in TASK_TERMINAL_STATUSES:
+            continue
+        due = str(r.get("due_date") or "")
+        if not due:
+            continue
+        # Compare on the DATE part so a full ISO timestamp sorts against a
+        # bare date correctly; an unparseable AI date ("next Friday") simply
+        # does not match a range and is left out rather than guessed at.
+        day = due[:10]
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            continue
+        if today <= day <= horizon:
+            rows.append(r)
+    return _tool_result(_ai_render_tasks(_ai_sort_by_due(rows), ctx), "tasks",
+                        window={"from": today, "to": horizon})
+
+
+def tool_get_task(ctx, task_id=""):
+    """One task by id — ownership-checked, never trusted from the model.
+
+    _owned_task is the SAME predicate GET /tasks/{id} enforces, and it answers
+    404 for a task belonging to anyone else. So a model that invents or is fed
+    another tenant's task id learns nothing beyond "not found".
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        raise AIToolError("task_id is required")
+    try:
+        row = _owned_task(ctx.user_id, tid)
+    except ApiError:
+        raise AIToolError("No task with that id exists in your workspace.")
+
+    view = _ai_task_view(
+        row, ctx, _speaker_names_for_recording(row.get("source_recording_id")))
+    out = {"task": view}
+
+    # The meeting it came from, ownership-checked in its own right rather than
+    # assumed from the task (defense in depth: the task pointing at it is not
+    # by itself proof the caller may read that recording row).
+    key = row.get("source_recording_id")
+    if key:
+        rec = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+        if ctx.owns_recording(rec):
+            out["meeting"] = _ai_meeting_view(rec)
+    fid = row.get("folder_id")
+    if fid:
+        folder = _folders.get_item(Key={"folder_id": fid}).get("Item")
+        if folder and folder.get("owner_user_id") == ctx.user_id:
+            out["folder_name"] = folder.get("name", "")
+    return out
+
+
+def tool_search_my_tasks(ctx, query="", status="", include_completed=False):
+    """Substring search across the caller's own tasks.
+
+    Applied AFTER the owner-scoped read, never as a query that could reach
+    outside it — the same shape as the REST contact search.
+    """
+    needle = str(query or "").strip().casefold()
+    if not needle:
+        raise AIToolError("query is required")
+
+    want = _ai_clean_status(status)
+    rows = []
+    for r in _ai_owner_tasks(ctx):
+        if want and r.get("status") != want:
+            continue
+        if not include_completed and not want and \
+                r.get("status") in TASK_TERMINAL_STATUSES:
+            continue
+        haystack = " ".join(str(r.get(f) or "") for f in
+                            ("title", "description", "assignee_name",
+                             "ai_evidence")).casefold()
+        if needle in haystack:
+            rows.append(r)
+    return _tool_result(_ai_render_tasks(_ai_sort_by_due(rows), ctx), "tasks",
+                        query=str(query).strip()[:100])
+
+
+def tool_get_tasks_from_meeting(ctx, recording_key="", meeting_query=""):
+    """Tasks captured from ONE meeting — the "what did I commit to" tool.
+
+    The meeting can be named either by its key or in words ("yesterday's
+    standup"), and either way it is resolved against MEETINGS THE CALLER OWNS
+    before any task is read. A key the caller does not own is "not found", the
+    same answer _owned_recording gives.
+    """
+    key = str(recording_key or "").strip()
+    if key:
+        rec = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+        if not ctx.owns_recording(rec):
+            raise AIToolError("No meeting with that id exists in your workspace.")
+    else:
+        rec = _ai_resolve_meeting(ctx, meeting_query)
+        if not rec:
+            raise AIToolError(
+                "Could not find a meeting matching that. Ask the user which "
+                "meeting they mean.")
+        key = rec.get("audio_s3_key", "")
+
+    # Meeting-index rows are re-checked against the owner before use, for the
+    # same reason list_all_tasks does it: the index is a lookup path only.
+    rows = [r for r in _tasks_for_recording(key)
+            if r.get("owner_user_id") == ctx.user_id]
+    names = _speaker_names_for_recording(key)
+    views = [_ai_task_view(r, ctx, names) for r in _ai_sort_by_due(rows)]
+    return _tool_result(views, "tasks", meeting=_ai_meeting_view(rec))
+
+
+def _ai_recent_meetings(ctx, limit=40):
+    """The caller's recent meetings, newest first.
+
+    Mirrors list_recordings' union (user-index for user-owned rows, plus the
+    legacy device-index path) so the assistant can see exactly the meetings
+    MinuteX shows — no more, and no fewer.
+    """
+    seen, out = set(), []
+
+    def _collect(items):
+        for item in items:
+            key = item.get("audio_s3_key", "")
+            if not key or key in seen or _is_trashed(item):
+                continue
+            seen.add(key)
+            out.append(item)
+
+    res = _recordings.query(
+        IndexName=USER_INDEX,
+        KeyConditionExpression=Key("user_id").eq(ctx.user_id),
+        ScanIndexForward=False, Limit=limit)
+    _collect(res.get("Items", []))
+
+    for device_id in ctx.devices:
+        res = _recordings.query(
+            IndexName=DEVICE_INDEX,
+            KeyConditionExpression=Key("device_id").eq(device_id),
+            ScanIndexForward=False, Limit=limit)
+        _collect(r for r in res.get("Items", []) if ctx.owns_recording(r))
+
+    out.sort(key=lambda r: str(r.get("recorded_at") or r.get("created_at") or ""),
+             reverse=True)
+    return out[:limit]
+
+
+def _ai_resolve_meeting(ctx, query):
+    """A meeting matching free text, or None. Owner-scoped by construction:
+    it only ever looks at _ai_recent_meetings, which is already the caller's.
+
+    Title match first, then relative-date words. "Latest"/"" falls back to the
+    most recent meeting, which is what a bare "the meeting" almost always
+    means.
+    """
+    meetings = _ai_recent_meetings(ctx)
+    if not meetings:
+        return None
+    text = str(query or "").strip().casefold()
+    if not text or text in ("latest", "last", "most recent", "the meeting"):
+        return meetings[0]
+
+    for item in meetings:
+        if text in str(item.get("title") or "").casefold():
+            return item
+
+    today = datetime.now(timezone.utc).date()
+    target = None
+    if "yesterday" in text:
+        target = (today - timedelta(days=1)).isoformat()
+    elif "today" in text:
+        target = today.isoformat()
+    if target:
+        for item in meetings:
+            when = str(item.get("recorded_at") or item.get("created_at") or "")
+            if when[:10] == target:
+                return item
+        return None
+
+    # A bare date in the question ("the Aug 20 call" arrives as 2026-08-20
+    # once the model normalizes it) is worth honoring.
+    match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+    if match:
+        for item in meetings:
+            when = str(item.get("recorded_at") or item.get("created_at") or "")
+            if when[:10] == match.group(0):
+                return item
+    return None
+
+
+def tool_list_my_meetings(ctx, limit=10):
+    """Recent meetings — what the assistant needs to answer "which meeting?"
+    and to turn a name into something get_tasks_from_meeting can use."""
+    try:
+        count = max(1, min(int(limit), AI_TOOL_ROW_LIMIT))
+    except (TypeError, ValueError):
+        count = 10
+    rows = _ai_recent_meetings(ctx, limit=max(count, 20))[:count]
+    return _tool_result([_ai_meeting_view(r) for r in rows], "meetings")
+
+# ---------------------------------------------------------------------------
+# Tool schemas — what the MODEL is told exists.
+#
+# Read the parameter lists closely: there is no user_id, contact_id,
+# organization_id, owner or account field anywhere in them, and that is the
+# single most important property of this section. The model cannot ask for
+# another user's data because the function signature it can see has nowhere to
+# put one. Identity is supplied by the dispatcher from the session; these
+# schemas describe only WHAT to fetch, never WHOSE.
+# ---------------------------------------------------------------------------
+AI_TOOL_SCHEMAS = [
+    {"type": "function", "function": {
+        "name": "get_my_tasks",
+        "description": (
+            "The signed-in user's own outstanding tasks, soonest due first. "
+            "Use for 'what are my tasks', 'what am I working on', 'what do I "
+            "owe'. Returns only tasks assigned to the signed-in user unless "
+            "include_assigned_to_others is true."),
+        "parameters": {"type": "object", "properties": {
+            "status": {"type": "string",
+                       "enum": ["Open", "In Progress", "Completed", "Cancelled"],
+                       "description": "Only this status. Omit for all "
+                                      "outstanding (non-completed) work."},
+            "include_assigned_to_others": {
+                "type": "boolean",
+                "description": "Also include tasks in the user's workspace "
+                               "that are assigned to other people. Use for "
+                               "'all tasks', not for 'my tasks'."},
+        }, "required": []}}},
+    {"type": "function", "function": {
+        "name": "get_overdue_tasks",
+        "description": (
+            "The signed-in user's tasks whose due date has passed and which "
+            "are not finished. Use for 'what is overdue', 'what am I late "
+            "on', 'what did I miss'."),
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "get_upcoming_tasks",
+        "description": (
+            "The signed-in user's tasks due between today and a horizon. Use "
+            "for 'what is due this week', 'what is coming up', 'what do I "
+            "need to finish by Friday'. Excludes already-overdue tasks."),
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer",
+                     "description": "Days ahead to look. Default 7."},
+            "due_before": {"type": "string",
+                           "description": "Explicit horizon as YYYY-MM-DD. "
+                                          "Overrides days."},
+        }, "required": []}}},
+    {"type": "function", "function": {
+        "name": "search_my_tasks",
+        "description": (
+            "Search the signed-in user's tasks by keyword — title, "
+            "description, assignee name or the sentence the task came from. "
+            "Use when the user names a topic, project or person."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Words to search for."},
+            "status": {"type": "string",
+                       "enum": ["Open", "In Progress", "Completed", "Cancelled"],
+                       "description": "Restrict to one status."},
+            "include_completed": {"type": "boolean",
+                                  "description": "Include finished tasks."},
+        }, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "get_task",
+        "description": (
+            "Full detail for ONE task by its id, including the meeting it "
+            "came from. Only call with an id returned by another tool."),
+        "parameters": {"type": "object", "properties": {
+            "task_id": {"type": "string",
+                        "description": "Task id from an earlier tool result."},
+        }, "required": ["task_id"]}}},
+    {"type": "function", "function": {
+        "name": "get_tasks_from_meeting",
+        "description": (
+            "Tasks captured from one meeting, with the evidence sentence "
+            "behind each. Use for 'what did I commit to in yesterday's "
+            "meeting' or 'what came out of the Acme call'. Name the meeting "
+            "in meeting_query, or pass a recording_key from list_my_meetings."),
+        "parameters": {"type": "object", "properties": {
+            "meeting_query": {"type": "string",
+                              "description": "How the user referred to the "
+                                             "meeting: a title, 'yesterday', "
+                                             "'latest', or a YYYY-MM-DD date."},
+            "recording_key": {"type": "string",
+                              "description": "Exact key from list_my_meetings."},
+        }, "required": []}}},
+    {"type": "function", "function": {
+        "name": "list_my_meetings",
+        "description": (
+            "The signed-in user's recent meetings, newest first. Use to find "
+            "which meeting the user means before asking for its tasks."),
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer",
+                      "description": "How many to return. Default 10."},
+        }, "required": []}}},
+]
+
+# name -> (implementation, accepted argument names). The dispatcher below is
+# the ONLY caller, and it passes ctx positionally, so a tool can never be
+# reached without one.
+#
+# The argument names are listed EXPLICITLY rather than read off the function
+# signature. That keeps the set of things a model may influence visible in one
+# place next to the schemas, and means adding a parameter to a tool never
+# silently widens what the model can pass — the allowlist has to be edited on
+# purpose.
+AI_TOOLS = {
+    "get_my_tasks": (tool_get_my_tasks,
+                     ("status", "include_assigned_to_others", "limit")),
+    "get_overdue_tasks": (tool_get_overdue_tasks, ()),
+    "get_upcoming_tasks": (tool_get_upcoming_tasks, ("due_before", "days")),
+    "search_my_tasks": (tool_search_my_tasks,
+                        ("query", "status", "include_completed")),
+    "get_task": (tool_get_task, ("task_id",)),
+    "get_tasks_from_meeting": (tool_get_tasks_from_meeting,
+                               ("recording_key", "meeting_query")),
+    "list_my_meetings": (tool_list_my_meetings, ("limit",)),
+}
+
+# Arguments the model is NEVER allowed to set, whatever the schemas say. The
+# schemas already omit them, so reaching this list means either a model
+# hallucinated an identity parameter or something tried to inject one — both
+# worth a log line, and neither worth honoring. Belt and braces on the single
+# rule this whole section exists to enforce.
+_AI_FORBIDDEN_ARGS = ("user_id", "owner_user_id", "contact_id", "assignee_user_id",
+                      "organization_id", "org_id", "tenant_id", "account_id",
+                      "email", "ctx", "context")
+
+
+def _ai_dispatch(ctx, name, raw_args):
+    """Run one tool call and return its JSON-serializable result.
+
+    Never raises: a tool failure comes back as {"error": ...} so the model can
+    tell the user it could not retrieve something, which is a far better
+    outcome than a 500 that loses the whole conversation. The one thing that
+    IS refused outright is an attempt to pass identity.
+    """
+    entry = AI_TOOLS.get(name)
+    if entry is None:
+        return {"error": f"unknown tool: {name}"}
+    fn, allowed = entry
+
+    args = raw_args if isinstance(raw_args, dict) else {}
+    stripped = [k for k in args if k.lower() in _AI_FORBIDDEN_ARGS]
+    if stripped:
+        # Log the ATTEMPT (ids only, per the audit rules) and drop the keys.
+        # Execution continues with the caller's real identity, so the model
+        # gets its own data rather than an error it might narrate as someone
+        # else's absence of data.
+        print(f"[audit] ai.tool.identity_arg_rejected user={ctx.user_id} "
+              f"tool={name} args={sorted(stripped)} req={ctx.request_id}")
+        args = {k: v for k, v in args.items() if k.lower() not in _AI_FORBIDDEN_ARGS}
+
+    # Unknown extras are dropped rather than passed through as **kwargs, which
+    # would TypeError on a model that invents a parameter — a routine event.
+    args = {k: v for k, v in args.items() if k in allowed}
+
+    try:
+        result = fn(ctx, **args)
+        ok, count = True, result.get("count")
+    except AIToolError as err:
+        result, ok, count = {"error": str(err)}, False, None
+    except ApiError as err:
+        result, ok, count = {"error": err.message}, False, None
+    except ClientError as err:
+        print(f"[error] ai.tool {name} failed for {ctx.user_id}: {err}")
+        result, ok, count = {"error": "That could not be retrieved."}, False, None
+
+    # Section 18: ids, tool name, outcome and correlation id — never the
+    # message text, never task titles, never anything from a transcript.
+    print(f"[audit] ai.tool user={ctx.user_id} tool={name} "
+          f"ok={ok} rows={count if count is not None else '-'} "
+          f"req={ctx.request_id}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# The agent loop
+# ---------------------------------------------------------------------------
+def _ai_clean_ai_history(raw):
+    """Validate client-supplied history — same rules as the meeting chat's
+    _clean_history: only user/assistant, only strings, only the recent tail."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ApiError(400, "history must be an array of {role, content}")
+    out = []
+    for m in raw[-(AI_HISTORY_TURNS * 2):]:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip().lower()
+        content = str(m.get("content") or "").strip()[:MAX_AI_MESSAGE_CHARS]
+        if role in ("user", "assistant") and content:
+            out.append({"role": role, "content": content})
+    return out
+
+
+def _ai_run_agent(ctx, message, history):
+    """Drive the model until it answers, executing tool calls in between.
+
+    Returns (reply_text, tools_used). The loop is bounded by AI_MAX_TOOL_HOPS
+    and by the same wall-clock deadline the rest of the on-demand AI uses, so
+    it cannot outlive API Gateway's 29s ceiling; a model that keeps asking for
+    tools past the budget is answered from what it has rather than left to be
+    killed mid-call.
+    """
+    system = (prompts.ASSISTANT_SYSTEM + "\n"
+              + prompts.assistant_identity(
+                  display_name=ctx.display_name, email=ctx.email,
+                  today=_ai_today()))
+
+    messages = [{"role": "system", "content": system}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": message})
+
+    deadline = time.monotonic() + ONDEMAND_DEADLINE_SECONDS
+    used = []
+
+    for hop in range(AI_MAX_TOOL_HOPS):
+        # On the last hop the tools are withdrawn, which forces prose: left
+        # available, a model can spend the final turn asking for another call
+        # whose result nobody will ever read, and the user gets no answer.
+        last = hop == AI_MAX_TOOL_HOPS - 1
+        reply = groq_client.complete_with_tools(
+            messages, [] if last else AI_TOOL_SCHEMAS,
+            label="assistant", temperature=0.2, deadline=deadline)
+
+        calls = reply.get("tool_calls") or []
+        if not calls or last:
+            return (reply.get("content") or "").strip(), used
+
+        # The assistant turn must go back verbatim, tool_calls included:
+        # a tool result with no matching call is a protocol error.
+        messages.append({"role": "assistant",
+                         "content": reply.get("content") or "",
+                         "tool_calls": calls})
+
+        for call in calls[:len(AI_TOOLS)]:
+            fn = call.get("function") or {}
+            name = str(fn.get("name") or "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except (ValueError, TypeError):
+                args = {}
+            result = _ai_dispatch(ctx, name, args)
+            used.append(name)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.get("id", ""),
+                "name": name,
+                "content": json.dumps(result, default=str),
+            })
+
+        if time.monotonic() >= deadline:
+            break
+
+    # Out of hops or out of time with tool results in hand. Ask for the answer
+    # with no tools attached rather than returning nothing.
+    try:
+        reply = groq_client.complete_with_tools(
+            messages, [], label="assistant-final", temperature=0.2,
+            deadline=time.monotonic() + 8)
+        return (reply.get("content") or "").strip(), used
+    except groq_client.GroqError:
+        return "", used
+
+
+def ai_chat(event):
+    """POST /ai/chat {message, history?} -> {reply, tools_used}
+
+    The workspace-wide assistant. The client sends ONLY a message: identity
+    comes from the Authorization header via _ai_context, and any user_id or
+    contact_id in the body is ignored outright (section 5/19).
+
+    Stateless by design — history round-trips through the client, as the
+    meeting chat already allows. There is no conversation store to build
+    (and no DynamoDB item to grow) until the product decides it needs one.
+    """
+    ctx = _ai_context(event)
+    data = _body(event)
+
+    message = str(data.get("message") or "").strip()
+    if not message:
+        raise ApiError(400, "message required")
+    if len(message) > MAX_AI_MESSAGE_CHARS:
+        raise ApiError(400,
+                       f"message too long (max {MAX_AI_MESSAGE_CHARS} chars)")
+
+    history = _ai_clean_ai_history(data.get("history"))
+
+    print(f"[audit] ai.chat user={ctx.user_id} chars={len(message)} "
+          f"turns={len(history)} req={ctx.request_id}")
+
+    try:
+        reply, used = _ai_run_agent(ctx, message, history)
+    except groq_client.GroqError as err:
+        _groq_error(err, "a reply")
+
+    if not reply:
+        raise ApiError(502, "Unable to generate a reply. Please retry.")
+    return _resp(200, {"reply": reply, "tools_used": used})
+
+
+def ai_suggestions(event):
+    """GET /ai/suggestions -> {suggestions}
+
+    Starter prompts, served from the backend for the same reason the meeting
+    chat serves its own: the catalogue belongs in one place, not hardcoded in
+    the app. Authenticated so it cannot be used to probe the API anonymously.
+    """
+    _require_auth(event)
+    return _resp(200, {"suggestions": [
+        "What are my tasks?",
+        "What's overdue?",
+        "What do I need to finish this week?",
+        "What did I commit to in my last meeting?",
+    ]})
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -8139,6 +9757,7 @@ _ROUTES = {
     ("GET", "/me"): get_me,
     ("PATCH", "/me"): patch_me,
     ("POST", "/me/password"): change_password,
+    ("POST", "/avatars/upload-request"): request_avatar_upload,
     ("POST", "/devices/pair-request"): pair_request,
     ("POST", "/devices/pair"): pair_device,
     ("POST", "/devices/claim"): claim_device,   # legacy — see claim_device()
@@ -8168,6 +9787,15 @@ _ROUTES = {
     ("PATCH", "/recordings/ai/documents/{key+}"): update_document,
     ("DELETE", "/recordings/ai/documents/{key+}"): delete_document,
     ("POST", "/recordings/ai/custom-document/{key+}"): generate_custom_document,
+    # Minutes of Meeting — the STRUCTURED, editable MoM. GET reads, POST
+    # generates/regenerates (merging over user edits), PUT saves the whole
+    # edited structure, DELETE resets it. Every write also refreshes the
+    # mirrored documents.minutes_of_meeting, so the Documents list, DOCX/PDF
+    # export and Share keep working with no knowledge of the structure.
+    ("GET", "/recordings/ai/mom/{key+}"): get_mom,
+    ("POST", "/recordings/ai/mom/{key+}"): generate_mom,
+    ("PUT", "/recordings/ai/mom/{key+}"): save_mom,
+    ("DELETE", "/recordings/ai/mom/{key+}"): delete_mom,
     ("POST", "/recordings/ai/update-documents/{key+}"): update_stale_documents,
     ("POST", "/recordings/ai/reprocess/{key+}"): reprocess_recording,
     ("POST", "/recordings/ai/quick/{key+}"): quick_action,
@@ -8226,6 +9854,12 @@ _ROUTES = {
     ("PATCH", "/tasks/{task_id}"): update_task_v2,
     ("POST", "/tasks/{task_id}/resolve"): resolve_task_assignee,
     ("GET", "/tasks/{task_id}/assignee-candidates"): suggest_task_assignees,
+    # MinuteX Assistant — the workspace-wide AI. Distinct from the per-meeting
+    # /recordings/ai/chat/{key+} above: that one answers about ONE transcript,
+    # this one answers about the user's whole workspace by calling the task
+    # tools. The client sends only {message}; identity comes from the JWT.
+    ("POST", "/ai/chat"): ai_chat,
+    ("GET", "/ai/suggestions"): ai_suggestions,
     # CRM — Salesforce connect (Phase 1). /callback is the one route in this
     # file Salesforce's browser redirect calls directly — no JWT, verified
     # via `state` instead. See the section above for the full flow.

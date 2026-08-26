@@ -1,20 +1,25 @@
 // src/app/(tabs)/profile.tsx — You: account, plan, preferences.
 //
 // "Workspace" edition. The masthead carries the email as its kicker and the
-// name as the bold title, with the initial set in a filled, fully rounded
-// avatar circle to its right. Stats live in a rounded, shadowed Card strip.
+// name as the bold title, with the profile photo — or the coloured initials
+// that stand in for one — in a circle to its right; tapping it opens the photo
+// picker. Stats live in a rounded, shadowed Card strip.
 // Account fields are backed by the userApi /me endpoints; plan tiers are
 // honest Coming Soon placeholders (no billing backend yet) — visible but
 // clearly not live.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { S, R, ELEV, CAPS, FONT, TABULAR, useTheme, ColorScale } from "../../../lib/theme";
 import {
-  Button, ComingSoonRow, ErrorText, ListRow, Loading, Masthead, SectionRule,
-  SoonBadge, SwitchRow, TextField, Toast, KeyboardAware, scrollFormProps,
+  Avatar, Button, ComingSoonRow, ErrorText, ListRow, Loading, Masthead,
+  SectionRule, SoonBadge, SwitchRow, TextField, Toast, KeyboardAware,
+  scrollFormProps,
 } from "../../../lib/ui";
+import { Icon } from "../../../lib/icons";
+import { PhotoPicker } from "../../../lib/photo-picker";
+import { canPickImage } from "../../../lib/avatars";
 import {
   canUseWavEngine, getRecEngine, loadRecEngine, setRecEngine,
 } from "../../../lib/rec-engine";
@@ -27,13 +32,14 @@ import {
 function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
   return StyleSheet.create({
     container: { flex: 1, backgroundColor: C.bg, paddingHorizontal: 20 },
-    // A filled, fully-rounded avatar disc in the soft primary tint.
-    avatar: {
-      width: 52, height: 52, borderRadius: R.pill,
-      backgroundColor: C.primarySoft,
+    // The little edit affordance on the avatar. Bordered in the page
+    // background so it reads as sitting ON the disc at any avatar colour.
+    avatarBadge: {
+      position: "absolute" as const, right: -2, bottom: -2,
+      width: 20, height: 20, borderRadius: 10,
+      backgroundColor: C.primary, borderWidth: 2, borderColor: C.bg,
       alignItems: "center" as const, justifyContent: "center" as const,
     },
-    avatarTxt: { fontFamily: FONT.extrabold, fontSize: 22, color: C.primary },
     editRow: { flexDirection: "row" as const, gap: S.sm, marginTop: S.md },
     pwMsg: { fontFamily: FONT.regular, fontSize: 13, color: C.primary, marginTop: S.sm },
     // Stat strip — a rounded, softly-shadowed Card split into two cells.
@@ -84,6 +90,11 @@ export default function ProfileScreen() {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState("");
   const [saving, setSaving] = useState(false);
+
+  // Profile photo. The picker uploads and hands back an S3 key; saving it is
+  // this screen's job (see savePhoto), which is what keeps an abandoned sheet
+  // from half-writing the profile.
+  const [photoOpen, setPhotoOpen] = useState(false);
 
   // Change-password state
   const [pwOpen, setPwOpen] = useState(false);
@@ -147,6 +158,14 @@ export default function ProfileScreen() {
     } finally { setSaving(false); }
   };
 
+  const savePhoto = async (avatarKey: string) => {
+    // Errors are re-thrown, not swallowed: the sheet is still open and shows
+    // the message, which is better than closing on a save that did not happen.
+    const u = await updateMe({ avatar_url: avatarKey });
+    setMe(u);
+    showToast(avatarKey ? "Photo updated" : "Photo removed");
+  };
+
   const submitPw = async () => {
     setPwMsg("");
     if (newPw.length < 8) { setPwMsg("New password must be at least 8 characters."); return; }
@@ -171,8 +190,6 @@ export default function ProfileScreen() {
 
   if (loading) return <Loading label="Loading profile…" />;
 
-  const initial = (me?.name || me?.email || "?").trim().charAt(0).toUpperCase();
-
   return (
     <KeyboardAware>
       <ScrollView style={[st.container, { paddingTop: insets.top + S.lg }]}
@@ -180,7 +197,38 @@ export default function ProfileScreen() {
         <Masthead
           kicker={me?.email}
           title={me?.name || "Add your name"}
-          right={<View style={st.avatar}><Text style={st.avatarTxt}>{initial}</Text></View>}
+          right={
+            <Pressable
+              onPress={() => setPhotoOpen(true)}
+              // A build without the native picker cannot open the sheet, so
+              // the disc stays a plain avatar rather than a dead tap target.
+              disabled={!canPickImage()}
+              accessibilityRole="button"
+              accessibilityLabel={
+                me?.avatar_view_url ? "Change your profile photo"
+                                    : "Add a profile photo"
+              }
+              hitSlop={8}
+            >
+              <View>
+                <Avatar
+                  name={me?.name || me?.email || ""}
+                  photoUri={me?.avatar_view_url}
+                  size={52}
+                  fontSize={22}
+                />
+                {canPickImage() ? (
+                  <View style={st.avatarBadge}>
+                    <Icon
+                      name={me?.avatar_view_url ? "pencil" : "plus"}
+                      size={11}
+                      tintColor="#fff"
+                    />
+                  </View>
+                ) : null}
+              </View>
+            </Pressable>
+          }
         />
         {error ? <ErrorText>{error}</ErrorText> : null}
 
@@ -272,6 +320,16 @@ export default function ProfileScreen() {
         <ListRow icon="info.circle" label="About MinuteX" sub="Version 1.0.0 · by Exceller Tech" />
         <ListRow icon="rectangle.portrait.and.arrow.right" label="Sign out" destructive onPress={logout} />
       </ScrollView>
+
+      <PhotoPicker
+        visible={photoOpen}
+        onClose={() => setPhotoOpen(false)}
+        name={me?.name || me?.email || ""}
+        currentPhotoUri={me?.avatar_view_url}
+        scope="user"
+        onPicked={savePhoto}
+        canRemove={!!me?.avatar_url}
+      />
 
       <Toast visible={!!toast} label={toast} />
     </KeyboardAware>

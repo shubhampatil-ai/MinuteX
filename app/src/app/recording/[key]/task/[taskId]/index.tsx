@@ -17,6 +17,7 @@ import { FONT, R, S, useTheme, ColorScale } from "../../../../../../lib/theme";
 import { Button, StatusPill } from "../../../../../../lib/ui";
 import { Icon } from "../../../../../../lib/icons";
 import { useMeeting } from "../../../../../../lib/meeting-context";
+import { DueDatePicker, isPlottableDue } from "../../../../../../lib/due-date-picker";
 import { initialsOf, nextId, type Task, type TaskStatus } from "../../../../../../lib/task-model";
 import { Pop, PressSpring } from "../../../../../../lib/motion";
 
@@ -102,7 +103,8 @@ export default function TaskDetailScreen() {
   const [notesDraft, setNotesDraft] = useState(task?.notes ?? "");
   const [statusPickerOpen, setStatusPickerOpen] = useState(false);
   const [priorityPickerOpen, setPriorityPickerOpen] = useState(false);
-  const [editingField, setEditingField] = useState<"title" | "description" | "due" | null>(null);
+  const [editingField, setEditingField] = useState<"title" | "description" | null>(null);
+  const [dueOpen, setDueOpen] = useState(false);
   const [editDraft, setEditDraft] = useState("");
 
   if (!task) {
@@ -120,16 +122,18 @@ export default function TaskDetailScreen() {
 
   const toggleDone = () => setTaskStatus(task.id, done ? "Open" : "Completed");
 
-  const openEdit = (field: "title" | "description" | "due") => {
-    setEditDraft(field === "title" ? task.task : field === "description" ? task.description : task.due);
+  // Text fields only. The due date is PICKED (DueDatePicker) rather than typed
+  // — dropping it from this union is what stops a future caller quietly
+  // reintroducing a free-text date the calendar cannot plot.
+  const openEdit = (field: "title" | "description") => {
+    setEditDraft(field === "title" ? task.task : task.description);
     setEditingField(field);
   };
   const saveEdit = () => {
     if (!editingField) return;
     const trimmed = editDraft.trim();
     if (editingField === "title") updateTask(task.id, trimmed ? { task: trimmed } : {});
-    else if (editingField === "description") updateTask(task.id, { description: trimmed });
-    else if (editingField === "due") updateTask(task.id, { due: trimmed });
+    else updateTask(task.id, { description: trimmed });
     setEditingField(null);
   };
 
@@ -229,7 +233,7 @@ export default function TaskDetailScreen() {
             </Pressable>
           </View>
 
-          <Pressable style={st.row} onPress={() => openEdit("due")} accessibilityLabel="Edit due date">
+          <Pressable style={st.row} onPress={() => setDueOpen(true)} accessibilityLabel="Edit due date">
             <Text style={st.rowLabel}>Due Date</Text>
             <View style={st.linkChip}>
               <Icon name="calendar" tintColor={C.textFaint} size={14} />
@@ -437,12 +441,22 @@ export default function TaskDetailScreen() {
         </Pressable>
       </Modal>
 
+      {/* Due dates are PICKED, never typed. update_meeting_task stores
+          due_date verbatim, so free text ("next Friday") would persist and
+          then fail to plot on /calendar — see lib/due-date-picker.tsx. */}
+      <DueDatePicker
+        visible={dueOpen}
+        onClose={() => setDueOpen(false)}
+        value={isPlottableDue(task.due) ? task.due : ""}
+        onChange={(dayKey) => updateTask(task.id, { due: dayKey })}
+      />
+
       <Modal visible={editingField !== null} transparent animationType="fade" onRequestClose={() => setEditingField(null)}>
         <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
           <Pressable style={st.sheetBackdrop} onPress={() => setEditingField(null)}>
             <Pressable style={st.sheet} onPress={() => {}}>
               <Text style={st.sheetTitle}>
-                {editingField === "title" ? "Edit title" : editingField === "description" ? "Edit description" : "Edit due date"}
+                {editingField === "title" ? "Edit title" : "Edit description"}
               </Text>
               <TextInput
                 style={st.editInput}
@@ -450,7 +464,6 @@ export default function TaskDetailScreen() {
                 onChangeText={setEditDraft}
                 autoFocus
                 multiline={editingField === "description"}
-                placeholder={editingField === "due" ? "e.g. 7 Aug, or next Friday" : undefined}
                 placeholderTextColor={C.textFaint}
                 returnKeyType={editingField === "description" ? "default" : "done"}
                 onSubmitEditing={editingField === "description" ? undefined : saveEdit}

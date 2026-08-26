@@ -14,7 +14,7 @@
 //     confirm dialog states each of those counts, because "delete" next to a
 //     list of meetings is otherwise a terrifying and ambiguous button.
 //
-// Layout follows Trash and The Desk (masthead, cards, skeletons,
+// Layout follows Trash and MinuteX (masthead, cards, skeletons,
 // pull-to-refresh, stated empty state) so this reads as the same product.
 import { useCallback, useMemo, useState } from "react";
 import {
@@ -86,9 +86,8 @@ export default function FoldersScreen() {
         // Spell out what SURVIVES. This is the difference between a user
         // deleting a folder confidently and never touching the feature again.
         count > 0
-          ? `The folder will be removed. Its ${count} meeting${
-              count === 1 ? "" : "s"
-            } will move to General — nothing is deleted, and your contacts and tasks are kept.`
+          ? `The folder will be removed. Its ${count} meeting${count === 1 ? "" : "s"
+          } will move to General — nothing is deleted, and your contacts and tasks are kept.`
           : "The folder will be removed. Your contacts and tasks are kept.",
         [
           { text: "Cancel", style: "cancel" },
@@ -102,8 +101,7 @@ export default function FoldersScreen() {
                 if (res.meetings_moved > 0) {
                   Alert.alert(
                     "Folder deleted",
-                    `${res.meetings_moved} meeting${
-                      res.meetings_moved === 1 ? "" : "s"
+                    `${res.meetings_moved} meeting${res.meetings_moved === 1 ? "" : "s"
                     } moved to General.`
                   );
                 }

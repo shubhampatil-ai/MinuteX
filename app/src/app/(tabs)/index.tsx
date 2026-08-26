@@ -1,6 +1,6 @@
-// src/app/(tabs)/index.tsx — The Desk: every brief, newest first, all sources.
+// src/app/(tabs)/index.tsx — MinuteX: every brief, newest first, all sources.
 //
-// "Workspace" edition. The Desk is a stack of soft, shadowed cards on a light
+// "Workspace" edition. MinuteX is a stack of soft, shadowed cards on a light
 // gray canvas: a masthead, a stat strip, then meeting cards with a rounded
 // source-icon bubble, a bold headline, a quiet summary, and a blue accent
 // reserved for the single primary action per row. Recordings from every source
@@ -178,7 +178,7 @@ function Stat({
   );
 }
 
-// The Workspace row — Tasks / Folders / Contacts, directly on the Desk.
+// The Workspace row — Tasks / Folders / Contacts, directly on MinuteX.
 //
 // These three were briefly buried under You › Organize, which was wrong: they
 // are places you WORK, not preferences you set once. Tasks especially — "what
@@ -199,18 +199,19 @@ function WorkspaceRow({
   const tiles: {
     key: string; label: string; icon: IconName; path: string; badge?: string;
   }[] = [
-    {
-      key: "tasks", label: "Tasks", icon: "checklist", path: "/tasks",
-      // Capped at 99+: the badge is a glanceable "how much", and a real
-      // account already carries 61 open tasks, so three digits would either
-      // overflow the circle or shrink the type past legibility.
-      badge: openTasks != null && openTasks > 0
-        ? (openTasks > 99 ? "99+" : String(openTasks))
-        : undefined,
-    },
-    { key: "folders", label: "Folders", icon: "folder", path: "/folders" },
-    { key: "contacts", label: "People", icon: "person.2.fill", path: "/contacts" },
-  ];
+      {
+        key: "tasks", label: "Tasks", icon: "checklist", path: "/tasks",
+        // Capped at 99+: the badge is a glanceable "how much", and a real
+        // account already carries 61 open tasks, so three digits would either
+        // overflow the circle or shrink the type past legibility.
+        badge: openTasks != null && openTasks > 0
+          ? (openTasks > 99 ? "99+" : String(openTasks))
+          : undefined,
+      },
+      { key: "calendar", label: "Calendar", icon: "calendar", path: "/calendar" },
+      { key: "folders", label: "Folders", icon: "folder", path: "/folders" },
+      { key: "contacts", label: "People", icon: "person.2.fill", path: "/contacts" },
+    ];
   return (
     <View style={st.wsRow}>
       {tiles.map((t, i) => (
@@ -244,7 +245,7 @@ function WorkspaceRow({
   );
 }
 
-// The Desk's top-left device pill — the hardware's entry point since the
+// MinuteX's top-left device pill — the hardware's entry point since the
 // bottom bar went to three tabs (Desk · Record · You). It reports the live
 // link in one glance and taps through to /devices for the full dashboard.
 //
@@ -266,10 +267,10 @@ function DevicePill({
   // an error, so it gets the neutral faint treatment rather than a red alarm.
   const { tint, label } =
     recording ? { tint: C.danger, label: "Recording" }
-    : connected ? { tint: C.success, label: device?.name ?? "Device" }
-    : linking ? { tint: C.warn, label: "Connecting" }
-    : device ? { tint: C.textFaint, label: "Device off" }
-    : { tint: C.textFaint, label: "No device" };
+      : connected ? { tint: C.success, label: device?.name ?? "Device" }
+        : linking ? { tint: C.warn, label: "Connecting" }
+          : device ? { tint: C.textFaint, label: "Device off" }
+            : { tint: C.textFaint, label: "No device" };
 
   // Tinted background only when there's something to say; an absent or
   // sleeping device sits on the plain inset surface.
@@ -314,7 +315,7 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     // the hardware lives now that the bottom bar is three tabs: connectivity
     // is a status you glance at, so it states the link and only then offers
     // the trip to /devices. Sized as a chip, not a button: it must not
-    // out-shout "The Desk" directly beneath it.
+    // out-shout "MinuteX" directly beneath it.
     deviceRow: {
       flexDirection: "row" as const, alignItems: "center" as const,
       marginBottom: 10,
@@ -428,7 +429,7 @@ export default function DeskScreen() {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   // Open-task count for the Workspace row. A number is what makes that row
-  // worth a place on the Desk rather than being pure navigation chrome —
+  // worth a place on MinuteX rather than being pure navigation chrome —
   // "3 open" is a reason to tap; a bare "Tasks" label is not.
   const [openTasks, setOpenTasks] = useState<number | null>(null);
 
@@ -448,7 +449,7 @@ export default function DeskScreen() {
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
   // The task count rides in its OWN request, deliberately not inside load():
-  // the Desk's job is to show briefs, and a task-service hiccup must not blank
+  // MinuteX's job is to show briefs, and a task-service hiccup must not blank
   // the page or surface an error over it. A failure just leaves the badge off.
   useFocusEffect(useCallback(() => {
     let alive = true;
@@ -466,7 +467,7 @@ export default function DeskScreen() {
   // it can't be triggered by a scroll the way a swipe can.
   //
   // Nothing here destroys anything: the brief goes to Trash, where it can be
-  // restored or permanently deleted. That is what makes clearing the desk in
+  // restored or permanently deleted. That is what makes clearing MinuteX in
   // a few presses safe — a mis-tap costs a trip to Trash, not a recording.
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
 
@@ -477,7 +478,7 @@ export default function DeskScreen() {
       failed
         ? "Nothing was written up for this one. You can restore it later from Trash."
         : `“${item.title || "Untitled conversation"}” moves to Trash with its `
-          + "transcript and everything written from it. You can restore it later.",
+        + "transcript and everything written from it. You can restore it later.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -498,8 +499,8 @@ export default function DeskScreen() {
                 isStillUploading(e)
                   ? "This recording is still being processed. Try again in a minute."
                   : e instanceof ApiError
-                  ? e.message
-                  : "Something went wrong. Please try again."
+                    ? e.message
+                    : "Something went wrong. Please try again."
               );
               load();
             } finally {
@@ -572,7 +573,7 @@ export default function DeskScreen() {
       <View style={st.masthead}>
         <View style={{ flex: 1 }}>
           <Text style={st.dateline}>{fmtToday()}</Text>
-          <Text style={st.title}>The Desk</Text>
+          <Text style={st.title}>MinuteX</Text>
         </View>
         {captured ? (
           <View style={{ alignItems: "flex-end", gap: 3 }}>
@@ -595,7 +596,7 @@ export default function DeskScreen() {
         />
       </View>
 
-      {/* Workspace — Tasks / Folders / People. On the Desk itself, because
+      {/* Workspace — Tasks / Folders / People. On MinuteX itself, because
           these are daily destinations, not settings. */}
       <WorkspaceRow
         st={st}
@@ -626,7 +627,7 @@ export default function DeskScreen() {
               <Text style={st.noticeTitle}>
                 Transferring {status!.pendingUploads} recording{(status!.pendingUploads ?? 0) > 1 ? "s" : ""}…
               </Text>
-              <Text style={st.noticeSub}>They'll land on the desk once written up</Text>
+              <Text style={st.noticeSub}>They'll land on MinuteX once written up</Text>
             </View>
           </View>
           <SweepBar color={C.primary} track={C.border} />
@@ -641,37 +642,37 @@ export default function DeskScreen() {
             <Icon
               name={j.phase === "failed" ? "exclamationmark.triangle.fill"
                 : j.phase === "done" ? "checkmark.circle.fill"
-                // "waiting" is not a failure — the recording is safe on disk
-                // and the upload is queued. A warning triangle here would
-                // read as data loss, which is the opposite of the truth.
-                : j.phase === "waiting" ? "clock"
-                : "tray.and.arrow.up.fill"}
+                  // "waiting" is not a failure — the recording is safe on disk
+                  // and the upload is queued. A warning triangle here would
+                  // read as data loss, which is the opposite of the truth.
+                  : j.phase === "waiting" ? "clock"
+                    : "tray.and.arrow.up.fill"}
               tintColor={j.phase === "failed" ? C.danger
                 : j.phase === "done" ? C.success
-                : j.phase === "waiting" ? C.warn
-                : C.primary}
+                  : j.phase === "waiting" ? C.warn
+                    : C.primary}
               size={18}
             />
             <View style={{ flex: 1 }}>
               <Text style={st.noticeTitle} numberOfLines={1}>
                 {j.phase === "failed" ? "Upload failed"
                   : j.phase === "done" ? "Uploaded"
-                  : j.phase === "waiting" ? "Waiting to upload"
-                  : `Uploading “${j.title}”…`}
+                    : j.phase === "waiting" ? "Waiting to upload"
+                      : `Uploading “${j.title}”…`}
               </Text>
               <Text style={st.noticeSub} numberOfLines={2}>
                 {j.phase === "failed" ? (j.error || "Something went wrong.")
                   : j.phase === "done" ? "Writing it up now"
-                  // Say plainly that the audio is safe. This banner is what a
-                  // user sees after recording a meeting offline, and the one
-                  // thing they need to know is that they haven't lost it.
-                  : j.phase === "waiting" ? "Saved on this phone — it'll upload when you're back online"
-                  : j.phase === "finalizing" ? "Finishing up…"
-                  // Real byte counts while the transfer is live — a big file
-                  // on a slow link should look busy, not stuck.
-                  : j.progress != null && j.totalBytes
-                  ? `${fmtBytes(j.bytesSent ?? 0)} of ${fmtBytes(j.totalBytes)}`
-                  : j.source === "MOBILE" ? "Phone recording" : "Audio file"}
+                    // Say plainly that the audio is safe. This banner is what a
+                    // user sees after recording a meeting offline, and the one
+                    // thing they need to know is that they haven't lost it.
+                    : j.phase === "waiting" ? "Saved on this phone — it'll upload when you're back online"
+                      : j.phase === "finalizing" ? "Finishing up…"
+                        // Real byte counts while the transfer is live — a big file
+                        // on a slow link should look busy, not stuck.
+                        : j.progress != null && j.totalBytes
+                          ? `${fmtBytes(j.bytesSent ?? 0)} of ${fmtBytes(j.totalBytes)}`
+                          : j.source === "MOBILE" ? "Phone recording" : "Audio file"}
               </Text>
             </View>
             {/* Percentage sits opposite the title, in mono, so it lines up
@@ -775,7 +776,7 @@ export default function DeskScreen() {
           }
           ListEmptyComponent={
             <EmptyState
-              title={filtering ? "Nothing matches that" : "Nothing on the desk yet"}
+              title={filtering ? "Nothing matches that" : "Nothing on MinuteX yet"}
               subtitle={filtering
                 ? "Try a different search or filter."
                 : "Record your next conversation and the first brief lands here in a couple of minutes."}

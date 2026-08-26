@@ -447,9 +447,24 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
     }
   }, [rec, meetingKey, refreshDocumentStatus, refreshTaskAssignees]);
 
+  // UPSERT by type, not a blind prepend. Regenerating a document, or saving
+  // the structured MoM (which rewrites its mirrored minutes_of_meeting on
+  // every save — see lib/mom-editor.tsx), calls this repeatedly with the same
+  // type; prepending each time would stack duplicate rows in Documents(N) for
+  // what is one document. A refreshed document keeps its POSITION rather than
+  // jumping to the top, so the list does not reshuffle under the user while
+  // they edit.
   const addDocument = useCallback((doc: GeneratedDoc) => {
-    setDocuments((prev) => [doc, ...prev]);
-    logActivity(`Document generated: ${doc.label}`);
+    let replaced = false;
+    setDocuments((prev) => {
+      const at = prev.findIndex((d) => d.type === doc.type);
+      if (at < 0) return [doc, ...prev];
+      replaced = true;
+      const next = prev.slice();
+      next[at] = doc;
+      return next;
+    });
+    if (!replaced) logActivity(`Document generated: ${doc.label}`);
   }, [logActivity]);
 
   // "Update All": regenerate every currently-flagged-stale document against

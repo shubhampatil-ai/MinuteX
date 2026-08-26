@@ -17,6 +17,7 @@ import { Markdown } from "../../../../lib/document-renderer";
 import { useMeeting } from "../../../../lib/meeting-context";
 import { Tasks } from "../../../../lib/meeting-tasks";
 import { CreateDocumentSheet, type GeneratedDoc } from "../../../../lib/meeting-documents";
+import { MomEditorScreen } from "../../../../lib/mom-editor";
 import {
   ApiError, ChatTurn, getAiChat, isNotReady, isRetryable, sendAiChat,
 } from "../../../../lib/api";
@@ -108,6 +109,7 @@ export default function AssistantScreen() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
+  const [momOpen, setMomOpen] = useState(false);
   const [openDocIndex, setOpenDocIndex] = useState<number | null>(null);
   const lastAsked = useRef("");
   const scrollRef = useRef<ScrollView>(null);
@@ -341,7 +343,24 @@ export default function AssistantScreen() {
         recordingKey={key}
         onClose={() => setCreateOpen(false)}
         onGenerated={addDocument}
+        onOpenMomEditor={() => setMomOpen(true)}
       />
+
+      {/* Minutes of Meeting is structured, so it opens its own editor here
+          exactly as it does from Overview — one MoM, one editor, whichever
+          surface the user reached it from. */}
+      <Modal
+        visible={momOpen}
+        animationType="slide"
+        onRequestClose={() => setMomOpen(false)}
+      >
+        <MomEditorScreen
+          recordingKey={key}
+          meetingTitle={rec?.title || "Meeting"}
+          onClose={() => setMomOpen(false)}
+          onDocumentChange={addDocument}
+        />
+      </Modal>
 
       {openDoc ? (
         <AssistantDocSheet

@@ -2,7 +2,7 @@
 // Desk · Record (large raised center) · You.
 //
 // Three destinations, not four: the device is a piece of hardware you check on,
-// not a place you work, so it moved off the bar to the Desk's top-left status
+// not a place you work, so it moved off the bar to MinuteX's top-left status
 // pill (src/app/(tabs)/index.tsx) where its live connection state is visible
 // without a trip. It still lives at /devices, also reachable from You.
 //

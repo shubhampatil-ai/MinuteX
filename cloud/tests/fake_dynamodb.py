@@ -50,10 +50,28 @@ class ClientError(Exception):
     text to tell a missing-parent-map ValidationException apart from a genuine
     expression bug (see _save_task in the userApi). A stub whose str() dropped
     it would let that path pass a test it fails in production.
+
+    Accepts BOTH construction shapes, because this one class is now shared by
+    every offline test — tests/conftest.py installs it as botocore's
+    ClientError so that `except ClientError` in the Lambda catches what the
+    tests raise (see that file for the collision this fixes):
+
+        ClientError("ValidationException", "msg")     # this fake's own shape
+        ClientError({"Error": {...}}, "UpdateItem")   # real botocore's
+
+    The second is the signature real botocore has, so the tests written
+    against it describe the production contract accurately and keep working
+    unchanged.
     """
 
     def __init__(self, code, message="", operation_name="PutItem"):
-        self.response = {"Error": {"Code": code, "Message": message}}
+        if isinstance(code, dict):
+            # botocore's own (response, operation_name) signature.
+            self.response = code
+            err = code.get("Error", {})
+            code, message = err.get("Code", "Unknown"), err.get("Message", "")
+        else:
+            self.response = {"Error": {"Code": code, "Message": message}}
         super().__init__(
             f"An error occurred ({code}) when calling the "
             f"{operation_name} operation: {message}")
@@ -432,6 +450,59 @@ def _split_top_level(text):
 # The five organization-layer tables plus Recordings, with the exact key
 # schemas scripts/31_create_workspace_tables.sh creates. Kept here so a test
 # and the provisioning script cannot disagree about an index name.
+class FakeResource:
+    """The boto3 dynamodb *resource*, for the one call that is not a Table.
+
+    Only batch_get_item, because that is the only resource-level call the
+    codebase makes (_linked_avatar_map, to read many Users rows in one go).
+    Faithful in the two respects that path depends on:
+
+      * ProjectionExpression is ENFORCED here, unlike FakeTable's
+        (which ignores it because every index projects ALL). That matters:
+        _linked_avatar_map is a deliberate cross-account read and its whole
+        safety argument is that it projects user_id and avatar_url only. A
+        fake that returned the full row would let a leak of another user's
+        name or email pass every test.
+      * Missing keys are simply ABSENT from Responses, as the real service
+        does — never None entries the caller has to filter.
+
+    `batch_calls` counts invocations, so a test can prove a 50-contact page
+    costs ONE read rather than fifty.
+    """
+
+    def __init__(self, tables_by_name):
+        self.tables_by_name = tables_by_name
+        self.batch_calls = 0
+
+    def batch_get_item(self, RequestItems=None):
+        self.batch_calls += 1
+        responses = {}
+        for table_name, spec in (RequestItems or {}).items():
+            table = self.tables_by_name.get(table_name)
+            if table is None:
+                raise ClientError("ResourceNotFoundException",
+                                  f"no table {table_name}")
+            keys = spec.get("Keys") or []
+            if len(keys) > 100:
+                raise ClientError(
+                    "ValidationException",
+                    "Too many items requested for the BatchGetItem call")
+            projection = [f.strip() for f in
+                          (spec.get("ProjectionExpression") or "").split(",")
+                          if f.strip()]
+            rows = []
+            for key in keys:
+                item = table.items.get(table._key_from_arg(key))
+                if item is None:
+                    continue
+                item = copy.deepcopy(item)
+                if projection:
+                    item = {k: v for k, v in item.items() if k in projection}
+                rows.append(item)
+            responses[table_name] = rows
+        return {"Responses": responses, "UnprocessedKeys": {}}
+
+
 def build_tables():
     return {
         "recordings": FakeTable(

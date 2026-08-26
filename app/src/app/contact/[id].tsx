@@ -20,14 +20,15 @@ import {
   S, R, ELEV, CAPS, FONT, useTheme, ColorScale,
 } from "../../../lib/theme";
 import {
-  Button, Card, ErrorText, KeyboardAware, Loading, SectionTitle, TextField,
-  scrollFormProps,
+  Avatar, Button, Card, ErrorText, KeyboardAware, Loading, SectionTitle,
+  TextField, scrollFormProps,
 } from "../../../lib/ui";
 import {
   ApiContact, ApiError, ApiFolder, ApiTask, deleteContact, getAllTasks,
   getContact, updateContact,
 } from "../../../lib/api";
-import { avatarColorFor, initialsOf } from "../../../lib/task-model";
+import { PhotoPicker } from "../../../lib/photo-picker";
+import { canPickImage } from "../../../lib/avatars";
 
 export default function ContactDetailScreen() {
   const { C, T } = useTheme();
@@ -51,6 +52,7 @@ export default function ContactDetailScreen() {
   const [role, setRole] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [photoOpen, setPhotoOpen] = useState(false);
 
   const load = useCallback(
     async (isRefresh = false) => {
@@ -100,6 +102,16 @@ export default function ContactDetailScreen() {
     setSaveError("");
     setEditing(true);
   };
+
+  const savePhoto = useCallback(
+    async (avatarKey: string) => {
+      // Re-throws on failure so the still-open sheet shows the message; see
+      // PhotoPicker.onPicked.
+      const updated = await updateContact(contactId, { avatar_url: avatarKey });
+      setContact(updated);
+    },
+    [contactId]
+  );
 
   const save = useCallback(async () => {
     const trimmed = name.trim();
@@ -208,17 +220,48 @@ export default function ContactDetailScreen() {
       <Stack.Screen options={{ title: contact.name || "Contact" }} />
 
       <View style={st.hero}>
-        <View
-          style={[st.avatar, { backgroundColor: avatarColorFor(contact.name) }]}
+        <Pressable
+          onPress={() => setPhotoOpen(true)}
+          disabled={!canPickImage()}
+          accessibilityRole="button"
+          accessibilityLabel={
+            contact.avatar_view_url
+              ? `Change ${contact.name}'s photo`
+              : `Add a photo for ${contact.name}`
+          }
+          hitSlop={8}
         >
-          <Text style={st.avatarTxt}>{initialsOf(contact.name)}</Text>
-        </View>
+          <View style={{ marginBottom: 4 }}>
+            <Avatar
+              name={contact.name}
+              photoUri={contact.avatar_view_url}
+              size={72}
+              fontSize={26}
+            />
+            {canPickImage() ? (
+              <View style={st.avatarBadge}>
+                <Icon
+                  name={contact.avatar_view_url ? "pencil" : "plus"}
+                  size={12}
+                  tintColor="#fff"
+                />
+              </View>
+            ) : null}
+          </View>
+        </Pressable>
         <Text style={st.heroName}>{contact.name}</Text>
         {!!(contact.role || contact.company) && (
           <Text style={st.heroSub}>
             {[contact.role, contact.company].filter(Boolean).join(" · ")}
           </Text>
         )}
+        {/* Say whose photo this is. "Their profile photo" and "a photo you
+            saved" differ in who can change it and whether it updates itself,
+            so leaving it ambiguous would invite the user to try to edit an
+            image that is not theirs to edit. */}
+        {contact.avatar_source === "minutex" ? (
+          <Text style={st.heroSub}>Their MinuteX profile photo</Text>
+        ) : null}
         {/* State the notification reality plainly rather than implying it. */}
         <View
           style={[
@@ -380,6 +423,21 @@ export default function ContactDetailScreen() {
         />
       </View>
     </ScrollView>
+
+    <PhotoPicker
+      visible={photoOpen}
+      onClose={() => setPhotoOpen(false)}
+      name={contact.name}
+      currentPhotoUri={contact.avatar_view_url}
+      scope="contact"
+      contactId={contactId}
+      onPicked={savePhoto}
+      // Only a photo THIS account stored can be removed. avatar_url is set
+      // just for that case: a photo rendered from the linked MinuteX user's
+      // profile leaves it empty, because that image is theirs.
+      canRemove={!!contact.avatar_url}
+      isLinkedPhoto={contact.avatar_source === "minutex"}
+    />
     </KeyboardAware>
   );
 }
@@ -406,11 +464,12 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
   return StyleSheet.create({
     container: { flex: 1, backgroundColor: C.bg, paddingHorizontal: 20 },
     hero: { alignItems: "center" as const, paddingVertical: S.lg, gap: 6 },
-    avatar: {
-      width: 72, height: 72, borderRadius: 36, alignItems: "center" as const,
-      justifyContent: "center" as const, marginBottom: 4,
+    avatarBadge: {
+      position: "absolute" as const, right: -1, bottom: 3,
+      width: 24, height: 24, borderRadius: 12,
+      backgroundColor: C.primary, borderWidth: 2, borderColor: C.bg,
+      alignItems: "center" as const, justifyContent: "center" as const,
     },
-    avatarTxt: { fontFamily: FONT.bold, fontSize: 26, color: "#fff" },
     heroName: { ...T.headline, textAlign: "center" as const },
     heroSub: { ...T.bodyDim, textAlign: "center" as const },
     linkPill: {

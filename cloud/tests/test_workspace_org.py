@@ -55,9 +55,13 @@ sys.modules["boto3.dynamodb"] = mock.MagicMock()
 _conditions = mock.MagicMock()
 _conditions.Key = fdb.Key
 sys.modules["boto3.dynamodb.conditions"] = _conditions
-_botocore_exc = mock.MagicMock()
+# Reuse the installed stub module when present (conftest.py under
+# pytest) so every file shares ONE ClientError class; install this
+# file's own only when running standalone.
+_botocore_exc = sys.modules.get("botocore.exceptions") \
+    or mock.MagicMock()
 _botocore_exc.ClientError = fdb.ClientError
-sys.modules["botocore"] = mock.MagicMock()
+sys.modules.setdefault("botocore", mock.MagicMock())
 sys.modules["botocore.exceptions"] = _botocore_exc
 sys.modules["botocore.config"] = mock.MagicMock()
 
@@ -136,7 +140,23 @@ class OrgTestCase(unittest.TestCase):
 
     def setUp(self):
         self.t = fdb.build_tables()
+        # The resource-level handle, for _linked_avatar_map's batch_get_item.
+        # Keyed by the table NAMES the Lambda passes, not by our short keys.
+        self.ddb = fdb.FakeResource({t.name: t for t in self.t.values()})
+        # A presigner that returns a real, recognisable STRING. The default
+        # MagicMock would make _avatar_view_url return a Mock, and every
+        # assertion about an avatar URL would pass against an object that is
+        # not a URL at all.
+        self.s3 = mock.MagicMock()
+        self.s3.generate_presigned_url.side_effect = (
+            lambda op, Params=None, ExpiresIn=None:
+            f"https://s3.test/{op}/{(Params or {}).get('Key', '')}"
+        )
         self.patches = [
+            mock.patch.object(api, "_ddb", self.ddb),
+            mock.patch.object(api, "_s3", self.s3),
+            mock.patch.object(api, "BUCKET_NAME", "test-bucket"),
+            mock.patch.object(api, "USERS_TABLE", self.t["users"].name),
             mock.patch.object(api, "_recordings", self.t["recordings"]),
             mock.patch.object(api, "_contacts", self.t["contacts"]),
             mock.patch.object(api, "_folders", self.t["folders"]),

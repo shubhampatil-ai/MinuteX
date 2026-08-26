@@ -25,6 +25,7 @@ import {
   Button, ErrorText, KeyboardAwareSheet, TextField, scrollFormProps,
 } from "./ui";
 import { ContactPicker } from "./contact-picker";
+import { DueDatePicker, dueDateLabel } from "./due-date-picker";
 import { ApiContact, getParticipants } from "./api";
 import { avatarColorFor, initialsOf, type Task } from "./task-model";
 
@@ -54,6 +55,7 @@ export function AddTaskSheet({
   const [priority, setPriority] = useState<Task["priority"]>("Medium");
   const [assignee, setAssignee] = useState<ApiContact | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [dueOpen, setDueOpen] = useState(false);
   const [meetingContacts, setMeetingContacts] = useState<ApiContact[]>([]);
   const [folderContacts, setFolderContacts] = useState<ApiContact[]>([]);
   const [folderId, setFolderId] = useState("");
@@ -69,6 +71,7 @@ export function AddTaskSheet({
     setPriority("Medium");
     setAssignee(null);
     setPickerOpen(false);
+    setDueOpen(false);
     setError("");
 
     // Ranking context for the assignee picker: who is tagged in this meeting,
@@ -189,12 +192,22 @@ export function AddTaskSheet({
               </Pressable>
 
               <Text style={st.label}>Due</Text>
-              <TextField
-                value={due}
-                onChangeText={setDue}
-                placeholder="e.g. Friday, or 2026-08-29 (optional)"
-                maxLength={100}
-              />
+              {/* A PICKER, not a text field. due_date is stored verbatim by
+                  the backend, so free text like "Friday" persists but never
+                  plots on the calendar — picking guarantees a real
+                  YYYY-MM-DD. */}
+              <Pressable
+                onPress={() => setDueOpen(true)}
+                accessibilityRole="button"
+                accessibilityLabel={due ? `Due ${due}, change it` : "Set a due date"}
+                style={({ pressed }) => [st.assigneeRow, pressed && { opacity: 0.7 }]}
+              >
+                <Icon name="calendar" size={15} tintColor={due ? C.primary : C.textFaint} />
+                <Text style={due ? st.assigneeName : st.assigneePlaceholder}>
+                  {due ? dueDateLabel(due, new Date()) : "No due date (optional)"}
+                </Text>
+                <Icon name="chevron.right" size={14} tintColor={C.textFaint} />
+              </Pressable>
 
               <Text style={st.label}>Priority</Text>
               <View style={st.priorityRow}>
@@ -248,6 +261,13 @@ export function AddTaskSheet({
       {/* Sibling, not nested: a Modal inside a Modal renders behind on
           Android. The add-task sheet stays open underneath, so cancelling the
           picker returns to the half-filled form rather than losing it. */}
+      <DueDatePicker
+        visible={dueOpen}
+        onClose={() => setDueOpen(false)}
+        value={due}
+        onChange={setDue}
+      />
+
       <ContactPicker
         visible={pickerOpen}
         onClose={() => setPickerOpen(false)}

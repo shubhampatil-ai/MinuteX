@@ -205,7 +205,7 @@ function RootContent() {
             expo-router tries to route it). */}
         <Stack.Screen name="crm-connected" options={{ headerShown: false }} />
         <Stack.Screen name="salesforce-config" options={{ title: "Salesforce mapping" }} />
-        {/* Your device — reached from the Desk's top-left status pill (and
+        {/* Your device — reached from MinuteX's top-left status pill (and
             from You › Your device). It was a bottom tab until the bar went
             to three; the page keeps its own Masthead, which carries the live
             connection state, so the stack header is title-less and exists
@@ -226,6 +226,7 @@ function RootContent() {
         <Stack.Screen name="contact/[id]" options={{ title: "Contact" }} />
         <Stack.Screen name="tasks" options={{ title: "Tasks" }} />
         <Stack.Screen name="task/[id]" options={{ title: "Task" }} />
+        <Stack.Screen name="calendar" options={{ title: "Calendar" }} />
       </Stack>
     </DeviceProvider>
   );

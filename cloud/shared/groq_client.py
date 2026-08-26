@@ -256,31 +256,46 @@ def complete(system_prompt, user_content, label="groq", json_mode=True,
     if max_tokens:
         payload["max_tokens"] = int(max_tokens)
 
+    # The request/retry loop lives in _chat_once (see the tool-calling section
+    # below) so the 429 backoff, the deadline rule and the socket-timeout cap
+    # are shared with the agent path rather than written twice.
+    message = _chat_once(payload, label, key=key, deadline=deadline)
+    return (message.get("content", "") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Tool calling — the transport half of the AI agent loop.
+#
+# complete() above answers with prose; this answers with EITHER prose or a list
+# of tool calls the caller is expected to execute and feed back. The retry /
+# 429 / deadline policy is deliberately NOT duplicated: _chat_once() is the one
+# request loop, and complete() now goes through it too, so a change to the
+# backoff rules can never apply to one path and miss the other.
+#
+# The tool schema is OpenAI-compatible, which is what Groq's API speaks.
+# ---------------------------------------------------------------------------
+def _chat_once(payload, label, key=None, deadline=None):
+    """POST one chat completion with the 429/backoff/deadline policy.
+
+    Returns the raw `message` object (not just its text) so a caller that
+    cares about tool_calls can see them. Raises GroqError exactly as
+    complete() does.
+    """
     headers = {"Authorization": f"Bearer {key or api_key()}",
                "Content-Type": "application/json"}
 
     last = ""
     for attempt in range(GROQ_MAX_RETRIES + 1):
-        # Cap the socket timeout at the time actually remaining, so a slow
-        # response can't overrun the caller's ceiling either.
         timeout = GROQ_HTTP_TIMEOUT
         if deadline is not None:
             timeout = max(1.0, min(timeout, deadline - time.monotonic()))
         status, data = _post_json(GROQ_URL, headers, payload, timeout)
         if status == 200:
-            return ((data.get("choices") or [{}])[0]
-                    .get("message", {}).get("content", "") or "").strip()
+            return (data.get("choices") or [{}])[0].get("message", {}) or {}
         last = str(data)[:500]
-        # 429 = TPM exhausted; it refills continuously, so waiting genuinely
-        # fixes it. 5xx/0 = Groq or the network hiccuped. A 4xx never fixes
-        # itself, so don't burn the Lambda's clock on it.
         if status in (429, 0) or 500 <= status < 600:
             if attempt < GROQ_MAX_RETRIES:
-                wait = _retry_wait(attempt, data) if status == 429 else \
-                    GROQ_RETRY_BACKOFF[min(attempt, len(GROQ_RETRY_BACKOFF) - 1)]
-                # Never sleep past the caller's deadline. Being killed mid-sleep
-                # turns a recoverable 429 into an opaque gateway 500, so bail
-                # out now and let the caller return something useful.
+                wait = _retry_wait(attempt, data) if status == 429 else                     GROQ_RETRY_BACKOFF[min(attempt, len(GROQ_RETRY_BACKOFF) - 1)]
                 if deadline is not None and time.monotonic() + wait >= deadline:
                     raise GroqError(
                         f"Groq {status} on {label}; no time left to retry "
@@ -297,6 +312,31 @@ def complete(system_prompt, user_content, label="groq", json_mode=True,
 
     raise GroqError(f"Groq exhausted retries on {label}: {last}",
                     status=429, retryable=True)
+
+
+def complete_with_tools(messages, tools, label="agent", key=None,
+                        temperature=0.2, max_tokens=None, deadline=None,
+                        tool_choice="auto"):
+    """One tool-enabled turn. Returns the assistant `message` dict, which has
+    EITHER `content` (a final answer) OR `tool_calls` (work for the caller).
+
+    `messages` is the full conversation INCLUDING the system turn and any
+    prior tool results — this function is stateless, so the agent loop that
+    owns the conversation stays in the caller where the authorization context
+    lives. Tools are never executed here: this module has no database access
+    and must not grow any.
+    """
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+    if max_tokens:
+        payload["max_tokens"] = int(max_tokens)
+    return _chat_once(payload, label, key=key, deadline=deadline)
 
 
 def complete_json(system_prompt, user_content, label="groq", key=None,

@@ -141,7 +141,7 @@ export const CAPS = {
 
 function buildTypeScale(C: ColorScale) {
   return {
-    // Screen title / masthead ("The Desk", meeting title)
+    // Screen title / masthead ("MinuteX", meeting title)
     display: { fontFamily: FONT.extrabold, fontSize: 30, lineHeight: 36, color: C.text, letterSpacing: -0.4 },
     // Meeting detail headline
     headline: { fontFamily: FONT.extrabold, fontSize: 22, lineHeight: 28, color: C.text, letterSpacing: -0.3 },
@@ -210,7 +210,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 
   const setMode = (m: ThemeMode | "system") => {
     setPref(m);
-    store.setItemAsync(THEME_KEY, m).catch(() => {});
+    store.setItemAsync(THEME_KEY, m).catch(() => { });
   };
 
   const mode: ThemeMode = pref === "system" ? systemScheme : pref;

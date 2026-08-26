@@ -1,17 +1,17 @@
 // src/app/trash.tsx — Trash: briefs the user deleted, and the two ways out.
 //
-// Deleting on the Desk is a SOFT delete — the recording, its transcript and
+// Deleting on MinuteX is a SOFT delete — the recording, its transcript and
 // every AI artifact stay exactly where they were, with a `trashed` flag on the
 // row. This screen is where that becomes visible and reversible:
 //
-//   Restore            -> back to the Desk, transcript and AI output intact
+//   Restore            -> back to MinuteX, transcript and AI output intact
 //   Delete permanently -> the ONLY action in the app that destroys data
 //
 // The two are deliberately not peers. Restore is the quiet, safe default and
 // reads as a normal action; permanent delete is danger-coloured, sits behind a
 // blunt confirm, and is the only place the phrase "cannot be undone" appears.
 //
-// Layout mirrors The Desk (masthead, cards, skeletons, pull-to-refresh, stated
+// Layout mirrors MinuteX (masthead, cards, skeletons, pull-to-refresh, stated
 // empty state) so Trash reads as the same product rather than a settings
 // sub-page — but it is a plain FlatList: rows are grouped by when they were
 // DELETED, not recorded, and "what did I just bin" is one flat recency
@@ -107,11 +107,11 @@ export default function TrashScreen() {
     }
   }, [router]);
 
-  // Refetch on focus, as the Desk does: a brief trashed on the Desk while
+  // Refetch on focus, as MinuteX does: a brief trashed on MinuteX while
   // this screen is mounted must be here when the user comes back.
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
-  // Restore is optimistic — it only ever ADDS a recording back to the Desk, so
+  // Restore is optimistic — it only ever ADDS a recording back to MinuteX, so
   // the worst case of a failure is a row reappearing in Trash, which load()
   // does for us. Nothing can be lost by guessing wrong here.
   const restore = useCallback(async (item: TrashedRecording) => {
@@ -157,8 +157,8 @@ export default function TrashScreen() {
                 isStillUploading(e)
                   ? "This recording is still being processed. Try again in a minute."
                   : e instanceof ApiError
-                  ? e.message
-                  : "Something went wrong. Please try again."
+                    ? e.message
+                    : "Something went wrong. Please try again."
               );
             } finally {
               setBusyKey(null);
@@ -175,7 +175,7 @@ export default function TrashScreen() {
 
       <Text style={st.intro}>
         Deleted briefs stay here with their transcripts and AI notes. Restore
-        one to put it back on the Desk, or delete it permanently to remove it
+        one to put it back on MinuteX, or delete it permanently to remove it
         for good.
       </Text>
 

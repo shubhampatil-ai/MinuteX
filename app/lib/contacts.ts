@@ -20,7 +20,21 @@ import { Linking, Platform } from "react-native";
 import type { Assignee, NotifyChannel } from "./task-model";
 import { avatarColorFor } from "./task-model";
 
-export type ContactPickResult = { name: string; phone?: string; email?: string };
+export type ContactPickResult = {
+  name: string;
+  phone?: string;
+  email?: string;
+  /** Stable identity for list keys and dedup. For device contacts this is the
+   * OS record id; for sample/manual entries it is derived from the fields. */
+  id: string;
+  /** A LOCAL file:// (or content://) URI for this person's address-book photo,
+   * when the device has one. Only ever a device-local path — it is not a MinuteX
+   * avatar and must be uploaded (lib/avatars.ts) before it can be stored on a
+   * contact, since the URI means nothing to any other device or after the OS
+   * revokes it. Absent for most contacts: an address book usually has photos
+   * for a small minority of entries. */
+  photoUri?: string;
+};
 
 // ---- Sample directories — DEPRECATED, no longer rendered anywhere ---------
 //
@@ -35,14 +49,14 @@ export type ContactPickResult = { name: string; phone?: string; email?: string }
 // these into a screen; grep confirmed no screen references them any more.
 /** @deprecated Use the real contacts API via lib/contact-picker.tsx. */
 export const SAMPLE_TEAM: ContactPickResult[] = [
-  { name: "Shubham Patil", email: "shubham.patil@company.com" },
-  { name: "Ritesh More", email: "ritesh.more@company.com" },
+  { id: "sample-team-1", name: "Shubham Patil", email: "shubham.patil@company.com" },
+  { id: "sample-team-2", name: "Ritesh More", email: "ritesh.more@company.com" },
 ];
 
 /** @deprecated Use the real contacts API via lib/contact-picker.tsx. */
 export const SAMPLE_RECENT: ContactPickResult[] = [
-  { name: "Rahul Patil", email: "rahul.patil@company.com", phone: "+91 98765 43210" },
-  { name: "Anita Sharma", email: "anita.sharma@company.com" },
+  { id: "sample-recent-1", name: "Rahul Patil", email: "rahul.patil@company.com", phone: "+91 98765 43210" },
+  { id: "sample-recent-2", name: "Anita Sharma", email: "anita.sharma@company.com" },
 ];
 
 // ---- Device contacts (expo-contacts is a native module — same defensive
@@ -111,6 +125,105 @@ export async function hasContactsPermission(): Promise<boolean> {
   return status === "granted";
 }
 
+/** Comparable form of a phone number: digits only, keeping any leading "+".
+ * Mirrors the backend's _norm_phone so the app and the API agree on when two
+ * numbers are "the same" — "+91 98765 43210" and "+919876543210" collapse,
+ * while a bare local number stays distinct from its international spelling
+ * (the safe direction to fail: two rows the user can merge, not one row
+ * wrongly fused from two people). */
+function normPhone(raw?: string): string {
+  const t = (raw ?? "").trim();
+  if (!t) return "";
+  const digits = t.replace(/\D/g, "");
+  if (digits.length < 7) return "";
+  return (t.startsWith("+") ? "+" : "") + digits;
+}
+
+function normEmail(raw?: string): string {
+  return (raw ?? "").trim().toLowerCase();
+}
+
+function normName(raw?: string): string {
+  return (raw ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/** Collapse the SAME PERSON appearing several times in one address book.
+ *
+ * This is the normal state of a real device, not an edge case: a phone linked
+ * to both a Google account and a SIM (or to two Google accounts, or to
+ * WhatsApp) holds one row per source for the same person. expo-contacts
+ * returns every row, so without this the picker shows "Rahul Patil" two or
+ * three times, and — because those rows carry identical name/email/phone —
+ * React sees duplicate keys and warns.
+ *
+ * Two rows are the same person when they share a strong identifier (email or
+ * phone) or when the name matches and neither side contributes a CONFLICTING
+ * identifier. A shared name with two different emails is left as two rows:
+ * two people called "Rahul Sharma" is ordinary, and merging them here would
+ * be the silent identity inference the backend deliberately refuses to make.
+ *
+ * Merging keeps the first row's name and fills in any field the winner is
+ * missing, so a SIM row with only a number and a Google row with only an
+ * email become one complete person rather than two half ones.
+ */
+function dedupePhoneContacts(rows: ContactPickResult[]): ContactPickResult[] {
+  const out: ContactPickResult[] = [];
+  // Strong identifiers -> index into `out`, so a later row can find its match
+  // in O(1) instead of rescanning.
+  const byEmail = new Map<string, number>();
+  const byPhone = new Map<string, number>();
+  const byName = new Map<string, number[]>();
+
+  for (const row of rows) {
+    const email = normEmail(row.email);
+    const phone = normPhone(row.phone);
+    const name = normName(row.name);
+
+    let at = -1;
+    if (email && byEmail.has(email)) at = byEmail.get(email)!;
+    else if (phone && byPhone.has(phone)) at = byPhone.get(phone)!;
+    else {
+      // Name-only match: allowed ONLY when nothing contradicts it.
+      for (const i of byName.get(name) ?? []) {
+        const kept = out[i];
+        const keptEmail = normEmail(kept.email);
+        const keptPhone = normPhone(kept.phone);
+        const emailConflict = !!email && !!keptEmail && email !== keptEmail;
+        const phoneConflict = !!phone && !!keptPhone && phone !== keptPhone;
+        if (!emailConflict && !phoneConflict) { at = i; break; }
+      }
+    }
+
+    if (at >= 0) {
+      // Fill the gaps in the row we already kept; never overwrite a value it
+      // already has, so the first (usually richest) source stays authoritative.
+      const kept = out[at];
+      if (!kept.email && row.email) {
+        kept.email = row.email;
+        byEmail.set(normEmail(row.email), at);
+      }
+      if (!kept.phone && row.phone) {
+        kept.phone = row.phone;
+        const np = normPhone(row.phone);
+        if (np) byPhone.set(np, at);
+      }
+      // Same gap-filling rule for the photo: only ONE of a person's several
+      // address-book rows usually carries it (typically the Google/WhatsApp
+      // one, not the SIM), so without this the merged person loses the picture
+      // whenever the photo-less row happens to come first.
+      if (!kept.photoUri && row.photoUri) kept.photoUri = row.photoUri;
+      continue;
+    }
+
+    const i = out.length;
+    out.push({ ...row });
+    if (email) byEmail.set(email, i);
+    if (phone) byPhone.set(phone, i);
+    byName.set(name, [...(byName.get(name) ?? []), i]);
+  }
+  return out;
+}
+
 export async function searchPhoneContacts(query: string): Promise<ContactPickResult[]> {
   if (!Contacts) return [];
   try {
@@ -118,12 +231,19 @@ export async function searchPhoneContacts(query: string): Promise<ContactPickRes
     if (status !== "granted") return [];
 
     const { data } = await Contacts.getContactsAsync({
-      fields: [Contacts.Fields.Emails, Contacts.Fields.PhoneNumbers],
+      // Image is the THUMBNAIL (320x320 on iOS, device-dependent on Android),
+      // deliberately not RawImage: an avatar renders at ~72pt, and rawImage is
+      // the full uncropped original — megabytes per contact, fetched for every
+      // row in a search result, to be downscaled anyway.
+      fields: [
+        Contacts.Fields.Emails, Contacts.Fields.PhoneNumbers,
+        Contacts.Fields.Image,
+      ],
       name: query || undefined,
     });
 
     const q = query.trim().toLowerCase();
-    return data
+    const mapped = data
       // Real device address books are messy: some rows have a name field
       // that's present but blank/whitespace-only, or a name made only of
       // characters that don't survive round-tripping — normalize and drop
@@ -132,12 +252,23 @@ export async function searchPhoneContacts(query: string): Promise<ContactPickRes
       .map((c) => ({ ...c, name: typeof c.name === "string" ? c.name.trim() : "" }))
       .filter((c) => c.name.length > 0)
       .filter((c) => !q || c.name.toLowerCase().includes(q))
-      .slice(0, 30)
-      .map((c) => ({
+      .map((c, i) => ({
+        // The OS record id is the only genuinely stable key. Some Android
+        // providers omit it, so fall back to a positional id — unique within
+        // this result set, which is all a list key needs.
+        id: String(c.id ?? `idx-${i}`),
         name: c.name,
         phone: c.phoneNumbers?.[0]?.number ?? undefined,
         email: c.emails?.[0]?.email ?? undefined,
+        // imageAvailable is the cheap check the OS provides; the uri can still
+        // be missing when it is true (a provider that reports a photo it will
+        // not hand over), so both are required before we claim a photo.
+        photoUri: c.imageAvailable && c.image?.uri ? c.image.uri : undefined,
       }));
+
+    // Dedupe BEFORE capping. Capping first would spend the 30-row budget on
+    // repeats of the same few people and push real contacts off the list.
+    return dedupePhoneContacts(mapped).slice(0, 30);
   } catch (e) {
     if (__DEV__) console.warn("[contacts] searchPhoneContacts failed:", e);
     return [];
@@ -145,6 +276,11 @@ export async function searchPhoneContacts(query: string): Promise<ContactPickRes
 }
 
 export function toAssignee(pick: ContactPickResult, source: Assignee["source"]): Assignee {
+  // NOTE: pick.photoUri is deliberately NOT carried onto an Assignee. An
+  // Assignee is persisted with its task, and a device-local photo URI would be
+  // a dangling path on any other device (and after the OS revokes it). A photo
+  // reaches a task only via the CONTACT it resolves to, whose avatar is stored
+  // server-side.
   return {
     name: pick.name,
     phone: pick.phone,

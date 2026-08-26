@@ -46,6 +46,13 @@ const EXAMPLE_PROMPTS = [
   "Create lecture notes", "Summarize for executives",
 ];
 
+// The one document type with a structured editor behind it. Opening it from
+// the list routes to lib/mom-editor.tsx instead of the Markdown viewer — the
+// stored Markdown is a MIRROR of that structure (see the backend's
+// _mirror_document), so editing it as text would be edited away by the next
+// structured save.
+const STRUCTURED_MOM_TYPE = "minutes_of_meeting";
+
 const DOC_ICONS: Record<string, { icon: string; color: string }> = {
   minutes_of_meeting: { icon: "list.number", color: "#3E6BFF" },
   executive_summary: { icon: "doc.richtext", color: "#1FA972" },
@@ -131,12 +138,15 @@ function buildStyles(C: ReturnType<typeof useTheme>["C"]) {
 // workspace, so it is exported standalone rather than bundled with a button.
 // ===========================================================================
 export function CreateDocumentSheet({
-  visible, recordingKey, onClose, onGenerated,
+  visible, recordingKey, onClose, onGenerated, onOpenMomEditor,
 }: {
   visible: boolean;
   recordingKey: string;
   onClose: () => void;
   onGenerated: (doc: GeneratedDoc) => void;
+  /** Minutes of Meeting opens the structured editor instead of generating a
+   * Markdown blob — see runTemplate. */
+  onOpenMomEditor: () => void;
 }) {
   const { C, T } = useTheme();
   const st = buildStyles(C);
@@ -166,6 +176,14 @@ export function CreateDocumentSheet({
   };
 
   const runTemplate = async (t: (typeof QUICK_TEMPLATES)[number]) => {
+    // Minutes of Meeting is structured now: hand off to the editor, which
+    // generates it (no Groq call) and lets the user edit before anything is
+    // exported. The other six templates keep the prompt path unchanged.
+    if (t.key === STRUCTURED_MOM_TYPE) {
+      onClose();
+      onOpenMomEditor();
+      return;
+    }
     setBusyTemplate(t.key); setError(""); setRetry(null);
     try {
       if (t.kind === "document") {
@@ -296,7 +314,7 @@ export function CreateDocumentSheet({
 // ===========================================================================
 export function DocumentsList({
   recordingKey, meetingTitle, documents, onChange, onCreatePress,
-  documentsNeedingUpdate, onUpdateAll,
+  documentsNeedingUpdate, onUpdateAll, onOpenMomEditor,
 }: {
   recordingKey: string;
   meetingTitle: string;
@@ -305,6 +323,9 @@ export function DocumentsList({
   onCreatePress: () => void;
   documentsNeedingUpdate: string[];
   onUpdateAll: () => Promise<{ updated: number; remaining: number }>;
+  /** Tapping the Minutes of Meeting row opens the structured editor rather
+   * than the Markdown viewer — see STRUCTURED_MOM_TYPE. */
+  onOpenMomEditor: () => void;
 }) {
   const { C } = useTheme();
   const st = buildStyles(C);
@@ -374,7 +395,9 @@ export function DocumentsList({
               layout={LinearTransition.springify().damping(16).stiffness(180)}
             >
               <Pressable
-                onPress={() => setOpenIndex(i)}
+                onPress={() => (doc.type === STRUCTURED_MOM_TYPE
+                  ? onOpenMomEditor()
+                  : setOpenIndex(i))}
                 style={({ pressed }) => [
                   st.docRow, i > 0 && { borderTopWidth: 1, borderTopColor: C.border },
                   pressed && { opacity: 0.7 },

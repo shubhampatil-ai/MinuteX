@@ -24,7 +24,7 @@
 // Dates: the backend stores `due_date` as a plain YYYY-MM-DD day string, with
 // no timezone. Comparing those as strings is exact and TZ-proof, which is why
 // every boundary below is a `toDayKey()` string rather than a Date instance.
-import type { ApiTask } from "./api";
+import type { ApiTask, RecordingSummary } from "./api";
 import { assigneeLabel, needsAssigneeResolution } from "./api";
 
 // ---------------------------------------------------------------------------
@@ -318,6 +318,180 @@ export function weekStrip(now: Date): WeekDay[] {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Calendar (the /calendar screen)
+//
+// The month grid and the per-day buckets behind it. Same rule as everything
+// else in this file: a day shows what the loaded tasks actually say about it,
+// and a day with nothing due renders empty rather than borrowing a number
+// from somewhere else.
+// ---------------------------------------------------------------------------
+
+/** Monday-first weekday index (0 = Mon … 6 = Sun). The grid starts on Monday
+ * to match startOfWeek() and the dashboard's Mon–Fri strip; using JS's raw
+ * getDay() here would shift every cell by one. */
+export function mondayIndex(d: Date): number {
+  const day = d.getDay();
+  return day === 0 ? 6 : day - 1;
+}
+
+export function startOfMonth(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), 1);
+}
+
+/** Move `n` whole months from `d`, landing on the 1st. Going through the 1st
+ * avoids the classic overflow bug where "one month after Jan 31" becomes
+ * March 3. */
+export function addMonths(d: Date, n: number): Date {
+  return new Date(d.getFullYear(), d.getMonth() + n, 1);
+}
+
+export type CalendarCell = {
+  dayKey: string;
+  date: number;
+  /** False for the leading/trailing days that belong to the adjacent month.
+   * They are rendered dimmed rather than blank, so the grid stays a real
+   * calendar the eye can track across a month boundary. */
+  inMonth: boolean;
+  isToday: boolean;
+  isPast: boolean;
+};
+
+/** A full 6×7 month grid, Monday-first, always 42 cells.
+ *
+ * Fixed height on purpose: a grid that grows to 5 rows one month and 6 the
+ * next makes everything below it jump as you page through months. */
+export function monthGrid(month: Date, now: Date): CalendarCell[] {
+  const first = startOfMonth(month);
+  const gridStart = addDays(first, -mondayIndex(first));
+  const today = toDayKey(now);
+  const cells: CalendarCell[] = [];
+  for (let i = 0; i < 42; i++) {
+    const d = addDays(gridStart, i);
+    const dayKey = toDayKey(d);
+    cells.push({
+      dayKey,
+      date: d.getDate(),
+      inMonth: d.getMonth() === first.getMonth(),
+      isToday: dayKey === today,
+      isPast: dayKey < today,
+    });
+  }
+  return cells;
+}
+
+export type DayLoad = {
+  /** Open (not closed) tasks due that day. */
+  open: number;
+  /** Of those, how many are overdue — a past day with work still on it. */
+  overdue: number;
+  /** Tasks completed that day, by due date or completion stamp. */
+  completed: number;
+  /** Meetings recorded that day. A calendar that only knew about tasks would
+   * be missing half of where the day actually went. */
+  meetings: number;
+  /** AI-extracted deadlines from meeting highlights that resolve to this day.
+   * These are DATES MENTIONED, not tasks — nobody owes them and they have no
+   * status. See MeetingDeadline. */
+  deadlines: number;
+};
+
+const EMPTY_LOAD: DayLoad = {
+  open: 0, overdue: 0, completed: 0, meetings: 0, deadlines: 0,
+};
+
+/** Tasks bucketed by the day they are due, for the month dots.
+ *
+ * Keyed by day so a cell lookup is O(1) while paging months. A task with no
+ * due date belongs to no day and is simply absent — it is not silently
+ * dropped onto today. */
+export function loadByDay(
+  tasks: ApiTask[],
+  now: Date,
+  meetings: RecordingSummary[] = [],
+  deadlines: MeetingDeadline[] = []
+): Map<string, DayLoad> {
+  const map = new Map<string, DayLoad>();
+  const bump = (key: string, patch: Partial<DayLoad>) => {
+    if (!key) return;
+    const cur = map.get(key) ?? { ...EMPTY_LOAD };
+    map.set(key, {
+      open: cur.open + (patch.open ?? 0),
+      overdue: cur.overdue + (patch.overdue ?? 0),
+      completed: cur.completed + (patch.completed ?? 0),
+      meetings: cur.meetings + (patch.meetings ?? 0),
+      deadlines: cur.deadlines + (patch.deadlines ?? 0),
+    });
+  };
+  for (const t of tasks) {
+    const due = dueKeyOf(t);
+    if (t.status === "Completed") {
+      // A completion lands on the day it happened when we know it, and on the
+      // due date otherwise — never on both, so a task is counted once.
+      bump(completionDayKey(t) || due, { completed: 1 });
+      continue;
+    }
+    if (isClosed(t)) continue; // Cancelled: no load, nothing was owed.
+    if (!due) continue;
+    bump(due, { open: 1, overdue: isOverdue(t, now) ? 1 : 0 });
+  }
+  for (const r of meetings) {
+    bump(meetingDayKey(r), { meetings: 1 });
+  }
+  for (const d of deadlines) {
+    bump(d.dayKey, { deadlines: 1 });
+  }
+  return map;
+}
+
+export function dayLoad(map: Map<string, DayLoad>, dayKey: string): DayLoad {
+  return map.get(dayKey) ?? EMPTY_LOAD;
+}
+
+/** Every task due on one day, ordered the way the dashboard orders work:
+ * open tasks by urgency first, then whatever is already closed. */
+export function tasksOnDay(
+  tasks: ApiTask[],
+  dayKey: string,
+  now: Date
+): ApiTask[] {
+  const onDay = tasks.filter((t) => {
+    if (dueKeyOf(t) === dayKey) return true;
+    // A task completed on this day belongs to it even if it was due earlier —
+    // that is the day the work actually happened.
+    return t.status === "Completed" && completionDayKey(t) === dayKey;
+  });
+  const open = rankForAttention(onDay, now);
+  const closed = onDay.filter((t) => isClosed(t));
+  return [...open, ...closed];
+}
+
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+export function monthLabel(d: Date): string {
+  return `${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+/** "Today", "Tomorrow", "Yesterday", else "Wed, Aug 26" — the heading over a
+ * selected day's task list. */
+const WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+export function dayHeading(dayKey: string, now: Date): string {
+  const days = daysUntil(dayKey, now);
+  if (days === 0) return "Today";
+  if (days === 1) return "Tomorrow";
+  if (days === -1) return "Yesterday";
+  const [y, m, d] = dayKey.split("-").map(Number);
+  const date = new Date(y, m - 1, d);
+  return `${WEEKDAY_NAMES[date.getDay()]}, ${shortDate(dayKey)}`;
+}
+
+/** The Mon-first weekday headers for the grid. */
+export const GRID_DAY_LABELS = ["M", "T", "W", "T", "F", "S", "S"];
+
 /** Completion for the current week.
  *
  * "Total" is the week's workload: every loaded task due this week plus every
@@ -480,4 +654,250 @@ export function shortDate(dayKey: string): string {
   if (!isDayKey(dayKey)) return "";
   const [, m, d] = dayKey.split("-").map(Number);
   return `${MONTHS[m - 1]} ${d}`;
+}
+
+// ---------------------------------------------------------------------------
+// The unified agenda — tasks AND meetings on one day.
+//
+// A calendar that only knew about tasks would answer "what is due?" while
+// leaving out where the day actually went. Meetings are the other half, and on
+// this product they are the half that GENERATES the first: an agenda that
+// shows the Acme review at 10:00 and the three tasks it produced due Friday is
+// the whole pitch in one screen.
+//
+// The two kinds are deliberately NOT merged into one shape. A meeting happened
+// at an instant; a task is owed on a day. Flattening them into a fake common
+// "event" would mean inventing a time for every task — so an AgendaEntry is a
+// tagged union, and the renderer decides how each reads.
+// ---------------------------------------------------------------------------
+
+/** The local day a meeting was recorded. `recorded_at` is a real instant (not
+ * a day string like due_date), so it converts through the local timezone — a
+ * 00:30 meeting belongs to the day the person experienced it. */
+export function meetingDayKey(r: RecordingSummary): string {
+  const raw = String(r.recorded_at || r.created_at || "").trim();
+  if (!raw) return "";
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return "";
+  return toDayKey(d);
+}
+
+/** Minutes past local midnight, or null when the timestamp is unusable. Used
+ * only for ORDERING and for the "10:30" label — never to place a task, which
+ * has no time. */
+export function minutesOfDay(iso: string): number | null {
+  const raw = String(iso || "").trim();
+  if (!raw) return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+/** "9:05 AM" from an ISO instant. Empty when it cannot be read, so a row
+ * renders without a time rather than with a broken one. */
+export function clockLabel(iso: string): string {
+  const mins = minutesOfDay(iso);
+  if (mins === null) return "";
+  const h24 = Math.floor(mins / 60);
+  const m = mins % 60;
+  const ampm = h24 < 12 ? "AM" : "PM";
+  const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+  return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
+}
+
+/** "42m" / "1h 12m" from the seconds a recording reports. DynamoDB Decimals
+ * serialize as strings, so the value is coerced before use — same tolerance
+ * as MinuteX's weekCaptured(). Empty when there is no usable duration. */
+export function durationLabel(raw: number | string | null | undefined): string {
+  const secs = Number(raw);
+  if (!Number.isFinite(secs) || secs <= 0) return "";
+  const h = Math.floor(secs / 3600);
+  const m = Math.round((secs % 3600) / 60);
+  if (h) return `${h}h ${m}m`;
+  return m > 0 ? `${m}m` : "<1m";
+}
+
+export type AgendaEntry =
+  | {
+    kind: "meeting";
+    id: string;
+    /** Minutes past midnight, for ordering. Null sorts to the end. */
+    at: number | null;
+    recording: RecordingSummary;
+  }
+  | {
+    kind: "deadline";
+    id: string;
+    at: null;
+    deadline: MeetingDeadline;
+  }
+  | {
+    kind: "task";
+    id: string;
+    at: null;
+    task: ApiTask;
+  };
+
+/** One day's agenda: the meetings that happened, in clock order, then the
+ * tasks owed that day in the dashboard's own urgency order.
+ *
+ * Meetings come first because they are FIXED — they happened at a time, and a
+ * day reads chronologically. Tasks follow as the day's workload, ordered by
+ * what needs attention rather than by an invented hour. Merging them into one
+ * time-sorted list would require pretending a task has a time, which is the
+ * kind of small lie that makes a calendar untrustworthy. */
+export function agendaForDay(
+  tasks: ApiTask[],
+  meetings: RecordingSummary[],
+  dayKey: string,
+  now: Date,
+  deadlines: MeetingDeadline[] = []
+): AgendaEntry[] {
+  const onDay = meetings
+    .filter((r) => meetingDayKey(r) === dayKey)
+    .map((r) => ({
+      kind: "meeting" as const,
+      id: r.audio_s3_key,
+      at: minutesOfDay(String(r.recorded_at || r.created_at || "")),
+      recording: r,
+    }))
+    .sort((a, b) => {
+      if (a.at === b.at) return a.id < b.id ? -1 : 1;
+      if (a.at === null) return 1;
+      if (b.at === null) return -1;
+      return a.at - b.at;
+    });
+
+  // Dates the meeting MENTIONED, between what happened and what is owed:
+  // they are context for the day, not work in it.
+  const dates = deadlinesOnDay(deadlines, dayKey).map((d) => ({
+    kind: "deadline" as const,
+    id: d.id,
+    at: null,
+    deadline: d,
+  }));
+
+  const dayTasks = tasksOnDay(tasks, dayKey, now).map((t) => ({
+    kind: "task" as const,
+    id: t.id,
+    at: null,
+    task: t,
+  }));
+
+  return [...onDay, ...dates, ...dayTasks];
+}
+
+/** A one-line summary of a day, for the heading under the grid: "2 meetings ·
+ * 3 due · 1 overdue". Only the clauses that apply, and "" for an empty day so
+ * the caller renders nothing rather than "0 meetings, 0 due". */
+export function describeDay(load: DayLoad): string {
+  const parts: string[] = [];
+  if (load.meetings) {
+    parts.push(`${load.meetings} meeting${load.meetings === 1 ? "" : "s"}`);
+  }
+  if (load.open) parts.push(`${load.open} due`);
+  if (load.overdue) parts.push(`${load.overdue} overdue`);
+  if (load.completed) {
+    parts.push(`${load.completed} completed`);
+  }
+  if (load.deadlines) {
+    parts.push(
+      `${load.deadlines} date${load.deadlines === 1 ? "" : "s"} mentioned`
+    );
+  }
+  return parts.join("  ·  ");
+}
+
+// ---------------------------------------------------------------------------
+// Dates mentioned in meetings (MeetingHighlights.deadlines)
+//
+// The AI extracts every date, time and milestone a meeting mentions, stored
+// EXACTLY as spoken — "next Tuesday", "end of Q3", "15th March" — because
+// prompts.py forbids it from resolving relative dates (it does not know the
+// meeting's date, so it would be guessing). lib/spoken-dates.ts does that
+// resolution here on the client, anchored to the meeting's recorded_at.
+//
+// These are NOT tasks. Nobody owes them, they have no status, and they cannot
+// be completed. A "deadline" here is a date the meeting REFERRED to — a
+// contract expiry, a launch, a board review. Putting them on the calendar is
+// what makes it show everything that was said to matter, not only what got
+// turned into a task.
+//
+// Anything that does not resolve to a real day keeps dayKey "" and is surfaced
+// separately as an unplaced date rather than pinned to a guess.
+// ---------------------------------------------------------------------------
+
+export type MeetingDeadline = {
+  /** Stable within a render: meeting key + index. Highlights carry no ids. */
+  id: string;
+  /** What the deadline is about ("contract expires"). */
+  what: string;
+  /** The phrase exactly as spoken ("end of Q3"). Always shown — the resolved
+   * date never replaces the speaker's own words. */
+  when: string;
+  /** Resolved day, or "" when the phrase is not placeable. */
+  dayKey: string;
+  /** "exact" (a date was spoken) | "relative" (inferred from the meeting
+   * date) | "none" (not a day at all). Drives the "inferred" marker. */
+  confidence: "exact" | "relative" | "none";
+  recordingKey: string;
+  meetingTitle: string;
+};
+
+/** Build the deadline list for one meeting's highlights.
+ *
+ * `resolve` is injected rather than imported so this module stays free of
+ * lib/spoken-dates and the two can be tested independently — and so the whole
+ * date-parsing policy lives in exactly one place. */
+export function deadlinesFromHighlights(
+  recordingKey: string,
+  meetingTitle: string,
+  recordedAt: string,
+  rows: { what: string; when: string }[],
+  resolve: (when: string, anchor: Date) => {
+    dayKey: string;
+    confidence: "exact" | "relative" | "none";
+  }
+): MeetingDeadline[] {
+  const anchor = new Date(recordedAt);
+  const anchored = Number.isNaN(anchor.getTime()) ? null : anchor;
+  const out: MeetingDeadline[] = [];
+  rows.forEach((r, i) => {
+    const what = String(r?.what || "").trim();
+    const when = String(r?.when || "").trim();
+    // A row with neither half says nothing; skip rather than render a blank.
+    if (!what && !when) return;
+    // With no usable meeting date a relative phrase cannot be anchored, so
+    // nothing is resolved — the row still shows, just without a day.
+    const res = anchored
+      ? resolve(when, anchored)
+      : { dayKey: "", confidence: "none" as const };
+    out.push({
+      id: `${recordingKey}#${i}`,
+      what,
+      when,
+      dayKey: res.dayKey,
+      confidence: res.confidence,
+      recordingKey,
+      meetingTitle,
+    });
+  });
+  return out;
+}
+
+/** The deadlines that landed on a given day. */
+export function deadlinesOnDay(
+  deadlines: MeetingDeadline[],
+  dayKey: string
+): MeetingDeadline[] {
+  return deadlines.filter((d) => d.dayKey === dayKey);
+}
+
+/** Deadlines that could NOT be placed — real dates the meeting mentioned that
+ * are not calendar days ("end of Q3", "before the holidays"). Surfaced as a
+ * list so they are visible without being pinned to a date nobody said. */
+export function unplacedDeadlines(
+  deadlines: MeetingDeadline[]
+): MeetingDeadline[] {
+  return deadlines.filter((d) => !d.dayKey);
 }

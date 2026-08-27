@@ -28,7 +28,15 @@ import re
 #   * "state what's missing" — silence reads as "there was no budget", which
 #     is a different claim from "the budget wasn't discussed".
 #   * "names verbatim" — product/API names were being helpfully "corrected".
-#   * "same language" — a Hindi meeting was being answered in English.
+#   * "always English" - a deliverable is read, forwarded and exported by
+#     people who were not in the room, so the OUTPUT language is a product
+#     decision and not the transcript's to make. This replaced an earlier
+#     "answer in the transcript's language", under which a Hindi meeting
+#     produced a Hindi document its English-reading recipients could not
+#     use. Proper nouns and direct quotes are carved out so that
+#     translating can never silently rewrite a name, a product or a figure.
+#     SCOPE: generated DELIVERABLES only. CHAT_SYSTEM and ASSISTANT_SYSTEM
+#     deliberately mirror the USER's language instead - see each.
 # ---------------------------------------------------------------------------
 BASE_SYSTEM = (
     "You are the MinuteX AI Meeting Assistant. You create factual, "
@@ -51,7 +59,16 @@ BASE_SYSTEM = (
     "- Never repeat transcript sentences verbatim; write the substance.\n"
     "- Merge duplicate ideas; state each point once.\n"
     "- Maintain professional business language.\n"
-    "- Write in the SAME language as the transcript.\n"
+    "- ALWAYS WRITE IN ENGLISH. This is absolute and it OVERRIDES the "
+    "language of the transcript: a meeting held in Hindi, Marathi, "
+    "Hinglish or any other language still produces an ENGLISH document. "
+    "Translate the substance faithfully - do not summarise more loosely "
+    "because you are translating, and never append the original-language "
+    "text alongside the English.\n"
+    "- The ONE exception is PROPER NOUNS AND DIRECT QUOTES: keep every "
+    "person, company, product, API and place name exactly as spoken, and "
+    "if you quote a speaker word-for-word, keep the quote in the original "
+    "language and put the English rendering after it in parentheses.\n"
 )
 
 # Prose deliverables are rendered, copied and exported as Markdown.
@@ -1257,6 +1274,9 @@ CUSTOM_TITLE_SYSTEM = (
     "3 to 6 words, Title Case, no trailing punctuation, no quotes. "
     'Example: "create a project status report" -> "Project Status Report". '
     'Example: "convert into jira tickets" -> "Jira Tickets". '
+    "Always write the title in ENGLISH, even when the request is written in "
+    "another language - it labels the document alongside built-in English "
+    "labels. Keep proper nouns as given. "
     "Respond with ONLY the title text, nothing else."
 )
 
@@ -1315,7 +1335,11 @@ ASSISTANT_SYSTEM = (
     "- Prefer a specific date over a relative phrase when the tool gives you "
     "one.\n"
     "- Markdown is allowed for lists and bold, but keep it light.\n"
-    "- Write in the same language the user writes in."
+    "- Write in the same language the user writes in. This prompt does "
+    "NOT inherit BASE_SYSTEM's always-English rule, and that is "
+    "deliberate: this is a conversation, not a generated document. If "
+    "asked to draft something someone else will read, write the draft in "
+    "English unless another language was requested."
 )
 
 
@@ -1367,7 +1391,14 @@ CHAT_SYSTEM = BASE_SYSTEM + (
     "- Quote figures and names exactly as spoken.\n"
     "- Markdown is allowed for lists and bold, but keep it light.\n"
     "- If asked to draft something (email, message, summary), produce the "
-    "draft directly with no commentary around it."
+    "draft directly with no commentary around it.\n"
+    "- LANGUAGE - this REPLACES the always-English rule above, which "
+    "governs generated documents and not this conversation: reply in the "
+    "language the USER wrote their question in. A question asked in Hindi "
+    "gets a Hindi answer even though the document generators would "
+    "produce English. If they ask you to DRAFT a document, email or "
+    "message, write that draft in English unless they asked for another "
+    "language - a draft is a deliverable someone else will read."
 )
 
 
@@ -1509,7 +1540,14 @@ def analysis_context(rec, meeting_highlights=None):
             pass
     lang = (rec.get("language") or "").strip()
     if lang and lang != "unknown":
-        parts.append(f"LANGUAGE: {lang}\n")
+        # Labelled SPOKEN and paired with the output language on purpose. As a
+        # bare "LANGUAGE: hi" this read as an instruction, and a hint sitting
+        # beside the transcript beats a rule far away in the system prompt --
+        # which is how Hindi meetings kept producing Hindi documents.
+        parts.append(f"SPOKEN LANGUAGE OF THE SOURCE AUDIO: {lang}\n")
+        parts.append("(This describes the SOURCE RECORDING only. It is not "
+                     "an instruction about the language to write in - your "
+                     "system prompt decides that.)\n")
 
     # THE MEETING OVERVIEW — the current primary analysis. Emitted with its own
     # section titles intact rather than flattened into one blob: the titles are

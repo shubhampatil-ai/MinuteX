@@ -575,6 +575,82 @@ class TestPrompts(unittest.TestCase):
         self.assertIn("never says at all", prompts.BASE_SYSTEM)
 
 
+class TestOutputLanguage(unittest.TestCase):
+    """Every GENERATED DELIVERABLE is English, whatever language was spoken.
+
+    The rule this replaced was "write in the SAME language as the transcript",
+    so a Hindi meeting produced a Hindi document -- unusable to the English-
+    reading colleagues these documents are exported and forwarded to. The
+    split below is the whole point and is easy to undo by accident:
+    deliverables are English, CONVERSATIONS mirror the user.
+    """
+
+    def test_base_system_forces_english(self):
+        self.assertIn("ALWAYS WRITE IN ENGLISH", prompts.BASE_SYSTEM)
+        # ...and the rule it replaced is gone, not merely outvoted. Both
+        # present at once is a contradiction the model resolves at random.
+        self.assertNotIn("SAME language as the transcript", prompts.BASE_SYSTEM)
+
+    def test_every_document_template_inherits_it(self):
+        """All 8 fixed templates, via _prose_system -> BASE_SYSTEM."""
+        self.assertTrue(prompts.DOCUMENTS)
+        for key, spec in prompts.DOCUMENTS.items():
+            self.assertIn("ALWAYS WRITE IN ENGLISH", spec["system"], key)
+
+    def test_every_quick_action_inherits_it(self):
+        self.assertTrue(prompts.QUICK_ACTIONS)
+        for key, spec in prompts.QUICK_ACTIONS.items():
+            self.assertIn("ALWAYS WRITE IN ENGLISH", spec["system"], key)
+
+    def test_the_analysis_stages_inherit_it(self):
+        """The overview/tasks/title analysis feeds MoM and every later
+        generation, so English has to start here rather than being translated
+        downstream."""
+        for name in ("SUMMARY_SYSTEM", "SUMMARY_REDUCE_SYSTEM",
+                     "HIGHLIGHTS_SYSTEM", "HIGHLIGHTS_REDUCE_SYSTEM",
+                     "CUSTOM_DOCUMENT_SYSTEM"):
+            self.assertIn("ALWAYS WRITE IN ENGLISH", getattr(prompts, name),
+                          name)
+
+    def test_names_and_quotes_are_exempt_from_translation(self):
+        """Translating must never rewrite a product name or a figure."""
+        self.assertIn("PROPER NOUNS AND DIRECT QUOTES", prompts.BASE_SYSTEM)
+        self.assertIn("EXACTLY as spoken", prompts.BASE_SYSTEM)
+
+    def test_a_custom_document_title_is_english_too(self):
+        """CUSTOM_TITLE_SYSTEM is standalone -- no BASE_SYSTEM to inherit --
+        and its output labels a document beside 8 English labels."""
+        self.assertIn("ENGLISH", prompts.CUSTOM_TITLE_SYSTEM)
+
+    def test_chat_replies_mirror_the_user_not_the_english_rule(self):
+        """Chat inherits BASE_SYSTEM, so without an explicit override a Hindi
+        question would get an English answer. It must override."""
+        self.assertIn("ALWAYS WRITE IN ENGLISH", prompts.CHAT_SYSTEM)
+        self.assertIn("REPLACES the always-English", prompts.CHAT_SYSTEM)
+        self.assertIn("language the USER wrote", prompts.CHAT_SYSTEM)
+
+    def test_the_assistant_mirrors_the_user(self):
+        """ASSISTANT_SYSTEM does not inherit BASE_SYSTEM; that is deliberate
+        and the prompt says so, so it does not get "fixed" into English."""
+        self.assertIn("same language the user writes in",
+                      prompts.ASSISTANT_SYSTEM)
+        self.assertNotIn("ALWAYS WRITE IN ENGLISH", prompts.ASSISTANT_SYSTEM)
+
+    def test_the_spoken_language_hint_is_not_an_instruction(self):
+        """A bare "LANGUAGE: hi" next to the transcript beat the far-away
+        system rule and kept producing Hindi. It has to read as a property of
+        the recording, and must not assert an output language either way --
+        the same context block feeds chat, which mirrors the user."""
+        ctx = prompts.analysis_context(dict(RECORDING, language="hi"))
+        self.assertIn("SOURCE RECORDING", ctx)
+        self.assertNotIn("LANGUAGE: hi", ctx)
+        self.assertIn("not an instruction", ctx)
+
+    def test_an_unknown_spoken_language_is_still_omitted(self):
+        ctx = prompts.analysis_context(dict(RECORDING, language="unknown"))
+        self.assertNotIn("SOURCE RECORDING", ctx)
+
+
 class TestContextAssembly(unittest.TestCase):
 
     def test_analysis_context_includes_the_stored_analysis(self):

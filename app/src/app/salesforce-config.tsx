@@ -26,6 +26,7 @@ import { S, R, FONT, useTheme, ColorScale } from "../../lib/theme";
 import {
   Button, Card, ErrorText, Loading, Masthead, SectionRule,
   KeyboardAware,
+  KeyboardAwareSheet,
 } from "../../lib/ui";
 import { Icon } from "../../lib/icons";
 import {
@@ -546,73 +547,75 @@ export default function SalesforceConfigScreen() {
         animationType="slide"
         onRequestClose={() => setPicker(null)}
       >
-        <Pressable style={st.backdrop} onPress={() => setPicker(null)}>
-          <Pressable style={st.sheet} onPress={() => {}}>
-            <View style={st.sheetHead}>
-              <Text style={st.sheetTitle}>
-                {picker?.kind === "object" ? "Choose a record type"
-                  : picker?.kind === "lookup" ? "Identified by"
-                  : picker?.label}
-              </Text>
-              <Text style={st.sheetSub}>
-                {picker?.kind === "object"
-                  ? "Read from your Salesforce org. Custom objects are listed first."
-                  : picker?.kind === "lookup"
-                    ? "Only searchable fields are listed — MinuteX filters on this to find the record."
-                    : "Only writable long text fields are listed, so your content can't be truncated."}
-              </Text>
-              <TextInput
-                style={st.search}
-                value={search}
-                onChangeText={setSearch}
-                placeholder="Search…"
-                placeholderTextColor={C.textFaint}
-                autoCorrect={false}
-              />
-            </View>
-            <ScrollView keyboardShouldPersistTaps="handled">
-              {picker?.kind === "target" ? (
-                <Pressable style={st.optRow} onPress={() => choose(null)}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={st.optNone}>Don&apos;t sync this</Text>
-                  </View>
-                  {!drafts[picker.forIndex]?.targets[picker.target] ? (
-                    <Icon name="checkmark" tintColor={C.primary} size={16} />
-                  ) : null}
-                </Pressable>
-              ) : null}
-              {shown.map((o) => {
-                const draft = picker && picker.kind !== "object"
-                  ? drafts[picker.forIndex] : null;
-                const selected = picker?.kind === "lookup"
-                  ? draft?.lookupField === o.value
-                  : picker?.kind === "target"
-                    ? draft?.targets[picker.target] === o.value
-                    : false;
-                return (
-                  <Pressable key={o.value} style={st.optRow} onPress={() => choose(o.value)}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={st.optLabel}>{o.label}</Text>
-                      <Text style={st.optMeta}>{o.meta}</Text>
-                    </View>
-                    {selected ? <Icon name="checkmark" tintColor={C.primary} size={16} /> : null}
-                  </Pressable>
-                );
-              })}
-              {shown.length === 0 ? (
-                <Text style={st.emptyList}>
-                  {search.trim() ? "Nothing matches that search."
-                    : picker?.kind === "object"
-                      ? "Every available object is already configured."
-                      : picker?.kind === "target"
-                        ? "This object has no writable long text fields. Add a Long Text Area field in Salesforce Setup."
-                        : "No searchable fields on this object."}
+        <KeyboardAwareSheet>
+          <Pressable style={st.backdrop} onPress={() => setPicker(null)}>
+            <Pressable style={st.sheet} onPress={() => {}}>
+              <View style={st.sheetHead}>
+                <Text style={st.sheetTitle}>
+                  {picker?.kind === "object" ? "Choose a record type"
+                    : picker?.kind === "lookup" ? "Identified by"
+                    : picker?.label}
                 </Text>
-              ) : null}
-              <View style={{ height: 28 }} />
-            </ScrollView>
+                <Text style={st.sheetSub}>
+                  {picker?.kind === "object"
+                    ? "Read from your Salesforce org. Custom objects are listed first."
+                    : picker?.kind === "lookup"
+                      ? "Only searchable fields are listed — MinuteX filters on this to find the record."
+                      : "Only writable long text fields are listed, so your content can't be truncated."}
+                </Text>
+                <TextInput
+                  style={st.search}
+                  value={search}
+                  onChangeText={setSearch}
+                  placeholder="Search…"
+                  placeholderTextColor={C.textFaint}
+                  autoCorrect={false}
+                />
+              </View>
+              <ScrollView keyboardShouldPersistTaps="handled">
+                {picker?.kind === "target" ? (
+                  <Pressable style={st.optRow} onPress={() => choose(null)}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={st.optNone}>Don&apos;t sync this</Text>
+                    </View>
+                    {!drafts[picker.forIndex]?.targets[picker.target] ? (
+                      <Icon name="checkmark" tintColor={C.primary} size={16} />
+                    ) : null}
+                  </Pressable>
+                ) : null}
+                {shown.map((o) => {
+                  const draft = picker && picker.kind !== "object"
+                    ? drafts[picker.forIndex] : null;
+                  const selected = picker?.kind === "lookup"
+                    ? draft?.lookupField === o.value
+                    : picker?.kind === "target"
+                      ? draft?.targets[picker.target] === o.value
+                      : false;
+                  return (
+                    <Pressable key={o.value} style={st.optRow} onPress={() => choose(o.value)}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={st.optLabel}>{o.label}</Text>
+                        <Text style={st.optMeta}>{o.meta}</Text>
+                      </View>
+                      {selected ? <Icon name="checkmark" tintColor={C.primary} size={16} /> : null}
+                    </Pressable>
+                  );
+                })}
+                {shown.length === 0 ? (
+                  <Text style={st.emptyList}>
+                    {search.trim() ? "Nothing matches that search."
+                      : picker?.kind === "object"
+                        ? "Every available object is already configured."
+                        : picker?.kind === "target"
+                          ? "This object has no writable long text fields. Add a Long Text Area field in Salesforce Setup."
+                          : "No searchable fields on this object."}
+                  </Text>
+                ) : null}
+                <View style={{ height: 28 }} />
+              </ScrollView>
+            </Pressable>
           </Pressable>
-        </Pressable>
+        </KeyboardAwareSheet>
       </Modal>
     </KeyboardAware>
   );

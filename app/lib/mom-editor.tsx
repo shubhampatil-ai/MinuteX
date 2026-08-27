@@ -21,7 +21,7 @@
 // discarded by the next regeneration.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, Pressable,
+  ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Pressable,
   ScrollView, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import Animated, { FadeInDown, LinearTransition } from "react-native-reanimated";
@@ -42,7 +42,7 @@ import {
 import { exportMomPdf } from "./mom-pdf";
 import { MomPreview } from "./mom-preview";
 import { ELEV, FONT, R, S, useTheme, type ColorScale } from "./theme";
-import { Button, Card } from "./ui";
+import { Button, Card, KeyboardAwareSheet } from "./ui";
 
 // ---------------------------------------------------------------------------
 // Styles
@@ -712,8 +712,7 @@ function AddSectionSheet({ visible, onClose, onAdd }: {
 
   return (
     <Modal visible transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView style={{ flex: 1 }}
-                            behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <KeyboardAwareSheet>
         <Pressable style={st.backdrop} onPress={onClose}>
           <Pressable style={st.sheet} onPress={() => {}}>
             <Text style={st.sheetTitle}>Add section</Text>
@@ -763,7 +762,7 @@ function AddSectionSheet({ visible, onClose, onAdd }: {
             </View>
           </Pressable>
         </Pressable>
-      </KeyboardAvoidingView>
+      </KeyboardAwareSheet>
     </Modal>
   );
 }
@@ -787,8 +786,10 @@ function SectionEditor({ section, onClose, onChange }: {
 
   return (
     <Modal visible animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView style={st.wrap}
-                            behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      {/* Full-screen Modal (no backdrop), so it behaves like a screen rather
+          than a bottom sheet — but "padding" is right on both platforms here
+          for the Android 15 reason in lib/ui.tsx, not because it is a screen. */}
+      <KeyboardAvoidingView style={st.wrap} behavior="padding">
         <View style={st.bar}>
           <Pressable onPress={onClose} hitSlop={8} accessibilityLabel="Back">
             <Icon name="chevron.left" tintColor={C.text} size={20} />
@@ -837,30 +838,32 @@ function SectionEditor({ section, onClose, onChange }: {
       {renaming ? (
         <Modal visible transparent animationType="fade"
                onRequestClose={() => setRenaming(false)}>
-          <View style={st.backdrop}>
-            <Pressable style={{ flex: 1 }} onPress={() => setRenaming(false)} />
-            <View style={st.sheet}>
-              <Text style={st.sheetTitle}>Rename section</Text>
-              <TextInput
-                style={[st.input, { marginTop: 14 }]}
-                value={draftTitle} onChangeText={setDraftTitle}
-                autoFocus maxLength={120} returnKeyType="done"
-                onSubmitEditing={() => {
-                  onChange((m) => renameSection(m, id, draftTitle));
-                  setRenaming(false);
-                }}
-              />
-              <View style={{ flexDirection: "row", gap: S.sm, marginTop: 18 }}>
-                <Button label="Cancel" variant="secondary" style={{ flex: 1 }}
-                        onPress={() => setRenaming(false)} />
-                <Button label="Save" style={{ flex: 1 }}
-                        onPress={() => {
-                          onChange((m) => renameSection(m, id, draftTitle));
-                          setRenaming(false);
-                        }} />
+          <KeyboardAwareSheet>
+            <View style={st.backdrop}>
+              <Pressable style={{ flex: 1 }} onPress={() => setRenaming(false)} />
+              <View style={st.sheet}>
+                <Text style={st.sheetTitle}>Rename section</Text>
+                <TextInput
+                  style={[st.input, { marginTop: 14 }]}
+                  value={draftTitle} onChangeText={setDraftTitle}
+                  autoFocus maxLength={120} returnKeyType="done"
+                  onSubmitEditing={() => {
+                    onChange((m) => renameSection(m, id, draftTitle));
+                    setRenaming(false);
+                  }}
+                />
+                <View style={{ flexDirection: "row", gap: S.sm, marginTop: 18 }}>
+                  <Button label="Cancel" variant="secondary" style={{ flex: 1 }}
+                          onPress={() => setRenaming(false)} />
+                  <Button label="Save" style={{ flex: 1 }}
+                          onPress={() => {
+                            onChange((m) => renameSection(m, id, draftTitle));
+                            setRenaming(false);
+                          }} />
+                </View>
               </View>
             </View>
-          </View>
+          </KeyboardAwareSheet>
         </Modal>
       ) : null}
 
@@ -1071,8 +1074,7 @@ function RowEditor({ st, C, section, rowId, onClose, onChange }: {
   if (!row) return null;
   return (
     <Modal visible transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView style={{ flex: 1 }}
-                            behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <KeyboardAwareSheet>
         <Pressable style={st.backdrop} onPress={onClose}>
           <Pressable style={st.sheet} onPress={() => {}}>
             <View style={{ flexDirection: "row", alignItems: "center" }}>
@@ -1098,7 +1100,7 @@ function RowEditor({ st, C, section, rowId, onClose, onChange }: {
             </ScrollView>
           </Pressable>
         </Pressable>
-      </KeyboardAvoidingView>
+      </KeyboardAwareSheet>
     </Modal>
   );
 }
@@ -1115,8 +1117,7 @@ function ColumnsEditor({ st, C, section, onClose, onChange }: {
   const last = columns.length <= 1;
   return (
     <Modal visible transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView style={{ flex: 1 }}
-                            behavior={Platform.OS === "ios" ? "padding" : undefined}>
+      <KeyboardAwareSheet>
         <Pressable style={st.backdrop} onPress={onClose}>
           <Pressable style={st.sheet} onPress={() => {}}>
             <View style={{ flexDirection: "row", alignItems: "center" }}>
@@ -1159,7 +1160,7 @@ function ColumnsEditor({ st, C, section, onClose, onChange }: {
             </ScrollView>
           </Pressable>
         </Pressable>
-      </KeyboardAvoidingView>
+      </KeyboardAwareSheet>
     </Modal>
   );
 }

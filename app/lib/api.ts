@@ -1934,3 +1934,141 @@ export async function assignTaskToContact(
   });
   return res.task;
 }
+
+// ---------------------------------------------------------------------------
+// Meeting Share — a read-only public link to one meeting.
+//
+// The recipient needs no MinuteX account: the link carries a high-entropy
+// token and the backend renders an HTML page from it. Two consequences shape
+// this client:
+//
+//   * THE URL IS RETURNED EXACTLY ONCE, by createShare. Only sha256(token) is
+//     stored server-side, so listShares deliberately CANNOT return a `url` —
+//     the server has no way to reconstruct one. That is why the UI shows the
+//     link in a "copy it now" state after creation and offers only Revoke for
+//     older links. It is a security property, not a missing feature.
+//
+//   * THE TOGGLES ARE ENFORCED SERVER-SIDE. Sending transcript:false means the
+//     transcript never enters the rendered page at all, so this client never
+//     has to worry about hiding anything.
+//
+// Route shape note: the action segment comes FIRST and the recording key LAST
+// ("/recordings/share/{key+}"), the same constraint every recording-scoped
+// route in this API obeys — a key contains slashes, so it must be the greedy
+// trailing variable.
+// ---------------------------------------------------------------------------
+
+/** What a share link exposes. Mirrors share_schema.TOGGLES on the backend. */
+export type ShareConfig = {
+  summary: boolean;
+  highlights: boolean;
+  decisions: boolean;
+  tasks: boolean;
+  participants: boolean;
+  transcript: boolean;
+  audio: boolean;
+};
+
+/** The V1 default: notes shared, transcript and audio withheld. */
+export const DEFAULT_SHARE_CONFIG: ShareConfig = {
+  summary: true,
+  highlights: true,
+  decisions: true,
+  tasks: true,
+  participants: true,
+  transcript: false,
+  audio: false,
+};
+
+/** One share link as its OWNER sees it. Never carries the token or its hash. */
+export type MeetingShare = {
+  share_id: string;
+  recording_key: string;
+  access_type: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  updated_at: string;
+  view_count: number;
+  last_viewed_at: string | null;
+  active: boolean;
+  summary_enabled: boolean;
+  highlights_enabled: boolean;
+  decisions_enabled: boolean;
+  tasks_enabled: boolean;
+  participants_enabled: boolean;
+  transcript_enabled: boolean;
+  audio_enabled: boolean;
+  /** Present ONLY on the create response — see the section header. */
+  url?: string;
+};
+
+export type CreateShareResult = {
+  share_id: string;
+  url: string;
+  expires_at: string | null;
+  share: MeetingShare;
+};
+
+function sharePath(action: "share" | "shares", key: string): string {
+  return `/recordings/${action}/${encodeURIComponent(key)}`;
+}
+
+/** Turn the backend's *_enabled row into the toggle shape the sheet edits. */
+export function shareConfigOf(share: MeetingShare): ShareConfig {
+  return {
+    summary: share.summary_enabled,
+    highlights: share.highlights_enabled,
+    decisions: share.decisions_enabled,
+    tasks: share.tasks_enabled,
+    participants: share.participants_enabled,
+    transcript: share.transcript_enabled,
+    audio: share.audio_enabled,
+  };
+}
+
+/**
+ * Create a public link for one meeting.
+ *
+ * `expiresInDays` null/undefined means the link never expires. The returned
+ * `url` is the ONLY time the raw token exists on this device — show it, let
+ * the user copy or share it, and do not expect to fetch it again later.
+ */
+export async function createShare(
+  key: string,
+  config: ShareConfig,
+  expiresInDays?: number | null
+): Promise<CreateShareResult> {
+  return request<CreateShareResult>(sharePath("share", key), {
+    method: "POST",
+    body: { ...config, expires_at: expiresInDays ?? null },
+  });
+}
+
+/** Every share link for this meeting, newest first. No URLs — see above. */
+export async function listShares(key: string): Promise<MeetingShare[]> {
+  const res = await request<{ shares?: MeetingShare[] }>(sharePath("shares", key));
+  return res.shares ?? [];
+}
+
+/** Retoggle or re-expire a LIVE link, without changing its URL. Narrowing a
+ * share takes effect immediately on the already-published page. */
+export async function updateShare(
+  shareId: string,
+  config: Partial<ShareConfig>,
+  expiresInDays?: number | null
+): Promise<MeetingShare> {
+  const body: Record<string, unknown> = { ...config };
+  if (expiresInDays !== undefined) body.expires_at = expiresInDays;
+  const res = await request<{ share: MeetingShare }>(
+    `/shares/${encodeURIComponent(shareId)}`,
+    { method: "PATCH", body }
+  );
+  return res.share;
+}
+
+/** Kill a link. The URL stops working immediately and permanently — there is
+ * no un-revoke, because the token only exists with whoever already has it. */
+export async function revokeShare(shareId: string): Promise<void> {
+  await request(`/shares/${encodeURIComponent(shareId)}`, { method: "DELETE" });
+}

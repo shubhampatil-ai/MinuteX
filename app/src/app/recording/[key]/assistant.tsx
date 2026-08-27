@@ -6,10 +6,11 @@
 // "Ask MinuteX" anymore, just the floating Assistant button that opens here.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, Pressable,
-  ScrollView, Share, StyleSheet, Text, TextInput, View,
+  ActivityIndicator, Alert, Keyboard, Modal,
+  Platform, Pressable, ScrollView, Share, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { Stack, useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ELEV, FONT, R, S, useTheme, ColorScale } from "../../../../lib/theme";
 import { RawGradient } from "../../../../lib/ui";
 import { Icon } from "../../../../lib/icons";
@@ -99,6 +100,7 @@ function docVisual(type: string) {
 
 export default function AssistantScreen() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
   const { key, rec, documents, addDocument, setDocuments, tasks, activity, logActivity } = useMeeting();
@@ -113,6 +115,52 @@ export default function AssistantScreen() {
   const [openDocIndex, setOpenDocIndex] = useState<number | null>(null);
   const lastAsked = useRef("");
   const scrollRef = useRef<ScrollView>(null);
+
+  // ---- Keyboard height, measured rather than inferred ---------------------
+  //
+  // The composer is pinned to the bottom of the screen, which is exactly where
+  // the keyboard appears, so something has to lift it. KeyboardAvoidingView is
+  // the usual answer and it does NOT work on this screen.
+  //
+  // WHY NOT KeyboardAvoidingView. It derives its inset from
+  //   frame.y + frame.height - (keyboardFrame.screenY - keyboardVerticalOffset)
+  // where `frame` comes from its own onLayout. That subtraction only means
+  // anything if both terms are in the same coordinate space. This screen is
+  // registered with presentation: "modal" (see _layout.tsx), so under
+  // react-native-screens it lives in its own native container and its onLayout
+  // frame is container-relative while the keyboard's screenY is window-relative.
+  // The two disagree, the difference collapses toward zero, and you get no
+  // padding — silently, with no error and nothing visibly wrong in the code.
+  // That is why every other screen in the app is fine with the shared wrapper
+  // and this one was not.
+  //
+  // Tracking endCoordinates.height directly skips the measurement entirely:
+  // the OS tells us how tall the keyboard is, and we pad by that. Nothing here
+  // depends on window resizing either, so it is also correct under the enforced
+  // edge-to-edge of Android 15+, where the OS no longer resizes the window.
+  //
+  // ANDROID USES keyboardDidShow, NOT keyboardWillShow — the "will" events are
+  // iOS-only, so listening for them on Android silently never fires.
+  const [kbHeight, setKbHeight] = useState(0);
+  useEffect(() => {
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+    const show = Keyboard.addListener(showEvent, (e) => {
+      setKbHeight(e.endCoordinates?.height ?? 0);
+      // Lifting the composer shortens the scroll view, which would otherwise
+      // leave the newest message hidden behind the keyboard in an existing
+      // conversation. Runs after the lift has laid out.
+      requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
+    });
+    const hide = Keyboard.addListener(hideEvent, () => setKbHeight(0));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
+
+  // The keyboard's reported height spans from the bottom of the SCREEN, so on a
+  // device with a gesture bar it already covers the area `insets.bottom` also
+  // accounts for. Subtracting it prevents padding by that strip twice; clamped
+  // at 0 so a device without one is unaffected.
+  const composerLift = kbHeight > 0 ? Math.max(kbHeight - insets.bottom, 0) : 0;
 
   useEffect(() => {
     if (!key) return;
@@ -170,11 +218,10 @@ export default function AssistantScreen() {
         }}
       />
 
-      <KeyboardAvoidingView
-        style={{ flex: 1 }}
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
-      >
+      {/* A plain View, deliberately — see the composerLift note above for why
+          KeyboardAvoidingView cannot measure this screen correctly. The lift is
+          applied to the composer itself at the bottom of this tree. */}
+      <View style={{ flex: 1 }}>
         <ScrollView
           ref={scrollRef}
           contentContainerStyle={st.scrollBody}
@@ -304,8 +351,11 @@ export default function AssistantScreen() {
           ) : null}
         </ScrollView>
 
-        {/* ---- Fixed chat input ---- */}
-        <View style={st.composerWrap}>
+        {/* ---- Fixed chat input ----
+            marginBottom (not paddingBottom) so composerWrap's own border and
+            background stop at the top of the keyboard instead of the surface
+            stretching down behind it. */}
+        <View style={[st.composerWrap, { marginBottom: composerLift }]}>
           <View style={st.composerRow}>
             <Pressable onPress={() => setCreateOpen(true)} hitSlop={8} accessibilityLabel="Create document">
               <Icon name="plus" tintColor={C.textDim} size={22} />
@@ -336,7 +386,7 @@ export default function AssistantScreen() {
           </View>
           <View style={{ height: S.sm }} />
         </View>
-      </KeyboardAvoidingView>
+      </View>
 
       <CreateDocumentSheet
         visible={createOpen}

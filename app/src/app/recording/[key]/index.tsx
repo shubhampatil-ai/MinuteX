@@ -32,7 +32,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, Pressable,
-  ScrollView, Share, StyleSheet, Text, TextInput, View,
+  ScrollView, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { Stack, useRouter } from "expo-router";
 import { Icon } from "../../../../lib/icons";
@@ -48,6 +48,7 @@ import { CrmRecordsBlock } from "../../../../lib/meeting-crm-records";
 import { Tasks } from "../../../../lib/meeting-tasks";
 import { AddTaskSheet } from "../../../../lib/add-task-sheet";
 import { DocumentsList, CreateDocumentSheet } from "../../../../lib/meeting-documents";
+import { ShareMeetingSheet } from "../../../../lib/meeting-share";
 import { MomEditorScreen } from "../../../../lib/mom-editor";
 import { AssistantButton } from "../../../../lib/assistant-button";
 import { ContactPicker } from "../../../../lib/contact-picker";
@@ -225,6 +226,7 @@ export default function MeetingDetailScreen() {
   // The structured MoM editor. Full-screen rather than a route so the
   // Overview state underneath (documents, tasks) survives closing it.
   const [momOpen, setMomOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
 
   const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
   const [speakerDraft, setSpeakerDraft] = useState("");
@@ -371,13 +373,14 @@ export default function MeetingDetailScreen() {
     }
   };
 
-  const shareMeeting = async () => {
+  // Opens the share-link sheet. This used to Share.share() the meeting TITLE
+  // as plain text — the recipient got a sentence, not the meeting. A link
+  // gives them the actual notes on their phone with no MinuteX account, and
+  // unlike an exported PDF it can be narrowed or revoked afterwards.
+  // See lib/meeting-share.tsx.
+  const shareMeeting = () => {
     setMenuOpen(false);
-    try {
-      await Share.share({ message: rec?.title || "Meeting", title: rec?.title || "Meeting" });
-    } catch {
-      // user cancelled
-    }
+    setShareOpen(true);
   };
 
   // Contact tagging inside the rename sheet.
@@ -1090,6 +1093,17 @@ export default function MeetingDetailScreen() {
           onClose={() => setAddTaskOpen(false)}
           recordingKey={key}
           onSubmit={addTask}
+        />
+
+        {/* Share as a public read-only link. Mounted out here, as a sibling of
+            the overflow menu rather than inside it, for the same Android
+            reason the contact picker is: a Modal nested in a Modal can render
+            behind its parent. */}
+        <ShareMeetingSheet
+          visible={shareOpen}
+          onClose={() => setShareOpen(false)}
+          recordingKey={key}
+          meetingTitle={rec?.title || "Meeting"}
         />
 
         <ContactPicker

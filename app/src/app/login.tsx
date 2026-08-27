@@ -9,7 +9,7 @@
 // Google button that is honestly labeled Coming Soon (no backend yet).
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Animated, Easing, KeyboardAvoidingView, Modal, Platform, Pressable,
+  Animated, Easing, KeyboardAvoidingView, Modal, Pressable,
   ScrollView, StyleSheet, Text, TextInput, TextInputProps, View,
 } from "react-native";
 import { Icon } from "../../lib/icons";
@@ -196,7 +196,10 @@ export default function LoginScreen() {
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: C.bg }}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      // "padding" on BOTH platforms: on Android 15+ edge-to-edge means the OS
+      // no longer resizes the window, and RN's KeyboardAvoidingView ignores the
+      // keyboard entirely when behavior is undefined. See lib/ui.tsx.
+      behavior="padding"
     >
       <ScrollView
         contentContainerStyle={st.scroll}

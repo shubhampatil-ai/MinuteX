@@ -55,6 +55,27 @@ Routes (HTTP API, payload format v2.0):
   PATCH  /recordings/ai/tasks/{key+}      {id, ...}           -> {task}
   DELETE /recordings/ai/tasks/{key+}      {id}                -> {deleted, id}
 
+  Meeting Share — a read-only public link (see the Meeting Share section).
+  POST   /recordings/share/{key+}   {summary?,highlights?,decisions?,tasks?,
+                                     participants?,transcript?,audio?,
+                                     expires_at?}          (JWT)
+                                  -> 201 {share_id, url, expires_at, share}
+         The `url` is the ONLY time the raw token is ever returned — only its
+         sha256 is stored, so it cannot be re-derived later.
+  GET    /recordings/shares/{key+}                  (JWT)  -> {shares:[...]}
+  PATCH  /shares/{share_id}   {toggles?, expires_at?} (JWT) -> {share}
+  DELETE /shares/{share_id}                          (JWT)  -> {share_id, revoked}
+  GET    /share/{token}     (NO JWT — the token IS the credential) -> text/html
+  GET    /share/{token}/audio  (NO JWT) -> 302 to a fresh short-lived presign
+         The <audio> element points HERE, never at S3, so every seek
+         re-validates the share and re-signs. That is what makes revocation
+         reach playback already under way, and what makes a two-hour meeting
+         seekable — S3 checks a presign at REQUEST time, so one flat window
+         would break the first seek past it.
+         The greedy {key+} sits LAST for the same API Gateway reason the AI
+         routes give above, which is why it is /recordings/share/{key+} and
+         not /recordings/{key}/share.
+
   CRM — Salesforce connect + configuration (see the CRM sections below).
   GET    /crm/salesforce/connect                    (JWT)    -> {authorize_url}
   GET    /crm/salesforce/callback  ?code&state    (NO JWT — Salesforce redirect) -> 302
@@ -186,6 +207,7 @@ import groq_client
 import mom_schema
 import spoken_dates
 import prompts
+import share_schema
 import stt_result
 import transcript_store
 
@@ -9748,6 +9770,586 @@ def ai_suggestions(event):
     ]})
 
 
+# ===========================================================================
+# MEETING SHARE — a read-only public link to one meeting.
+#
+# The product goal is the one every meeting-notes tool has: send someone a URL
+# and they read the notes on their phone, with no account, no app and no
+# login. That requirement is what makes this the THIRD unauthenticated route
+# in this file (after /crm/salesforce/callback and the ElevenLabs STT
+# webhook), and it is worth being explicit about what replaces the JWT.
+#
+# THE TOKEN IS THE CREDENTIAL. Possession of a 256-bit URL-safe token IS the
+# authorization — there is no identity behind it to check. Everything else
+# follows from that:
+#
+#   * Only sha256(token) is stored. A dump of the Shares table yields no
+#     working links, and the raw token exists exactly once, in the create
+#     response. This is why there is no "resend link" route: the server
+#     genuinely cannot reconstruct one. Revoke and re-share instead.
+#   * The token is NEVER logged. share_schema.redact_token() produces the
+#     hash prefix for the one place a log line is useful.
+#   * The public route reads the SHARES table first and the recording second,
+#     so an unknown token costs one indexed lookup and never touches the
+#     recording row.
+#   * The public payload is ASSEMBLED (share_schema.public_payload), never a
+#     stripped-down recording row — see that module's docstring for why the
+#     direction matters.
+#
+# WHAT THIS DOES NOT CHANGE. Every authenticated route keeps the exact
+# ownership rule it had: _owned_recording / get_recording are untouched, and a
+# share confers no authenticated access to anything. Sharing is purely
+# additive — a recording with no shares behaves precisely as before.
+#
+# STORAGE. One table, Shares, PK share_id, with a token-index GSI on
+# token_hash because the public route arrives holding only the token, and a
+# recording-index GSI so the owner's list is a query rather than a scan.
+# ===========================================================================
+SHARES_TABLE = os.environ.get("SHARES_TABLE", "Shares")
+SHARES_TOKEN_INDEX = os.environ.get("SHARES_TOKEN_INDEX", "token-index")
+SHARES_RECORDING_INDEX = os.environ.get("SHARES_RECORDING_INDEX",
+                                        "recording-index")
+# Where the public page lives. An env var rather than a constant so the link
+# can move to a custom domain later without touching this code — the route
+# path (/share/{token}) stays identical either way.
+SHARE_BASE_URL = os.environ.get("SHARE_BASE_URL", "")
+# A ceiling on live links per recording. Not a licensing limit — it stops a
+# runaway client (or a user tapping Create repeatedly) from filling the table
+# with links nobody can enumerate afterwards.
+MAX_SHARES_PER_RECORDING = int(os.environ.get("MAX_SHARES_PER_RECORDING", "20"))
+MAX_SHARE_TTL_DAYS = int(os.environ.get("MAX_SHARE_TTL_DAYS", "365"))
+
+_shares = _ddb.Table(SHARES_TABLE)
+
+
+def _share_base_url(event):
+    """The origin the public link should use.
+
+    Prefers SHARE_BASE_URL; falls back to the API Gateway host the request
+    arrived on, so a fresh deploy produces working links before anyone sets
+    the variable. The Host header is only ever used to BUILD a link shown to
+    the authenticated owner — never to make an authorization decision — so a
+    spoofed Host cannot grant access to anything.
+    """
+    if SHARE_BASE_URL:
+        return SHARE_BASE_URL.rstrip("/")
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    host = headers.get("host") or ""
+    stage = ((event.get("requestContext") or {}).get("stage") or "")
+    if not host:
+        return ""
+    base = f"https://{host}"
+    # HTTP API's implicit "$default" stage is not part of the URL; a named
+    # stage is.
+    if stage and stage != "$default":
+        base = f"{base}/{stage}"
+    return base
+
+
+def _html_resp(status, body):
+    """An HTML response, with the cache posture a private page needs.
+
+    _resp() answers JSON for every other route in this file; the share page is
+    the one place that must return text/html, so it gets its own builder
+    rather than a mode flag on _resp.
+
+    Cache-Control is `no-store` on purpose. A shared meeting can be revoked,
+    and a page a CDN or a phone browser kept would outlive the revocation — so
+    the one thing this response must never be is durably cached. It also keeps
+    meeting content out of shared/proxy caches on whatever network the
+    recipient happens to be using.
+    """
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store, no-cache, must-revalidate, private",
+            "Pragma": "no-cache",
+            "X-Robots-Tag": "noindex, nofollow, noarchive",
+            # Deny-by-default, then the four things this page genuinely
+            # needs. Each entry is here for a stated reason; anything not
+            # listed is blocked, which is the point.
+            #
+            #   style-src   'unsafe-inline' for the inline <style> block, plus
+            #               fonts.googleapis.com for the app's own two
+            #               families (theme.tsx FONT) — the shared page is
+            #               typographically the SAME product, not a lookalike.
+            #   font-src    fonts.gstatic.com, where that stylesheet's @font-face
+            #               rules actually fetch the files from.
+            #   script-src  'unsafe-inline' for the ~14-line tab switcher. It
+            #               is the only script on the page and it touches
+            #               nothing but a class name and `hidden`. A nonce
+            #               would be stricter, but with no other script source
+            #               permitted there is nothing for an injected tag to
+            #               do — and every interpolation is html-escaped.
+            #   media-src   https:, so the <audio> element can follow the
+            #               gateway's 302 to the presigned S3 URL.
+            "Content-Security-Policy": (
+                "default-src 'none'; "
+                "style-src 'unsafe-inline' https://fonts.googleapis.com; "
+                "font-src https://fonts.gstatic.com; "
+                "script-src 'unsafe-inline'; "
+                "img-src 'self' data:; media-src https:; "
+                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+        "body": body,
+    }
+
+
+def _share_by_id(share_id, user_id):
+    """One share the caller owns, or 404.
+
+    Same 404-not-403 rule the recording routes use: a share_id belonging to
+    another user is reported as missing, so the endpoint cannot confirm that
+    an id exists.
+    """
+    if not share_id:
+        raise ApiError(400, "share id required")
+    item = _shares.get_item(Key={"share_id": share_id}).get("Item")
+    if not item or item.get("owner_id") != user_id:
+        raise ApiError(404, "share not found")
+    return item
+
+
+def _shares_for_recording(key):
+    res = _shares.query(
+        IndexName=SHARES_RECORDING_INDEX,
+        KeyConditionExpression=Key("recording_key").eq(key),
+    )
+    return res.get("Items", [])
+
+
+def _parse_expires_at(raw):
+    """The requested expiry -> a stored ISO string, or "" for never.
+
+    Accepts an ISO timestamp or a number of days, because the app's picker
+    offers durations while an API caller more naturally sends an instant.
+    """
+    if raw is None or raw == "":
+        return ""
+    if isinstance(raw, bool):
+        raise ApiError(400, "expires_at must be a timestamp, a number of "
+                            "days, or null")
+    if isinstance(raw, (int, float, Decimal)):
+        days = float(raw)
+        if days <= 0:
+            raise ApiError(400, "expiry must be greater than zero days")
+        if days > MAX_SHARE_TTL_DAYS:
+            raise ApiError(400, f"expiry cannot exceed {MAX_SHARE_TTL_DAYS} days")
+        at = datetime.now(timezone.utc) + timedelta(days=days)
+        return at.isoformat().replace("+00:00", "Z")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return ""
+        try:
+            at = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            raise ApiError(400, "expires_at must be an ISO-8601 timestamp")
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if at <= now:
+            raise ApiError(400, "expires_at must be in the future")
+        if at > now + timedelta(days=MAX_SHARE_TTL_DAYS):
+            raise ApiError(400, f"expiry cannot exceed {MAX_SHARE_TTL_DAYS} days")
+        return at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    raise ApiError(400, "expires_at must be a timestamp, a number of days, or null")
+
+
+def _shared_mom(user_id, key, item):
+    """The MoM structure the public page renders from.
+
+    Prefers the STORED structure, so the shared page shows exactly what the
+    owner edited in the MoM editor. A recording that has never had a MoM
+    generated falls back to building the sections on the fly — a read-only
+    build, never persisted, because a viewer opening a link must not cause a
+    write to the owner's meeting.
+    """
+    stored = _stored_mom(item)
+    if stored is not None:
+        return mom_schema.coerce_mom(stored)
+    mom = mom_schema.empty_mom()
+    try:
+        mom["sections"] = _build_fresh_sections(user_id, key, item)
+    except Exception as e:  # noqa: BLE001
+        # A share that renders the header and nothing else beats a 500. The
+        # recording key is safe to log; the token never appears here.
+        print(f"[share] section build failed for {key}: {type(e).__name__}: {e}")
+        mom["sections"] = []
+    return mom
+
+
+def create_share(event):
+    """POST /recordings/share/{key+} -> {share_id, url, expires_at, share}
+
+    The ONLY place a raw token exists. It is returned once and then forgotten:
+    only its hash is written, so this response is the user's single
+    opportunity to capture the link.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    body = _body(event)
+
+    active = [s for s in _shares_for_recording(key) if share_schema.is_active(s)]
+    if len(active) >= MAX_SHARES_PER_RECORDING:
+        raise ApiError(409, "this meeting already has the maximum number of "
+                            "active share links; revoke one first")
+
+    config = share_schema.coerce_config(body)
+    expires_at = _parse_expires_at(
+        body.get("expires_at", body.get("expires_in_days")))
+
+    token = share_schema.new_token()
+    now = _now_iso()
+    share = {
+        "share_id": f"shr_{uuid.uuid4().hex}",
+        "recording_key": key,
+        "owner_id": user_id,
+        "token_hash": share_schema.hash_token(token),
+        "access_type": share_schema.ACCESS_PUBLIC,
+        "expires_at": expires_at,
+        "revoked_at": "",
+        "created_at": now,
+        "updated_at": now,
+        "view_count": 0,
+        "last_viewed_at": "",
+        # A denormalised copy so the owner's list screen reads without a
+        # second lookup. Nothing reads it for authorization.
+        "recording_title": (item.get("title") or "").strip()[:200],
+    }
+    share.update(config)
+
+    _shares.put_item(Item=share,
+                     ConditionExpression="attribute_not_exists(share_id)")
+
+    base = _share_base_url(event)
+    return _resp(201, {
+        "share_id": share["share_id"],
+        "url": share_schema.public_share_url(base, token),
+        "expires_at": expires_at or None,
+        "share": share_schema.owner_view(share, base_url=base, token=token),
+    })
+
+
+def list_shares(event):
+    """GET /recordings/shares/{key+} -> {shares:[...]}
+
+    No `url` on any row: the raw tokens are unrecoverable by design (only
+    their hashes were stored), so the app shows a revoke control for old links
+    and a Create button for a new one.
+    """
+    _, key, _item = _owned_recording(event, hydrate=False)
+    rows = _shares_for_recording(key)
+    rows.sort(key=lambda s: s.get("created_at", ""), reverse=True)
+    return _resp(200, {"shares": [share_schema.owner_view(s) for s in rows]})
+
+
+def update_share(event):
+    """PATCH /shares/{share_id} -> {share}
+
+    Toggles and expiry only. The token never changes: rotating it would break
+    a link the owner has already sent while leaving the old one revoked
+    anyway, so "change who can see what" and "issue a new link" stay separate
+    operations.
+    """
+    user_id = _require_auth(event)
+    share_id = (event.get("pathParameters") or {}).get("share_id", "")
+    share = _share_by_id(share_id, user_id)
+    body = _body(event)
+
+    updates = share_schema.coerce_config(body, base=share)
+    now = _now_iso()
+    values = {":now": now}
+    names = {}
+    sets = ["updated_at = :now"]
+
+    for i, (name, _default, _roles) in enumerate(share_schema.TOGGLES):
+        sets.append(f"#n{i} = :t{i}")
+        names[f"#n{i}"] = name
+        values[f":t{i}"] = updates[name]
+
+    if "expires_at" in body or "expires_in_days" in body:
+        sets.append("expires_at = :exp")
+        values[":exp"] = _parse_expires_at(
+            body.get("expires_at", body.get("expires_in_days")))
+
+    # Un-revoking is deliberately not offered: a revoked link's token is gone
+    # from the owner's reach anyway, so "restore" would resurrect a URL only a
+    # recipient still holds. The condition re-checks ownership at write time.
+    _shares.update_item(
+        Key={"share_id": share_id},
+        UpdateExpression="SET " + ", ".join(sets),
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues={**values, ":owner": user_id},
+        ConditionExpression="owner_id = :owner",
+    )
+
+    fresh = _shares.get_item(Key={"share_id": share_id}).get("Item") or share
+    return _resp(200, {"share": share_schema.owner_view(fresh)})
+
+
+def revoke_share(event):
+    """DELETE /shares/{share_id} -> {share_id, revoked}
+
+    A soft revoke: the row stays, stamped with revoked_at. Keeping it is what
+    makes the kill auditable — "this link existed and was killed at 14:02" is
+    worth more than the reclaimed row, and the public route treats a revoked
+    share exactly like a nonexistent one.
+    """
+    user_id = _require_auth(event)
+    share_id = (event.get("pathParameters") or {}).get("share_id", "")
+    share = _share_by_id(share_id, user_id)
+
+    if share.get("revoked_at"):
+        return _resp(200, {"share_id": share_id, "revoked": True,
+                           "revoked_at": share["revoked_at"]})
+
+    now = _now_iso()
+    _shares.update_item(
+        Key={"share_id": share_id},
+        UpdateExpression="SET revoked_at = :now, updated_at = :now",
+        ExpressionAttributeValues={":now": now, ":owner": user_id},
+        ConditionExpression="owner_id = :owner",
+    )
+    return _resp(200, {"share_id": share_id, "revoked": True, "revoked_at": now})
+
+
+def _share_by_token(token):
+    """The share row for a raw token, or None. Reads the hash, never the token."""
+    res = _shares.query(
+        IndexName=SHARES_TOKEN_INDEX,
+        KeyConditionExpression=Key("token_hash").eq(
+            share_schema.hash_token(token)),
+    )
+    rows = res.get("Items", [])
+    return rows[0] if rows else None
+
+
+def _count_share_view(share):
+    """Best-effort view counter. Never fails the page.
+
+    A share link's whole value is that it opens; a throttled counter update
+    must not be the reason a recipient sees an error.
+    """
+    try:
+        _shares.update_item(
+            Key={"share_id": share.get("share_id")},
+            UpdateExpression="SET view_count = if_not_exists(view_count, :z) "
+                             "+ :one, last_viewed_at = :now",
+            ExpressionAttributeValues={":z": 0, ":one": 1, ":now": _now_iso()},
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[share] view count failed for "
+              f"{share.get('share_id')}: {type(e).__name__}: {e}")
+
+
+# The wording every dead link gets, whatever killed it. One tuple so the
+# revoked and unknown paths cannot drift apart and start distinguishing
+# themselves — see _resolve_public_share.
+_SHARE_GONE = ("This link isn't available",
+               "It may have been revoked by its owner, or the address may be "
+               "incomplete. Ask the sender for a new link.")
+
+
+class ShareGone(Exception):
+    """A public share request that must not be served.
+
+    Carries the HTTP status and the page to render. Raised rather than
+    returned so the validation sequence reads top-to-bottom in one place and
+    BOTH public routes (the page and the audio gateway) are forced through
+    exactly the same checks — an audio gateway that silently skipped the
+    revocation test is precisely the bug this shape prevents.
+    """
+
+    def __init__(self, status, headline, detail):
+        super().__init__(headline)
+        self.status = status
+        self.headline = headline
+        self.detail = detail
+
+    def response(self):
+        return _html_resp(self.status, share_schema.render_error_page(
+            self.status, self.headline, self.detail))
+
+
+def _resolve_public_share(event):
+    """(token, share, item) for a public request, or raise ShareGone.
+
+    THE one gate in front of every unauthenticated read. The checks run
+    cheapest and most-likely-to-reject first, so a flood of bad URLs costs a
+    regex and at most one indexed lookup:
+
+      1. SHAPE      the token must look like a token at all (no DB read).
+      2. LOOKUP     token-index on sha256(token). Unknown -> 404.
+      3. REVOKED    revoked_at set -> 404, the SAME page as unknown.
+      4. EXPIRED    expires_at passed -> 410, and says so: an expiry is a
+                    fact the owner chose to communicate, unlike a revocation.
+      5. RECORDING  resolved from the SHARE, never from the URL.
+      6. TRASHED    a meeting in the Trash stops being shared with it.
+
+    Failures 2 and 3 render the same page on purpose, so a dead link cannot be
+    used to learn whether a share ever existed.
+    """
+    token = _url_unquote((event.get("pathParameters") or {}).get("token", ""))
+
+    if not share_schema.token_looks_valid(token):
+        raise ShareGone(404, *_SHARE_GONE)
+
+    try:
+        share = _share_by_token(token)
+    except ClientError as e:
+        print(f"[share] lookup failed for {share_schema.redact_token(token)}: "
+              f"{type(e).__name__}: {e}")
+        raise ShareGone(503, "Something went wrong",
+                        "This page couldn't be loaded right now. "
+                        "Please try again.")
+
+    if not share or share_schema.is_revoked(share):
+        raise ShareGone(404, *_SHARE_GONE)
+
+    if share_schema.is_expired(share):
+        raise ShareGone(410, "This link has expired",
+                        "The owner set this share link to expire. "
+                        "Ask them for a new one.")
+
+    key = share.get("recording_key") or ""
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") \
+        if key else None
+    if not item or _is_trashed(item):
+        raise ShareGone(404, *_SHARE_GONE)
+
+    return token, share, item
+
+
+def public_share_audio(event):
+    """GET /share/{token}/audio -> 302 to a fresh presign. NO JWT.
+
+    THE AUDIO GATEWAY. The page never points <audio> at S3 directly; it points
+    here, and this re-validates the share and re-signs on EVERY request. Three
+    things follow, and each is a reason this route exists:
+
+      * REVOCATION REACHES PLAYBACK. An HTML5 player re-requests on every seek
+        and on many pause/resumes. Because each of those passes through
+        _resolve_public_share again, revoking a share (or turning its audio
+        toggle off) stops audio that is already under way, instead of leaving
+        a signed URL working in someone's tab until it lapses.
+
+      * NO S3 URL IN THE PAGE SOURCE. What ships in the HTML is this route,
+        which is useless without a live share behind it. The presign exists
+        only inside a 302 the browser follows.
+
+      * LONG RECORDINGS WORK. S3 checks a presign's expiry at REQUEST time, so
+        a ranged read that starts inside the window completes, but the NEXT
+        one — every seek — is checked afresh. Re-signing per request means the
+        window only ever has to be one read wide, and a two-hour meeting still
+        seeks correctly at minute 118.
+
+    RANGE / 206 is preserved because the browser replays its original request,
+    Range header and all, against the Location it is given. S3 answers the 206
+    directly; this Lambda never proxies a byte of audio, which also keeps it
+    clear of API Gateway's 29s timeout and 10MB response cap.
+    """
+    try:
+        _token, share, item = _resolve_public_share(event)
+    except ShareGone as gone:
+        return gone.response()
+
+    # Checked HERE, not only when rendering the page: a viewer holding an
+    # already-loaded page must not keep streaming after the owner turns audio
+    # off. This is the check that makes that true.
+    if not share.get("audio_enabled"):
+        return ShareGone(404, *_SHARE_GONE).response()
+
+    key = share.get("recording_key") or ""
+    if not (BUCKET_NAME and key):
+        return ShareGone(404, *_SHARE_GONE).response()
+
+    try:
+        url = _s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET_NAME, "Key": key},
+            # Flat and short: this URL only has to outlive ONE ranged read,
+            # because the next seek comes back through this route.
+            ExpiresIn=share_schema.SHARE_AUDIO_URL_EXPIRY,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[share] presign failed for {key}: {type(e).__name__}: {e}")
+        return ShareGone(503, "Something went wrong",
+                         "The recording couldn't be loaded right now. "
+                         "Please try again.").response()
+
+    # 302, not 301: a permanent redirect is exactly the thing a browser is
+    # entitled to cache, and caching it would pin one expiring presign in
+    # front of every later seek.
+    return {
+        "statusCode": 302,
+        "headers": {
+            "Location": url,
+            "Cache-Control": "no-store, no-cache, must-revalidate, private",
+            "Referrer-Policy": "no-referrer",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
+        "body": "",
+    }
+
+
+def public_share(event):
+    """GET /share/{token} -> a mobile-friendly HTML page. NO JWT.
+
+    THE THIRD UNAUTHENTICATED ROUTE IN THIS FILE (public_share_audio above is
+    the fourth). Validation lives in _resolve_public_share; what remains here
+    is assembling the payload from the enabled toggles only.
+    """
+    try:
+        token, share, item = _resolve_public_share(event)
+    except ShareGone as gone:
+        return gone.response()
+
+    key = share.get("recording_key") or ""
+
+    # The transcript lives in S3 for newer rows, so it is only fetched when the
+    # share actually publishes it — a notes-only share costs no S3 GET.
+    if share.get("transcript_enabled"):
+        try:
+            item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+        except Exception as e:  # noqa: BLE001
+            print(f"[share] transcript hydrate failed for {key}: "
+                  f"{type(e).__name__}: {e}")
+
+    # The page points at the GATEWAY, never at S3. The permanent object URL is
+    # never exposed and no presign appears in the HTML at all — the gateway
+    # mints one per request, behind a fresh validation. See public_share_audio.
+    #
+    # FALLBACK: if the gateway address cannot be resolved (no SHARE_BASE_URL
+    # and no Host header), fall back to a direct presign sized to the
+    # RECORDING rather than to a flat 15 minutes — a fixed window breaks
+    # seeking on any meeting longer than it. Still only when audio is shared.
+    audio_url = None
+    if share.get("audio_enabled") and BUCKET_NAME and key:
+        base = _share_base_url(event)
+        if base:
+            audio_url = f"{base}/share/{token}/audio"
+        else:
+            try:
+                audio_url = _s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": BUCKET_NAME, "Key": key},
+                    ExpiresIn=share_schema.audio_url_expiry(item.get("duration")),
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[share] presign failed for {key}: "
+                      f"{type(e).__name__}: {e}")
+                audio_url = None
+
+    mom = _shared_mom(share.get("owner_id") or "", key, item)
+    payload = share_schema.public_payload(item, mom, share, audio_url=audio_url)
+    _count_share_view(share)
+    return _html_resp(200, share_schema.render_page(payload))
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -9883,6 +10485,15 @@ _ROUTES = {
     # unauthenticated route in this file (after /crm/salesforce/callback):
     # ElevenLabs has no MinuteX JWT, so identity is proven by an HMAC signature
     # over the raw body instead. See the section above for all five checks.
+    # --- Meeting Share. The first four are owner-only (JWT); /share/{token}
+    # is the ONLY unauthenticated way to read a meeting, and it authorizes on
+    # the token alone. See the Meeting Share section above.
+    ("POST", "/recordings/share/{key+}"): create_share,
+    ("GET", "/recordings/shares/{key+}"): list_shares,
+    ("PATCH", "/shares/{share_id}"): update_share,
+    ("DELETE", "/shares/{share_id}"): revoke_share,
+    ("GET", "/share/{token}"): public_share,
+    ("GET", "/share/{token}/audio"): public_share_audio,
     ("POST", "/webhooks/elevenlabs/stt"): stt_webhook,
     # Recover a job whose webhook never arrived, by asking ElevenLabs directly.
     # JWT-authenticated and owner-scoped — this one is for the user/operator,

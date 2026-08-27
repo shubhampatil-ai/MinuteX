@@ -817,6 +817,211 @@ export async function syncCrmRecord(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Integrations — connecting MinuteX to external applications.
+//
+// The app NEVER sees a provider credential. It asks the backend for an
+// authorize URL, opens it (lib/integrations.ts owns that browser round-trip),
+// and afterwards re-reads status. Access tokens, refresh tokens and client
+// secrets exist only server-side; nothing in these types can carry one,
+// because the backend assembles its responses field by field.
+// ---------------------------------------------------------------------------
+
+// The four states the backend reports. NOT_CONNECTED is what the ABSENCE of a
+// connection means; the other three are stored. The app must branch on this
+// rather than on "did we get an account address back" — a revoked connection
+// still has one.
+export type IntegrationStatusValue =
+  | "NOT_CONNECTED" | "CONNECTED" | "REAUTH_REQUIRED" | "ERROR";
+
+export type Integration = {
+  provider: string;
+  name: string;
+  category: string;
+  description: string;
+  /** Whether this provider can actually be connected yet. Server-driven, so
+   *  the day WhatsApp ships every installed build lights that card up without
+   *  an app update — and an old build can never offer a connect button for
+   *  something the backend cannot honour. */
+  available: boolean;
+  /** True for Salesforce: listed here so the Integrations screen is a complete
+   *  picture, but connected through its own existing screen rather than the
+   *  generic flow. The card routes there instead of calling connect. */
+  managed_elsewhere: boolean;
+  status: IntegrationStatusValue;
+  connected: boolean;
+  /** The connected account as the user knows it — a Gmail address today. */
+  account_identifier: string;
+  account_name: string;
+  scopes: string[];
+  connected_at: string;
+  updated_at: string;
+  /** Why the connection is unusable. Present only when status is
+   *  REAUTH_REQUIRED or ERROR, and always user-facing wording. */
+  message: string;
+};
+
+// The backend's "your MinuteX session is fine, but this INTEGRATION cannot
+// serve the request" answers (HTTP 409 + one of these codes).
+//
+// Deliberately NOT 401, for exactly the reason SALESFORCE_RECONNECT_CODE
+// documents above: a 401 makes `request` below clear the stored JWT and bounce
+// the user to /login, and a dead Gmail token must never sign anyone out of
+// MinuteX. Reconnecting Gmail is the fix; signing out never was.
+export const INTEGRATION_NOT_CONNECTED_CODE = "integration_not_connected";
+export const INTEGRATION_REAUTH_CODE = "integration_reauth_required";
+
+/** True when this error means "the integration is unusable" — either never
+ *  connected or needing reconnection. The single check every Gmail-dependent
+ *  screen uses, so no screen invents its own. */
+export function isIntegrationUnavailable(e: unknown): boolean {
+  return e instanceof ApiError
+    && (e.code === INTEGRATION_NOT_CONNECTED_CODE
+      || e.code === INTEGRATION_REAUTH_CODE);
+}
+
+export function isIntegrationReauth(e: unknown): boolean {
+  return e instanceof ApiError && e.code === INTEGRATION_REAUTH_CODE;
+}
+
+export async function getIntegrations(): Promise<Integration[]> {
+  const res = await request<{ integrations: Integration[] }>("/integrations");
+  return res.integrations ?? [];
+}
+
+export async function getIntegration(provider: string): Promise<Integration> {
+  const res = await request<{ integration: Integration }>(
+    `/integrations/${encodeURIComponent(provider)}`
+  );
+  return res.integration;
+}
+
+/** The provider's consent URL. Opening it is lib/integrations.ts's job. */
+export async function getIntegrationAuthorizeUrl(
+  provider: string
+): Promise<string> {
+  const res = await request<{ authorize_url: string }>(
+    `/integrations/${encodeURIComponent(provider)}/connect`,
+    { method: "POST" }
+  );
+  return res.authorize_url;
+}
+
+export async function disconnectIntegration(provider: string): Promise<void> {
+  await request(`/integrations/${encodeURIComponent(provider)}`, {
+    method: "DELETE",
+  });
+}
+
+// ---- Gmail ----------------------------------------------------------------
+
+/** One person an email can go to. `contact_id` is what the backend resolves
+ *  the address from — sending a contact_id alongside a different email is
+ *  ignored server-side, which is what stops the picker being a way to mail an
+ *  arbitrary address under a contact's name. */
+export type EmailRecipient = {
+  contact_id?: string;
+  name?: string;
+  email?: string;
+};
+
+/** A participant the backend resolved (or could not) for a meeting. */
+export type ResolvedRecipient = {
+  contact_id: string;
+  name: string;
+  email: string;
+  speaker_id: string;
+};
+
+export type MeetingRecipients = {
+  recipients: ResolvedRecipient[];
+  /** Participants mapped to a contact with NO email address. Shown next to the
+   *  person it applies to, so the user learns before pressing Send rather than
+   *  after — and the backend refuses the send if any are selected. */
+  unresolved: ResolvedRecipient[];
+  meeting_title: string;
+};
+
+/** Attachment types the backend accepts. Matches ATTACHMENT_TYPES in
+ *  cloud/shared/email_message.py — an allow-list on both sides. */
+export type EmailAttachmentType = "pdf" | "docx" | "md" | "txt";
+
+/** An attachment, rendered BY THE APP.
+ *
+ *  The PDF and DOCX renderers live here (lib/mom-pdf.ts, lib/mom-docx.ts) and
+ *  produce exactly what the user previews. Re-implementing them server-side
+ *  would mean two renderers that drift, and a recipient receiving a document
+ *  that differs from the preview — so the bytes travel base64 with the send
+ *  request instead. The backend validates them as untrusted input. */
+export type EmailAttachment = {
+  type: EmailAttachmentType;
+  filename: string;
+  content_base64: string;
+};
+
+export type SendEmailResult = {
+  sent: boolean;
+  message_id: string;
+  thread_id: string;
+  recipient_count: number;
+};
+
+export type SendEmailInput = {
+  recipients: EmailRecipient[];
+  subject?: string;
+  body?: string;
+  cc?: string[];
+  attachments?: EmailAttachment[];
+};
+
+/** Participants of a meeting, already resolved to addresses by the backend.
+ *  Requires a usable Gmail connection — throws with an integration code
+ *  otherwise, which is the server-side half of the visibility rule. */
+export async function getMeetingEmailRecipients(
+  key: string
+): Promise<MeetingRecipients> {
+  return request<MeetingRecipients>(
+    `/integrations/gmail/recipients/${encodeURIComponent(key)}`
+  );
+}
+
+/** Send meeting material (MoM, summary, highlights, action items) by Gmail. */
+export async function sendMeetingEmail(
+  key: string, input: SendEmailInput
+): Promise<SendEmailResult> {
+  return request<SendEmailResult>(
+    `/integrations/gmail/send/meeting/${encodeURIComponent(key)}`,
+    { method: "POST", body: input }
+  );
+}
+
+/** Send one task's details by Gmail. Explicitly triggered — this is
+ *  communication, not a notification engine: nothing schedules or batches. */
+export async function sendTaskEmail(
+  taskId: string, input: Partial<SendEmailInput> = {}
+): Promise<SendEmailResult> {
+  return request<SendEmailResult>(
+    `/integrations/gmail/send/task/${encodeURIComponent(taskId)}`,
+    { method: "POST", body: input }
+  );
+}
+
+/** A general email through the user's Gmail — follow-up communication that is
+ *  not tied to one meeting or task.
+ *
+ *  Named sendGmailEmail, not sendEmail, because lib/contacts.ts already
+ *  exports a sendEmail(): a mailto: deep link that opens whatever mail app the
+ *  phone has and needs no Gmail connection. Two functions called sendEmail
+ *  with completely different requirements — one gated on an OAuth connection,
+ *  one not — is a mistake waiting to be made at a call site. */
+export async function sendGmailEmail(
+  input: SendEmailInput
+): Promise<SendEmailResult> {
+  return request<SendEmailResult>("/integrations/gmail/send", {
+    method: "POST", body: input,
+  });
+}
+
 export async function getRecordings(): Promise<RecordingSummary[]> {
   const res = await request<{ recordings: RecordingSummary[] }>("/recordings");
   return res.recordings ?? [];

@@ -20,6 +20,10 @@ import { useMeeting } from "../../../../../../lib/meeting-context";
 import { DueDatePicker, isPlottableDue } from "../../../../../../lib/due-date-picker";
 import { initialsOf, nextId, type Task, type TaskStatus } from "../../../../../../lib/task-model";
 import { Pop, PressSpring } from "../../../../../../lib/motion";
+import {
+  GmailTaskButton, GmailTaskSheet,
+} from "../../../../../../lib/gmail-task-share";
+import { useGmail } from "../../../../../../lib/integrations";
 
 const STATUS_STEPS: TaskStatus[] = ["Open", "In Progress", "Completed"];
 const PRIORITY_COLOR: Record<Task["priority"], (C: ColorScale) => string> = {
@@ -105,6 +109,10 @@ export default function TaskDetailScreen() {
   const [priorityPickerOpen, setPriorityPickerOpen] = useState(false);
   const [editingField, setEditingField] = useState<"title" | "description" | null>(null);
   const [dueOpen, setDueOpen] = useState(false);
+  const [gmailTaskOpen, setGmailTaskOpen] = useState(false);
+  // The ONE Gmail check this screen makes — the shared context, so
+  // disconnecting Gmail in Settings removes this action here immediately.
+  const gmail = useGmail();
   const [editDraft, setEditDraft] = useState("");
 
   if (!task) {
@@ -280,6 +288,24 @@ export default function TaskDetailScreen() {
           onPress={() => router.push({ pathname: "/recording/[key]/task/[taskId]/assign", params: { key, taskId } })}
           style={{ marginTop: S.xl }}
         />
+
+        {/* Email the task to its assignee, through the user's own Gmail.
+            Explicitly triggered communication — distinct from Notify Assignee,
+            which is a multi-channel deep-link handoff and the seed of the
+            notification feature that comes later.
+
+            GmailTaskButton owns the visibility rule: with Gmail unconnected it
+            becomes a prompt routing to Settings, never an action that fails.
+            Offered only for an ASSIGNED task, because the assignee is who the
+            backend resolves the recipient from. */}
+        {task.assignee ? (
+          <GmailTaskButton
+            usable={gmail.usable}
+            needsReauth={gmail.needsReauth}
+            onPress={() => setGmailTaskOpen(true)}
+            style={{ marginTop: S.md }}
+          />
+        ) : null}
 
         {/* ---- Status stepper ---- */}
         <Text style={[st.descLabel, { marginTop: S.xxl }]}>Status</Text>
@@ -476,6 +502,17 @@ export default function TaskDetailScreen() {
           </Pressable>
         </KeyboardAwareSheet>
       </Modal>
+
+      {/* Gmail send. A sibling of the edit modal, not nested inside it — a
+          Modal within a Modal can render behind its parent on Android. */}
+      <GmailTaskSheet
+        visible={gmailTaskOpen}
+        onClose={() => setGmailTaskOpen(false)}
+        taskId={taskId}
+        taskTitle={task.task}
+        assigneeName={task.assignee?.name}
+        onSent={() => Alert.alert("Sent", "The task was emailed.")}
+      />
     </View>
   );
 }

@@ -19,7 +19,7 @@ import {
 import {
   openAppSettings, useOnForeground, openLocationSettings,
 } from "../../lib/permissions";
-import { getSalesforceStatus } from "../../lib/api";
+import { useIntegrations } from "../../lib/integrations";
 
 // Small persisted-boolean hook — settings survive app restarts.
 function useStoredBool(key: string, initial: boolean): [boolean, (v: boolean) => void] {
@@ -73,7 +73,16 @@ export default function SettingsScreen() {
   // Phone-wide GPS switch, not a MinuteX permission — so it can't be fixed
   // from this app's settings page, only from the OS location screen.
   const [locOn, setLocOn] = useState(true);
-  const [sfConnected, setSfConnected] = useState<boolean | null>(null);
+  // Read from the app-wide integration context rather than fetching here:
+  // one source of truth means this row cannot disagree with the Integrations
+  // screen it links to. Null while the first load is in flight, so the row
+  // says nothing rather than claiming "Nothing connected yet" prematurely.
+  const {
+    integrations, loading: integrationsLoading, refresh: refreshIntegrations,
+  } = useIntegrations();
+  const connectedCount = integrationsLoading && !integrations.length
+    ? null
+    : integrations.filter((i) => i.connected).length;
   const [autoSync, setAutoSync] = useStoredBool("minutex.pref.autosync", true);
   const { checkPermissions, requestPermissions, areScanPrerequisitesMet } = useDevice();
   const [autoTranscribe, setAutoTranscribe] = useStoredBool("minutex.pref.autotranscribe", true);
@@ -93,19 +102,11 @@ export default function SettingsScreen() {
   useEffect(() => { refresh(); }, [refresh]);
   useOnForeground(refresh);
 
-  // Connection state for the Integrations row. Null while unknown so the row
-  // shows "Checking…" rather than claiming "Not connected" before we know.
-  const refreshSalesforce = useCallback(async () => {
-    try {
-      const s = await getSalesforceStatus();
-      setSfConnected(s.connected);
-    } catch {
-      setSfConnected(null);  // leave it unstated rather than wrong
-    }
-  }, []);
-  // Wrapped in a void arrow, not passed directly: useFocusEffect treats a
-  // returned value as a cleanup function, and an async fn returns a Promise.
-  useFocusEffect(useCallback(() => { refreshSalesforce(); }, [refreshSalesforce]));
+  // Re-read integration status on every return to this screen, so connecting
+  // or disconnecting something and coming back shows the new count. Wrapped in
+  // a void arrow, not passed directly: useFocusEffect treats a returned value
+  // as a cleanup function, and an async fn returns a Promise.
+  useFocusEffect(useCallback(() => { refreshIntegrations(); }, [refreshIntegrations]));
 
   const fixBle = async () => {
     if (bleBlocked) { openAppSettings(); return; }
@@ -186,16 +187,24 @@ export default function SettingsScreen() {
 
       {/* Integrations */}
       <SectionRule>Integrations</SectionRule>
+      {/* ONE row, not one per application. Salesforce used to sit here as its
+          own row; it now lives inside Connected apps alongside Gmail and the
+          Coming Soon cards, so there is a single place to look for "what is
+          MinuteX linked to". Its own screen still owns connecting and field
+          mapping — the card routes there — which is why moving it cost no
+          functionality. */}
       <ListRow
-        icon="cloud.fill"
-        label="Salesforce"
+        icon="link"
+        label="Connected apps"
         sub={
-          sfConnected === null ? "Push meeting notes into your CRM"
-            : sfConnected ? "Connected"
-              : "Not connected"
+          connectedCount === null ? "Gmail, Salesforce and more"
+            : connectedCount === 0 ? "Nothing connected yet"
+              : `${connectedCount} connected`
         }
-        right={sfConnected ? <Text style={st.granted}>Connected</Text> : undefined}
-        onPress={() => router.push("/salesforce")}
+        right={
+          connectedCount ? <Text style={st.granted}>{connectedCount}</Text> : undefined
+        }
+        onPress={() => router.push("/integrations")}
       />
 
       {/* Notifications & permissions */}

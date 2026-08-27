@@ -15,6 +15,7 @@ import { FONT, ThemeProvider, useTheme } from "../../lib/theme";
 import { Splash } from "../../lib/splash";
 import { getToken } from "../../lib/api";
 import { DeviceProvider } from "../../lib/device-context";
+import { IntegrationsProvider } from "../../lib/integrations";
 import { recoverUploads } from "../../lib/uploads";
 
 // Root error boundary — a crash anywhere in the tree lands here instead of a
@@ -177,6 +178,12 @@ function RootContent() {
 
   return (
     <DeviceProvider>
+      {/* ONE integration status for the whole app. Mounted here, above the
+          navigator, so connecting or disconnecting Gmail on the Manage screen
+          immediately changes what every OTHER screen offers — see
+          lib/integrations.tsx for why a per-screen fetch would let them
+          disagree. */}
+      <IntegrationsProvider>
       {statusBar}
       <Stack
         screenOptions={{
@@ -205,6 +212,14 @@ function RootContent() {
             expo-router tries to route it). */}
         <Stack.Screen name="crm-connected" options={{ headerShown: false }} />
         <Stack.Screen name="salesforce-config" options={{ title: "Salesforce mapping" }} />
+        {/* Integrations — the central place external applications are
+            connected. index is the card list; one screen per provider that
+            has something to manage (Gmail today). */}
+        <Stack.Screen name="integrations/index" options={{ title: "" }} />
+        <Stack.Screen name="integrations/gmail" options={{ title: "" }} />
+        {/* The generic OAuth redirect landing route, for every provider —
+            same transient-hop reasoning as crm-connected above. */}
+        <Stack.Screen name="integrations-connected" options={{ headerShown: false }} />
         {/* Your device — reached from MinuteX's top-left status pill (and
             from You › Your device). It was a bottom tab until the bar went
             to three; the page keeps its own Masthead, which carries the live
@@ -228,6 +243,7 @@ function RootContent() {
         <Stack.Screen name="task/[id]" options={{ title: "Task" }} />
         <Stack.Screen name="calendar" options={{ title: "Calendar" }} />
       </Stack>
+      </IntegrationsProvider>
     </DeviceProvider>
   );
 }

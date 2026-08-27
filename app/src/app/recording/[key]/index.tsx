@@ -49,6 +49,8 @@ import { Tasks } from "../../../../lib/meeting-tasks";
 import { AddTaskSheet } from "../../../../lib/add-task-sheet";
 import { DocumentsList, CreateDocumentSheet } from "../../../../lib/meeting-documents";
 import { ShareMeetingSheet } from "../../../../lib/meeting-share";
+import { GmailShareRow, GmailShareSheet } from "../../../../lib/gmail-share";
+import { useGmail } from "../../../../lib/integrations";
 import { MomEditorScreen } from "../../../../lib/mom-editor";
 import { AssistantButton } from "../../../../lib/assistant-button";
 import { ContactPicker } from "../../../../lib/contact-picker";
@@ -227,6 +229,12 @@ export default function MeetingDetailScreen() {
   // Overview state underneath (documents, tasks) survives closing it.
   const [momOpen, setMomOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [gmailShareOpen, setGmailShareOpen] = useState(false);
+  // The ONE Gmail check this screen makes. Reading the shared context rather
+  // than fetching status here is what keeps this menu in step with the
+  // Integrations screen: disconnecting Gmail there removes the action here
+  // without this screen being remounted.
+  const gmail = useGmail();
 
   const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
   const [speakerDraft, setSpeakerDraft] = useState("");
@@ -845,6 +853,16 @@ export default function MeetingDetailScreen() {
                 <Icon name="square.and.arrow.up" tintColor={C.text} size={18} />
                 <Text style={st.menuTxt}>Share meeting</Text>
               </Pressable>
+              {/* Email the minutes through the user's own Gmail. GmailShareRow
+                  owns the visibility rule: when Gmail is not connected (or the
+                  connection went stale) it renders as an explanatory prompt
+                  routing to Settings, never as an action that would fail. */}
+              <GmailShareRow
+                usable={gmail.usable}
+                needsReauth={gmail.needsReauth}
+                onPress={() => { setMenuOpen(false); setGmailShareOpen(true); }}
+                style={st.menuRow}
+              />
               {/* Identify the voices. Mapping a speaker to a contact is also
                   what lets this meeting's AI tasks find a real owner, which is
                   why it sits in the primary menu rather than buried in the
@@ -1104,6 +1122,23 @@ export default function MeetingDetailScreen() {
           onClose={() => setShareOpen(false)}
           recordingKey={key}
           meetingTitle={rec?.title || "Meeting"}
+        />
+
+        {/* Gmail send. A sibling of the overflow menu for the same Android
+            reason as the share sheet above: a Modal nested in a Modal can
+            render behind its parent. */}
+        <GmailShareSheet
+          visible={gmailShareOpen}
+          onClose={() => setGmailShareOpen(false)}
+          recordingKey={key}
+          meetingTitle={rec?.title || "Meeting"}
+          // MeetingProvider already loaded these for the Documents tab, so
+          // passing them saves the sheet a redundant round trip — and means
+          // the share list matches the Documents tab exactly.
+          documents={documents}
+          onSent={(count) => Alert.alert(
+            "Sent",
+            `Your email was sent to ${count} ${count === 1 ? "person" : "people"}.`)}
         />
 
         <ContactPicker

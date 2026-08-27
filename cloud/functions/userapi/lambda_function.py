@@ -89,6 +89,24 @@ Routes (HTTP API, payload format v2.0):
                               -> {status: found|not_found|ambiguous, ...}
   POST   /crm/salesforce/sync/{key+} {object}         (JWT)   -> {crm_record}
 
+  Integrations — connect MinuteX to external applications (see the
+  INTEGRATIONS section). Generic over providers; Gmail is the only one that
+  can currently be connected.
+  GET    /integrations                          (JWT) -> {integrations:[...]}
+  GET    /integrations/{provider}               (JWT) -> {integration:{...}}
+  POST   /integrations/{provider}/connect       (JWT) -> {authorize_url}
+  GET    /integrations/{provider}/callback ?code&state  (NO JWT — the
+                                    provider's browser redirect) -> 302
+  DELETE /integrations/{provider}               (JWT) -> {disconnected}
+
+  Gmail communication (JWT, and every one of them ALSO requires a usable
+  Gmail connection — they answer 409 with a `code` otherwise):
+  POST   /integrations/gmail/send   {recipients, subject, body, cc?,
+                                     attachments?}         -> {sent, message_id}
+  GET    /integrations/gmail/recipients/{key+}   -> {recipients, unresolved}
+  POST   /integrations/gmail/send/meeting/{key+} {recipients, ...}
+  POST   /integrations/gmail/send/task/{task_id} {recipients?, ...}
+
   Every /crm route that TALKS to Salesforce (objects, fields, config PUT,
   lookup, sync) answers 409 {"code": "salesforce_reconnect_required"} when the
   stored Salesforce refresh token is dead. That is NOT 401 on purpose: 401 from
@@ -203,7 +221,9 @@ from botocore.exceptions import ClientError
 # The shared AI core — the SAME modules transcribeRecording uses. Vendored flat
 # into this function's zip (see scripts/21_deploy_ai_workspace.sh).
 import ai_schema
+import email_message
 import groq_client
+import integrations
 import mom_schema
 import spoken_dates
 import prompts
@@ -218,6 +238,7 @@ DEVICE_KEYS_TABLE = os.environ.get("DEVICE_KEYS_TABLE", "DeviceKeys")
 DEVICES_TABLE = os.environ.get("DEVICES_TABLE", "Devices")
 RECORDINGS_TABLE = os.environ.get("RECORDINGS_TABLE", "Recordings")
 CRM_CONNECTIONS_TABLE = os.environ.get("CRM_CONNECTIONS_TABLE", "CrmConnections")
+INTEGRATIONS_TABLE = os.environ.get("INTEGRATIONS_TABLE", "Integrations")
 CONTACTS_TABLE = os.environ.get("CONTACTS_TABLE", "Contacts")
 FOLDERS_TABLE = os.environ.get("FOLDERS_TABLE", "Folders")
 FOLDER_CONTACTS_TABLE = os.environ.get("FOLDER_CONTACTS_TABLE", "FolderContacts")
@@ -262,6 +283,27 @@ SALESFORCE_API_VERSION = os.environ.get("SALESFORCE_API_VERSION", "v62.0")
 # Where the callback redirects the browser once the exchange is done — a deep
 # link back into the app, e.g. "minutex://crm/salesforce/connected".
 SALESFORCE_RETURN_URL = os.environ.get("SALESFORCE_RETURN_URL", "")
+
+# --- Integrations (generic) + the Google OAuth client behind Gmail ---
+# ONE Google OAuth client serves every Google-family integration: Gmail today,
+# Calendar and Tasks later. They differ only by the scopes requested at
+# authorize time, so a second client id would be three sets of credentials to
+# rotate for no isolation gain — Google scopes the grant per user per scope,
+# not per client.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET_ARN = os.environ.get("GOOGLE_CLIENT_SECRET_ARN", "")
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "")
+# Separate from SALESFORCE_KMS_KEY_ID so an integration credential and a CRM
+# credential are not protected by the same key — revoking or rotating one must
+# not reach the other. Falls back to the Salesforce key when unset (see
+# _integration_kms_encrypt) so an un-provisioned stack degrades to "still
+# encrypted", never to plaintext.
+INTEGRATIONS_KMS_KEY_ID = os.environ.get("INTEGRATIONS_KMS_KEY_ID", "")
+# Deep link the OAuth callback redirects back to, e.g.
+# "minutex://integrations/connected". One URL for every provider — the
+# callback appends ?provider= so the app knows which card to refresh.
+INTEGRATION_RETURN_URL = os.environ.get("INTEGRATION_RETURN_URL", "")
+INTEGRATION_STATE_TTL = int(os.environ.get("INTEGRATION_STATE_TTL", "600"))
 
 # Wall-clock ceiling for one on-demand AI generation. Unlike the S3-triggered
 # pipeline (which can spend 300s because nobody is waiting), these routes answer
@@ -413,6 +455,7 @@ _device_keys = _ddb.Table(DEVICE_KEYS_TABLE)
 _devices = _ddb.Table(DEVICES_TABLE)
 _recordings = _ddb.Table(RECORDINGS_TABLE)
 _crm_connections = _ddb.Table(CRM_CONNECTIONS_TABLE)
+_integrations = _ddb.Table(INTEGRATIONS_TABLE)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -10351,6 +10394,1120 @@ def public_share(event):
 
 
 # ---------------------------------------------------------------------------
+# INTEGRATIONS — the generic "connect MinuteX to an external application"
+# layer, with Gmail as the first (and currently only) working provider.
+#
+# WHY A SECOND OAUTH SECTION EXISTS ALONGSIDE THE SALESFORCE ONE ABOVE. The
+# Salesforce code is the right pattern and this section reuses every part of
+# it that is genuinely generic — the signed/expiring `state` (_sign_oauth_state
+# / _verify_oauth_state), PKCE, KMS envelope-encryption of the refresh token,
+# the "never 401 for a dead third-party credential" rule. What it does NOT do
+# is widen the Salesforce handlers to take a provider argument, because those
+# handlers are wound through Salesforce-specific concerns (instance_url, org
+# describe, field mapping, SOQL) that no other provider has. Generalising them
+# would mean a growing pile of `if provider == "salesforce"` inside code that
+# currently reads straight through.
+#
+# So the split is by SHAPE, not by vendor:
+#   * shared/integrations.py owns the connection model + status vocabulary
+#   * IntegrationProvider below owns the OAuth mechanics every provider shares
+#   * GmailProvider owns only what is Gmail-specific
+# Adding WhatsApp later is a subclass plus a PROVIDERS entry. Salesforce can be
+# migrated onto this table when someone wants it to be, and until then it is
+# listed in the catalog as managed elsewhere so the Integrations screen is
+# still a complete picture.
+#
+# THE FLOW (identical in shape to the Salesforce one, three parties):
+#   1. POST /integrations/{provider}/connect  (JWT) -> {authorize_url}
+#   2. the app opens it; the user approves on Google's own page
+#   3. Google redirects to GET /integrations/{provider}/callback?code&state
+#      — UNAUTHENTICATED, because a browser redirect carries no JWT; `state`
+#      is the credential there, exactly as in the Salesforce callback
+#   4. the callback exchanges the code, encrypts the refresh token, writes
+#      one Integrations row with status CONNECTED
+#   5. GET /integrations and DELETE /integrations/{provider} let the app read
+#      status and disconnect — tokens never appear in any response
+# ---------------------------------------------------------------------------
+
+# Google's OAuth endpoints. Constants rather than env vars: unlike the
+# Salesforce login host (which legitimately differs for a sandbox org), these
+# are the same for every Google account in the world.
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+
+# SCOPES — the minimum for Phase 1, and this list is the security boundary.
+#
+# gmail.send is a SEND-ONLY scope: it grants permission to send mail as the
+# user and NOTHING else. It cannot read the inbox, cannot search, cannot list
+# threads, cannot even read the message it just sent. That is exactly the
+# capability MinuteX needs and exactly the one it should hold — the moment a
+# read scope is added, every meeting-notes product becomes a mailbox-scraping
+# product in the user's eyes and in Google's verification review.
+#
+# userinfo.email exists only so the Manage screen can show WHICH account is
+# connected. Without it the app could say "Gmail: Connected" but not whose
+# Gmail, which is the difference between a trustworthy integration and a
+# spooky one.
+#
+# Explicitly NOT requested: gmail.readonly, gmail.modify, gmail.compose,
+# gmail.metadata, or any Calendar/Tasks/Contacts scope. Phase 1 does not need
+# them, and Gmail inbox reading is named in the scope boundary as out of scope.
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
+
+# The provider whose connection is REQUIRED for the mail routes below.
+INTEGRATION_GMAIL = integrations.PROVIDER_GMAIL
+
+# HTTP status + code for "MinuteX is fine, but the INTEGRATION behind this
+# route is not usable". Same reasoning as SF_RECONNECT_STATUS above, and the
+# reasoning is worth restating because it is the single most load-bearing
+# decision in this file's error handling: 401 on this API means the MinuteX
+# JWT is dead, and lib/api.ts reacts by clearing the session and bouncing the
+# user to /login. A dead Gmail refresh token must never do that — the user's
+# MinuteX session is perfectly valid and the fix is "reconnect Gmail", not
+# "sign in again".
+#
+# 409 Conflict is the honest code: authenticated, well-formed, but in conflict
+# with the current state of the resource. The app branches on `code`.
+INTEGRATION_STATUS_CODE = 409
+INTEGRATION_REAUTH_CODE = "integration_reauth_required"
+INTEGRATION_NOT_CONNECTED_CODE = "integration_not_connected"
+
+
+class IntegrationNotConnected(ApiError):
+    """The user has not connected this provider (or has disconnected it).
+
+    409 rather than 400 for the same reason as below: the app needs ONE branch
+    for "this integration cannot serve the request", distinguished by `code`.
+    """
+
+    def __init__(self, provider: str, message: str = ""):
+        meta = integrations.PROVIDERS_BY_ID.get(provider, {})
+        name = meta.get("name", provider)
+        super().__init__(INTEGRATION_STATUS_CODE,
+                         message or f"Connect {name} to use this feature.")
+        self.code = INTEGRATION_NOT_CONNECTED_CODE
+        self.provider = provider
+
+
+class IntegrationReauthRequired(ApiError):
+    """The stored credential is dead — the user must reconnect.
+
+    Raising this also FLIPS THE STORED STATUS to REAUTH_REQUIRED (see
+    _mark_integration_status), which is what makes the backend the source of
+    truth the requirement asks for: the next GET /integrations reports the
+    honest state without needing another failed send to discover it.
+    """
+
+    def __init__(self, provider: str, message: str = ""):
+        meta = integrations.PROVIDERS_BY_ID.get(provider, {})
+        name = meta.get("name", provider)
+        super().__init__(INTEGRATION_STATUS_CODE,
+                         message or f"Your {name} connection expired. "
+                                    f"Reconnect {name} to continue.")
+        self.code = INTEGRATION_REAUTH_CODE
+        self.provider = provider
+
+
+def _google_client_secret():
+    """The OAuth client secret from Secrets Manager — same lazy per-container
+    cache as _jwt_secret()/_salesforce_client_secret(). No env-var fallback:
+    a client secret must never land as a plaintext Lambda env var, and there
+    is no legacy deployment here to stay compatible with."""
+    global _google_secret_cache
+    if _google_secret_cache is not None:
+        return _google_secret_cache
+    if not GOOGLE_CLIENT_SECRET_ARN:
+        raise ApiError(500, "Gmail integration is not configured")
+    sm = boto3.client("secretsmanager", region_name=REGION)
+    _google_secret_cache = sm.get_secret_value(
+        SecretId=GOOGLE_CLIENT_SECRET_ARN)["SecretString"]
+    return _google_secret_cache
+
+
+_google_secret_cache = None
+
+
+def _integration_kms_encrypt(plaintext: str) -> str:
+    """Envelope-encrypt a refresh token for storage.
+
+    Uses INTEGRATIONS_KMS_KEY_ID, falling back to the Salesforce key when it
+    is unset so a deployment that has not yet run the new provisioning script
+    still works rather than storing plaintext. Storing plaintext is never an
+    acceptable degradation, so if NEITHER key exists this raises.
+    """
+    key_id = INTEGRATIONS_KMS_KEY_ID or SALESFORCE_KMS_KEY_ID
+    if not key_id:
+        raise ApiError(500, "integration credential storage is not configured")
+    resp = _kms.encrypt(KeyId=key_id, Plaintext=plaintext.encode("utf-8"))
+    return _b64u_encode(resp["CiphertextBlob"])
+
+
+def _integration_kms_decrypt(ciphertext_b64: str) -> str:
+    # KeyId is omitted deliberately: a symmetric ciphertext blob carries the
+    # key it was encrypted under, so decrypt works even if the configured key
+    # changed after the row was written. Passing a mismatched KeyId would
+    # fail an otherwise recoverable decrypt.
+    resp = _kms.decrypt(CiphertextBlob=_b64u_decode(ciphertext_b64))
+    return resp["Plaintext"].decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Storage — the Integrations table, keyed exactly like CrmConnections.
+# ---------------------------------------------------------------------------
+def _get_integration(user_id: str, provider: str):
+    return _integrations.get_item(
+        Key={"user_id": user_id, "provider": provider}).get("Item")
+
+
+def _all_integrations(user_id: str) -> dict:
+    """Every connection row this user has, keyed by provider.
+
+    One Query on the partition key, not N GetItems: the catalog needs all of
+    them and the row count per user is bounded by the provider list.
+    """
+    try:
+        res = _integrations.query(
+            KeyConditionExpression=Key("user_id").eq(user_id))
+    except Exception as e:  # noqa: BLE001
+        # A brand-new deployment may not have the table yet. The Integrations
+        # screen showing everything as not-connected is a far better failure
+        # than a 500 that hides the Coming Soon cards too.
+        print(f"[integrations] list failed for {user_id}: {type(e).__name__}: {e}")
+        return {}
+    return {row.get("provider"): row for row in res.get("Items", [])
+            if row.get("provider")}
+
+
+def _mark_integration_status(user_id: str, provider: str, status: str,
+                             message: str = "") -> None:
+    """Persist a status transition (CONNECTED -> REAUTH_REQUIRED / ERROR).
+
+    Best-effort by design: this is called from a failure path that is already
+    reporting a useful error to the user, and failing THAT over a bookkeeping
+    write would be strictly worse. The next call re-discovers the same state.
+    """
+    try:
+        _integrations.update_item(
+            Key={"user_id": user_id, "provider": provider},
+            UpdateExpression=("SET #s = :s, status_message = :m, "
+                              "updated_at = :now"),
+            # Only touch a row that EXISTS. A disconnect that raced with this
+            # must not be resurrected as a REAUTH_REQUIRED row — that would
+            # show the user a "Reconnect" card for something they just removed.
+            ConditionExpression="attribute_exists(user_id)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": status, ":m": message[:300],
+                                       ":now": _now_iso()},
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[integrations] status write failed ({provider}={status}): "
+              f"{type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Provider abstraction.
+#
+# The base class owns the OAuth-2 authorization-code flow as Google, Slack,
+# HubSpot, Microsoft and most others implement it — which is why a future
+# provider overrides configuration (URLs, scopes) rather than logic. It
+# deliberately does NOT declare send_message(): a calendar provider has no
+# such operation, and an abstract method that half the subclasses raise
+# NotImplementedError from is a worse contract than no method at all. Each
+# provider declares the capabilities it actually has.
+# ---------------------------------------------------------------------------
+class IntegrationProvider:
+    """Base: connect / disconnect / status / refresh_credentials."""
+
+    provider = ""
+    auth_url = ""
+    token_url = ""
+    revoke_url = ""
+    scopes = ()
+
+    # ---- configuration -------------------------------------------------
+    def client_id(self) -> str:
+        raise NotImplementedError
+
+    def client_secret(self) -> str:
+        raise NotImplementedError
+
+    def redirect_uri(self) -> str:
+        raise NotImplementedError
+
+    def is_configured(self) -> bool:
+        return bool(self.client_id() and self.redirect_uri())
+
+    # ---- HTTP ----------------------------------------------------------
+    def _post_form(self, url: str, form: dict, what: str) -> dict:
+        """POST x-www-form-urlencoded, return parsed JSON.
+
+        Mirrors SalesforceClient._post_form — stdlib urllib, no dependencies,
+        matching this file's convention. The provider's own error body is
+        logged and never returned: an OAuth error body can echo parameters.
+        """
+        body = urllib.parse.urlencode(form).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            print(f"[{self.provider}] {what} failed: {e.code} {detail[:300]}")
+            # invalid_grant is THE signal that a refresh token is dead (user
+            # revoked access in their Google account, or it went unused for
+            # six months). It is the one OAuth error with a specific user
+            # action attached, so it must not be flattened into "try again".
+            if "invalid_grant" in detail:
+                raise IntegrationReauthRequired(self.provider)
+            raise ApiError(502, f"Could not complete the {what}. Try again.")
+        except urllib.error.URLError as e:
+            print(f"[{self.provider}] {what} network error: {e}")
+            raise ApiError(502, "Could not reach the provider. "
+                                "Check your connection and try again.")
+
+    # ---- flow ----------------------------------------------------------
+    def authorize_url(self, state: str, verifier: str) -> str:
+        """The provider's consent URL for this attempt.
+
+        access_type=offline + prompt=consent is what makes Google return a
+        REFRESH token. Google issues one only on the first consent for a given
+        client/user pair, and returns nothing on subsequent authorizations —
+        so a user who disconnects and reconnects would come back with no
+        refresh token at all, i.e. a connection that works for one hour and
+        then dies. prompt=consent forces the consent screen every time and
+        with it a fresh refresh token. The cost is one extra tap on reconnect;
+        the alternative is a connection that silently rots.
+        """
+        return self.auth_url + "?" + urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id": self.client_id(),
+            "redirect_uri": self.redirect_uri(),
+            "scope": " ".join(self.scopes),
+            "state": state,
+            "access_type": "offline",
+            "prompt": "consent",
+            "include_granted_scopes": "true",
+            # Only the CHALLENGE goes over the wire — the verifier rides
+            # inside the signed state. See the PKCE note in the CRM section.
+            "code_challenge": _pkce_challenge(verifier),
+            "code_challenge_method": PKCE_METHOD,
+        })
+
+    def exchange_code(self, code: str, verifier: str) -> dict:
+        return self._post_form(self.token_url, {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": self.client_id(),
+            "client_secret": self.client_secret(),
+            "redirect_uri": self.redirect_uri(),
+            "code_verifier": verifier,
+        }, "connection")
+
+    def refresh_credentials(self, refresh_token: str) -> dict:
+        """refresh_token -> a fresh short-lived access token.
+
+        Access tokens are NOT stored, for the same reason the Salesforce path
+        does not store them: they expire in an hour, and persisting them would
+        mean a second secret to encrypt, rotate and leak for no gain. Each
+        request pays one cheap refresh.
+        """
+        return self._post_form(self.token_url, {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": self.client_id(),
+            "client_secret": self.client_secret(),
+        }, "token refresh")
+
+    def revoke(self, refresh_token: str) -> None:
+        """Best-effort revoke on disconnect.
+
+        Never blocks the local disconnect: the user asked MinuteX to stop
+        using their account, and that must happen whether or not Google is
+        reachable. They can also revoke from their Google account page.
+        """
+        if not self.revoke_url:
+            return
+        try:
+            self._post_form(self.revoke_url, {"token": refresh_token}, "revoke")
+        except ApiError as e:
+            print(f"[{self.provider}] revoke failed (non-fatal): {e.message}")
+
+    def account_info(self, access_token: str) -> dict:
+        """{account_identifier, account_name} for the Manage screen. Optional —
+        a provider with no identity endpoint returns {}."""
+        return {}
+
+
+class GmailProvider(IntegrationProvider):
+    """Gmail: OAuth + send. No read capability, by design (see GMAIL_SCOPES)."""
+
+    provider = integrations.PROVIDER_GMAIL
+    auth_url = GOOGLE_AUTH_URL
+    token_url = GOOGLE_TOKEN_URL
+    revoke_url = GOOGLE_REVOKE_URL
+    scopes = tuple(GMAIL_SCOPES)
+
+    def client_id(self) -> str:
+        return GOOGLE_CLIENT_ID
+
+    def client_secret(self) -> str:
+        return _google_client_secret()
+
+    def redirect_uri(self) -> str:
+        return GOOGLE_REDIRECT_URI
+
+    def account_info(self, access_token: str) -> dict:
+        """Which Google account this is — the userinfo.email scope's purpose."""
+        req = urllib.request.Request(
+            GOOGLE_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as e:
+            # Cosmetic: the connection itself succeeded. Better to show
+            # "Connected" with no address than to fail the whole connect.
+            print(f"[gmail] userinfo failed (non-fatal): {e}")
+            return {}
+        return {"account_identifier": str(data.get("email") or ""),
+                "account_name": str(data.get("name") or "")}
+
+    def send_message(self, access_token: str, raw_message: str) -> dict:
+        """POST one base64url-encoded RFC 2822 message to Gmail.
+
+        Error mapping is where the user-facing quality of this feature lives.
+        Gmail answers with codes ("invalid_grant", "rateLimitExceeded",
+        "Invalid to header") that mean nothing to a user, so each is turned
+        into a sentence describing what happened and what to do. The raw body
+        goes to CloudWatch, never to the client.
+        """
+        body = json.dumps({"raw": raw_message}).encode("utf-8")
+        req = urllib.request.Request(
+            GMAIL_SEND_URL, data=body, method="POST",
+            headers={"Authorization": f"Bearer {access_token}",
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                raw = r.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            print(f"[gmail] send failed: {e.code} {detail[:400]}")
+            if e.code == 401:
+                # The ACCESS token was rejected. _gmail_call refreshes and
+                # retries once before this can reach the user.
+                raise GmailAuthExpired(detail[:200])
+            if e.code == 403:
+                if "rateLimit" in detail or "userRateLimit" in detail:
+                    raise ApiError(429, "Gmail is rate-limiting this account. "
+                                        "Wait a moment and try again.")
+                if "quotaExceeded" in detail or "Daily" in detail:
+                    raise ApiError(429, "This Gmail account has reached its "
+                                        "daily sending limit. Try again "
+                                        "tomorrow.")
+                # A 403 that is not a quota means the grant no longer carries
+                # the send scope — reconnecting is genuinely the fix.
+                raise IntegrationReauthRequired(
+                    self.provider,
+                    "MinuteX no longer has permission to send from this "
+                    "Gmail account. Reconnect Gmail to continue.")
+            if e.code == 429:
+                raise ApiError(429, "Gmail is rate-limiting this account. "
+                                    "Wait a moment and try again.")
+            if e.code == 400:
+                # Almost always a malformed recipient that survived validation
+                # (an address Gmail rejects but our regex accepts).
+                raise ApiError(400, "Gmail rejected the message — check the "
+                                    "recipient addresses and try again.")
+            raise ApiError(502, "Gmail could not send the message. Try again.")
+        except urllib.error.URLError as e:
+            print(f"[gmail] send network error: {e}")
+            raise ApiError(502, "Could not reach Gmail. Check your connection "
+                                "and try again.")
+
+
+class GmailAuthExpired(Exception):
+    """The ACCESS token was rejected (401) — internal, never surfaced.
+
+    Same distinction SalesforceAuthExpired draws: this one means "mint a new
+    access token and retry", which _gmail_call does transparently. A dead
+    REFRESH token is IntegrationReauthRequired, which the user does see.
+    """
+
+
+_gmail_provider = GmailProvider()
+
+PROVIDER_IMPLS = {
+    integrations.PROVIDER_GMAIL: _gmail_provider,
+}
+
+
+def _provider_impl(provider: str):
+    """The implementation for `provider`, or a 404.
+
+    404 rather than 400 for an unknown provider: the path segment names a
+    resource, and one MinuteX does not have simply does not exist.
+    """
+    impl = PROVIDER_IMPLS.get(provider)
+    if impl is None:
+        raise ApiError(404, "unknown integration")
+    return impl
+
+
+def _path_provider(event) -> str:
+    """The {provider} path parameter, normalised and checked against the
+    registry BEFORE it is used to key anything."""
+    provider = str((event.get("pathParameters") or {}).get("provider") or
+                   "").strip().lower()
+    if provider not in integrations.PROVIDERS_BY_ID:
+        raise ApiError(404, "unknown integration")
+    return provider
+
+
+# ---------------------------------------------------------------------------
+# The credential lifecycle — one place, exactly like _sf_call.
+# ---------------------------------------------------------------------------
+def _integration_call(user_id: str, provider: str, fn):
+    """Run `fn(access_token)` against the user's connected account.
+
+    Owns the whole access-token lifecycle so no route handler repeats it:
+    verify the connection is USABLE, decrypt the refresh token, mint an access
+    token, call, and on a 401 mint once more and retry.
+
+    THE OWNERSHIP CHECK IS HERE, not in the handlers. Every outbound operation
+    passes through this function and it reads the connection row keyed by the
+    user_id from the JWT — so there is no code path on which user A's request
+    can reach user B's credential, because no handler ever names a user.
+    """
+    row = _get_integration(user_id, provider)
+    if not row or not row.get("refresh_token_enc"):
+        raise IntegrationNotConnected(provider)
+    if row.get("status") == integrations.STATUS_REAUTH_REQUIRED:
+        raise IntegrationReauthRequired(provider)
+    if not integrations.is_usable(row):
+        raise IntegrationNotConnected(
+            provider, row.get("status_message") or "")
+
+    impl = _provider_impl(provider)
+    refresh_token = _integration_kms_decrypt(row["refresh_token_enc"])
+
+    try:
+        tokens = impl.refresh_credentials(refresh_token)
+    except IntegrationReauthRequired:
+        # The refresh token itself is dead. Record it so the NEXT status read
+        # is honest without needing another failed send to discover it — this
+        # is what makes the backend the source of truth.
+        _mark_integration_status(
+            user_id, provider, integrations.STATUS_REAUTH_REQUIRED,
+            "The connection was revoked or expired.")
+        raise
+
+    access_token = tokens.get("access_token")
+    if not access_token:
+        _mark_integration_status(
+            user_id, provider, integrations.STATUS_REAUTH_REQUIRED,
+            "The connection could not be renewed.")
+        raise IntegrationReauthRequired(provider)
+
+    # Google does not rotate refresh tokens the way Salesforce can, so there
+    # is no rotation write here. If a provider that DOES rotate is added, this
+    # is the one place that needs the conditional-write dance
+    # _persist_rotated_refresh_token performs.
+    try:
+        return fn(access_token)
+    except GmailAuthExpired:
+        print(f"[{provider}] access token rejected; refreshing once and retrying")
+        tokens = impl.refresh_credentials(refresh_token)
+        access_token = tokens.get("access_token")
+        if not access_token:
+            _mark_integration_status(
+                user_id, provider, integrations.STATUS_REAUTH_REQUIRED,
+                "The connection could not be renewed.")
+            raise IntegrationReauthRequired(provider)
+        try:
+            return fn(access_token)
+        except GmailAuthExpired:
+            _mark_integration_status(
+                user_id, provider, integrations.STATUS_REAUTH_REQUIRED,
+                "The connection kept being rejected.")
+            raise IntegrationReauthRequired(provider)
+
+
+def _require_integration(user_id: str, provider: str) -> dict:
+    """The connection row, or the right 409. The server-side half of the
+    "Gmail-dependent features are unavailable without Gmail" rule — hiding the
+    button in the app is presentation; THIS is enforcement."""
+    row = _get_integration(user_id, provider)
+    if not row or not row.get("refresh_token_enc"):
+        raise IntegrationNotConnected(provider)
+    if row.get("status") == integrations.STATUS_REAUTH_REQUIRED:
+        raise IntegrationReauthRequired(provider)
+    if not integrations.is_usable(row):
+        raise IntegrationNotConnected(provider, row.get("status_message") or "")
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Routes — status
+# ---------------------------------------------------------------------------
+def _integration_rows(user_id: str) -> dict:
+    """Every provider's connection row for this user, from EVERY source.
+
+    Two tables feed one catalog. Integrations holds the providers this system
+    manages; CrmConnections holds Salesforce, which predates it and is
+    connected through /crm/salesforce/*. Merging here — rather than teaching
+    the catalog about two tables, or reporting Salesforce as "not connected"
+    because its row lives elsewhere — is what lets the Integrations screen be
+    one honest list.
+
+    The Salesforce read is best-effort: an unconfigured CrmConnections table
+    must degrade that ONE card to "not connected", never take down the whole
+    Integrations screen (which is also how Coming Soon cards reach the user).
+    """
+    rows = _all_integrations(user_id)
+    try:
+        crm = _get_salesforce_connection(user_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[integrations] salesforce read failed for {user_id}: "
+              f"{type(e).__name__}: {e}")
+        crm = None
+    sf = integrations.salesforce_row(crm)
+    if sf:
+        rows[integrations.PROVIDER_SALESFORCE] = sf
+    return rows
+
+
+def list_integrations(event):
+    """GET /integrations (JWT) -> {integrations:[...]}.
+
+    The FULL catalog, not just what is connected: the Integrations screen
+    renders Coming Soon cards from this too, so a new provider appears in
+    every already-installed client the day it is added to PROVIDERS.
+    """
+    user_id = _require_auth(event)
+    return _resp(200, {
+        "integrations": integrations.catalog(_integration_rows(user_id))})
+
+
+def get_integration(event):
+    """GET /integrations/{provider} (JWT) -> {integration:{...}}."""
+    user_id = _require_auth(event)
+    provider = _path_provider(event)
+    # Reads through the same merge as the catalog, so a single-provider fetch
+    # can never disagree with the list it came from.
+    return _resp(200, {"integration": integrations.public_status(
+        provider, _integration_rows(user_id).get(provider))})
+
+
+def integration_connect(event):
+    """POST /integrations/{provider}/connect (JWT) -> {authorize_url}.
+
+    Mints a fresh PKCE verifier per attempt and carries it inside the signed
+    state, exactly as salesforce_connect does — see the PKCE note in the CRM
+    section for why the verifier is server-side rather than on the device.
+
+    The state additionally carries the PROVIDER, so a state minted for one
+    integration cannot be replayed against another's callback. Without it, the
+    signature would still verify (same secret, same user) and the code would
+    be exchanged against the wrong provider's token endpoint.
+    """
+    user_id = _require_auth(event)
+    provider = _path_provider(event)
+    if provider not in integrations.CONNECTABLE:
+        raise ApiError(400, "That integration isn't available yet.")
+    impl = _provider_impl(provider)
+    if not impl.is_configured():
+        raise ApiError(500, "This integration is not configured on the server.")
+
+    verifier = _new_pkce_verifier()
+    state = _sign_integration_state(user_id, provider, verifier)
+    _audit("integration.connect_started", user_id, provider)
+    return _resp(200, {"authorize_url": impl.authorize_url(state, verifier)})
+
+
+def _sign_integration_state(user_id: str, provider: str, verifier: str) -> str:
+    """HMAC-signed, expiring state — CSRF guard, PKCE carrier AND provider
+    binding. Same construction and same secret as _sign_oauth_state; the extra
+    `pv` claim is what stops a cross-provider replay."""
+    payload = {"sub": user_id, "pv": provider, "cv": verifier,
+               "exp": int(time.time()) + INTEGRATION_STATE_TTL}
+    seg = _b64u_encode(json.dumps(payload, separators=(",", ":")).encode())
+    sig = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
+    return seg + "." + _b64u_encode(sig)
+
+
+def _verify_integration_state(state: str, provider: str) -> tuple:
+    """(user_id, verifier) from a state minted for THIS provider, or ApiError."""
+    try:
+        seg, sig_b64 = state.split(".")
+        expected = hmac.new(_jwt_secret().encode(), seg.encode(),
+                            hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, _b64u_decode(sig_b64)):
+            raise ValueError("bad signature")
+        payload = json.loads(_b64u_decode(seg))
+    except (ValueError, TypeError, KeyError):
+        raise ApiError(400, "invalid or tampered state")
+    if not isinstance(payload, dict) or payload.get("exp", 0) < int(time.time()):
+        raise ApiError(410, "connect session expired — try again")
+    user_id = payload.get("sub")
+    verifier = str(payload.get("cv") or "")
+    if not user_id or not verifier:
+        raise ApiError(400, "invalid state")
+    if payload.get("pv") != provider:
+        # A state signed for a different integration. Same user, same secret,
+        # valid signature — and still wrong.
+        raise ApiError(400, "state does not match this integration")
+    return user_id, verifier
+
+
+def integration_callback(event):
+    """GET /integrations/{provider}/callback?code&state (NO JWT — the
+    provider's browser redirect calls this).
+
+    `state` is the credential here, exactly as in salesforce_callback: a
+    browser redirect cannot carry a bearer token. Ends in a 302 to the app's
+    deep link with an ok/error param, because the browser tab — not this
+    Lambda — is the only thing that can hand control back to the app.
+    """
+    provider = _path_provider(event)
+    qs = event.get("queryStringParameters") or {}
+
+    def _redirect(ok: bool, reason: str = "") -> dict:
+        params = {"provider": provider}
+        params.update({"connected": "1"} if ok
+                      else {"connected": "0", "reason": reason})
+        target = INTEGRATION_RETURN_URL or SALESFORCE_RETURN_URL or "/"
+        return {"statusCode": 302,
+                "headers": {"Location": f"{target}?{urllib.parse.urlencode(params)}"},
+                "body": ""}
+
+    error = qs.get("error")
+    if error:
+        # access_denied is the user pressing Cancel/Deny — a normal choice,
+        # distinguished from a real failure so the app can stay quiet about it.
+        print(f"[{provider}] callback error param: {error}")
+        return _redirect(False, "denied" if error == "access_denied" else "failed")
+
+    code = qs.get("code")
+    state = qs.get("state")
+    if not code or not state:
+        return _redirect(False, "missing_params")
+
+    try:
+        user_id, verifier = _verify_integration_state(state, provider)
+    except ApiError as e:
+        print(f"[{provider}] callback state rejected: {e.message}")
+        return _redirect(False, "expired")
+
+    impl = _provider_impl(provider)
+    try:
+        tokens = impl.exchange_code(code, verifier)
+    except ApiError as e:
+        # e.message is our own wording — never the code, the verifier or a token.
+        print(f"[{provider}] callback exchange failed: {e.message}")
+        return _redirect(False, "exchange_failed")
+
+    refresh_token = tokens.get("refresh_token")
+    access_token = tokens.get("access_token")
+    if not access_token:
+        print(f"[{provider}] token response carried no access token")
+        return _redirect(False, "exchange_failed")
+    if not refresh_token:
+        # Google omits the refresh token when the user has already granted
+        # consent and prompt=consent was not honoured. Without one the
+        # connection would work for an hour and then die, so refuse now and
+        # tell the app to retry rather than storing a connection that rots.
+        print(f"[{provider}] token response carried no refresh token")
+        return _redirect(False, "no_refresh_token")
+
+    info = {}
+    try:
+        info = impl.account_info(access_token)
+    except Exception as e:  # noqa: BLE001 - identity is cosmetic, never fatal
+        print(f"[{provider}] account info failed (non-fatal): {e}")
+
+    granted = str(tokens.get("scope") or "").split()
+    now = _now_iso()
+    existing = _get_integration(user_id, provider)
+    _integrations.put_item(Item={
+        "user_id": user_id,
+        "provider": provider,
+        "status": integrations.STATUS_CONNECTED,
+        "status_message": "",
+        "refresh_token_enc": _integration_kms_encrypt(refresh_token),
+        "account_identifier": info.get("account_identifier", ""),
+        "account_name": info.get("account_name", ""),
+        "scopes": granted or list(impl.scopes),
+        # Preserved across a reconnect so the Manage screen can show when the
+        # user FIRST connected, not when they last re-approved.
+        "connected_at": (existing or {}).get("connected_at") or now,
+        "updated_at": now,
+    })
+    _audit("integration.connected", user_id, provider,
+           scopes=len(granted or impl.scopes))
+    return _redirect(True)
+
+
+def integration_disconnect(event):
+    """DELETE /integrations/{provider} (JWT) -> {disconnected}.
+
+    Revokes the grant with the provider (best-effort) and DELETES the row.
+
+    Deleting rather than flagging is deliberate: the requirement is that the
+    stored credential is removed, and a row flagged "disconnected" that still
+    holds ciphertext is a credential we said we deleted and did not. Absence
+    of a row IS integrations.STATUS_NOT_CONNECTED, so nothing is lost.
+
+    Nothing else is touched. Meetings, contacts, tasks, MoMs and documents are
+    MinuteX data and have no dependency on the connection — disconnecting Gmail
+    removes the ability to send mail, not anything the user created.
+    """
+    user_id = _require_auth(event)
+    provider = _path_provider(event)
+
+    # A provider whose connection this system does not own must not be
+    # disconnected through here. Without this guard the delete below would run
+    # against the Integrations table for a Salesforce row that lives in
+    # CrmConnections — reporting success while leaving the real credential in
+    # place, which is the worst possible outcome for a "disconnect".
+    meta = integrations.PROVIDERS_BY_ID.get(provider) or {}
+    if meta.get("managed_elsewhere"):
+        raise ApiError(400, f"Disconnect {meta.get('name', provider)} from its "
+                            f"own settings screen.")
+
+    row = _get_integration(user_id, provider)
+    if row and row.get("refresh_token_enc"):
+        try:
+            impl = _provider_impl(provider)
+            impl.revoke(_integration_kms_decrypt(row["refresh_token_enc"]))
+        except Exception as e:  # noqa: BLE001 - never blocks the disconnect
+            print(f"[{provider}] revoke on disconnect failed (non-fatal): "
+                  f"{type(e).__name__}: {e}")
+
+    _integrations.delete_item(Key={"user_id": user_id, "provider": provider})
+    _audit("integration.disconnected", user_id, provider)
+    return _resp(200, {"disconnected": True,
+                       "integration": integrations.public_status(provider)})
+
+
+# ---------------------------------------------------------------------------
+# Gmail — communication.
+#
+# WHERE THE LAYERING SITS. Meeting/task/MoM code does not know Gmail exists;
+# it hands a message to the communication layer, which asks the integration
+# layer for a provider. Concretely:
+#
+#     POST /integrations/gmail/send        a message the caller composed
+#     POST /integrations/gmail/send/meeting/{key+}   a MEETING message
+#     POST /integrations/gmail/send/task/{task_id}   a TASK message
+#
+# The last two exist so recipient resolution and ownership live on the server.
+# The alternative — the app posting a list of raw addresses to the generic
+# route — would mean the backend could not verify that a recipient is really a
+# participant of a meeting the caller owns, and "send to whoever the client
+# says" is how a mail relay gets abused.
+#
+# ATTACHMENTS COME FROM THE CLIENT. The PDF and DOCX renderers live in the app
+# (lib/mom-pdf.ts, lib/mom-docx.ts) and are what the user previews before
+# sending. Re-implementing them server-side would mean two renderers that
+# drift, and the recipient would receive a document that differs from the
+# preview. So the app sends the bytes it rendered, base64, and the backend
+# validates them as untrusted input (see shared/email_message.py).
+# ---------------------------------------------------------------------------
+def _gmail_call(user_id: str, fn):
+    return _integration_call(user_id, INTEGRATION_GMAIL, fn)
+
+
+def _send_via_gmail(user_id: str, row: dict, to, subject: str, body: str,
+                    cc=None, attachments=None) -> dict:
+    """Build the message and send it. One place, so every caller — generic,
+    meeting, task — produces identically shaped mail and identical errors."""
+    sender = row.get("account_identifier") or ""
+    if not sender:
+        # The address is only cosmetic on the status screen, but as a From
+        # header it matters. Gmail rewrites From to the authenticated account
+        # anyway, so an empty one is safe — it just loses the display name.
+        print(f"[gmail] no stored account identifier for {user_id}")
+    sender_name = row.get("account_name") or ""
+
+    try:
+        raw = email_message.build_message(
+            sender=sender, sender_name=sender_name, to=to, subject=subject,
+            body=body, cc=cc, attachments=attachments)
+    except email_message.EmailError as e:
+        # Always user-facing wording by construction — see EmailError.
+        raise ApiError(400, str(e))
+
+    result = _gmail_call(user_id, lambda tok:
+                         _gmail_provider.send_message(tok, raw))
+    return {"message_id": str(result.get("id") or ""),
+            "thread_id": str(result.get("threadId") or "")}
+
+
+def _recipient_payload(data) -> list:
+    """The `recipients` field of a send request, sanity-bounded.
+
+    Accepts [{contact_id?, email?, name?}]. Plain strings are accepted too,
+    so a caller with only an address does not have to wrap it.
+    """
+    raw = data.get("recipients")
+    if not isinstance(raw, list):
+        raise ApiError(400, "recipients must be a list")
+    if len(raw) > email_message.MAX_RECIPIENTS:
+        raise ApiError(400, f"Send to at most {email_message.MAX_RECIPIENTS} "
+                            f"people at a time.")
+    out = []
+    for entry in raw:
+        if isinstance(entry, str):
+            out.append({"email": entry})
+        elif isinstance(entry, dict):
+            out.append(entry)
+    return out
+
+
+def _resolve_contact_recipients(user_id: str, requested) -> tuple:
+    """Turn requested recipients into (resolved, unresolved), resolving any
+    contact_id through the OWNER'S contacts.
+
+    A contact_id that is not this user's resolves to nothing and lands in
+    `unresolved` rather than raising — the caller reports "no email address
+    for this person", which is also the honest answer for a contact that does
+    not exist as far as this user is concerned. Same reasoning as the 404-not-
+    403 rule elsewhere: the API must not confirm that some other user's
+    contact id is real.
+    """
+    hydrated = []
+    for entry in requested:
+        contact_id = str(entry.get("contact_id") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        email = str(entry.get("email") or "").strip()
+        if contact_id:
+            row = _contacts.get_item(Key={"contact_id": contact_id}).get("Item")
+            if row and row.get("owner_user_id") == user_id:
+                # The stored contact is authoritative for the address — a
+                # client-supplied email alongside a contact_id would otherwise
+                # be a way to send to an arbitrary address while looking like
+                # a legitimate contact send.
+                email = str(row.get("email") or "")
+                name = name or str(row.get("name") or "")
+            else:
+                email = ""
+                name = name or "This contact"
+        hydrated.append({"name": name, "email": email, "contact_id": contact_id})
+    return email_message.resolve_recipients(hydrated)
+
+
+def _require_resolved(resolved, unresolved):
+    """Refuse the send when anyone could not be resolved.
+
+    The product rule is explicit: do NOT silently attempt to send. A partial
+    send looks identical to a complete one from the app's point of view, and
+    the person left out never learns they were.
+    """
+    if unresolved:
+        raise ApiError(422, email_message.describe_unresolved(unresolved))
+    if not resolved:
+        raise ApiError(400, "Choose at least one recipient.")
+
+
+def gmail_send(event):
+    """POST /integrations/gmail/send (JWT) -> {sent, message_id}.
+
+    The generic path: the caller supplies recipients, subject, body and any
+    attachments. Used for follow-up communication that is not tied to one
+    meeting or task.
+    """
+    user_id = _require_auth(event)
+    row = _require_integration(user_id, INTEGRATION_GMAIL)
+    data = _body(event)
+
+    resolved, unresolved = _resolve_contact_recipients(
+        user_id, _recipient_payload(data))
+    _require_resolved(resolved, unresolved)
+
+    sent = _send_via_gmail(
+        user_id, row,
+        to=[email_message.format_recipient(r["name"], r["email"])
+            for r in resolved],
+        subject=data.get("subject"),
+        body=data.get("body"),
+        cc=[a for a in (email_message.normalize_email(c)
+                        for c in (data.get("cc") or [])) if a],
+        attachments=data.get("attachments"),
+    )
+    # Recipient COUNT, never addresses — see _audit's rule on personal data.
+    _audit("gmail.sent", user_id, "generic", recipients=len(resolved),
+           attachments=len(data.get("attachments") or []))
+    return _resp(200, {"sent": True, **sent, "recipient_count": len(resolved)})
+
+
+def gmail_meeting_recipients(event):
+    """GET /integrations/gmail/recipients/{key+} (JWT)
+    -> {recipients:[...], unresolved:[...]}
+
+    The participant list for the Share sheet, already resolved to addresses.
+    Returned BEFORE the user picks, so the sheet can show "Email address
+    unavailable for Rahul" next to the person it applies to rather than
+    failing at Send time.
+
+    Requires Gmail: this is a Gmail-dependent surface, and the requirement is
+    that the backend enforces that too, not only the UI.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    _require_integration(user_id, INTEGRATION_GMAIL)
+
+    rows = _participant_rows(key)
+    recipients, unresolved = [], []
+    seen = set()
+    for row in rows:
+        contact_id = str(row.get("contact_id") or "")
+        if not contact_id:
+            continue
+        contact = _contacts.get_item(Key={"contact_id": contact_id}).get("Item")
+        if not contact or contact.get("owner_user_id") != user_id:
+            continue
+        name = str(contact.get("name") or "")
+        email = email_message.normalize_email(contact.get("email"))
+        entry = {"contact_id": contact_id, "name": name, "email": email,
+                 "speaker_id": str(row.get("speaker_id") or "")}
+        if not email:
+            unresolved.append(entry)
+            continue
+        if email in seen:
+            continue
+        seen.add(email)
+        recipients.append(entry)
+
+    return _resp(200, {"recipients": recipients, "unresolved": unresolved,
+                       "meeting_title": str(item.get("title") or "")})
+
+
+def gmail_send_meeting(event):
+    """POST /integrations/gmail/send/meeting/{key+} (JWT) -> {sent, message_id}.
+
+    MoM / summary / highlights / action-item sharing for ONE meeting the caller
+    owns. The recording key comes LAST for the same API Gateway reason every
+    other {key+} route gives: a greedy variable is only legal in final position.
+
+    Ownership is checked by _owned_recording before anything else, so a caller
+    cannot mail themselves someone else's meeting by guessing a key.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    row = _require_integration(user_id, INTEGRATION_GMAIL)
+    data = _body(event)
+
+    resolved, unresolved = _resolve_contact_recipients(
+        user_id, _recipient_payload(data))
+    _require_resolved(resolved, unresolved)
+
+    title = str(item.get("title") or "Meeting")
+    subject = str(data.get("subject") or "").strip() or f"Minutes of Meeting — {title}"
+    body = str(data.get("body") or "").strip() or _default_meeting_body(title)
+
+    sent = _send_via_gmail(
+        user_id, row,
+        to=[email_message.format_recipient(r["name"], r["email"])
+            for r in resolved],
+        subject=subject, body=body,
+        cc=[a for a in (email_message.normalize_email(c)
+                        for c in (data.get("cc") or [])) if a],
+        attachments=data.get("attachments"),
+    )
+    _audit("gmail.sent_meeting", user_id, key, recipients=len(resolved),
+           attachments=len(data.get("attachments") or []))
+    return _resp(200, {"sent": True, **sent, "recipient_count": len(resolved)})
+
+
+def _default_meeting_body(title: str) -> str:
+    """The fallback body when the user did not write one.
+
+    Deliberately plain and deliberately CONTENT-FREE beyond the title: the
+    user chooses what to share by choosing attachments and by editing this
+    text. Auto-composing a summary into the body would send meeting content
+    the user did not explicitly select, which the requirement rules out.
+    """
+    return (f"Hi,\n\nPlease find the Minutes of Meeting from {title}.\n\n"
+            f"Regards,\nMinuteX")
+
+
+def gmail_send_task(event):
+    """POST /integrations/gmail/send/task/{task_id} (JWT) -> {sent, message_id}.
+
+    Task communication — explicitly triggered from the task screen, never
+    automatic. This is NOT a notification engine: nothing here schedules,
+    batches or reacts to a task changing. One user action, one email.
+
+    When no recipients are supplied, the task's ASSIGNEE is used — which is
+    the whole point of sending a task by mail, and saves the app resolving it.
+    """
+    user_id = _require_auth(event)
+    row = _require_integration(user_id, INTEGRATION_GMAIL)
+    task_id = str((event.get("pathParameters") or {}).get("task_id") or "").strip()
+    task = _owned_task(user_id, task_id)
+    data = _body(event)
+
+    requested = _recipient_payload(data) if isinstance(data.get("recipients"),
+                                                       list) else []
+    if not requested:
+        assignee_contact = str(task.get("assignee_contact_id") or "")
+        if not assignee_contact:
+            raise ApiError(422, "This task has no assignee to email. "
+                                "Choose a recipient.")
+        requested = [{"contact_id": assignee_contact}]
+
+    resolved, unresolved = _resolve_contact_recipients(user_id, requested)
+    _require_resolved(resolved, unresolved)
+
+    title = str(task.get("title") or "Task")
+    subject = str(data.get("subject") or "").strip() or f"Action item — {title}"
+    body = str(data.get("body") or "").strip() or _default_task_body(task, resolved)
+
+    sent = _send_via_gmail(
+        user_id, row,
+        to=[email_message.format_recipient(r["name"], r["email"])
+            for r in resolved],
+        subject=subject, body=body,
+        attachments=data.get("attachments"),
+    )
+    _audit("gmail.sent_task", user_id, task_id, recipients=len(resolved))
+    return _resp(200, {"sent": True, **sent, "recipient_count": len(resolved)})
+
+
+def _default_task_body(task: dict, resolved) -> str:
+    """The fallback task email.
+
+    Only fields the task ACTUALLY has are included — an empty "Due:" line
+    invites the reader to infer a deadline that was never set, and inventing
+    one is exactly the fabrication the project rules forbid.
+    """
+    greeting = ""
+    if len(resolved) == 1 and resolved[0].get("name"):
+        greeting = f"Hi {resolved[0]['name'].split()[0]},\n\n"
+
+    lines = [f"Task:\n{task.get('title') or 'Untitled task'}"]
+    notes = str(task.get("description") or "").strip()
+    if notes:
+        lines.append(f"Details:\n{notes}")
+    due = str(task.get("due_date") or "").strip()
+    if due:
+        lines.append(f"Due:\n{due}")
+    priority = str(task.get("priority") or "").strip()
+    if priority:
+        lines.append(f"Priority:\n{priority}")
+
+    return greeting + "\n\n".join(lines) + "\n\nRegards,\nMinuteX"
+
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 _ROUTES = {
@@ -10494,6 +11651,26 @@ _ROUTES = {
     ("DELETE", "/shares/{share_id}"): revoke_share,
     ("GET", "/share/{token}"): public_share,
     ("GET", "/share/{token}/audio"): public_share_audio,
+    # --- Integrations. Generic connect/status/disconnect for ANY provider;
+    # only the ones flagged available in shared/integrations.py can actually
+    # start a flow. /callback is the THIRD unauthenticated route in this file
+    # (after the Salesforce callback and the ElevenLabs webhook), for the same
+    # reason: a provider's browser redirect carries no JWT, so the signed
+    # `state` is the credential there.
+    ("GET", "/integrations"): list_integrations,
+    ("GET", "/integrations/{provider}"): get_integration,
+    ("POST", "/integrations/{provider}/connect"): integration_connect,
+    ("GET", "/integrations/{provider}/callback"): integration_callback,
+    ("DELETE", "/integrations/{provider}"): integration_disconnect,
+    # Gmail communication. Every one of these 409s with
+    # "integration_not_connected" / "integration_reauth_required" when Gmail
+    # is not usable — hiding the button in the app is presentation, these are
+    # the enforcement. The {key+} routes put the action first and the greedy
+    # key last, for the same API Gateway reason as the AI routes.
+    ("POST", "/integrations/gmail/send"): gmail_send,
+    ("GET", "/integrations/gmail/recipients/{key+}"): gmail_meeting_recipients,
+    ("POST", "/integrations/gmail/send/meeting/{key+}"): gmail_send_meeting,
+    ("POST", "/integrations/gmail/send/task/{task_id}"): gmail_send_task,
     ("POST", "/webhooks/elevenlabs/stt"): stt_webhook,
     # Recover a job whose webhook never arrived, by asking ElevenLabs directly.
     # JWT-authenticated and owner-scoped — this one is for the user/operator,

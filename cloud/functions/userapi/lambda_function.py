@@ -225,6 +225,7 @@ import email_message
 import groq_client
 import integrations
 import mom_schema
+import notification_schema
 import spoken_dates
 import prompts
 import share_schema
@@ -245,6 +246,9 @@ FOLDER_CONTACTS_TABLE = os.environ.get("FOLDER_CONTACTS_TABLE", "FolderContacts"
 MEETING_PARTICIPANTS_TABLE = os.environ.get("MEETING_PARTICIPANTS_TABLE",
                                             "MeetingParticipants")
 TASKS_TABLE = os.environ.get("TASKS_TABLE", "Tasks")
+NOTIFICATIONS_TABLE = os.environ.get("NOTIFICATIONS_TABLE", "Notifications")
+NOTIFICATION_DEDUPE_TABLE = os.environ.get("NOTIFICATION_DEDUPE_TABLE",
+                                           "NotificationDedupe")
 DEVICE_INDEX = os.environ.get("DEVICE_INDEX", "device-index")
 USER_INDEX = os.environ.get("USER_INDEX", "user-index")
 PAIRED_USER_INDEX = os.environ.get("PAIRED_USER_INDEX", "paired-user-index")
@@ -264,6 +268,10 @@ TASKS_MEETING_INDEX = os.environ.get("TASKS_MEETING_INDEX", "meeting-index")
 TASKS_FOLDER_INDEX = os.environ.get("TASKS_FOLDER_INDEX", "folder-index")
 TASKS_ASSIGNEE_INDEX = os.environ.get("TASKS_ASSIGNEE_INDEX", "assignee-index")
 TASKS_DEDUPE_INDEX = os.environ.get("TASKS_DEDUPE_INDEX", "dedupe-index")
+NOTIFICATIONS_USER_INDEX = os.environ.get("NOTIFICATIONS_USER_INDEX",
+                                          "user-index")
+NOTIFICATIONS_UNREAD_INDEX = os.environ.get("NOTIFICATIONS_UNREAD_INDEX",
+                                            "user-unread-index")
 JWT_TTL = int(os.environ.get("JWT_TTL", "86400"))  # seconds (default 24h)
 PAIRING_CODE_TTL = int(os.environ.get("PAIRING_CODE_TTL", "300"))  # seconds
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
@@ -456,6 +464,8 @@ _devices = _ddb.Table(DEVICES_TABLE)
 _recordings = _ddb.Table(RECORDINGS_TABLE)
 _crm_connections = _ddb.Table(CRM_CONNECTIONS_TABLE)
 _integrations = _ddb.Table(INTEGRATIONS_TABLE)
+_notifications = _ddb.Table(NOTIFICATIONS_TABLE)
+_notification_dedupe = _ddb.Table(NOTIFICATION_DEDUPE_TABLE)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -5983,6 +5993,20 @@ def _seed_ai_tasks(user_id, key, item):
                 raise
             continue
         _mirror_task_to_recording(key, row)
+        # Two DIFFERENT facts, and a task is only ever one of them:
+        #
+        #   * the AI named a speaker we could map to a linked account -> the
+        #     assignee is real, so they are told (TASK_ASSIGNED);
+        #   * the AI named someone we could NOT resolve -> nobody was
+        #     assigned, and the OWNER is asked to confirm rather than the
+        #     system guessing a person (AI_ACTION_REQUIRED, section 13).
+        #
+        # A task the AI left unassigned entirely (RESOLUTION_NONE) raises
+        # neither: there is no ambiguity to review and nobody to notify.
+        if _task_assignee_user(row):
+            _notify_task_assigned(row, actor_user_id=user_id)
+        elif row.get("resolution_status") == RESOLUTION_UNRESOLVED:
+            _notify_ai_action_required(row)
         created += 1
     if created:
         print(f"[seed] {key}: {created} AI task(s) created")
@@ -6024,6 +6048,13 @@ def _resolve_tasks_for_speaker(user_id, key, speaker_id, contact):
         else:
             removes.append("assignee_user_id")
         _apply_update(_tasks, {"task_id": row["task_id"]}, updates, removes)
+        # Naming a speaker is what finally gives these tasks a real recipient
+        # (section 18's chain). Read back rather than assuming: only a contact
+        # LINKED to a MinuteX account produces an assignee_user_id, and
+        # _notify_task_assigned is what decides whether there is anyone to tell.
+        fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item")
+        if fresh:
+            _notify_task_assigned(fresh, actor_user_id=user_id)
         resolved += 1
     return resolved
 
@@ -6042,6 +6073,8 @@ def list_meeting_tasks(event):
     rows = [r for r in _tasks_for_recording(key)
             if r.get("owner_user_id") == user_id]
     rows.sort(key=lambda r: r.get("created_at", ""))
+    # Same sweep as the Task Tracker, over the rows this route already read.
+    _sweep_task_deadlines(user_id, rows)
     # The recording row is already loaded, so speaker names cost no extra read.
     names = item.get("speaker_names") or {}
     return _resp(200, {"tasks": [_public_task_v2(r, names) for r in rows],
@@ -6103,6 +6136,11 @@ def create_meeting_task(event):
     _write_task(row)
     _mirror_task_to_recording(key, row)
     _audit("task.created", user_id, row["task_id"], recording_key=key)
+    # AFTER the task exists, never before: a notification pointing at a task
+    # that failed to write is a dead tap. `actor_user_id` stops a user who
+    # assigned work to themselves being told about it.
+    _notify_task_assigned(row, actor_user_id=user_id,
+                          meeting_title=_recording_title(item))
     return _resp(201, {"task": _public_task_v2(row,
                                                item.get("speaker_names") or {})})
 
@@ -6211,12 +6249,23 @@ def update_meeting_task(event):
     if not updates and not removes:
         raise ApiError(400, "nothing to update")
 
+    # Captured BEFORE the write: after it, the row no longer knows who used to
+    # hold the task, and that is exactly who TASK_REASSIGNED has to reach.
+    previous_assignee = _task_assignee_user(row)
+
     updates["updated_at"] = _now_iso()
     _apply_update(_tasks, {"task_id": row["task_id"]}, updates, removes)
     fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item") or {}
     _mirror_task_to_recording(key, fresh)
     _audit("task.updated", user_id, row["task_id"],
            fields=sorted(set(updates) | set(removes)))
+    # A reassignment is TWO facts for two different people, and only when the
+    # assignee actually changed — an edit to the title or the due date of an
+    # already-assigned task must not re-notify anyone.
+    if _task_assignee_user(fresh) != previous_assignee:
+        _notify_task_reassigned(previous_assignee, fresh, actor_user_id=user_id)
+        _notify_task_assigned(fresh, actor_user_id=user_id,
+                              meeting_title=_recording_title(item))
     return _resp(200, {"task": _public_task_v2(fresh,
                                                item.get("speaker_names") or {})})
 
@@ -6386,6 +6435,13 @@ def list_all_tasks(event):
         next_cursor = _encode_cursor(cursor_key)
     elif last_key:
         next_cursor = _encode_cursor(last_key)
+    # Deadlines are noticed HERE because nothing in MinuteX fires at the
+    # moment a task falls due (see the sweep's own header). It costs no extra
+    # reads — these rows are already loaded and already ownership-checked —
+    # and the day-scoped dedupe key makes it exactly-once per day however
+    # often the tracker is opened.
+    _sweep_task_deadlines(user_id, out)
+
     # One recording read per DISTINCT meeting on this page, not per task —
     # a page of 50 tasks from 3 meetings costs 3 reads (see
     # _speaker_names_for_recording on why the cache is per-request).
@@ -6493,12 +6549,19 @@ def resolve_task_assignee(event):
         updates["assignee_user_id"] = linked
     else:
         removes.append("assignee_user_id")
+    previous_assignee = _task_assignee_user(row)
     _apply_update(_tasks, {"task_id": row["task_id"]}, updates, removes)
     fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item") or {}
     if fresh.get("source_recording_id"):
         _mirror_task_to_recording(fresh["source_recording_id"], fresh)
     _audit("task.assignee_resolved", user_id, row["task_id"],
            contact_id=contact["contact_id"])
+    # Resolving "which Rahul?" to a contact with a MinuteX account is the
+    # moment the task first has a real recipient — so it is a genuine
+    # assignment, and the person it moved away from (if any) is told too.
+    if _task_assignee_user(fresh) != previous_assignee:
+        _notify_task_reassigned(previous_assignee, fresh, actor_user_id=user_id)
+        _notify_task_assigned(fresh, actor_user_id=user_id)
     return _resp(200, {"task": _public_task_v2(
         fresh, _speaker_names_for_recording(fresh.get("source_recording_id")))})
 
@@ -10068,6 +10131,14 @@ def create_share(event):
     _shares.put_item(Item=share,
                      ConditionExpression="attribute_not_exists(share_id)")
 
+    # AFTER the share exists. The owner is both actor and recipient here, and
+    # that is deliberate rather than an oversight of the never-notify-the-actor
+    # rule: a share link is a durable thing that stays live until revoked, and
+    # the notification is the record of "this meeting is exposed by a link" —
+    # which is worth being able to find later, unlike a transient action. It is
+    # the one event site that passes no actor_user_id, for that reason.
+    _notify_meeting_shared(user_id, key, item, share["share_id"])
+
     base = _share_base_url(event)
     return _resp(201, {
         "share_id": share["share_id"],
@@ -11508,6 +11579,589 @@ def _default_task_body(task: dict, resolved) -> str:
 
 
 # ---------------------------------------------------------------------------
+# NOTIFICATIONS — the in-app notification engine (Phase 1).
+#
+# WHAT THIS IS. One place that turns a MinuteX BUSINESS EVENT into a
+# notification for one user. Every event site in this file calls
+# `_notify(...)` and nothing else: no route writes the Notifications table
+# directly, and no UI component decides what a notification says.
+#
+#     business action succeeds
+#            |
+#            v
+#     _notify(user_id, TYPE, entity_id, subject=...)
+#            |
+#            +-- notification_schema.build()   copy + priority + entity kind
+#            +-- dedupe claim (conditional)    "this fact, once"
+#            +-- Notifications row             the stored record
+#            |
+#            v
+#     GET /notifications  ->  in-app notification centre
+#
+# THE ORDERING RULE, AND WHY IT IS ABSOLUTE. A notification is only ever
+# raised AFTER the business write it describes has succeeded. "A task was
+# assigned to you" that links to a task which was never created is worse than
+# no notification: the user taps it, gets a 404, and learns not to trust the
+# bell. So every call site here sits after its _write_task / _apply_update /
+# _upsert, never before and never in the same try block.
+#
+# THE FAILURE RULE, AND WHY IT IS THE OPPOSITE. A notification failing must
+# NEVER fail the business action. The task was genuinely created; answering
+# 500 because the bell could not be updated would turn a cosmetic problem into
+# a data-entry one, and the client's retry would then create a second task.
+# So `_notify` swallows and logs. This is the same best-effort reasoning
+# _mirror_task_to_recording already documents.
+#
+# NEVER NOTIFY THE ACTOR. Every event site passes the RECIPIENT, and _notify
+# drops the write when the recipient is the person who caused the event. A
+# user who assigns a task to themselves already knows; telling them is the
+# noise the requirement rules out. This is enforced HERE rather than at each
+# call site, so a new event site cannot forget it.
+#
+# GMAIL IS NOT INVOLVED. This engine has no email path, imports nothing from
+# the Gmail section, and is not reachable from it. Gmail remains what it was:
+# a communication integration the user triggers by hand. When EMAIL becomes a
+# delivery channel it will be a consumer of the rows written here, reading the
+# `channels` seam — not a second place notifications are decided.
+# ---------------------------------------------------------------------------
+
+# How long a dedupe claim is kept before DynamoDB's TTL reaps it.
+#
+# 90 days, which is comfortably longer than any fact this system dedupes stays
+# interesting: a "due today" claim matters for one day, a "processing
+# completed" claim for as long as someone might reprocess that meeting. The
+# cost of it being too LONG is a few bytes; the cost of it being too SHORT is
+# a duplicate notification, so it is deliberately generous.
+NOTIFICATION_DEDUPE_TTL_DAYS = int(
+    os.environ.get("NOTIFICATION_DEDUPE_TTL_DAYS", "90"))
+
+# Page sizes for GET /notifications. Same convention as the tasks list.
+NOTIFICATIONS_PAGE_DEFAULT = 20
+NOTIFICATIONS_PAGE_MAX = 50
+
+# Ceiling for one mark-all-read call. A user with a huge unread backlog is
+# served across several calls rather than one request that risks the gateway's
+# 30s timeout half-way through — the response says whether more remain, so the
+# client can finish the job. Chosen well under what 29s allows.
+NOTIFICATIONS_MARK_ALL_MAX = 500
+
+
+def _notification_row(user_id, built, entity_id, dedupe):
+    """Assemble one Notifications item from a built notification.
+
+    The SHAPE lives in notification_schema.make_row so this Lambda and
+    transcribeRecording write identical rows — only the id and the clock are
+    supplied here.
+    """
+    return notification_schema.make_row(
+        user_id, built, entity_id, dedupe,
+        notification_id=uuid.uuid4().hex[:20], now=_now_iso())
+
+
+def _claim_notification(dedupe):
+    """Win the right to write this notification, or return False.
+
+    The uniqueness mechanism. DynamoDB can only enforce a condition against an
+    item's OWN key, so the claim is an item whose KEY IS the dedupe key —
+    written with attribute_not_exists, which exactly one caller can win.
+    Whoever wins writes the notification; everyone else drops the event.
+
+    This is what makes the whole engine idempotent under retries, reprocessing,
+    concurrent readers and the deadline sweep running on every list call. It is
+    the same conditional-claim shape _folder_name_claim uses for folder names.
+
+    Fails OPEN on an unexpected error: if the claim table is unreachable, a
+    possible duplicate notification is a better outcome than silently losing a
+    real one, and the caller's log records it.
+    """
+    if not dedupe:
+        return True
+    expires = int(time.time()) + NOTIFICATION_DEDUPE_TTL_DAYS * 86400
+    try:
+        _notification_dedupe.put_item(
+            Item={"dedupe_key": dedupe, "created_at": _now_iso(),
+                  "expires_at": expires},
+            ConditionExpression="attribute_not_exists(dedupe_key)",
+        )
+        return True
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                == "ConditionalCheckFailedException":
+            return False
+        print(f"[notify] dedupe claim errored for {dedupe}: {err}")
+        return True
+    except Exception as err:  # noqa: BLE001
+        # Broad on purpose, and it is what makes "fails open" true rather than
+        # aspirational: an unreachable claim table raises something other than
+        # ClientError, and letting that escape would reach _notify's outer
+        # handler and drop the notification — turning a duplicate-prevention
+        # mechanism into a notification-LOSS mechanism. A possible duplicate is
+        # the strictly better failure.
+        print(f"[notify] dedupe claim failed for {dedupe}: "
+              f"{type(err).__name__}: {err}")
+        return True
+
+
+def _notify(user_id, notification_type, entity_id, *, subject="",
+            metadata=None, title="", message="", dedupe_day="",
+            actor_user_id=""):
+    """Raise ONE notification for ONE user. The only way notifications are made.
+
+    Returns the created row, or None when nothing was written — which is a
+    normal outcome, not a failure: no recipient, the recipient is the actor, or
+    the fact was already notified.
+
+    `dedupe_day` makes the identity per-day instead of once-ever (the deadline
+    types). `actor_user_id` is who CAUSED the event, and is never notified.
+
+    Never raises. See the failure rule in this section's header: the business
+    action has already succeeded by the time this runs, and it must not be
+    undone by a notification problem.
+    """
+    try:
+        recipient = str(user_id or "").strip()
+        if not recipient:
+            # Not an error: an unassigned task, or one assigned to a contact
+            # with no MinuteX account, has nobody to notify. Silence is the
+            # correct behaviour — there is no user to tell.
+            return None
+        if actor_user_id and recipient == str(actor_user_id).strip():
+            return None
+
+        built = notification_schema.build(
+            notification_type, subject=subject, metadata=metadata,
+            title=title, message=message)
+        dedupe = notification_schema.dedupe_key(
+            recipient, notification_type, entity_id, dedupe_day)
+        if not _claim_notification(dedupe):
+            return None
+
+        row = _notification_row(recipient, built, entity_id, dedupe)
+        _notifications.put_item(Item=row)
+        _audit("notification.created", recipient, row["notification_id"],
+               type=notification_type, entity=built["entity_type"])
+        return row
+    except Exception as err:  # noqa: BLE001
+        # Deliberately broad. Every caller is a business action that has
+        # already committed, and there is no notification failure worth
+        # failing it for.
+        print(f"[notify] FAILED type={notification_type} "
+              f"user={user_id}: {type(err).__name__}: {err}")
+        return None
+
+
+def _recording_title(item):
+    """The meeting label a notification shows, or an honest placeholder.
+
+    Never invents one: an untitled recording is a real state (AI titling can
+    fail), and "Untitled meeting" says so rather than guessing from the
+    transcript — which would be exactly the fabrication the project rules
+    forbid.
+    """
+    return (str((item or {}).get("title") or "").strip()
+            or notification_schema.UNTITLED_MEETING)
+
+
+def _task_title(row):
+    return (str((row or {}).get("title") or "").strip()
+            or notification_schema.UNTITLED_TASK)
+
+
+def _task_assignee_user(row):
+    """The MinuteX USER a task is assigned to, or "".
+
+    This is the whole basis of task notifications, and it is deliberately NOT
+    the assignee's name or email. A task can name "Rahul Sharma" without Rahul
+    having a MinuteX account — that is an UNRESOLVED assignee, and there is no
+    inbox to notify. `assignee_user_id` is only ever written from a Contact
+    that is LINKED to a real account (see _new_task_row), so its presence is
+    exactly the condition "there is a person here who can receive this".
+    """
+    return str((row or {}).get("assignee_user_id") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Event sites — the notifications each MinuteX event raises.
+#
+# Each helper is named for the BUSINESS event, not for the notification, so a
+# call site reads as "this happened" rather than "send this". They are grouped
+# here rather than inlined so the complete set of things MinuteX notifies
+# about can be read in one place — which is what stops the noise the
+# requirement warns against creeping in one route at a time.
+# ---------------------------------------------------------------------------
+def _notify_task_assigned(task_row, *, actor_user_id="", meeting_title=""):
+    """A task now has an assignee who holds a MinuteX account."""
+    recipient = _task_assignee_user(task_row)
+    if not recipient:
+        return None
+    meta = {}
+    if task_row.get("source_recording_id"):
+        meta["recording_key"] = task_row["source_recording_id"]
+    if meeting_title:
+        meta["meeting_title"] = meeting_title
+    return _notify(recipient, notification_schema.TYPE_TASK_ASSIGNED,
+                   task_row.get("task_id"), subject=_task_title(task_row),
+                   metadata=meta, actor_user_id=actor_user_id)
+
+
+def _notify_task_reassigned(previous_user_id, task_row, *, actor_user_id=""):
+    """A task moved AWAY from someone who held a MinuteX account.
+
+    Only the departing assignee gets this; the arriving one gets
+    TASK_ASSIGNED from _notify_task_assigned. Nobody else is told — the
+    requirement is explicit that unrelated users are not notified, and the
+    task's owner is almost always the actor anyway.
+    """
+    previous = str(previous_user_id or "").strip()
+    if not previous:
+        return None
+    if previous == _task_assignee_user(task_row):
+        return None  # not actually a reassignment
+    return _notify(previous, notification_schema.TYPE_TASK_REASSIGNED,
+                   task_row.get("task_id"), subject=_task_title(task_row),
+                   actor_user_id=actor_user_id)
+
+
+def _notify_ai_action_required(task_row):
+    """An AI-extracted task names an assignee the system could not resolve.
+
+    This is the "AI must not silently assign uncertain work" rule made
+    visible. The AI heard a name; MinuteX could not match it to a contact, so
+    rather than guessing a person (or dropping the assignment quietly) it asks
+    the OWNER to confirm. The owner is the recipient because they are the only
+    one who can resolve it — the intended assignee has no account to notify,
+    which is precisely why it is unresolved.
+    """
+    owner = str(task_row.get("owner_user_id") or "").strip()
+    if not owner:
+        return None
+    meta = {"resolution_status": str(task_row.get("resolution_status") or "")}
+    if task_row.get("source_recording_id"):
+        meta["recording_key"] = task_row["source_recording_id"]
+    name = str(task_row.get("assignee_name_legacy") or "").strip()
+    if name:
+        meta["assignee_name"] = name
+    return _notify(owner, notification_schema.TYPE_AI_ACTION_REQUIRED,
+                   task_row.get("task_id"), subject=_task_title(task_row),
+                   metadata=meta)
+
+
+def _notify_document_ready(user_id, key, item, doc_type, label=""):
+    """A meeting-generated document finished generating.
+
+    ONE path for every document type (summary, MoM, custom, Quick AI) — the
+    requirement rules out per-type notification logic, and the generic
+    Documents model already makes that unnecessary. The document TYPE travels
+    in metadata so the app can scroll to it; the notification itself points at
+    the MEETING, because that is where documents are read.
+
+    Deduped on the meeting AND the document type, so regenerating a document
+    the user already has does not re-notify, while a DIFFERENT document from
+    the same meeting still does.
+    """
+    title = _recording_title(item)
+    shown = str(label or "").strip() or str(doc_type or "").strip()
+    return _notify(
+        user_id, notification_schema.TYPE_MEETING_DOCUMENT_READY, key,
+        message=f"{title} — {shown}" if shown else title,
+        metadata={"document_type": str(doc_type or ""), "meeting_title": title},
+        dedupe_day=str(doc_type or ""),
+    )
+
+
+def _notify_meeting_shared(user_id, key, item, share_id=""):
+    """A read-only public link was created for a meeting's outputs."""
+    return _notify(user_id, notification_schema.TYPE_MEETING_OUTPUT_SHARED,
+                   key, subject=_recording_title(item),
+                   metadata={"share_id": str(share_id or "")},
+                   # Per share, not per meeting: creating a second link is a
+                   # second real event worth its own row.
+                   dedupe_day=str(share_id or ""))
+
+
+# ---------------------------------------------------------------------------
+# Deadline notifications — TASK_DUE_TODAY / TASK_OVERDUE.
+#
+# WHY THESE ARE SWEPT RATHER THAN SCHEDULED. A deadline is not an event
+# anything in MinuteX causes: no request happens at the moment a task becomes
+# overdue. The two honest ways to notice are a scheduled job (EventBridge) or
+# a sweep when the user's tasks are read. This implements the SWEEP, because:
+#
+#   * it needs no new infrastructure, which the project rules ask us to avoid
+#     adding without justification;
+#   * it is exactly-once per day REGARDLESS of how often it runs, because the
+#     dedupe key carries the day — so "every app open" costs nothing;
+#   * a user who never opens MinuteX gets no in-app notification, which is
+#     correct: an in-app notification only exists to be seen in the app. When
+#     EMAIL becomes a channel, THAT is when a scheduled job earns its place,
+#     and it will call this same function.
+#
+# The sweep is bounded (it only ever looks at tasks already read for another
+# purpose) and it never blocks the response — a failure inside _notify is
+# swallowed, so the task list is served either way.
+# ---------------------------------------------------------------------------
+def _sweep_task_deadlines(user_id, rows, now=None):
+    """Raise due-today / overdue notifications for the caller's OWN tasks.
+
+    `rows` are tasks that have ALREADY been read and ownership-checked by the
+    caller, so this adds no reads of its own.
+
+    Only tasks assigned to THIS user are considered — `assignee_user_id`, the
+    same condition every other task notification uses. A task the user owns
+    but assigned to someone else is that person's deadline to be reminded of,
+    not theirs.
+
+    Returns the number of notifications raised (used by tests; callers ignore
+    it — the sweep is a side effect of reading, never something a response
+    reports).
+    """
+    moment = now or datetime.now(timezone.utc)
+    today = notification_schema.today_iso(moment)
+    raised = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("owner_user_id") != user_id:
+            continue
+        if _task_assignee_user(row) != user_id:
+            continue
+        if row.get("status") in TASK_TERMINAL_STATUSES:
+            continue
+
+        due = (str(row.get("due_date_normalized") or "").strip()
+               or str(row.get("due_date") or "").strip())
+        if not due:
+            continue
+
+        if _is_overdue(row.get("due_date"), row.get("status"),
+                       row.get("due_date_normalized", "")):
+            ntype = notification_schema.TYPE_TASK_OVERDUE
+        elif due[:10] == today:
+            # Due today and not yet past — a bare date is compared on the day
+            # itself, which is why _is_overdue is asked first: a task due
+            # today only becomes overdue at the end of the day, and until then
+            # "due today" is the true statement.
+            ntype = notification_schema.TYPE_TASK_DUE_TODAY
+        else:
+            continue
+
+        # The day is part of the identity, so this is at most one per task per
+        # day per type — on every app open, from every device, forever.
+        if _notify(user_id, ntype, row.get("task_id"),
+                   subject=_task_title(row), dedupe_day=today,
+                   metadata={"due_date": str(row.get("due_date") or "")}):
+            raised += 1
+    return raised
+
+
+# ---------------------------------------------------------------------------
+# Notification API — the read side.
+#
+# SECURITY. Every route derives the user from the JWT (_require_auth) and
+# never from the request. Reads are keyed by that user_id on the user-index;
+# writes go through _owned_notification, which re-checks the row's user_id
+# after the GetItem. A notification_id is therefore not a capability: holding
+# someone else's id gets a 404, the same answer an id that does not exist
+# gets, so the API does not confirm the row's existence either.
+# ---------------------------------------------------------------------------
+def _owned_notification(user_id, notification_id):
+    """One notification belonging to this user, or 404.
+
+    404 rather than 403 ON PURPOSE, matching _owned_task / _owned_contact /
+    _owned_folder: telling a caller "this exists but is not yours" leaks that
+    the id is real. Same answer for both cases, no oracle.
+    """
+    nid = str(notification_id or "").strip()
+    if not nid:
+        raise ApiError(400, "notification id required")
+    row = _notifications.get_item(Key={"notification_id": nid}).get("Item")
+    if not row or row.get("user_id") != user_id:
+        raise ApiError(404, "notification not found")
+    return row
+
+
+def list_notifications(event):
+    """GET /notifications?limit=&cursor=&unread=  -> {notifications, count,
+                                                     next_cursor, unread_count}
+
+    Newest first, paginated — the app never loads a user's whole history.
+    `unread=1` narrows to unread rows, served from the sparse unread index so
+    it stays cheap no matter how much read history has accumulated.
+
+    The unread COUNT rides along on the first page (no cursor) so the centre
+    can render its badge without a second round trip on open. Later pages omit
+    it: it is a property of the inbox, not of the page, and recomputing it per
+    page would be a read the client already has the answer to.
+    """
+    user_id = _require_auth(event)
+    qs = event.get("queryStringParameters") or {}
+    limit = _clean_limit(qs.get("limit"), NOTIFICATIONS_PAGE_DEFAULT,
+                         NOTIFICATIONS_PAGE_MAX)
+    unread_only = str(qs.get("unread") or "").strip().lower() in ("1", "true")
+
+    if unread_only:
+        query = {"IndexName": NOTIFICATIONS_UNREAD_INDEX,
+                 "KeyConditionExpression": Key("user_id").eq(user_id)}
+    else:
+        query = {"IndexName": NOTIFICATIONS_USER_INDEX,
+                 "KeyConditionExpression": Key("user_id").eq(user_id)}
+    query["ScanIndexForward"] = False
+    query["Limit"] = limit
+
+    cursor = _decode_cursor(qs.get("cursor"))
+    if cursor:
+        query["ExclusiveStartKey"] = cursor
+
+    res = _notifications.query(**query)
+    # Re-checked against the caller even though the index is keyed by user_id:
+    # an index is a lookup path, never an authorization decision. Same rule
+    # list_all_tasks states.
+    rows = [r for r in res.get("Items", []) if r.get("user_id") == user_id]
+
+    body = {
+        "notifications": [notification_schema.public_notification(r)
+                          for r in rows],
+        "count": len(rows),
+        "next_cursor": _encode_cursor(res.get("LastEvaluatedKey")),
+    }
+    if not cursor:
+        body["unread_count"] = _unread_count(user_id)
+    return _resp(200, body)
+
+
+def _unread_count(user_id):
+    """How many unread notifications this user has.
+
+    Counted over the SPARSE unread index, so the work is proportional to the
+    unread rows — not to the user's whole notification history. A user with
+    three unread and four years of read notifications pays for three.
+
+    Uses Select=COUNT so DynamoDB never ships the items themselves.
+    """
+    total, start_key = 0, None
+    # Paged because COUNT is still subject to the 1 MB scan limit per call.
+    # Bounded by the same page ceiling the filtered task list uses, so a
+    # pathological backlog cannot make the badge query unbounded.
+    for _ in range(_SEARCH_MAX_PAGES):
+        query = {"IndexName": NOTIFICATIONS_UNREAD_INDEX,
+                 "KeyConditionExpression": Key("user_id").eq(user_id),
+                 "Select": "COUNT"}
+        if start_key:
+            query["ExclusiveStartKey"] = start_key
+        res = _notifications.query(**query)
+        total += int(res.get("Count") or 0)
+        start_key = res.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    return total
+
+
+def get_unread_count(event):
+    """GET /notifications/unread-count -> {unread_count}
+
+    Separate from the list on purpose (section 24): the badge is polled far
+    more often than the centre is opened, and it must not pay for a page of
+    notification bodies to render a number.
+    """
+    user_id = _require_auth(event)
+    return _resp(200, {"unread_count": _unread_count(user_id)})
+
+
+def _mark_read(row):
+    """Flip one row to read, and drop it out of the unread index.
+
+    REMOVING `unread_marker` is what takes the row out of the sparse index —
+    that is the mechanism, not a cleanup. Writing is_read=true alone would
+    leave the badge counting it forever.
+
+    Conditional on the row still being unread so a double-tap (or two devices)
+    cannot overwrite the original read_at with a later one.
+    """
+    now = _now_iso()
+    try:
+        _notifications.update_item(
+            Key={"notification_id": row["notification_id"]},
+            UpdateExpression="SET is_read = :t, read_at = :now "
+                             "REMOVE unread_marker",
+            ConditionExpression="attribute_exists(unread_marker)",
+            ExpressionAttributeValues={":t": True, ":now": now},
+        )
+        return True
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                == "ConditionalCheckFailedException":
+            return False   # already read — the desired end state either way
+        raise
+
+
+def mark_notification_read(event):
+    """POST /notifications/{notification_id}/read -> {notification}
+
+    Idempotent: marking an already-read notification succeeds and returns it
+    unchanged, because the client's goal ("this is read") is already true. An
+    error there would make a double-tap look like a failure.
+    """
+    user_id = _require_auth(event)
+    nid = (event.get("pathParameters") or {}).get("notification_id")
+    row = _owned_notification(user_id, nid)
+
+    if _mark_read(row):
+        row = dict(row)
+        row["is_read"] = True
+        row["read_at"] = _now_iso()
+        row.pop("unread_marker", None)
+        _audit("notification.read", user_id, row["notification_id"])
+
+    return _resp(200, {
+        "notification": notification_schema.public_notification(row),
+        "unread_count": _unread_count(user_id),
+    })
+
+
+def mark_all_notifications_read(event):
+    """POST /notifications/read-all -> {marked, unread_count, remaining}
+
+    Sweeps the sparse unread index, which is exactly the set that needs
+    changing — a scan over all notifications filtering on is_read would get
+    slower every week the user keeps the app.
+
+    Bounded per call (NOTIFICATIONS_MARK_ALL_MAX). `remaining` tells the
+    client whether to call again, so a very large backlog is finished across
+    calls instead of risking the gateway timeout mid-sweep. In practice one
+    call clears any realistic inbox.
+    """
+    user_id = _require_auth(event)
+    marked, start_key, hit_ceiling = 0, None, False
+
+    while True:
+        query = {"IndexName": NOTIFICATIONS_UNREAD_INDEX,
+                 "KeyConditionExpression": Key("user_id").eq(user_id)}
+        if start_key:
+            query["ExclusiveStartKey"] = start_key
+        res = _notifications.query(**query)
+
+        for row in res.get("Items", []):
+            # The index is keyed by user_id, but ownership is re-checked
+            # before a WRITE for the same reason it is before a read.
+            if row.get("user_id") != user_id:
+                continue
+            if marked >= NOTIFICATIONS_MARK_ALL_MAX:
+                hit_ceiling = True
+                break
+            if _mark_read(row):
+                marked += 1
+
+        start_key = res.get("LastEvaluatedKey")
+        if hit_ceiling or not start_key:
+            break
+
+    remaining = _unread_count(user_id)
+    _audit("notification.read_all", user_id, "-", marked=marked)
+    return _resp(200, {"marked": marked, "unread_count": remaining,
+                       "remaining": remaining})
+
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 _ROUTES = {
@@ -11671,6 +12325,14 @@ _ROUTES = {
     ("GET", "/integrations/gmail/recipients/{key+}"): gmail_meeting_recipients,
     ("POST", "/integrations/gmail/send/meeting/{key+}"): gmail_send_meeting,
     ("POST", "/integrations/gmail/send/task/{task_id}"): gmail_send_task,
+    # --- Notifications. The in-app notification centre (Phase 1). Every one
+    # of these is JWT-only and scoped to the caller: there is no route that
+    # takes a user_id, and no route that reads another user's rows. See the
+    # NOTIFICATIONS section for the engine that writes them.
+    ("GET", "/notifications"): list_notifications,
+    ("GET", "/notifications/unread-count"): get_unread_count,
+    ("POST", "/notifications/{notification_id}/read"): mark_notification_read,
+    ("POST", "/notifications/read-all"): mark_all_notifications_read,
     ("POST", "/webhooks/elevenlabs/stt"): stt_webhook,
     # Recover a job whose webhook never arrived, by asking ElevenLabs directly.
     # JWT-authenticated and owner-scoped — this one is for the user/operator,

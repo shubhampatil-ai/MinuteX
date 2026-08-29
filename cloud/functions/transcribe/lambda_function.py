@@ -73,6 +73,7 @@ come from env only, never hardcoded.
 """
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -82,11 +83,13 @@ from decimal import Decimal
 
 import boto3
 from botocore.config import Config as _BotoConfig
+from botocore.exceptions import ClientError
 
 # The shared AI core — one Groq client, one set of prompts, one coercion layer
 # for the whole backend. Vendored into this zip alongside lambda_function.py.
 import ai_schema
 import groq_client
+import notification_schema
 import prompts
 import stt_result
 import transcript_store
@@ -812,6 +815,9 @@ def handle_s3_event(event):
                 print(f"[elevenlabs] SYNC fallback FAILED for {key}: {sync_err}")
                 _upsert(key, {"status": "failed",
                               "error": str(sync_err)[:1000]})
+                _notify_processing_outcome(
+                    key, _notify_recipient(key), "failed",
+                    _notify_meeting_title(key))
                 raise
             outcome = analyze_and_persist(bucket, key, transcript, timestamps,
                                           language)
@@ -820,6 +826,12 @@ def handle_s3_event(event):
         except Exception as err:  # noqa: BLE001
             print(f"[elevenlabs] START FAILED for {key}: {err}")
             _upsert(key, {"status": "failed", "error": str(err)[:1000]})
+            # Deduped per meeting, so the S3/Lambda retries this `raise`
+            # triggers do not each add a notification — the user is told once
+            # that this recording could not be processed.
+            _notify_processing_outcome(
+                key, _notify_recipient(key), "failed",
+                _notify_meeting_title(key))
             raise  # abort -> S3/Lambda retry semantics apply
 
         # Persist the id BEFORE returning. This write is what makes the async
@@ -1102,6 +1114,16 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # finished is stt_completed_request_id, written by the webhook's idempotency
     # claim — the reconciler compares the two rather than testing for absence.
     _upsert(key, fields, remove=RETIRED_ANALYSIS_ATTRS)
+    # AFTER the terminal status is persisted, never before: the notification
+    # says the meeting is ready, so the row the user lands on must already say
+    # so too. `fields` holds the title this write decided, so no read-back is
+    # needed here.
+    # `user_id` here is the one parsed from the key, which is empty for a
+    # legacy row — _notify_recipient falls back to the row's own stamped owner
+    # so those recordings still reach their user.
+    _notify_processing_outcome(
+        key, user_id or _notify_recipient(key), status,
+        _notify_meeting_title(key, str(fields.get("title") or "").strip()))
     print(f"[done] {key} status={status} source={source} (device={device_id})")
     return {"key": key, "status": status}
 
@@ -1111,6 +1133,174 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
 # creating it if absent, never touching fields it wasn't given (unlike
 # put_item, which replaces the whole item).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# NOTIFICATIONS — the two events this pipeline raises.
+#
+# This Lambda is where a meeting's processing actually FINISHES, successfully
+# or not, so it is where those two facts are known first. Everything else the
+# notification engine does lives in userApi; this is deliberately the smallest
+# possible write path rather than a second engine:
+#
+#   * the VOCABULARY (types, copy, priority, dedupe rule, row shape) comes
+#     from shared/notification_schema.py — the same module userApi builds
+#     from, so the two cannot drift;
+#   * the two tables are the same two tables;
+#   * the claim-then-write sequence is the same sequence.
+#
+# WHAT IT DOES NOT DO. It does not notify per AI step. The pipeline has many
+# internal stages (transcription queued, transcript delivered, analysis
+# mapped, documents mirrored) and none of them is a user-facing fact. Exactly
+# one notification is raised per terminal outcome, at the point the row's
+# final status is persisted — which is also what makes the requirement's
+# "never notify before the state is persisted" rule structural here rather
+# than a thing to remember.
+# ---------------------------------------------------------------------------
+NOTIFICATIONS_TABLE = os.environ.get("NOTIFICATIONS_TABLE", "Notifications")
+NOTIFICATION_DEDUPE_TABLE = os.environ.get("NOTIFICATION_DEDUPE_TABLE",
+                                           "NotificationDedupe")
+NOTIFICATION_DEDUPE_TTL_DAYS = int(
+    os.environ.get("NOTIFICATION_DEDUPE_TTL_DAYS", "90"))
+
+
+def _notify(user_id, notification_type, entity_id, *, subject="",
+            metadata=None, dedupe_day=""):
+    """Raise ONE notification. Best-effort, never raises.
+
+    Mirrors userApi's `_notify` and shares its two rules:
+
+      * it runs AFTER the status write it describes, so a notification never
+        points at a state the database does not have;
+      * it can never fail the pipeline. The transcription and the analysis
+        have already been paid for and persisted by the time this runs —
+        letting a notification error throw would fail the invocation, and S3
+        would then retry the WHOLE pipeline, re-paying for both.
+    """
+    try:
+        recipient = str(user_id or "").strip()
+        if not recipient:
+            # A legacy recording with no user_id stamped on the key. There is
+            # nobody to notify — not a failure, just an older row.
+            return None
+
+        built = notification_schema.build(notification_type, subject=subject,
+                                          metadata=metadata)
+        dedupe = notification_schema.dedupe_key(
+            recipient, notification_type, entity_id, dedupe_day)
+
+        # The claim IS the idempotency: a reprocess, an S3 retry or a
+        # duplicate webhook delivery all recompute the same key and lose the
+        # conditional write, so one completed meeting produces one
+        # notification however many times this code runs for it.
+        try:
+            _ddb.Table(NOTIFICATION_DEDUPE_TABLE).put_item(
+                Item={"dedupe_key": dedupe,
+                      "created_at": datetime.now(timezone.utc).isoformat()
+                                    .replace("+00:00", "Z"),
+                      "expires_at": int(time.time())
+                                    + NOTIFICATION_DEDUPE_TTL_DAYS * 86400},
+                ConditionExpression="attribute_not_exists(dedupe_key)",
+            )
+        except ClientError as err:
+            if err.response.get("Error", {}).get("Code") \
+                    == "ConditionalCheckFailedException":
+                return None
+            # Fails OPEN, like userApi: a possible duplicate beats losing a
+            # real notification, and the log records that it happened.
+            print(f"[notify] dedupe claim errored for {dedupe}: {err}")
+        except Exception as err:  # noqa: BLE001
+            # Same reasoning, for the errors that are not ClientError: an
+            # unreachable claim table must not cost the notification.
+            print(f"[notify] dedupe claim failed for {dedupe}: "
+                  f"{type(err).__name__}: {err}")
+
+        row = notification_schema.make_row(
+            recipient, built, entity_id, dedupe,
+            notification_id=uuid.uuid4().hex[:20],
+            now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+        _ddb.Table(NOTIFICATIONS_TABLE).put_item(Item=row)
+        print(f"[notify] {notification_type} user={recipient} "
+              f"id={row['notification_id']}")
+        return row
+    except Exception as err:  # noqa: BLE001
+        print(f"[notify] FAILED type={notification_type} "
+              f"user={user_id}: {type(err).__name__}: {err}")
+        return None
+
+
+def _notify_processing_outcome(key, user_id, status, title):
+    """The one notification a finished meeting raises.
+
+    THREE terminal statuses, TWO user-facing outcomes:
+
+      complete     the whole pipeline worked            -> COMPLETED
+      transcribed  the transcript is there, the AI      -> COMPLETED
+                   analysis degraded (see the fallback
+                   in analyze_and_persist)
+      failed       there is no usable transcript        -> FAILED
+
+    "transcribed" counts as SUCCESS on purpose. The user has a real,
+    readable meeting — the transcript is the source of truth, and the
+    workspace can regenerate the AI output on demand. Telling them it failed
+    would be false, and would send them to reprocess something that worked.
+
+    AI_OUTPUT_READY is raised only for a FULL success, and only in addition:
+    it is the "your summary and highlights are ready" fact, which is
+    genuinely not true for a degraded row. Both are deduped per meeting, so a
+    reprocess of an already-notified meeting stays silent.
+    """
+    if status == "failed":
+        _notify(user_id, notification_schema.TYPE_MEETING_PROCESSING_FAILED,
+                key, subject=title)
+        return
+
+    _notify(user_id, notification_schema.TYPE_MEETING_PROCESSING_COMPLETED,
+            key, subject=title)
+    if status == "complete":
+        _notify(user_id, notification_schema.TYPE_AI_OUTPUT_READY,
+                key, subject=title)
+
+
+def _notify_recipient(key):
+    """The user to notify about this recording, or "".
+
+    The key carries the owner for every recording uploaded since user
+    ownership existed, so that is the first source. LEGACY keys
+    ({deviceId}/{meetingId}_{ts}.wav) carry none — for those the row itself
+    may still have a user_id, stamped by an unpair (see the userApi's
+    _stamp_user_on_legacy_recordings). Falling back to the row is what lets a
+    legacy recording still notify its owner; when neither has one, there is
+    genuinely nobody to tell and "" is the honest answer.
+    """
+    user_id = parse_key(key)[0]
+    if user_id:
+        return user_id
+    try:
+        row = _table.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+        return str(row.get("user_id") or "").strip()
+    except Exception as err:  # noqa: BLE001
+        print(f"[notify] could not read owner for {key}: {err}")
+        return ""
+
+
+def _notify_meeting_title(key, fallback=""):
+    """The title to show, read back from the row that was just written.
+
+    Read back rather than passed in, because the title is decided by
+    _resolve_title_fields during the same write and the caller does not
+    otherwise hold the winner. Falls back to the honest placeholder rather
+    than inventing a name for an untitled meeting.
+    """
+    if fallback:
+        return fallback
+    try:
+        row = _table.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+        return (str(row.get("title") or "").strip()
+                or notification_schema.UNTITLED_MEETING)
+    except Exception as err:  # noqa: BLE001
+        print(f"[notify] could not read title for {key}: {err}")
+        return notification_schema.UNTITLED_MEETING
+
+
 def _upsert(key, fields, remove=()):
     """SET `fields` on the row, and REMOVE the attributes named in `remove`.
 

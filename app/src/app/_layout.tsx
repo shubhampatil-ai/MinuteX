@@ -16,6 +16,7 @@ import { Splash } from "../../lib/splash";
 import { getToken } from "../../lib/api";
 import { DeviceProvider } from "../../lib/device-context";
 import { IntegrationsProvider } from "../../lib/integrations";
+import { NotificationsProvider } from "../../lib/notification-center";
 import { recoverUploads } from "../../lib/uploads";
 
 // Root error boundary — a crash anywhere in the tree lands here instead of a
@@ -184,6 +185,11 @@ function RootContent() {
           lib/integrations.tsx for why a per-screen fetch would let them
           disagree. */}
       <IntegrationsProvider>
+      {/* ONE unread count for the whole app, for the same reason: the bell in
+          the masthead and the Notification Centre are the same data, and a
+          per-screen fetch would let the badge disagree with the list the
+          moment either marked something read. */}
+      <NotificationsProvider>
       {statusBar}
       <Stack
         screenOptions={{
@@ -242,7 +248,9 @@ function RootContent() {
         <Stack.Screen name="tasks" options={{ title: "Tasks" }} />
         <Stack.Screen name="task/[id]" options={{ title: "Task" }} />
         <Stack.Screen name="calendar" options={{ title: "Calendar" }} />
+        <Stack.Screen name="notifications" options={{ title: "Notifications" }} />
       </Stack>
+      </NotificationsProvider>
       </IntegrationsProvider>
     </DeviceProvider>
   );

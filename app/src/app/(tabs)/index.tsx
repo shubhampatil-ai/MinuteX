@@ -17,6 +17,7 @@ import { useFocusEffect, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon, type IconName } from "../../../lib/icons";
 import { S, R, ELEV, CAPS, FONT, TABULAR, useTheme, ColorScale } from "../../../lib/theme";
+import { NotificationBell } from "../../../lib/notification-bell";
 import {
   Button, Chip, EmptyState, ErrorText, IconCircle, SearchBar, SkeletonCard,
 } from "../../../lib/ui";
@@ -575,12 +576,17 @@ export default function DeskScreen() {
           <Text style={st.dateline}>{fmtToday()}</Text>
           <Text style={st.title}>MinuteX</Text>
         </View>
-        {captured ? (
-          <View style={{ alignItems: "flex-end", gap: 3 }}>
-            <Text style={st.weekFig}>{captured}</Text>
-            <Text style={st.weekLabel}>captured this week</Text>
-          </View>
-        ) : null}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: S.sm }}>
+          {captured ? (
+            <View style={{ alignItems: "flex-end", gap: 3 }}>
+              <Text style={st.weekFig}>{captured}</Text>
+              <Text style={st.weekLabel}>captured this week</Text>
+            </View>
+          ) : null}
+          {/* The notification centre's entry point. Reads its count from the
+              shared context, so it stays in step with the centre itself. */}
+          <NotificationBell />
+        </View>
       </View>
 
       {/* Stat strip */}

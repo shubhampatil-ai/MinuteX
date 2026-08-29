@@ -2277,3 +2277,116 @@ export async function updateShare(
 export async function revokeShare(shareId: string): Promise<void> {
   await request(`/shares/${encodeURIComponent(shareId)}`, { method: "DELETE" });
 }
+
+// ---------------------------------------------------------------------------
+// Notifications — the in-app notification centre.
+//
+// The backend derives the recipient from the JWT on EVERY one of these calls;
+// there is no user id in any signature below, and there is deliberately no way
+// to ask for someone else's notifications. See the userApi's NOTIFICATIONS
+// section for the server-side rule.
+//
+// Gmail is not involved. A notification is an in-app record; the Gmail
+// integration remains a separate thing the user triggers by hand. `channels`
+// below is the seam for a later email/WhatsApp delivery channel and is always
+// ["IN_APP"] in this phase.
+// ---------------------------------------------------------------------------
+export type NotificationType =
+  | "MEETING_PROCESSING_COMPLETED"
+  | "MEETING_PROCESSING_FAILED"
+  | "AI_OUTPUT_READY"
+  | "AI_ACTION_REQUIRED"
+  | "TASK_ASSIGNED"
+  | "TASK_REASSIGNED"
+  | "TASK_DUE_TODAY"
+  | "TASK_OVERDUE"
+  | "MEETING_DOCUMENT_READY"
+  | "MEETING_OUTPUT_SHARED";
+
+export type NotificationPriority = "LOW" | "NORMAL" | "HIGH";
+
+/** What a notification points AT. The app opens the entity by this pair —
+ *  never by anything embedded in the notification itself, which is why a
+ *  renamed task still opens correctly from an old notification. */
+export type NotificationEntityType = "task" | "meeting" | "document";
+
+export type AppNotification = {
+  notification_id: string;
+  // Widened with `string` on purpose: a row written by a newer backend must
+  // still render on an older build rather than crashing the list. Unknown
+  // types fall back to neutral styling and a non-actionable row.
+  type: NotificationType | string;
+  title: string;
+  message: string;
+  priority: NotificationPriority | string;
+  entity_type: NotificationEntityType | string;
+  entity_id: string;
+  is_read: boolean;
+  read_at: string;
+  created_at: string;
+  /** Small flat display extras (document_type, meeting_title, due_date …).
+   *  Bounded server-side — never a business object. */
+  metadata: Record<string, string>;
+  /** Delivered-on channels. Always ["IN_APP"] in Phase 1. */
+  channels: string[];
+};
+
+export type NotificationPage = {
+  notifications: AppNotification[];
+  count: number;
+  next_cursor: string;
+  /** Only present on the FIRST page (no cursor) — it is a property of the
+   *  inbox, not of the page, so later pages do not recompute it. */
+  unread_count?: number;
+};
+
+/** One page of notifications, newest first. */
+export async function getNotifications(opts?: {
+  limit?: number;
+  cursor?: string;
+  unreadOnly?: boolean;
+}): Promise<NotificationPage> {
+  const qs = new URLSearchParams();
+  if (opts?.limit) qs.set("limit", String(opts.limit));
+  if (opts?.cursor) qs.set("cursor", opts.cursor);
+  if (opts?.unreadOnly) qs.set("unread", "1");
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const res = await request<NotificationPage>(`/notifications${suffix}`);
+  return {
+    notifications: res.notifications ?? [],
+    count: res.count ?? 0,
+    next_cursor: res.next_cursor ?? "",
+    unread_count: res.unread_count,
+  };
+}
+
+/** Just the badge number. Separate from the list because it is polled far
+ *  more often than the centre is opened, and must not pay for a page of
+ *  notification bodies to render a count. */
+export async function getUnreadNotificationCount(): Promise<number> {
+  const res = await request<{ unread_count?: number }>(
+    "/notifications/unread-count"
+  );
+  return res.unread_count ?? 0;
+}
+
+/** Mark ONE notification read. Idempotent — marking an already-read one
+ *  succeeds, because the caller's goal is already true. */
+export async function markNotificationRead(
+  notificationId: string
+): Promise<{ notification: AppNotification; unread_count: number }> {
+  return request(
+    `/notifications/${encodeURIComponent(notificationId)}/read`,
+    { method: "POST", body: {} }
+  );
+}
+
+/** Mark every unread notification read. `remaining` is non-zero only for a
+ *  backlog larger than one call's ceiling — the caller repeats until it is 0. */
+export async function markAllNotificationsRead(): Promise<{
+  marked: number;
+  unread_count: number;
+  remaining: number;
+}> {
+  return request("/notifications/read-all", { method: "POST", body: {} });
+}

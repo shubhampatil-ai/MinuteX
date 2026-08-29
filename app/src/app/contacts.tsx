@@ -25,11 +25,10 @@ import {
   S, R, ELEV, FONT, useTheme, ColorScale,
 } from "../../lib/theme";
 import {
-  Button, EmptyState, ErrorText, SearchBar, SkeletonCard,
+  Avatar, Button, EmptyState, ErrorText, SearchBar, SkeletonCard,
 } from "../../lib/ui";
 import { ApiContact, ApiError, getContacts } from "../../lib/api";
 import { ContactPicker } from "../../lib/contact-picker";
-import { avatarColorFor, initialsOf } from "../../lib/task-model";
 
 const SEARCH_DEBOUNCE_MS = 300;
 const PAGE_SIZE = 50;
@@ -137,11 +136,11 @@ export default function ContactsScreen() {
         accessibilityLabel={`Open ${item.name}`}
       >
         <View style={st.row}>
-          <View
-            style={[st.avatar, { backgroundColor: avatarColorFor(item.name) }]}
-          >
-            <Text style={st.avatarTxt}>{initialsOf(item.name)}</Text>
-          </View>
+          {/* Whatever photo this person has — one the user saved, or their own
+              MinuteX profile photo when they are on MinuteX. Initials when
+              there is none. The API has already decided which; see
+              avatar_source on ApiContact. */}
+          <Avatar name={item.name} photoUri={item.avatar_view_url} size={42} />
           <View style={{ flex: 1 }}>
             <Text style={st.name} numberOfLines={1}>{item.name}</Text>
             {!!item.email && (
@@ -279,11 +278,6 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     row: {
       flexDirection: "row" as const, alignItems: "center" as const, gap: S.md,
     },
-    avatar: {
-      width: 42, height: 42, borderRadius: 21, alignItems: "center" as const,
-      justifyContent: "center" as const,
-    },
-    avatarTxt: { fontFamily: FONT.bold, fontSize: 15, color: "#fff" },
     name: { fontFamily: FONT.bold, fontSize: 15, color: C.text },
     sub: {
       fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 1,

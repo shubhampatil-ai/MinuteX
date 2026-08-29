@@ -152,12 +152,20 @@ export function Highlights({
 // speaker is most visible, so it's where the user reaches for the rename.
 // ===========================================================================
 export function Participants({
-  participants, resolveName, onRenameSpeaker,
+  participants, resolveName, onRenameSpeaker, talkTime, onOpenTranscript,
 }: {
   participants?: Participant[] | null;
   resolveName: (label: string) => string;
   /** Omitted on read-only surfaces; rows fall back to plain, unpressable Views. */
   onRenameSpeaker?: (label: string) => void;
+  /** Raw speaker label -> seconds spoken, summed from the transcript's own
+   *  segments by the caller. Optional: a non-diarized recording has no
+   *  segments, and the row simply omits the figure rather than showing "0:00",
+   *  which would read as "this person said nothing". */
+  talkTime?: Map<string, number>;
+  /** Shown as a footer link when given — the Speakers tab's way through to the
+   *  transcript, where a speaker's actual turns are. */
+  onOpenTranscript?: () => void;
 }) {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
@@ -192,6 +200,25 @@ export function Participants({
                     <Icon name="pencil" tintColor={C.textFaint} size={11} />
                   ) : null}
                 </View>
+                {/* The diarization LABEL and the talk time. Kept on one
+                    line under the name because both answer "which voice is
+                    this?" — the label is how the transcript identifies them,
+                    and the share of the meeting is how a reader recognises
+                    whether this was a main voice or an aside. */}
+                {(() => {
+                  const seconds = talkTime?.get(raw);
+                  const meta = [
+                    isNamed ? `Speaker ${raw}` : "",
+                    seconds != null && seconds > 0 ? fmtTalkTime(seconds) : "",
+                  ].filter(Boolean);
+                  return meta.length ? (
+                    <Text style={[st.highlightTxt, {
+                      marginTop: 1, fontSize: 12.5, color: C.textFaint,
+                    }]}>
+                      {meta.join(" · ")}
+                    </Text>
+                  ) : null;
+                })()}
                 {p.summary ? (
                   <Text style={[st.highlightTxt, { marginTop: 2, color: C.textDim }]}>{p.summary}</Text>
                 ) : null}
@@ -214,6 +241,25 @@ export function Participants({
           );
         })}
       </Card>
+      {onOpenTranscript ? (
+        <Pressable onPress={onOpenTranscript} hitSlop={6}
+                   style={{ marginTop: S.md, alignSelf: "flex-start" }}
+                   accessibilityRole="button">
+          <Text style={st.actionTxt}>Read their turns in the transcript</Text>
+        </Pressable>
+      ) : null}
     </View>
   );
+}
+
+/** Seconds -> "12 min" / "45 sec". Deliberately COARSE: this is a sense of who
+ *  dominated the meeting, not a measurement, and a precise "11:47" invites a
+ *  reader to trust it as one — diarization is not that accurate.
+ *
+ *  The sub-minute test is on the RAW seconds, not on the rounded minutes:
+ *  rounding first turns 45 seconds into "1 min", which overstates a short
+ *  contribution by a third. Under a minute always reads in seconds. */
+function fmtTalkTime(seconds: number): string {
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))} sec`;
+  return `${Math.round(seconds / 60)} min`;
 }

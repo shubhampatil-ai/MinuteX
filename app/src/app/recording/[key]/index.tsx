@@ -1,21 +1,30 @@
-// src/app/recording/[key]/index.tsx — Meeting Detail: Overview + Transcript.
+// src/app/recording/[key]/index.tsx — Meeting Detail: four analysis tabs.
 //
 // MinuteX is an AI Meeting Workspace, not a printed brief and not a scroll of
-// every AI surface the backend can produce. Two tabs, an animated segmented
+// every AI surface the backend can produce. FOUR tabs, an animated segmented
 // control, and exactly one entry point per capability:
 //
-//   Overview tab:    Summary (one AI note, Read more, Share)
-//                       -> Highlights (4-5 icon-assisted rows)
-//                       -> Tasks (top 3 + View all -> Task Detail)
-//                       -> Documents (list + Create Document)
-//   Transcript tab:  Search, speaker labels/colors, timestamps, tap-to-seek.
-//                       No AI features here at all.
+//   Overview   The AI's own sections for THIS meeting — dynamic titles,
+//              dynamic count, chosen by the model (lib/meeting-overview.tsx).
+//   Speakers   Who spoke, their talk time, rename / map to a contact.
+//   Tasks      The meeting's tasks: add, open, view all.
+//   Documents  Generated documents, the MoM editor, Create Document.
+//
+// The TRANSCRIPT is NOT a tab. It is its own screen
+// (recording/[key]/transcript), reached from "View Transcript" under the
+// player. Two reasons: it is the longest thing in the product and the one
+// thing read top-to-bottom, so a masthead + player + tab bar cost it the most
+// vertical space; and it is the only surface with no AI on it, which made it a
+// poor fit beside three that are entirely AI.
+//
+// Each tab was previously a BLOCK stacked in one scrolling Overview. Splitting
+// them changed no behaviour inside any block — the same components, the same
+// props, the same handlers. What changed is that only one is mounted at a time.
 //
 // Shared: title (tap to rename), a large Apple-Music-style audio player,
-// overflow menu (share/rename), speaker rename from the transcript, and a
-// floating Assistant button that opens the dedicated workspace at
-// recording/[key]/assistant — chat, generated documents and tasks all live
-// there now, not inline on this screen.
+// overflow menu (share/rename), speaker rename (from the Speakers tab or the
+// transcript screen — one mapping drives both), and a floating Assistant
+// button that opens the dedicated workspace at recording/[key]/assistant.
 //
 // MeetingProvider is mounted by the parent recording/[key]/_layout.tsx, not
 // here — this screen, Assistant, Task Detail, Assign To and Notify all share
@@ -27,16 +36,19 @@ import {
 } from "react-native";
 import { Stack, useRouter } from "expo-router";
 import { Icon } from "../../../../lib/icons";
-import { S, R, FONT, TABULAR, useTheme, ColorScale } from "../../../../lib/theme";
+import { S, R, FONT, useTheme, ColorScale } from "../../../../lib/theme";
 import { Button, SegmentedTabs, Skeleton } from "../../../../lib/ui";
-import { AudioPlayer, AudioPlayerProvider, useAudioSeek } from "../../../../lib/audio-player";
+import { AudioPlayer, AudioPlayerProvider } from "../../../../lib/audio-player";
 import { useMeeting } from "../../../../lib/meeting-context";
 import { sourceMeta, statusMeta, speakerName, normalizeSpeakerLabel, fmtDuration } from "../../../../lib/sources";
 import { MeetingSummary, Highlights, Participants } from "../../../../lib/meeting-summary";
+import { MeetingOverviewView, hasOverview } from "../../../../lib/meeting-overview";
+import { buildSpeakerBlocks, buildSpeakerColors } from "../../../../lib/transcript-view";
 import { CrmRecordsBlock } from "../../../../lib/meeting-crm-records";
 import { Tasks } from "../../../../lib/meeting-tasks";
 import { AddTaskSheet } from "../../../../lib/add-task-sheet";
 import { DocumentsList, CreateDocumentSheet } from "../../../../lib/meeting-documents";
+import { MomEditorScreen } from "../../../../lib/mom-editor";
 import { AssistantButton } from "../../../../lib/assistant-button";
 import { ContactPicker } from "../../../../lib/contact-picker";
 import { avatarColorFor, initialsOf } from "../../../../lib/task-model";
@@ -46,7 +58,10 @@ import {
   ApiContact, getParticipants, setParticipant,
 } from "../../../../lib/api";
 
-type Tab = "overview" | "transcript";
+// The four ANALYSIS tabs. "transcript" is deliberately NOT among them — it is
+// a screen (see the header). Adding a tab here means adding a case to the tab
+// body below and an entry to the SegmentedTabs list; nothing else.
+type Tab = "overview" | "speakers" | "tasks" | "documents";
 
 function buildStyles(C: ColorScale) {
   return StyleSheet.create({
@@ -109,14 +124,6 @@ function buildStyles(C: ColorScale) {
       paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: C.border,
     },
     menuTxt: { fontFamily: FONT.medium, fontSize: 15, color: C.text },
-    // ---- transcript ----
-    searchBar: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 9,
-      backgroundColor: C.surface2, borderRadius: R.pill,
-      paddingHorizontal: S.md, paddingVertical: 10, marginTop: S.lg,
-    },
-    searchInput: { flex: 1, fontFamily: FONT.regular, fontSize: 14.5, color: C.text, paddingVertical: 4 },
-    empty: { fontFamily: FONT.regular, fontSize: 13.5, color: C.textFaint, fontStyle: "italic" as const, marginTop: 16 },
   });
 }
 
@@ -192,14 +199,6 @@ function fmtDate(iso: string) {
   return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
-function fmtTs(sec: number) {
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
-const SPEAKER_LABEL_HIT = 6;
-
 export default function MeetingDetailScreen() {
   const router = useRouter();
   const { C } = useTheme();
@@ -223,6 +222,9 @@ export default function MeetingDetailScreen() {
   const [folderOptions, setFolderOptions] = useState<ApiFolder[]>([]);
   const [movingFolder, setMovingFolder] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  // The structured MoM editor. Full-screen rather than a route so the
+  // Overview state underneath (documents, tasks) survives closing it.
+  const [momOpen, setMomOpen] = useState(false);
 
   const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
   const [speakerDraft, setSpeakerDraft] = useState("");
@@ -258,8 +260,8 @@ export default function MeetingDetailScreen() {
                 isAlreadyRunning(e)
                   ? (e as ApiError).message
                   : e instanceof ApiError
-                  ? e.message
-                  : "Couldn't start. Please try again."
+                    ? e.message
+                    : "Couldn't start. Please try again."
               );
             } finally {
               setRetrying(false);
@@ -276,8 +278,8 @@ export default function MeetingDetailScreen() {
   // only the Trash screen can actually delete a recording.
   //
   // On success we navigate back rather than reload: this screen's recording is
-  // no longer on the Desk, and re-fetching would only show a meeting the user
-  // just filed away. The Desk re-queries on focus, so it is already gone by
+  // no longer on MinuteX, and re-fetching would only show a meeting the user
+  // just filed away. MinuteX re-queries on focus, so it is already gone by
   // the time they land there.
   const [deleting, setDeleting] = useState(false);
 
@@ -304,8 +306,8 @@ export default function MeetingDetailScreen() {
                 isStillUploading(e)
                   ? "This recording is still being processed. Try again in a minute."
                   : e instanceof ApiError
-                  ? e.message
-                  : "Something went wrong. Please try again."
+                    ? e.message
+                    : "Something went wrong. Please try again."
               );
             }
           },
@@ -466,28 +468,27 @@ export default function MeetingDetailScreen() {
     }
   };
 
-  const speakerColors = useMemo(() => {
-    const map = new Map<string, string>();
-    (rec?.timestamps ?? []).forEach((seg) => {
-      if (!map.has(seg.speaker)) map.set(seg.speaker, C.speakers[map.size % C.speakers.length]);
-    });
-    return map;
-  }, [rec, C]);
+  const speakerColors = useMemo(
+    () => buildSpeakerColors(rec?.timestamps, C.speakers),
+    [rec?.timestamps, C.speakers]);
 
-  const speakerBlocks = useMemo(() => {
-    const segs = rec?.timestamps ?? [];
-    const blocks: { speaker: string; start: number; end: number; texts: string[] }[] = [];
-    for (const s of segs) {
-      const last = blocks[blocks.length - 1];
-      if (last && last.speaker === s.speaker) {
-        last.texts.push(s.text);
-        last.end = Number(s.end) || last.end;
-      } else {
-        blocks.push({ speaker: s.speaker, start: Number(s.start) || 0, end: Number(s.end) || 0, texts: [s.text] });
+  const speakerBlocks = useMemo(
+    () => buildSpeakerBlocks(rec?.timestamps), [rec?.timestamps]);
+
+  // Talk time per speaker, summed from the segments the transcript already
+  // carries — sum(end - start). Derived on the client precisely because the
+  // data is already here: asking the backend for it would be a new field, a
+  // new write and a migration for something computable in one pass.
+  const talkTime = useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const seg of rec?.timestamps ?? []) {
+      const span = (Number(seg.end) || 0) - (Number(seg.start) || 0);
+      if (span > 0) {
+        totals.set(seg.speaker, (totals.get(seg.speaker) ?? 0) + span);
       }
     }
-    return blocks;
-  }, [rec]);
+    return totals;
+  }, [rec?.timestamps]);
 
   const resolveName = useCallback(
     (label: string) => speakerName(label, speakerNames),
@@ -541,7 +542,12 @@ export default function MeetingDetailScreen() {
   const hasTranscript = !!rec.transcript;
   const showTabs = hasTranscript;
 
-  const stage = rec.transcript ? (rec.summary ? 2 : 1) : 0;
+  // "Is there an analysis to show?" — the overview is the primary output, and
+  // a recording analysed before it shipped has only the legacy summary. Either
+  // one counts; neither means the AI stage produced nothing.
+  const hasAnalysis = hasOverview(rec.overview) || !!rec.summary;
+
+  const stage = rec.transcript ? (hasAnalysis ? 2 : 1) : 0;
 
   const datelineParts = [fmtDate(rec.created_at), duration, srcMeta.label].filter(Boolean);
 
@@ -565,7 +571,7 @@ export default function MeetingDetailScreen() {
           showsVerticalScrollIndicator={false}
           keyboardDismissMode="on-drag"
           stickyHeaderIndices={showTabs ? [1] : undefined}
-         keyboardShouldPersistTaps="handled">
+          keyboardShouldPersistTaps="handled">
           {/* ---- Shared masthead: title (tap to rename), dateline, player ---- */}
           <View>
             <Pressable onPress={openRenameTitle} style={st.titleRow} accessibilityLabel="Rename meeting">
@@ -578,6 +584,21 @@ export default function MeetingDetailScreen() {
                 <AudioPlayer url={rec.audio_url} seed={key} variant="hero" />
               </View>
             ) : null}
+
+            {/* The transcript's one entry point. Directly under the player
+                because the two are used together (tap a timestamp, hear it),
+                and ABOVE the tab bar so it reads as a peer of the meeting
+                itself rather than as one more analysis view. */}
+            {hasTranscript ? (
+              <Button
+                label="View Transcript"
+                variant="secondary"
+                onPress={() => router.push({
+                  pathname: "/recording/[key]/transcript", params: { key },
+                })}
+                style={{ marginTop: S.lg }}
+              />
+            ) : null}
           </View>
 
           {showTabs ? (
@@ -587,7 +608,9 @@ export default function MeetingDetailScreen() {
                 onChange={(v) => setTab(v as Tab)}
                 tabs={[
                   { key: "overview", label: "Overview" },
-                  { key: "transcript", label: "Transcript" },
+                  { key: "speakers", label: "Speakers" },
+                  { key: "tasks", label: "Tasks" },
+                  { key: "documents", label: "Documents" },
                 ]}
               />
             </View>
@@ -610,7 +633,7 @@ export default function MeetingDetailScreen() {
                   is why the confirm dialog names the cost in time.) */}
               {/* Two ways out of a dead end, side by side: replay it, or file
                   it away. Before this, a recording that failed twice could
-                  only be left on the desk forever. Trash keeps the audio, so
+                  only be left on MinuteX forever. Trash keeps the audio, so
                   a user who bins it can still change their mind. */}
               <View style={{ flexDirection: "row", gap: S.sm, marginTop: 16 }}>
                 <Button
@@ -647,11 +670,26 @@ export default function MeetingDetailScreen() {
             />
           ) : null}
 
-          {/* ================= OVERVIEW TAB ================= */}
+          {/* ================= OVERVIEW TAB =================
+              The AI's own sections. No hardcoded Summary/Highlights/Decisions
+              headings — MeetingOverviewView renders whatever the model
+              produced for THIS meeting. MeetingSummary/Highlights below are
+              the LEGACY path only, for a recording analysed before the
+              dynamic overview shipped. */}
           {!failed && !stillProcessing && hasTranscript && tab === "overview" ? (
-            rec.summary ? (
+            hasAnalysis ? (
               <View style={st.section}>
-                <MeetingSummary summary={rec.summary} />
+                {hasOverview(rec.overview) ? (
+                  <MeetingOverviewView overview={rec.overview} />
+                ) : (
+                  <>
+                    <MeetingSummary summary={rec.summary} />
+                    <Highlights
+                      highlights={rec.highlights}
+                      legacyHighlights={rec.meeting_highlights}
+                    />
+                  </>
+                )}
                 <CrmRecordsBlock
                   mappings={crmMappings}
                   records={rec.crm_records}
@@ -661,49 +699,29 @@ export default function MeetingDetailScreen() {
                   onConfirm={confirmCrmRecord}
                   onSync={syncCrmRecordNow}
                 />
-                <Highlights highlights={rec.highlights} legacyHighlights={rec.meeting_highlights} />
-                <Participants
-                  participants={rec.participants}
-                  resolveName={resolveName}
-                  onRenameSpeaker={openRenameSpeaker}
-                />
-                <Tasks
-                  tasks={tasks}
-                  onOpenTask={(id) => router.push({ pathname: "/recording/[key]/task/[taskId]", params: { key, taskId: id } })}
-                  onViewAll={() => router.push({ pathname: "/recording/[key]/task", params: { key } })}
-                  onAddTask={() => setAddTaskOpen(true)}
-                />
-                <DocumentsList
-                  recordingKey={key}
-                  meetingTitle={rec.title || "Meeting"}
-                  documents={documents}
-                  onChange={setDocuments}
-                  onCreatePress={() => setCreateOpen(true)}
-                  documentsNeedingUpdate={documentsNeedingUpdate}
-                  onUpdateAll={updateAllDocuments}
-                />
               </View>
             ) : (
-              // Backend has genuinely finished (status is "ready") but Groq's
-              // summarization came back empty — a real, terminal state, not a
-              // "still working" one. The transcript is safe either way; only
-              // the AI summary is missing.
+              // The backend has genuinely FINISHED (status is terminal) but the
+              // analysis came back empty — a real end state, not "still
+              // working". The transcript is safe either way; only the AI
+              // analysis is missing.
               <View style={st.section}>
                 <View style={st.noticeCard}>
                   <Text style={{ fontFamily: FONT.bold, fontSize: 16, lineHeight: 22, color: C.text }}>
-                    No summary for this meeting yet
+                    No overview for this meeting yet
                   </Text>
                   <Text style={{ fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 20, color: C.textDim, marginTop: 10 }}>
-                    The transcript finished, but the AI summary didn&apos;t come through. Nothing was lost —
-                    check the Transcript tab, or try generating a document from it below.
+                    The transcript finished, but the AI analysis didn&apos;t come through.
+                    Nothing was lost — read the transcript above, or generate a
+                    document from it in Documents.
                   </Text>
-                  {/* Re-runs the whole pipeline, including transcription. The
+                  {/* Re-runs the whole pipeline, transcription included. The
                       transcript here is already fine, so this is the heavier
-                      option — the cheaper one is generating a document from
-                      the existing transcript, which the text above points at
-                      first and which costs no STT. */}
+                      option — the cheaper one is generating a document from the
+                      existing transcript, which the text above points at first
+                      and which costs no STT. */}
                   <Button
-                    label="Write the summary again"
+                    label="Write the overview again"
                     variant="secondary"
                     loading={retrying}
                     onPress={retryProcessing}
@@ -715,7 +733,7 @@ export default function MeetingDetailScreen() {
                     </Text>
                   ) : null}
                 </View>
-                {/* Still offered when the summary failed: the record
+                {/* Still offered when the analysis failed: the record
                     identifier is independent of it, and the user may well want
                     to link this meeting to Salesforce anyway. Renders nothing
                     when no mappings are configured. */}
@@ -728,42 +746,58 @@ export default function MeetingDetailScreen() {
                   onConfirm={confirmCrmRecord}
                   onSync={syncCrmRecordNow}
                 />
-                <Participants
-                  participants={rec.participants}
-                  resolveName={resolveName}
-                  onRenameSpeaker={openRenameSpeaker}
-                />
-                <Tasks
-                  tasks={tasks}
-                  onOpenTask={(id) => router.push({ pathname: "/recording/[key]/task/[taskId]", params: { key, taskId: id } })}
-                  onViewAll={() => router.push({ pathname: "/recording/[key]/task", params: { key } })}
-                  onAddTask={() => setAddTaskOpen(true)}
-                />
-                <DocumentsList
-                  recordingKey={key}
-                  meetingTitle={rec.title || "Meeting"}
-                  documents={documents}
-                  onChange={setDocuments}
-                  onCreatePress={() => setCreateOpen(true)}
-                  documentsNeedingUpdate={documentsNeedingUpdate}
-                  onUpdateAll={updateAllDocuments}
-                />
               </View>
             )
           ) : null}
 
-          {/* ================= TRANSCRIPT TAB ================= */}
-          {!failed && hasTranscript && tab === "transcript" ? (
-            <TranscriptTab
-              st={st} C={C}
-              transcript={rec.transcript}
-              speakerBlocks={speakerBlocks}
-              speakerColors={speakerColors}
-              resolveName={resolveName}
-              onRenameSpeaker={openRenameSpeaker}
-              search={search}
-              onSearchChange={setSearch}
-            />
+          {/* ================= SPEAKERS TAB =================
+              The existing Participants block, unchanged, plus talk time
+              derived from the transcript's own segments. Renaming still routes
+              through the same openRenameSpeaker the transcript screen uses, so
+              one mapping drives every surface. */}
+          {!failed && !stillProcessing && hasTranscript && tab === "speakers" ? (
+            <View style={st.section}>
+              <Participants
+                participants={rec.participants}
+                resolveName={resolveName}
+                onRenameSpeaker={openRenameSpeaker}
+                talkTime={talkTime}
+                onOpenTranscript={() => router.push({
+                  pathname: "/recording/[key]/transcript", params: { key },
+                })}
+              />
+            </View>
+          ) : null}
+
+          {/* ================= TASKS TAB =================
+              The existing Tasks block and its existing routes. Nothing about
+              task CRUD changed — only where the block is mounted. */}
+          {!failed && !stillProcessing && hasTranscript && tab === "tasks" ? (
+            <View style={st.section}>
+              <Tasks
+                tasks={tasks}
+                onOpenTask={(id) => router.push({ pathname: "/recording/[key]/task/[taskId]", params: { key, taskId: id } })}
+                onViewAll={() => router.push({ pathname: "/recording/[key]/task", params: { key } })}
+                onAddTask={() => setAddTaskOpen(true)}
+              />
+            </View>
+          ) : null}
+
+          {/* ================= DOCUMENTS TAB =================
+              The existing DocumentsList and MoM editor entry point, unchanged. */}
+          {!failed && !stillProcessing && hasTranscript && tab === "documents" ? (
+            <View style={st.section}>
+              <DocumentsList
+                recordingKey={key}
+                meetingTitle={rec.title || "Meeting"}
+                documents={documents}
+                onChange={setDocuments}
+                onCreatePress={() => setCreateOpen(true)}
+                documentsNeedingUpdate={documentsNeedingUpdate}
+                onUpdateAll={updateAllDocuments}
+                onOpenMomEditor={() => setMomOpen(true)}
+              />
+            </View>
           ) : null}
         </ScrollView>
 
@@ -776,12 +810,30 @@ export default function MeetingDetailScreen() {
           recordingKey={key}
           onClose={() => setCreateOpen(false)}
           onGenerated={addDocument}
+          onOpenMomEditor={() => setMomOpen(true)}
         />
+
+        {/* ---- Structured Minutes of Meeting editor ----
+            addDocument also UPDATES an existing entry by type, so the mirrored
+            minutes_of_meeting row in Documents(N) refreshes on every save
+            without a re-fetch. */}
+        <Modal
+          visible={momOpen}
+          animationType="slide"
+          onRequestClose={() => setMomOpen(false)}
+        >
+          <MomEditorScreen
+            recordingKey={key}
+            meetingTitle={rec?.title || "Meeting"}
+            onClose={() => setMomOpen(false)}
+            onDocumentChange={addDocument}
+          />
+        </Modal>
 
         {/* ---- Overflow menu: Rename, Share, Move to Trash ---- */}
         <Modal visible={menuOpen} transparent animationType="fade" onRequestClose={() => setMenuOpen(false)}>
           <Pressable style={st.sheetBackdrop} onPress={() => setMenuOpen(false)}>
-            <Pressable style={st.sheet} onPress={() => {}}>
+            <Pressable style={st.sheet} onPress={() => { }}>
               <Pressable style={st.menuRow} onPress={openRenameTitle} accessibilityLabel="Rename meeting">
                 <Icon name="pencil" tintColor={C.text} size={18} />
                 <Text style={st.menuTxt}>Rename meeting</Text>
@@ -854,7 +906,7 @@ export default function MeetingDetailScreen() {
             style={st.sheetBackdrop}
             onPress={() => setFolderPickerOpen(false)}
           >
-            <Pressable style={st.sheet} onPress={() => {}}>
+            <Pressable style={st.sheet} onPress={() => { }}>
               <Text style={{
                 fontFamily: FONT.semibold, fontSize: 11, color: C.textFaint,
                 textTransform: "uppercase", letterSpacing: 0.6,
@@ -920,7 +972,7 @@ export default function MeetingDetailScreen() {
         <Modal visible={renaming} transparent animationType="fade" onRequestClose={() => setRenaming(false)}>
           <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
             <Pressable style={st.sheetBackdrop} onPress={() => setRenaming(false)}>
-              <Pressable style={st.sheet} onPress={() => {}}>
+              <Pressable style={st.sheet} onPress={() => { }}>
                 <Text style={{ fontFamily: FONT.semibold, fontSize: 11, color: C.textFaint, textTransform: "uppercase", letterSpacing: 0.6 }}>
                   Meeting title
                 </Text>
@@ -949,7 +1001,7 @@ export default function MeetingDetailScreen() {
         <Modal visible={editingSpeaker !== null} transparent animationType="fade" onRequestClose={() => setEditingSpeaker(null)}>
           <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
             <Pressable style={st.sheetBackdrop} onPress={() => setEditingSpeaker(null)}>
-              <Pressable style={st.sheet} onPress={() => {}}>
+              <Pressable style={st.sheet} onPress={() => { }}>
                 <Text style={{ fontFamily: FONT.semibold, fontSize: 11, color: C.textFaint, textTransform: "uppercase", letterSpacing: 0.6 }}>
                   {editingSpeaker != null ? speakerName(editingSpeaker, speakerNames) : ""}
                 </Text>
@@ -1058,107 +1110,5 @@ export default function MeetingDetailScreen() {
         />
       </View>
     </AudioPlayerProvider>
-  );
-}
-
-type SpeakerBlock = { speaker: string; start: number; end: number; texts: string[] };
-
-function TranscriptTab({
-  st, C, transcript, speakerBlocks, speakerColors, resolveName, onRenameSpeaker,
-  search, onSearchChange,
-}: {
-  st: ReturnType<typeof buildStyles>;
-  C: ColorScale;
-  transcript: string;
-  speakerBlocks: SpeakerBlock[];
-  speakerColors: Map<string, string>;
-  resolveName: (label: string) => string;
-  onRenameSpeaker: (label: string) => void;
-  search: string;
-  onSearchChange: (v: string) => void;
-}) {
-  const { seekTo, currentTime, playing } = useAudioSeek();
-  const q = search.trim().toLowerCase();
-  const filteredBlocks = q
-    ? speakerBlocks.filter((b) =>
-        b.texts.join(" ").toLowerCase().includes(q) ||
-        resolveName(b.speaker).toLowerCase().includes(q))
-    : speakerBlocks;
-
-  return (
-    <View>
-      {speakerBlocks.length ? (
-        <View style={st.searchBar}>
-          <Icon name="magnifyingglass" tintColor={C.textFaint} size={16} />
-          <TextInput
-            style={st.searchInput}
-            value={search}
-            onChangeText={onSearchChange}
-            placeholder="Search transcript"
-            placeholderTextColor={C.textFaint}
-            autoCapitalize="none"
-            autoCorrect={false}
-            returnKeyType="search"
-          />
-          {search ? (
-            <Pressable onPress={() => onSearchChange("")} hitSlop={8} accessibilityLabel="Clear search">
-              <Icon name="xmark.circle.fill" tintColor={C.textFaint} size={16} />
-            </Pressable>
-          ) : null}
-        </View>
-      ) : null}
-
-      {q && !filteredBlocks.length ? (
-        <Text style={st.empty}>Nothing in the transcript matches &quot;{search}&quot;.</Text>
-      ) : null}
-
-      {speakerBlocks.length ? (
-        filteredBlocks.map((b, i) => {
-          const color = speakerColors.get(b.speaker) ?? C.speakers[0];
-          const name = resolveName(b.speaker);
-          const isNamed = name !== `Speaker ${b.speaker}`;
-          const active = playing && currentTime >= b.start && currentTime < b.end;
-          return (
-            <View key={i} style={{ flexDirection: "row", gap: 12, marginTop: 18 }}>
-              <View style={{ width: 44, flexShrink: 0, alignItems: "flex-end" }}>
-                {seekTo ? (
-                  <Pressable onPress={() => seekTo(b.start)} hitSlop={8} accessibilityLabel={`Play from ${fmtTs(b.start)}`}>
-                    <Text style={{ ...TABULAR, fontSize: 10.5, color: C.primary }}>
-                      {fmtTs(b.start)}
-                    </Text>
-                  </Pressable>
-                ) : (
-                  <Text style={{ ...TABULAR, fontSize: 10.5, color: C.textFaint }}>{fmtTs(b.start)}</Text>
-                )}
-              </View>
-              <View style={{
-                flex: 1, backgroundColor: active ? C.primarySoft : "transparent",
-                borderRadius: R.md, padding: active ? 10 : 0,
-              }}>
-                <Pressable
-                  onPress={() => onRenameSpeaker(b.speaker)}
-                  hitSlop={SPEAKER_LABEL_HIT}
-                  style={{ flexDirection: "row", alignItems: "center", gap: 6, alignSelf: "flex-start" }}
-                  accessibilityLabel={`Rename ${name}`}
-                >
-                  <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: color }} />
-                  <Text style={{ fontFamily: FONT.bold, fontSize: 12.5, color }}>
-                    {name}
-                  </Text>
-                  {!isNamed ? <Icon name="pencil" tintColor={C.textFaint} size={11} /> : null}
-                </Pressable>
-                <Text style={{ fontFamily: FONT.regular, fontSize: 14.5, lineHeight: 21, color: C.text, marginTop: 5 }}>
-                  {b.texts.join(" ")}
-                </Text>
-              </View>
-            </View>
-          );
-        })
-      ) : (
-        <Text style={{ fontFamily: FONT.regular, fontSize: 14.5, lineHeight: 21, color: C.text, marginTop: S.lg }}>
-          {transcript}
-        </Text>
-      )}
-    </View>
   );
 }

@@ -19,8 +19,12 @@ import { Share } from "react-native";
 import { copyText, type CopyResult } from "./clipboard";
 
 type PrintModule = {
+  // numberOfPages is the print engine's OWN pagination of the rendered HTML —
+  // the only honest page count available, since nothing on the JS side knows
+  // how the text will actually lay out. lib/mom-preview.tsx uses it to replace
+  // its estimate once a PDF has been rendered.
   printToFileAsync: (opts: { html: string; base64?: boolean }) =>
-    Promise<{ uri: string }>;
+    Promise<{ uri: string; numberOfPages?: number; base64?: string }>;
   printAsync: (opts: { html: string }) => Promise<void>;
 };
 
@@ -149,14 +153,46 @@ export async function exportMarkdown(
 export async function exportPdf(
   content: string, label: string, meetingTitle: string
 ): Promise<ExportResult> {
-  if (!print) return "unsupported";
+  return printHtml(markdownToHtml(content, label, meetingTitle), label);
+}
+
+/**
+ * Render ARBITRARY print HTML to a PDF and share it.
+ *
+ * The half of exportPdf that has nothing to do with Markdown, exposed so
+ * lib/mom-pdf.ts can render the structured MoM's own HTML through exactly
+ * this path — the module loading, the "unsupported" contract and the
+ * share/save fallback are all subtle enough that a second copy would drift.
+ *
+ * `label` names the share sheet's dialog only. expo-print chooses the temp
+ * file's own name, so there is no filename parameter to honour here.
+ */
+export async function printHtml(
+  html: string, label: string
+): Promise<ExportResult> {
+  return (await printHtmlDetailed(html, label)).result;
+}
+
+/** printHtml, plus the print engine's own page count.
+ *
+ * Separate from printHtml so the common caller keeps the simple
+ * ExportResult contract, while the MoM preview can report a REAL page count
+ * ("3 pages") in place of its own estimate. `pages` is 0 when expo-print
+ * isn't in the build or the render failed — callers must not present 0 as a
+ * page count.
+ */
+export async function printHtmlDetailed(
+  html: string, label: string
+): Promise<{ result: ExportResult; pages: number }> {
+  if (!print) return { result: "unsupported", pages: 0 };
   try {
-    const { uri } = await print.printToFileAsync({
-      html: markdownToHtml(content, label, meetingTitle),
-    });
-    return shareFile(uri, "application/pdf", label);
+    const { uri, numberOfPages } = await print.printToFileAsync({ html });
+    return {
+      result: await shareFile(uri, "application/pdf", label),
+      pages: numberOfPages ?? 0,
+    };
   } catch {
-    return "failed";
+    return { result: "failed", pages: 0 };
   }
 }
 

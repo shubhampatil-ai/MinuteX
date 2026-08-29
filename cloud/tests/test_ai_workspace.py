@@ -87,9 +87,19 @@ class _ClientError(Exception):
         )
 
 
-_botocore_exc.ClientError = _ClientError
-sys.modules["botocore"] = mock.MagicMock()
-sys.modules["botocore.exceptions"] = _botocore_exc
+# Adopt an already-installed ClientError when there is one (conftest.py
+# installs the canonical stub under pytest). Overwriting it here would
+# give this file a ClientError that the Lambda's `except ClientError`
+# cannot catch, which is precisely the cross-file collision conftest.py
+# exists to prevent. Standalone runs still install this file's own.
+_installed = sys.modules.get("botocore.exceptions")
+if _installed is not None and getattr(_installed, "ClientError", None):
+    _ClientError = _installed.ClientError
+    _botocore_exc = _installed
+else:
+    _botocore_exc.ClientError = _ClientError
+    sys.modules["botocore"] = mock.MagicMock()
+    sys.modules["botocore.exceptions"] = _botocore_exc
 # functions/transcribe also does `from botocore.config import Config` (for
 # the S3 virtual-addressing client config) — a bare MagicMock for
 # "botocore.config" answers that import fine (Config becomes a MagicMock
@@ -308,7 +318,7 @@ class TestPrompts(unittest.TestCase):
         for action in ("decisions", "deadlines", "risks", "budget", "timeline"):
             self.assertIsNone(prompts.QUICK_ACTIONS[action]["alias"])
 
-    def test_summary_prompt_asks_for_exactly_the_five_fields(self):
+    def test_summary_prompt_asks_for_exactly_the_schema_fields(self):
         """The prompt's declared field list and the coercer's shape must not
         drift: a field asked for but not coerced is silently discarded, and a
         field coerced but not asked for is always empty."""
@@ -319,7 +329,10 @@ class TestPrompts(unittest.TestCase):
         """agenda/key_points/decisions/pending_discussions/action_items were
         removed from the schema. Asking for one again would make the model
         spend output tokens on a field coerce_analysis then throws away."""
-        for gone in ("agenda", "key_points", "pending_discussions"):
+        for gone in ("agenda", "key_points", "pending_discussions",
+                     # Removed BY this change: the fixed prose pair the
+                     # dynamic overview replaced.
+                     "highlights"):
             self.assertNotIn(f'"{gone}"', prompts.SUMMARY_SYSTEM, gone)
         # "decisions"/"action_items" appear as ENGLISH words in the summary and
         # tasks instructions ("major decisions or agreements"), which is fine —
@@ -337,30 +350,77 @@ class TestPrompts(unittest.TestCase):
                      '"decisions":', '"action_items":'):
             self.assertNotIn(gone, prompts.SUMMARY_REDUCE_SYSTEM, gone)
 
-    def test_the_summary_prompt_is_dense_but_bounded(self):
-        """Two regressions in tension, both real. Capping the summary ("5 to 10
+    def test_the_overview_prompt_is_dense_but_bounded(self):
+        """Two regressions in tension, both real. Capping the prose ("5 to 10
         short paragraphs", "AT MOST 5") made the model drop supporting numbers;
-        removing every bound made it write an analytical essay that repeated its
-        conclusions. The rule now names BOTH sides: dense AND SHORT, via a word
-        target that is explicitly not a hard cap."""
+        removing every bound made it write an analytical essay that repeated
+        its conclusions. With the overview dynamic there is no single length to
+        cap, so the rule is stated per section: dense AND short."""
         self.assertIn("information-dense", prompts.SUMMARY_SYSTEM)
         self.assertIn("did not attend", prompts.SUMMARY_SYSTEM)
         self.assertNotIn("AT MOST 5", prompts.SUMMARY_SYSTEM)
-        self.assertIn("roughly 120-250 words", prompts.SUMMARY_SYSTEM)
-        # The target must stay a TARGET — a hard cap is the regression that
-        # made the model drop facts to fit.
-        self.assertIn("exceed this range only when necessary",
-                      prompts.SUMMARY_SYSTEM)
-        self.assertIn("Do not pad the summary to reach a word count",
-                      prompts.SUMMARY_SYSTEM)
         self.assertIn("SHORT + INFORMATION-DENSE + FACTUAL + CONTEXTUAL",
                       prompts.SUMMARY_SYSTEM)
         self.assertIn("LONG + REPETITIVE + ANALYTICAL", prompts.SUMMARY_SYSTEM)
         # ...and the unbounded phrasing must be GONE.
         self.assertNotIn("NO artificial paragraph limit", prompts.SUMMARY_SYSTEM)
         # Inter-fact relationships must still survive the compression.
-        self.assertIn("Preserve the relationship between important facts",
+        self.assertIn("Preserve the RELATIONSHIP between facts",
                       prompts.SUMMARY_SYSTEM)
+        # The section COUNT is bounded by the meeting, never by a number: a
+        # fixed count is the template behaviour this feature removes.
+        self.assertIn("as many sections as the meeting genuinely earns",
+                      prompts.SUMMARY_SYSTEM)
+        self.assertIn("Never add a section to look thorough",
+                      prompts.SUMMARY_SYSTEM)
+
+    def test_the_overview_prompt_names_no_sections(self):
+        """THE core guarantee of the dynamic overview: the prompt must not hand
+        the model a section catalogue, because a model given example headings
+        reproduces them and every meeting comes out on the same template.
+
+        Asserted as an absence, which is unusual and deliberate — this is the
+        one property no amount of section-quality wording can restore once a
+        list creeps back in "as a default" or "as an example".
+        """
+        text = prompts.SUMMARY_SYSTEM
+        # None of these may be presented as a section to produce. They are the
+        # headings the old fixed schema and the usual LLM defaults gravitate
+        # to; the model is free to CHOOSE any of them for a meeting that
+        # warrants it, but the prompt must never name them.
+        for banned in ('"Executive Summary"', '"Highlights"', '"Decisions"',
+                       '"Risks"', '"Next Steps"', '"Action Items"',
+                       '"Open Questions"', '"Key Points"'):
+            self.assertNotIn(banned, text, banned)
+        # And it must say so positively.
+        self.assertIn("There is NO predefined list of sections", text)
+        self.assertIn("no section is required", text)
+        self.assertIn("YOU decide what this particular meeting needs", text)
+
+    def test_the_overview_prompt_demands_meeting_specific_sections(self):
+        """Generic-but-plausible headings are the failure mode that survives
+        "choose your own sections": the model picks Summary/Discussion/Next
+        Steps every time. The prompt names that failure and the check for it."""
+        text = prompts.SUMMARY_SYSTEM
+        self.assertIn("Two different meetings should produce DIFFERENT "
+                      "sections", text)
+        self.assertIn("If your sections would fit any meeting equally well, "
+                      "they are wrong", text)
+        self.assertIn("THE SECTION CHECK", text)
+        self.assertIn("could these same titles head the overview of a "
+                      "completely different meeting", text)
+
+    def test_the_overview_prompt_forbids_empty_and_absence_sections(self):
+        """Two distinct paddings. An EMPTY section is a heading with nothing
+        under it; an ABSENCE section is "Decisions: none were made", which
+        reads as a finding and is really just a filled template slot."""
+        text = prompts.SUMMARY_SYSTEM
+        self.assertIn("Never emit a section that is empty, near-empty or "
+                      "padded", text)
+        self.assertIn("Absence is not a section", text)
+        self.assertIn("do NOT add one saying none were made", text)
+        self.assertIn("Do not repeat the same information across sections",
+                      text)
 
     def test_the_summary_prompt_bans_generic_essay_commentary(self):
         """The observed failure: broad commentary on corporate strategy,
@@ -421,15 +481,21 @@ class TestPrompts(unittest.TestCase):
         must survive every rewrite of the length guidance around it."""
         self.assertIn("this field is a JSON STRING", prompts.SUMMARY_SYSTEM)
         self.assertIn("never with a real line break", prompts.SUMMARY_SYSTEM)
-        # The length guidance must survive alongside the format rule.
-        self.assertIn("roughly 120-250 words", prompts.SUMMARY_SYSTEM)
+        # The density guidance must survive alongside the format rule.
+        self.assertIn("information-dense", prompts.SUMMARY_SYSTEM)
 
-    def test_summary_and_highlights_are_given_distinct_jobs(self):
-        """Without this the model writes the summary twice at two lengths."""
-        self.assertIn("3-7", prompts.SUMMARY_SYSTEM)
-        self.assertIn("not from a separately generated summary",
-                      prompts.SUMMARY_SYSTEM)
-        self.assertIn("Do not simply copy the summary", prompts.SUMMARY_SYSTEM)
+    def test_overview_and_extraction_are_given_distinct_jobs(self):
+        """Without this the model writes the meeting twice — once as prose and
+        once as the four extraction lists — and degrades both. The unified
+        prompt is where the two meet, so the rule is asserted there."""
+        unified = prompts.unified_analysis_system()
+        self.assertIn("DIFFERENT outputs", unified)
+        self.assertIn("The overview is what a PERSON reads", unified)
+        self.assertIn("structured data other software reads as rows", unified)
+        self.assertIn("do not skip the extraction because the overview covers "
+                      "the same ground", unified)
+        self.assertIn("do not degrade the overview into a copy of these four "
+                      "lists", unified)
 
     def test_the_specificity_check_is_last_in_the_prompt(self):
         """Position is the point, not just presence. Measured on a 45k-char
@@ -448,16 +514,14 @@ class TestPrompts(unittest.TestCase):
         self.assertGreater(prompts.SUMMARY_SYSTEM.index("BEFORE YOU ANSWER"),
                            prompts.SUMMARY_SYSTEM.index("TASK ASSIGNMENT RULE"))
 
-    def test_highlights_are_taught_by_weak_vs_better_examples(self):
+    def test_specificity_is_taught_by_weak_vs_better_examples(self):
         """A rule alone ("be specific") produced topic labels; the paired
-        weak/better examples are what made highlights carry the actual fact."""
+        weak/better examples are what made the output carry the actual fact."""
         self.assertIn("Weak:", prompts.SUMMARY_SYSTEM)
         self.assertIn("Better:", prompts.SUMMARY_SYSTEM)
         self.assertIn("50% shortfall", prompts.SUMMARY_SYSTEM)
-        self.assertIn("should contain meaningful information, not simply name "
-                      "a topic", prompts.SUMMARY_SYSTEM)
-        self.assertIn("Each highlight should normally be one concise sentence",
-                      prompts.SUMMARY_SYSTEM)
+        self.assertIn("should carry meaningful information, not simply name a "
+                      "topic", prompts.SUMMARY_SYSTEM)
 
     def test_participants_and_task_assignees_are_independent(self):
         """The semantic correction: a name appearing only as a task owner was
@@ -528,6 +592,58 @@ class TestContextAssembly(unittest.TestCase):
         ctx = prompts.analysis_context(RECORDING)
         self.assertIn("Ravi", ctx)
         self.assertIn("Priya", ctx)
+
+    def test_stored_speaker_labels_are_resolved_before_reaching_the_model(self):
+        """The stored analysis was written while the speakers were anonymous,
+        and analysis_context feeds it back into every LATER generation. Left
+        raw, a document generated AFTER a rename was still shown "Speaker 0"
+        beside the new mapping and would sometimes echo the label back."""
+        ctx = prompts.analysis_context(RECORDING, HIGHLIGHTS)
+        # ai_tasks[].assignee and participants[].speaker are both "Speaker 0"
+        # on the fixture row; neither may survive into the prompt as a label.
+        self.assertIn("assignee: Ravi", ctx)
+        self.assertIn("- Ravi: Presented the quotation", ctx)
+        self.assertNotIn("assignee: Speaker 0", ctx)
+        self.assertNotIn("- Speaker 0:", ctx)
+        # The MAP itself is still emitted — the verbatim transcript below it
+        # really does say "Speaker 0", so the model needs it to read that.
+        self.assertIn("SPEAKER NAMES (user-provided)", ctx)
+
+    def test_a_highlighted_action_items_owner_resolves_too(self):
+        rec = {**RECORDING, "speaker_names": {"0": "Ravi"}}
+        highlights = {"action_items": [{"task": "Send revised quote",
+                                        "owner": "Speaker 0"}]}
+        ctx = prompts.analysis_context(rec, highlights)
+        self.assertIn("owner: Ravi", ctx)
+        self.assertNotIn("owner: Speaker 0", ctx)
+
+    def test_a_real_spoken_name_is_never_reinterpreted(self):
+        """resolve_speaker_text only ever upgrades a LABEL to a name. A name
+        the AI actually heard must pass through untouched."""
+        rec = {**RECORDING, "speaker_names": {"0": "Ravi"},
+               "ai_tasks": [{"task": "Call the vendor", "assignee": "Sunita"}]}
+        self.assertIn("assignee: Sunita", prompts.analysis_context(rec))
+
+    def test_an_unmapped_label_is_left_as_it_is(self):
+        """No name for that speaker yet — the label is the honest answer, and
+        inventing one would be exactly the hallucination the base rules ban."""
+        rec = {**RECORDING, "speaker_names": {"0": "Ravi"},
+               "ai_tasks": [{"task": "Book the room", "assignee": "Speaker 4"}]}
+        self.assertIn("assignee: Speaker 4", prompts.analysis_context(rec))
+
+    def test_a_longer_label_is_not_partially_matched(self):
+        """"Speaker 1" must not rewrite the "Speaker 12" beside it — the whole
+        label is matched or nothing is."""
+        names = {"1": "Ravi"}
+        self.assertEqual(
+            prompts.resolve_speaker_text("Speaker 12", names), "Speaker 12")
+        self.assertEqual(
+            prompts.resolve_speaker_text("Speaker 1", names), "Ravi")
+
+    def test_resolution_is_a_no_op_without_a_map(self):
+        for empty in ({}, None):
+            self.assertEqual(
+                prompts.resolve_speaker_text("Speaker 0", empty), "Speaker 0")
 
     def test_empty_sections_are_omitted_not_labelled_empty(self):
         """An empty "HIGHLIGHTS:" heading would read to the model as "nothing
@@ -773,31 +889,35 @@ class TestCoercion(unittest.TestCase):
 
     def test_specific_values_survive_coercion_verbatim(self):
         """Detail preservation is a prompt behavior, but the coercer must not
-        normalize, round or strip the values the model returns — the summary is
+        normalize, round or strip the values the model returns — a section is
         stored as-is."""
-        summary = ("Pricing moved from Rs 79 lakh to Rs 92 lakh after the 16.5% "
+        content = ("Pricing moved from Rs 79 lakh to Rs 92 lakh after the 16.5% "
                    "cost increase; the 8% discount and the 20/80 payment plan "
                    "were retained, with sign-off due Friday.")
         got = ai_schema.coerce_analysis({
             "title": "Pricing Revision and Payment Plan",
-            "summary": summary,
-            "highlights": ["Price revised from Rs 79 lakh to Rs 92 lakh on a "
-                           "16.5% cost increase"],
+            "overview": {"sections": [
+                {"title": "Pricing", "kind": "text", "content": content},
+                {"title": "Agreed", "kind": "list", "items": [
+                    "Price revised from Rs 79 lakh to Rs 92 lakh on a "
+                    "16.5% cost increase"]},
+            ]},
             "tasks": [], "participants": [],
         })
-        self.assertEqual(got["summary"], summary)
+        section = got["overview"]["sections"][0]
+        self.assertEqual(section["content"], content)
         for value in ("79 lakh", "92 lakh", "16.5%", "8%", "20/80", "Friday"):
-            self.assertIn(value, got["summary"], value)
-        self.assertIn("16.5%", got["highlights"][0])
+            self.assertIn(value, section["content"], value)
+        self.assertIn("16.5%", got["overview"]["sections"][1]["items"][0])
 
-    def test_analysis_schema_is_exactly_the_five_fields(self):
-        """title, summary, highlights, tasks, participants — and nothing else.
+    def test_analysis_schema_is_exactly_the_four_fields(self):
+        """title, overview, tasks, participants — and nothing else. The fixed
+        summary/highlights pair was replaced by the dynamic overview, and
         agenda/key_points/decisions/pending_discussions/action_items were
-        removed; a coercer that emitted one again would silently start writing
-        it back to DynamoDB."""
+        removed before that; a coercer that emitted one again would silently
+        start writing it back to DynamoDB."""
         self.assertEqual(sorted(ai_schema.empty_analysis()),
-                         ["highlights", "participants", "summary", "tasks",
-                          "title"])
+                         ["overview", "participants", "tasks", "title"])
 
     def test_a_model_still_emitting_a_removed_field_has_it_dropped(self):
         """The prompt no longer asks for these, but a model can still volunteer
@@ -811,7 +931,9 @@ class TestCoercion(unittest.TestCase):
                               "status": "Pending"}],
         })
         for gone in ("agenda", "key_points", "decisions",
-                     "pending_discussions", "action_items"):
+                     "pending_discussions", "action_items",
+                     # Removed by the dynamic overview.
+                     "summary", "highlights"):
             self.assertNotIn(gone, got)
 
     def test_hostile_model_output_cannot_break_the_item(self):
@@ -820,32 +942,147 @@ class TestCoercion(unittest.TestCase):
                      {"tasks": "not a list"},
                      {"tasks": [None, 5, "x"]},
                      {"participants": [{"speaker": None}]},
-                     {"summary": {"nested": "dict"}}):
+                     {"overview": "not an object"},
+                     {"overview": {"sections": "not a list"}},
+                     {"overview": {"sections": [None, 5, "x"]}},
+                     {"overview": {"sections": [{"items": "not a list"}]}},
+                     {"overview": [{"title": {"nested": "dict"}}]}):
             got = ai_schema.coerce_analysis(junk)
             self.assertIsInstance(got["title"], str)
-            self.assertIsInstance(got["summary"], str)
             self.assertIsInstance(got["tasks"], list)
-            self.assertIsInstance(got["highlights"], list)
             self.assertIsInstance(got["participants"], list)
+            self.assertIsInstance(got["overview"], dict)
+            self.assertIsInstance(got["overview"]["sections"], list)
 
     def test_highlights_hostile_output(self):
         for junk in (None, [], "str", 0, {"decisions": {"not": "a list"}},
+                     {"deadlines": [{"what": None}]},
+                     {"open_questions": [None, {}, "real question"]},
+                     # The two removed sections must be IGNORED, not crash a
+                     # coercer that no longer knows them.
                      {"important_numbers": [{"value": None}]},
                      {"risks": [None, {}, "real risk"]}):
             got = ai_schema.coerce_highlights(junk)
             for section in ai_schema.HIGHLIGHT_SECTIONS:
                 self.assertIsInstance(got[section], list)
 
-    def test_highlights_are_capped(self):
-        got = ai_schema.coerce_analysis(
-            {"highlights": [f"point {i}" for i in range(20)]})
-        self.assertEqual(len(got["highlights"]), ai_schema.MAX_HIGHLIGHTS)
-        self.assertEqual(got["highlights"][0], "point 0")
+    def test_overview_sections_are_capped(self):
+        """The cap protects the DynamoDB row, and must sit far enough above a
+        real meeting that it never shapes the AI's answer — a cap low enough to
+        bite would be a section count in disguise."""
+        got = ai_schema.coerce_analysis({"overview": {"sections": [
+            {"title": f"Topic {i}", "content": f"c{i}"} for i in range(40)]}})
+        self.assertEqual(len(got["overview"]["sections"]),
+                         ai_schema.MAX_OVERVIEW_SECTIONS)
+        self.assertEqual(got["overview"]["sections"][0]["title"], "Topic 0")
+        self.assertGreaterEqual(ai_schema.MAX_OVERVIEW_SECTIONS, 10)
 
-    def test_the_highlight_cap_matches_the_prompt_ceiling(self):
-        """The prompt asks for 3-7; the cap must not silently truncate a
-        compliant response."""
-        self.assertEqual(ai_schema.MAX_HIGHLIGHTS, 7)
+    def test_overview_total_size_is_bounded(self):
+        """A runaway response must not grow the row past DynamoDB's limit. The
+        budget cuts whole sections rather than truncating one mid-sentence."""
+        got = ai_schema.coerce_overview({"sections": [
+            {"title": f"T{i}", "content": "x" * 5_000} for i in range(20)]})
+        total = sum(len(s["content"]) for s in got["sections"])
+        self.assertLessEqual(total, ai_schema.MAX_OVERVIEW_CHARS)
+        self.assertTrue(got["sections"])
+
+    def test_an_empty_section_is_dropped_not_stored(self):
+        """A heading with nothing under it is what a model padding to look
+        thorough emits. Storing it would render an empty card."""
+        got = ai_schema.coerce_overview({"sections": [
+            {"title": "Real", "content": "something"},
+            {"title": "Padded", "content": "", "items": []},
+            {"title": "", "content": "orphan text"},
+            {"title": "Whitespace", "content": "   ", "items": ["  "]},
+        ]})
+        self.assertEqual([s["title"] for s in got["sections"]], ["Real"])
+
+    def test_duplicate_section_titles_are_folded(self):
+        """Two half-empty "Next Steps" cards is the failure this prevents; the
+        first keeps its position and absorbs the second's items."""
+        got = ai_schema.coerce_overview({"sections": [
+            {"title": "Next Steps", "items": ["a"]},
+            {"title": "Other", "content": "x"},
+            {"title": "next steps", "items": ["b", "a"]},
+        ]})
+        self.assertEqual([s["title"] for s in got["sections"]],
+                         ["Next Steps", "Other"])
+        self.assertEqual(got["sections"][0]["items"], ["a", "b"])
+
+    def test_section_kind_follows_the_content_not_the_label(self):
+        """The model reliably mislabels this. `kind` has an objectively right
+        answer given the content, so the code decides it."""
+        got = ai_schema.coerce_overview({"sections": [
+            {"title": "A", "kind": "text", "items": ["only items"]},
+            {"title": "B", "kind": "list", "content": "only prose"},
+            {"title": "C", "kind": "nonsense", "content": "prose"},
+        ]})
+        kinds = {s["title"]: s["kind"] for s in got["sections"]}
+        self.assertEqual(kinds["A"], ai_schema.OVERVIEW_KIND_LIST)
+        self.assertEqual(kinds["B"], ai_schema.OVERVIEW_KIND_TEXT)
+        self.assertEqual(kinds["C"], ai_schema.OVERVIEW_KIND_TEXT)
+
+    def test_every_section_gets_a_stable_id_and_ai_provenance(self):
+        got = ai_schema.coerce_overview({"sections": [
+            {"title": "A", "content": "x"}, {"title": "B", "content": "y"}]})
+        self.assertEqual([s["id"] for s in got["sections"]],
+                         ["section_0", "section_1"])
+        for s in got["sections"]:
+            self.assertEqual(s["source"], ai_schema.OVERVIEW_SOURCE_AI)
+
+    def test_overview_accepts_a_bare_list(self):
+        """A model that returns the array without the envelope has still given
+        a usable answer; rejecting it over the wrapper would throw it away."""
+        got = ai_schema.coerce_overview([{"title": "A", "content": "x"}])
+        self.assertEqual(len(got["sections"]), 1)
+
+    def test_overview_empty_detects_nothing_to_show(self):
+        self.assertTrue(ai_schema.overview_empty(ai_schema.empty_overview()))
+        self.assertTrue(ai_schema.overview_empty(None))
+        self.assertTrue(ai_schema.overview_empty("not a dict"))
+        self.assertFalse(ai_schema.overview_empty(
+            ai_schema.coerce_overview([{"title": "A", "content": "x"}])))
+
+    # -- evidence grounding -------------------------------------------------
+    # The model is asked for transcript segment ids and cannot be trusted with
+    # them: an id that resolves to nothing offers the reader a "jump to this
+    # moment" action that goes nowhere.
+
+    def test_invalid_evidence_ids_are_dropped_without_losing_the_section(self):
+        got = ai_schema.coerce_overview(
+            {"sections": [{"title": "A", "content": "x",
+                           "evidence_segment_ids": ["seg_1", "seg_999",
+                                                    "seg_2", "nonsense",
+                                                    "", "seg_1"]}]},
+            valid_ids={"seg_1", "seg_2"})
+        self.assertEqual(got["sections"][0]["evidence_segment_ids"],
+                         ["seg_1", "seg_2"])
+
+    def test_a_section_whose_every_evidence_id_is_invalid_still_survives(self):
+        """The section's text is useful without evidence and useless if a bad
+        reference discards it."""
+        got = ai_schema.coerce_overview(
+            {"sections": [{"title": "A", "content": "real content",
+                           "evidence_segment_ids": ["seg_999"]}]},
+            valid_ids={"seg_1"})
+        self.assertEqual(len(got["sections"]), 1)
+        self.assertEqual(got["sections"][0]["evidence_segment_ids"], [])
+
+    def test_evidence_ids_pass_shape_checks_when_no_transcript_is_available(self):
+        """With no segment list there is nothing to check membership against;
+        dropping every id would strip grounding from the back catalogue. The
+        SHAPE is still enforced."""
+        got = ai_schema.coerce_overview(
+            {"sections": [{"title": "A", "content": "x",
+                           "evidence_segment_ids": ["seg_7", "made up"]}]})
+        self.assertEqual(got["sections"][0]["evidence_segment_ids"], ["seg_7"])
+
+    def test_task_evidence_ids_are_validated_too(self):
+        got = ai_schema.coerce_analysis(
+            {"tasks": [{"task": "Send it",
+                        "evidence_segment_ids": ["seg_3", "seg_404"]}]},
+            valid_ids={"seg_3"})
+        self.assertEqual(got["tasks"][0]["evidence_segment_ids"], ["seg_3"])
 
     def test_tasks_priority_is_clamped_to_the_enum_or_blank(self):
         got = ai_schema.coerce_analysis(
@@ -896,10 +1133,10 @@ class TestCoercion(unittest.TestCase):
         self.assertEqual(len(got["tasks"]), 1)
 
         hl = ai_schema.coerce_highlights({
-            "important_numbers": [{"label": "x"}, {"label": "y", "value": "5%"}],
+            "decisions": [{"context": "c"}, {"decision": "Approved"}],
             "deadlines": [{"when": "Friday"}, {"what": "Review", "when": "Mon"}],
         })
-        self.assertEqual(len(hl["important_numbers"]), 1)
+        self.assertEqual(len(hl["decisions"]), 1)
         self.assertEqual(len(hl["deadlines"]), 1)
 
     def test_bool_does_not_become_the_string_true(self):
@@ -908,10 +1145,20 @@ class TestCoercion(unittest.TestCase):
         self.assertEqual(ai_schema.s(True), "")
         self.assertEqual(ai_schema.s(False), "")
 
-    def test_number_kind_is_clamped(self):
-        got = ai_schema.coerce_highlights(
-            {"important_numbers": [{"label": "l", "value": "5", "kind": "wat"}]})
-        self.assertEqual(got["important_numbers"][0]["kind"], "quantity")
+    def test_the_extraction_is_only_the_sections_with_readers(self):
+        """important_numbers and risks were removed with their (nonexistent)
+        consumers — their content now lands in the overview instead. Each
+        remaining section is read by something: see
+        ai_schema.HIGHLIGHT_SECTIONS."""
+        self.assertEqual(sorted(ai_schema.HIGHLIGHT_SECTIONS),
+                         ["action_items", "deadlines", "decisions",
+                          "open_questions"])
+        got = ai_schema.coerce_highlights({
+            "important_numbers": [{"label": "l", "value": "5"}],
+            "risks": ["a risk"],
+        })
+        self.assertNotIn("important_numbers", got)
+        self.assertNotIn("risks", got)
 
     def test_highlights_empty_detects_nothing_to_show(self):
         self.assertTrue(ai_schema.highlights_empty(ai_schema.empty_highlights()))
@@ -1198,76 +1445,101 @@ class TestCrmIdentifierNormalization(unittest.TestCase):
 
 class TestMerge(unittest.TestCase):
 
+    def _sections(self, *titled):
+        """An overview partial built from (title, content) pairs."""
+        return {"sections": [{"title": t, "kind": "text", "content": c,
+                              "items": [], "evidence_segment_ids": []}
+                             for t, c in titled]}
+
     def test_analysis_partials_dedupe_case_insensitively(self):
         merged = ai_schema.merge_analyses([
-            {"summary": "First half.",
-             "highlights": ["Ship on Friday"],
+            {"overview": self._sections(("Pricing", "First half.")),
              "tasks": [{"task": "Send SOW", "assignee": "", "due_date": "",
                         "priority": None}],
              "participants": [{"speaker": "Speaker 0", "summary": "led"}],
              "title": "Kickoff"},
-            {"summary": "Second half.",
-             "highlights": ["SHIP ON FRIDAY"],
+            {"overview": self._sections(("pricing", "Second half.")),
              "tasks": [{"task": "send sow", "assignee": "Ravi", "due_date": "",
                         "priority": None}],
              "participants": [{"speaker": "Speaker 0", "summary": "again"}],
              "title": "Later"},
         ])
-        self.assertEqual(len(merged["highlights"]), 1)
+        # One SUBJECT split across two chunks is one section, not two.
+        self.assertEqual(len(merged["overview"]["sections"]), 1)
         self.assertEqual(len(merged["tasks"]), 1)
         self.assertEqual(len(merged["participants"]), 1)
         self.assertEqual(merged["title"], "Kickoff")   # first non-empty wins
-        self.assertIn("First half.", merged["summary"])
-        self.assertIn("Second half.", merged["summary"])
+        content = merged["overview"]["sections"][0]["content"]
+        self.assertIn("First half.", content)
+        self.assertIn("Second half.", content)
 
-    def test_merge_emits_exactly_the_five_fields(self):
+    def test_merge_emits_exactly_the_four_fields(self):
         """The overflow merge must not resurrect a removed field, even when the
         per-chunk partials still carry one (an old cached partial, or a model
         that volunteered it)."""
         merged = ai_schema.merge_analyses([
             {**ai_schema.empty_analysis(), "title": "T",
-             "agenda": ["a"], "decisions": ["d"],
+             "agenda": ["a"], "summary": "S", "highlights": ["h"],
              "action_items": [{"task": "t"}]},
         ])
         self.assertEqual(sorted(merged),
-                         ["highlights", "participants", "summary", "tasks",
-                          "title"])
+                         ["overview", "participants", "tasks", "title"])
 
-    def test_analysis_merge_folds_highlights_and_tasks(self):
+    def test_analysis_merge_folds_sections_and_tasks(self):
         """The map_reduce FALLBACK path (a transcript too long for a single
-        pass) still produces the new primary fields, deduplicated across
-        chunks and capped, exactly like the single-pass path does."""
+        pass) still produces the primary fields, folded across chunks exactly
+        as the single-pass path would have written them once."""
         merged = ai_schema.merge_analyses([
             {**ai_schema.empty_analysis(), "title": "T",
-             "highlights": ["h0", "h1"],
+             "overview": self._sections(("Pricing", "Quoted 4.2 lakh."),
+                                        ("Timeline", "Six weeks.")),
              "tasks": [{"task": "Send SOW", "assignee": "", "due_date": "",
                        "priority": None}]},
             {**ai_schema.empty_analysis(),
-             "highlights": ["h0", "a new one"],
+             "overview": self._sections(("Pricing", "Discount held at 8%."),
+                                        ("Open Risks", "Vendor lead time.")),
              "tasks": [{"task": "send sow", "assignee": "Ravi",
                        "due_date": "Friday", "priority": "High"}]},
         ])
-        # "h0" appears in both chunks but is folded once; "a new one" is
-        # genuinely new and survives (unlike test data that would overflow
-        # MAX_HIGHLIGHTS, where the CAP is what truncates, not de-dup).
-        self.assertEqual(merged["highlights"], ["h0", "h1", "a new one"])
-        self.assertLessEqual(len(merged["highlights"]), ai_schema.MAX_HIGHLIGHTS)
+        titles = [s["title"] for s in merged["overview"]["sections"]]
+        # "Pricing" was discussed in both chunks and folds into one section,
+        # keeping the FIRST chunk's position; the chunk-only subjects survive.
+        self.assertEqual(titles, ["Pricing", "Timeline", "Open Risks"])
+        pricing = merged["overview"]["sections"][0]["content"]
+        self.assertIn("4.2 lakh", pricing)
+        self.assertIn("8%", pricing)
+        # Ids are re-derived so they stay positional after the fold.
+        self.assertEqual([s["id"] for s in merged["overview"]["sections"]],
+                         ["section_0", "section_1", "section_2"])
         self.assertEqual(len(merged["tasks"]), 1)
         self.assertEqual(merged["tasks"][0]["assignee"], "Ravi")
         self.assertEqual(merged["tasks"][0]["due_date"], "Friday")
 
-    def test_analysis_merge_caps_highlights_after_folding(self):
-        """When de-duplicated folding alone would exceed MAX_HIGHLIGHTS, the
-        CAP (not de-dup) is what trims the tail — later-chunk highlights beyond
-        the cap are dropped, matching the single-pass schema's own limit."""
-        over = ai_schema.MAX_HIGHLIGHTS + 1
+    def test_merge_folds_section_items_and_evidence_without_duplicates(self):
+        merged = ai_schema.merge_analyses([
+            {**ai_schema.empty_analysis(), "overview": {"sections": [
+                {"title": "Findings", "kind": "list", "content": "",
+                 "items": ["a", "b"], "evidence_segment_ids": ["seg_1"]}]}},
+            {**ai_schema.empty_analysis(), "overview": {"sections": [
+                {"title": "Findings", "kind": "list", "content": "",
+                 "items": ["b", "c"], "evidence_segment_ids": ["seg_1",
+                                                               "seg_9"]}]}},
+        ])
+        section = merged["overview"]["sections"][0]
+        self.assertEqual(section["items"], ["a", "b", "c"])
+        self.assertEqual(section["evidence_segment_ids"], ["seg_1", "seg_9"])
+
+    def test_merge_rebounds_an_oversized_fold(self):
+        """Concatenating chunks can push a section past the budget coercion
+        enforces, so the merged result is re-coerced rather than trusted."""
+        big = "x" * 20_000
         merged = ai_schema.merge_analyses([
             {**ai_schema.empty_analysis(),
-             "highlights": [f"h{i}" for i in range(over)]},
-            {**ai_schema.empty_analysis(), "highlights": ["a new one"]},
+             "overview": self._sections((f"T{i}", big))} for i in range(5)
         ])
-        self.assertEqual(len(merged["highlights"]), ai_schema.MAX_HIGHLIGHTS)
-        self.assertNotIn("a new one", merged["highlights"])
+        total = sum(len(s["content"])
+                    for s in merged["overview"]["sections"])
+        self.assertLessEqual(total, ai_schema.MAX_OVERVIEW_CHARS)
 
     def test_highlights_merge_keeps_the_fuller_copy(self):
         """A later segment usually restates the same item with MORE detail, so
@@ -1283,17 +1555,21 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(merged["action_items"][0]["owner"], "Ravi")
         self.assertEqual(merged["action_items"][0]["deadline"], "Friday")
 
-    def test_same_number_under_different_labels_is_two_facts(self):
-        """"₹5000 deposit" and "₹5000 balance" are different facts."""
+    def test_same_deadline_text_folds_but_distinct_ones_do_not(self):
+        """De-dup keys on the LOAD-BEARING field, not the whole dict: a later
+        segment usually restates an item with more detail, while two genuinely
+        different items must both survive."""
         merged = ai_schema.merge_highlights([
             {**ai_schema.empty_highlights(),
-             "important_numbers": [{"label": "Deposit", "value": "5000",
-                                    "kind": "money"}]},
+             "deadlines": [{"what": "Sign-off", "when": ""},
+                           {"what": "Delivery", "when": "Friday"}]},
             {**ai_schema.empty_highlights(),
-             "important_numbers": [{"label": "Balance", "value": "5000",
-                                    "kind": "money"}]},
+             "deadlines": [{"what": "sign-off", "when": "Monday"}]},
         ])
-        self.assertEqual(len(merged["important_numbers"]), 2)
+        self.assertEqual(len(merged["deadlines"]), 2)
+        by_what = {d["what"].lower(): d for d in merged["deadlines"]}
+        self.assertEqual(by_what["sign-off"]["when"], "Monday")
+        self.assertEqual(by_what["delivery"]["when"], "Friday")
 
     def test_merge_tolerates_junk_partials(self):
         merged = ai_schema.merge_highlights([None, "x", 5, HIGHLIGHTS])
@@ -1661,8 +1937,9 @@ class TestSinglePassAnalysis(unittest.TestCase):
 
         def _complete_json(prompt, content, **kw):
             calls.append(content)
-            return {"title": "T", "summary": "A real summary.",
-                    "highlights": [], "tasks": []}
+            return {"title": "T", "tasks": [],
+                    "overview": {"sections": [
+                        {"title": "Pricing", "content": "A real overview."}]}}
 
         with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
              mock.patch.object(groq_client, "GROQ_CONTEXT_TOKENS", 131_072), \
@@ -1675,7 +1952,8 @@ class TestSinglePassAnalysis(unittest.TestCase):
         self.assertEqual(total, 1)
         self.assertEqual(len(calls), 1)          # exactly one Groq call
         self.assertEqual(calls[0], text)          # the WHOLE transcript, unchunked
-        self.assertEqual(got["summary"], "A real summary.")
+        self.assertEqual(got["overview"]["sections"][0]["content"],
+                         "A real overview.")
 
     def test_long_transcript_exceeding_the_safe_limit_falls_back_to_chunking(self):
         """A transcript that genuinely exceeds the single-pass budget must
@@ -1687,10 +1965,13 @@ class TestSinglePassAnalysis(unittest.TestCase):
         def _complete_json(prompt, content, **kw):
             if prompt == prompts.SUMMARY_SYSTEM:
                 map_calls.append(content)
-                return {"title": "T", "summary": "partial", "highlights": [],
-                        "tasks": [], "participants": []}
-            return {"title": "T", "summary": "final reduced summary",
-                    "highlights": [], "tasks": [], "participants": []}
+                return {"title": "T", "tasks": [], "participants": [],
+                        "overview": {"sections": [
+                            {"title": "Part", "content": "partial"}]}}
+            return {"title": "T", "tasks": [], "participants": [],
+                    "overview": {"sections": [
+                        {"title": "Pricing",
+                         "content": "final reduced overview"}]}}
 
         with mock.patch.object(groq_client, "complete_json", side_effect=_complete_json), \
              mock.patch.object(groq_client.time, "sleep"):
@@ -1700,39 +1981,51 @@ class TestSinglePassAnalysis(unittest.TestCase):
                 deadline_seconds=120, label="summarize", key="k")
         self.assertGreater(len(map_calls), 1)     # genuinely chunked, not one call
         self.assertEqual(covered, total)          # every chunk succeeded
-        self.assertEqual(got["summary"], "final reduced summary")
+        self.assertEqual(got["overview"]["sections"][0]["content"],
+                         "final reduced overview")
 
-    def test_single_pass_returns_a_valid_summary(self):
+    def test_single_pass_returns_a_valid_overview(self):
         """The straightforward success path: one call, a real non-empty
-        summary, no fallback triggered."""
+        overview, no fallback triggered."""
         text = "Speaker 0: short meeting content."
         with mock.patch.object(groq_client, "complete_json",
-                               return_value={"title": "T", "summary": "Real summary here.",
-                                            "highlights": ["Point one"], "tasks": []}):
+                               return_value={"title": "T", "tasks": [],
+                                             "overview": {"sections": [
+                                                 {"title": "Pricing",
+                                                  "content": "Real content."},
+                                                 {"title": "Agreed",
+                                                  "items": ["Point one"]}]}}):
             got, covered, total = groq_client.analyze(
                 text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
                 merge=ai_schema.merge_analyses, coerce=ai_schema.coerce_analysis,
                 deadline_seconds=120, label="summarize", key="k",
-                is_usable=lambda a: bool((a.get("summary") or "").strip()))
+                is_usable=lambda a: not ai_schema.overview_empty(
+                    a.get("overview")))
         self.assertEqual(covered, 1)
-        self.assertEqual(got["summary"], "Real summary here.")
-        self.assertEqual(got["highlights"], ["Point one"])
+        sections = got["overview"]["sections"]
+        self.assertEqual([s["title"] for s in sections], ["Pricing", "Agreed"])
+        self.assertEqual(sections[1]["items"], ["Point one"])
 
-    def test_single_pass_empty_summary_retries_then_falls_back(self):
+    def test_single_pass_empty_overview_retries_then_falls_back(self):
         """The EXACT production failure this redesign fixes: a 200 response
-        whose "summary" came back empty despite everything else (title,
-        highlights, tasks) being populated. is_usable() must catch this,
-        retry once, and only fall back to map_reduce if the retry ALSO
-        comes back unusable."""
+        whose primary analysis came back empty despite everything else (title,
+        tasks) being populated. is_usable() must catch this, retry once, and
+        only fall back to map_reduce if the retry ALSO comes back unusable.
+
+        "Empty" now includes an overview whose only sections are UNUSABLE —
+        a heading with nothing under it — because coerce_overview drops those,
+        so the model can return a plausible-looking object that reduces to
+        nothing."""
         text = "Speaker 0: short meeting content."
         responses = iter([
-            # attempt 1: empty summary, everything else fine
-            {"title": "Real Title", "summary": "", "tasks": [],
-             "highlights": ["a highlight"]},
-            {"title": "Real Title", "summary": "", "highlights": [], "tasks": []},
+            # attempt 1: sections present but every one is empty -> dropped.
+            {"title": "Real Title", "tasks": [],
+             "overview": {"sections": [{"title": "Padded", "content": ""}]}},
+            {"title": "Real Title", "tasks": [], "overview": {"sections": []}},
             # map_reduce fallback: single-chunk path (text is short).
-            {"title": "Real Title", "summary": "Recovered via fallback.",
-             "highlights": [], "tasks": []},
+            {"title": "Real Title", "tasks": [],
+             "overview": {"sections": [
+                 {"title": "Pricing", "content": "Recovered via fallback."}]}},
         ])
 
         def _complete_json(prompt, content, **kw):
@@ -1743,8 +2036,10 @@ class TestSinglePassAnalysis(unittest.TestCase):
                 text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
                 merge=ai_schema.merge_analyses, coerce=ai_schema.coerce_analysis,
                 deadline_seconds=120, label="summarize", key="k",
-                is_usable=lambda a: bool((a.get("summary") or "").strip()))
-        self.assertEqual(got["summary"], "Recovered via fallback.")
+                is_usable=lambda a: not ai_schema.overview_empty(
+                    a.get("overview")))
+        self.assertEqual(got["overview"]["sections"][0]["content"],
+                         "Recovered via fallback.")
 
     def test_single_pass_usable_result_is_never_retried(self):
         """is_usable() gating must not cost an extra call on the common,
@@ -1753,14 +2048,16 @@ class TestSinglePassAnalysis(unittest.TestCase):
 
         def _complete_json(prompt, content, **kw):
             calls.append(1)
-            return {"title": "T", "summary": "Fine.", "highlights": [], "tasks": []}
+            return {"title": "T", "tasks": [], "overview": {"sections": [
+                {"title": "Pricing", "content": "Fine."}]}}
 
         with mock.patch.object(groq_client, "complete_json", side_effect=_complete_json):
             groq_client.analyze(
                 "Speaker 0: hi.", prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
                 merge=ai_schema.merge_analyses, coerce=ai_schema.coerce_analysis,
                 deadline_seconds=120, label="summarize", key="k",
-                is_usable=lambda a: bool((a.get("summary") or "").strip()))
+                is_usable=lambda a: not ai_schema.overview_empty(
+                    a.get("overview")))
         self.assertEqual(len(calls), 1)
 
     def test_single_pass_budget_is_bounded_by_the_context_window(self):
@@ -1797,14 +2094,15 @@ class TestSinglePassAnalysis(unittest.TestCase):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise groq_client.GroqError("429", 429, True)
-            return {"title": "T", "summary": "Recovered.", "highlights": [], "tasks": []}
+            return {"title": "T", "tasks": [], "overview": {"sections": [
+                {"title": "Pricing", "content": "Recovered."}]}}
 
         with mock.patch.object(groq_client, "complete_json", side_effect=_complete_json):
             got, covered, total = groq_client.analyze(
                 text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
                 merge=ai_schema.merge_analyses, coerce=ai_schema.coerce_analysis,
                 deadline_seconds=120, label="summarize", key="k")
-        self.assertEqual(got["summary"], "Recovered.")
+        self.assertEqual(got["overview"]["sections"][0]["content"], "Recovered.")
 
 
 # ===========================================================================
@@ -1832,14 +2130,25 @@ class TestUpsertRemovesRetiredAttributes(unittest.TestCase):
         return [names[tok.strip()]
                 for tok in expr.split("REMOVE")[1].split(",")]
 
-    def test_retired_attrs_are_the_five_removed_analysis_fields(self):
+    def test_retired_attrs_are_the_removed_analysis_fields(self):
+        """`highlights` joined the list when the dynamic overview replaced the
+        fixed prose pair. `summary` deliberately did NOT: it is still written,
+        derived from the overview, for the meetings list and the CRM push."""
         self.assertEqual(sorted(transcribe_api.RETIRED_ANALYSIS_ATTRS),
-                         ["action_items", "agenda", "decisions",
+                         ["action_items", "agenda", "decisions", "highlights",
                           "key_points", "pending_discussions"])
+        self.assertNotIn("summary", transcribe_api.RETIRED_ANALYSIS_ATTRS)
+        self.assertNotIn("overview", transcribe_api.RETIRED_ANALYSIS_ATTRS)
+
+    def test_crm_records_is_never_retired(self):
+        """A stored crm_records value may be a user's MANUAL, confirmed link to
+        a real Salesforce record. CRM extraction left the analysis path, but
+        reprocessing must not silently unlink a meeting."""
+        self.assertNotIn("crm_records", transcribe_api.RETIRED_ANALYSIS_ATTRS)
 
     def test_set_and_remove_are_combined_in_one_expression(self):
         transcribe_api._upsert(
-            "k", {"summary": "S", "highlights": ["a"]},
+            "k", {"summary": "S", "overview": {"sections": []}},
             remove=transcribe_api.RETIRED_ANALYSIS_ATTRS)
         expr = self.calls[-1]["UpdateExpression"]
         self.assertTrue(expr.startswith("SET "))
@@ -2527,6 +2836,98 @@ class TestUpdateStaleDocuments(AiTestCase):
             status, _ = parse(call(api.update_stale_documents,
                 self._event()))
         self.assertEqual(status, 401)
+
+
+# ===========================================================================
+# Speaker rename reaching TASKS — live resolution, no writes.
+#
+# A rename lands in exactly one place (speaker_names on the recording). Tasks
+# store the join key (assignee_speaker_id) and resolve the display name at
+# READ time, so every task the speaker owns reads correctly on the next
+# request without the rename writing to a single task row. These tests pin
+# both halves of that: the name does move for an unresolved AI task, and it
+# does NOT move for one a human assigned to a Contact.
+# ===========================================================================
+class TestSpeakerNameResolvesOnTasks(unittest.TestCase):
+    """_public_task_v2 / _speaker_display_name — pure shaping, no AWS."""
+
+    AI_TASK = {
+        "task_id": "t1", "title": "Send revised quote", "status": "Open",
+        "source_type": "ai", "assignee_speaker_id": "0",
+        "assignee_name_legacy": "Speaker 0",
+        "resolution_status": api.RESOLUTION_UNRESOLVED,
+    }
+
+    def test_unnamed_speaker_reads_as_its_label(self):
+        t = api._public_task_v2(self.AI_TASK, {})
+        self.assertEqual(t["assignee"]["name"], "Speaker 0")
+        self.assertEqual(t["speaker_name"], "Speaker 0")
+
+    def test_rename_moves_the_assignee_with_no_write(self):
+        """The whole point: the same stored row, a different names map, and the
+        task now names the person."""
+        t = api._public_task_v2(self.AI_TASK, {"0": "Ravi"})
+        self.assertEqual(t["assignee"]["name"], "Ravi")
+        self.assertEqual(t["speaker_name"], "Ravi")
+
+    def test_the_verbatim_ai_extraction_is_still_returned(self):
+        """Resolution is DISPLAY only — the string the AI actually produced
+        stays inspectable, which is why nothing is rewritten on the row."""
+        t = api._public_task_v2(self.AI_TASK, {"0": "Ravi"})
+        self.assertEqual(t["assignee_name_legacy"], "Speaker 0")
+        self.assertEqual(t["assignee_speaker_id"], "0")
+
+    def test_a_contact_assigned_task_is_never_repointed_by_a_rename(self):
+        """The guard that matters. Renaming the speaker who happened to say the
+        sentence must not overwrite a person a human chose — the same rule
+        _resolve_tasks_for_speaker applies when it skips resolved tasks."""
+        row = {**self.AI_TASK, "assignee_contact_id": "c9",
+               "assignee_name": "Priya Sharma",
+               "resolution_status": api.RESOLUTION_RESOLVED}
+        t = api._public_task_v2(row, {"0": "Ravi"})
+        self.assertEqual(t["assignee"]["name"], "Priya Sharma")
+        # Provenance is still reported, so the UI can say where it came from.
+        self.assertEqual(t["speaker_name"], "Ravi")
+
+    def test_a_contact_with_no_stored_name_does_not_fall_back_to_the_speaker(self):
+        """Guards the precedence order itself: `assignee_contact_id` alone is
+        enough to stop the speaker name being adopted, so a contact row that
+        somehow carries no name reads as unassigned rather than as the
+        speaker."""
+        row = {**self.AI_TASK, "assignee_contact_id": "c9",
+               "assignee_name": "", "assignee_name_legacy": "",
+               "resolution_status": api.RESOLUTION_RESOLVED}
+        self.assertIsNone(api._public_task_v2(row, {"0": "Ravi"})["assignee"])
+
+    def test_a_manual_task_has_no_speaker_at_all(self):
+        row = {"task_id": "t2", "title": "Buy cables", "status": "Open",
+               "source_type": "manual"}
+        t = api._public_task_v2(row, {"0": "Ravi"})
+        self.assertIsNone(t["assignee"])
+        self.assertEqual(t["speaker_name"], "")
+
+    def test_omitting_the_map_keeps_the_pre_rename_behaviour(self):
+        """A call site with no recording in hand must still return a valid
+        task — the stored string, exactly as before this existed."""
+        t = api._public_task_v2(self.AI_TASK)
+        self.assertEqual(t["assignee"]["name"], "Speaker 0")
+
+    def test_an_unmapped_speaker_still_renders_its_label(self):
+        t = api._public_task_v2(
+            {**self.AI_TASK, "assignee_speaker_id": "7",
+             "assignee_name_legacy": ""}, {"0": "Ravi"})
+        self.assertEqual(t["assignee"]["name"], "Speaker 7")
+
+    def test_a_non_numeric_label_stands_alone(self):
+        """"agent" is a real diarization label; "Speaker agent" would be wrong.
+        Mirrors lib/sources.ts' speakerName."""
+        self.assertEqual(api._speaker_display_name("agent", {}), "agent")
+        self.assertEqual(
+            api._speaker_display_name("agent", {"agent": "Support Bot"}),
+            "Support Bot")
+
+    def test_no_speaker_id_resolves_to_nothing(self):
+        self.assertEqual(api._speaker_display_name("", {"0": "Ravi"}), "")
 
 
 # ===========================================================================
@@ -5075,11 +5476,110 @@ class TestReprocess(AiTestCase):
                 self.lam.invoke.assert_not_called()
 
     # --- the cooldown ---------------------------------------------------
+    #
+    # `elapsed` is computed from TWO INDEPENDENT clock reads: datetime.now()
+    # when the stamp was written, and time.time() when it is checked. So the
+    # boundary tests below PIN time.time() rather than racing the real clock —
+    # which is not tidiness, it is the whole point. When these raced the wall
+    # clock, the same-instant case came out very slightly NEGATIVE about 0.8%
+    # of the time and this suite failed roughly one run in six.
+    def _stamp(self, offset_seconds):
+        """Put the last attempt `offset_seconds` in the PAST and pin the clock.
+
+        Returns nothing; the point is that elapsed == offset_seconds EXACTLY,
+        so a boundary assertion means what it says. A NEGATIVE offset puts the
+        stamp in the future, i.e. elapsed < 0.
+        """
+        started = datetime(2026, 8, 25, 12, 0, 0, tzinfo=timezone.utc)
+        self.item["reprocess_started_at"] =             started.isoformat().replace("+00:00", "Z")
+        pinned = started.timestamp() + offset_seconds
+        patcher = mock.patch.object(api.time, "time", lambda: pinned)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_second_attempt_inside_the_cooldown_is_429(self):
-        self.item["reprocess_started_at"] = api._now_iso()
+        self._stamp(10)          # elapsed = 10, cooldown = 300
         status, body = self._post()
         self.assertEqual(status, 429)
         self.assertIn("try again in", body["error"])
+        self.lam.invoke.assert_not_called()
+
+    def test_negative_elapsed_is_still_inside_the_cooldown(self):
+        """THE REGRESSION. Two calls landing in the same instant can read the
+        clock out of order, making elapsed marginally negative.
+
+        The old guard was `0 <= elapsed < COOLDOWN`, which treated exactly
+        that as "outside the window" and returned 202 — so the two taps
+        CLOSEST together were the ones the cooldown failed to catch, which is
+        precisely the double-charge it exists to prevent.
+        """
+        self._stamp(-0.001)      # stamp is 1ms in the future
+        status, body = self._post()
+        self.assertEqual(status, 429)
+        self.assertIn("try again in", body["error"])
+        self.lam.invoke.assert_not_called()
+
+    def test_sub_microsecond_negative_elapsed_is_blocked(self):
+        """The magnitude actually observed in the wild (~-2e-07s), not just a
+        conveniently large negative number."""
+        self._stamp(-0.000000238)
+        status, _ = self._post()
+        self.assertEqual(status, 429)
+        self.lam.invoke.assert_not_called()
+
+    def test_zero_elapsed_is_blocked(self):
+        """The exact instant of the previous attempt is inside the window."""
+        self._stamp(0)
+        status, _ = self._post()
+        self.assertEqual(status, 429)
+        self.lam.invoke.assert_not_called()
+
+    def test_exactly_at_the_cooldown_boundary_is_allowed(self):
+        """elapsed == COOLDOWN is OUT of the window: the guard is a strict
+        `<`, so the window is [0, COOLDOWN) and the wait the 429 quotes has
+        genuinely elapsed."""
+        self._stamp(api.REPROCESS_COOLDOWN_SECONDS)
+        status, _ = self._post()
+        self.assertEqual(status, 202)
+        self.lam.invoke.assert_called_once()
+
+    def test_one_second_past_the_cooldown_is_allowed(self):
+        self._stamp(api.REPROCESS_COOLDOWN_SECONDS + 1)
+        status, _ = self._post()
+        self.assertEqual(status, 202)
+        self.lam.invoke.assert_called_once()
+
+    def test_two_rapid_calls_the_second_is_refused(self):
+        """The end-to-end shape of the bug: tap, then tap again immediately.
+
+        The second call reads the stamp the FIRST one wrote, with the clock
+        pinned so the two land in the same instant — the case that used to
+        slip through. Nothing here needs a distributed lock; the stored stamp
+        is already the shared guard, it just has to be read correctly.
+        """
+        self.item.pop("reprocess_started_at", None)
+        writes = []
+        self.table.update_item.side_effect = lambda **kw: writes.append(kw) or {}
+
+        first, _ = self._post()
+        self.assertEqual(first, 202)
+        self.lam.invoke.assert_called_once()
+
+        # Apply the stamp the first call wrote, then freeze the clock at that
+        # same moment so elapsed is 0-or-negative for the second call.
+        stamped = writes[0]["ExpressionAttributeValues"][":t"]
+        self.item["reprocess_started_at"] = stamped
+        moment = datetime.fromisoformat(
+            str(stamped).replace("Z", "+00:00")).timestamp()
+        patcher = mock.patch.object(api.time, "time", lambda: moment - 1e-07)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.lam.invoke.reset_mock()
+
+        second, body = self._post()
+        self.assertEqual(second, 429)
+        self.assertIn("try again in", body["error"])
+        # The money test: the second tap must not have invoked anything.
         self.lam.invoke.assert_not_called()
 
     def test_attempt_after_the_cooldown_is_allowed(self):
@@ -5171,7 +5671,7 @@ class TestReprocess(AiTestCase):
 # The contracts worth protecting:
 #   * a normal Delete DESTROYS NOTHING — no S3 call, no delete_item, every AI
 #     artifact still attached to the same row;
-#   * a trashed recording leaves the Desk and appears in Trash;
+#   * a trashed recording leaves MinuteX and appears in Trash;
 #   * Restore is lossless and puts the row back in a usable status;
 #   * permanent delete is the ONLY destroyer, ordered S3-then-row so a retry
 #     converges;

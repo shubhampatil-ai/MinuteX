@@ -29,7 +29,8 @@ import {
 } from "./api";
 import type { GeneratedDoc } from "./meeting-documents";
 import {
-  taskFromApiTask, assigneeToApi, nextId, type Task, type TaskStatus,
+  taskFromApiTask, assigneeToApi, apiAssigneeToAssignee, nextId,
+  type Task, type TaskStatus,
   type Assignee, type NotifyChannel, type Attachment,
 } from "./task-model";
 
@@ -151,6 +152,42 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
     } catch {
       // Best-effort: the Documents list still works from getRecording's
       // copy, just without the "needs update" indicator until next load.
+    }
+  }, [meetingKey]);
+
+  // Re-read the tasks' ASSIGNEE ONLY, after a rename.
+  //
+  // A rename writes nothing to any task — the backend resolves the display
+  // name per request from the meeting's speaker_names (see
+  // _public_task_v2 / ApiTask.speaker_name). So the tasks already on screen
+  // are correct everywhere EXCEPT in this app's own local copy, which was
+  // built from the pre-rename response. Re-fetching is how that copy catches
+  // up; nothing is written back.
+  //
+  // MERGED, never replaced: `tasks` carries client-only fields (notes,
+  // subtasks, attachments, activity — see lib/task-model.ts) that exist
+  // nowhere on the server, so mapping the fetch straight into state the way
+  // load() does on first fetch would silently discard them. Only the assignee
+  // is taken from the response, because only the assignee can have changed.
+  const refreshTaskAssignees = useCallback(async () => {
+    try {
+      const apiTasks = await getTasks(meetingKey);
+      const byId = new Map(apiTasks.map((t) => [t.id, t]));
+      setTasks((prev) =>
+        prev.map((t) => {
+          const fresh = byId.get(t.id);
+          if (!fresh) return t;
+          const next = apiAssigneeToAssignee(fresh.assignee);
+          // Same object identity when the name did not move, so a task whose
+          // assignee is unaffected by this rename does not re-render.
+          if (next?.name === t.assignee?.name) return t;
+          return { ...t, assignee: next };
+        })
+      );
+    } catch {
+      // Best-effort, exactly like refreshDocumentStatus: the tasks on screen
+      // keep the previous name until the next load() rather than erroring out
+      // a rename that has already succeeded.
     }
   }, [meetingKey]);
 
@@ -400,15 +437,34 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
       // content is baked-in prose), so re-check which ones the backend now
       // considers stale under the bumped speaker_mapping_version.
       refreshDocumentStatus();
+      // Tasks resolve their assignee server-side from the map that just
+      // changed, so they need a re-read to pick the new name up — but no
+      // regeneration and no "needs update" step, unlike documents.
+      refreshTaskAssignees();
     } catch (e) {
       Alert.alert("Couldn't save the name", e instanceof ApiError ? e.message : "Something went wrong.");
       throw e;
     }
-  }, [rec, meetingKey, refreshDocumentStatus]);
+  }, [rec, meetingKey, refreshDocumentStatus, refreshTaskAssignees]);
 
+  // UPSERT by type, not a blind prepend. Regenerating a document, or saving
+  // the structured MoM (which rewrites its mirrored minutes_of_meeting on
+  // every save — see lib/mom-editor.tsx), calls this repeatedly with the same
+  // type; prepending each time would stack duplicate rows in Documents(N) for
+  // what is one document. A refreshed document keeps its POSITION rather than
+  // jumping to the top, so the list does not reshuffle under the user while
+  // they edit.
   const addDocument = useCallback((doc: GeneratedDoc) => {
-    setDocuments((prev) => [doc, ...prev]);
-    logActivity(`Document generated: ${doc.label}`);
+    let replaced = false;
+    setDocuments((prev) => {
+      const at = prev.findIndex((d) => d.type === doc.type);
+      if (at < 0) return [doc, ...prev];
+      replaced = true;
+      const next = prev.slice();
+      next[at] = doc;
+      return next;
+    });
+    if (!replaced) logActivity(`Document generated: ${doc.label}`);
   }, [logActivity]);
 
   // "Update All": regenerate every currently-flagged-stale document against

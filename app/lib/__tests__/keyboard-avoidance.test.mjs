@@ -77,11 +77,25 @@ const DELEGATES = new Map([
   // The picker/sheet components own every input on these screens.
   ["src/app/folders.tsx", "inputs live in FolderSheet"],
   ["src/app/folder/[id].tsx", "inputs live in ContactPicker"],
-  ["src/app/tasks.tsx", "no text input of its own"],
+  // Its search field is rendered by TaskSearchBar at the TOP of the list
+  // header, so the keyboard opens below it and cannot cover it — the same
+  // top-anchored-search-over-a-list case as contacts.tsx and the home tab.
+  ["src/app/tasks.tsx", "top-anchored search over a list"],
   ["src/app/task/[id].tsx", "inputs live in ContactPicker"],
   ["src/app/recording/[key]/participants.tsx", "inputs live in ContactPicker"],
   ["src/app/recording/[key]/task/[taskId]/assign.tsx", "inputs live in ContactPicker"],
   ["lib/ui.tsx", "defines the input primitives and the wrappers themselves"],
+  // TaskSearchBar is the only input here and it is top-anchored inside the
+  // task list's header (see src/app/tasks.tsx) — there is nothing below it
+  // for the keyboard to cover.
+  ["lib/task-action-center.tsx", "top-anchored search rendered in a list header"],
+  // The transcript's search field is the first thing in the scroll view, above
+  // every speaker block, so the keyboard opens BELOW it and cannot cover it —
+  // the same top-anchored-search-over-a-list case as contacts.tsx and the home
+  // tab. The screen that renders it (recording/[key]/transcript.tsx) wraps its
+  // rename Modal in KeyboardAwareSheet, which is the input that genuinely
+  // needed covering.
+  ["lib/transcript-view.tsx", "top-anchored search over the transcript list"],
 ]);
 
 describe("android keyboard layout mode", () => {

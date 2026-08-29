@@ -176,18 +176,273 @@ def _roster_filtered(participants, roster):
                     "summary": (got or {}).get("summary", "")})
     return out
 
+# `assignee_speaker_id`, `confidence` and `evidence` are NOT decoration: the
+# Tasks layer reads all three off each raw row (_seed_ai_tasks). Because
+# obj_list builds every element STRICTLY from this spec, a field missing here
+# is dropped before the seeder ever sees it — which is exactly how the
+# speaker-resolution chain (assignee_speaker_id -> Contact) came to be dead
+# code despite both ends being implemented. Add a field to the prompt and to
+# this spec together, or the prompt's output is silently discarded.
+#
+# assignee_speaker_id holds a transcript LABEL ("Speaker 0"), never a name —
+# that is the join key _seed_ai_tasks looks up in the meeting's speaker map and
+# _resolve_tasks_for_speaker matches on later.
 TASK_SPEC = {
     "task": ("task", s),
     "assignee": ("assignee", s),
+    "assignee_speaker_id": ("assignee_speaker_id", s),
     "due_date": ("due_date", s),
     "priority": ("priority", lambda x: clamp(
         x, {"Low", "Medium", "High"}, "") or None),
+    # A fixed enum, not a free number: a model asked for a 0-1 score returns
+    # noise dressed as precision. Unrecognised -> "" (no claim made).
+    "confidence": ("confidence", lambda x: clamp(
+        x, {"high", "medium", "low"}, "")),
+    "evidence": ("evidence", s),
+    # The verbatim quote above says WHAT created the task; this says WHERE it
+    # is, so the app can jump to that moment of the audio. Coerced permissively
+    # here (shape only) and re-validated against the real segment list by
+    # validate_task_evidence once the transcript is known — obj_list has no
+    # access to it, and a task must never be dropped over a bad reference.
+    "evidence_segment_ids": ("evidence_segment_ids",
+                             lambda v: _evidence_ids(v, None)),
 }
 
-# The prompt asks for 3-7 highlights; this is the hard cap that makes a model
-# ignoring the range harmless. Kept slightly generous rather than exact — the
-# cap exists to bound the UI list, not to enforce the prompt.
-MAX_HIGHLIGHTS = 7
+# ---------------------------------------------------------------------------
+# THE DYNAMIC OVERVIEW — the primary meeting understanding.
+#
+# Replaces the fixed `summary` prose + `highlights` list with sections the
+# MODEL chooses per meeting. A technical review yields "Architecture Concerns"
+# and "Panel Feedback"; a sales call yields "Pricing" and "Objections". There
+# is deliberately NO section taxonomy anywhere in this file or in the prompt —
+# a fixed list is exactly what this replaces, and adding one "just as a
+# fallback" would reintroduce the template the feature exists to remove.
+#
+# What IS enforced here is everything that is NOT a content decision:
+#
+#   * BOUNDS. The overview rides on the DynamoDB row (see the 400 KB limit
+#     transcript_store.py exists because of), so section count, text length,
+#     item count and total size are capped. The caps below are set well above
+#     what a real meeting produces — they protect storage, they do not shape
+#     the answer. A model that wants 4 sections and one that wants 9 are both
+#     under the cap; only a runaway response is trimmed.
+#   * EMPTINESS. A section with no content is dropped rather than stored. An
+#     empty "Risks" heading reads to a user as "risks were considered and
+#     there were none", which is a claim the transcript may not support — the
+#     same reason coerce_highlights drops a row missing its load-bearing field.
+#   * IDENTITY. Every section gets a stable id, so the app can key a list, and
+#     a user edit or a comment can point at one section across regenerations.
+#   * PROVENANCE. `source` records who wrote it, mirroring mom_schema's SOURCE_*
+#     values — the field that makes a future "user edited this section" merge
+#     decidable without a migration.
+# ---------------------------------------------------------------------------
+OVERVIEW_KIND_TEXT = "text"
+OVERVIEW_KIND_LIST = "list"
+OVERVIEW_KINDS = (OVERVIEW_KIND_TEXT, OVERVIEW_KIND_LIST)
+
+# Provenance. Only "ai" is ever written by a generation; the value exists so a
+# later user-edit path has somewhere to record itself.
+OVERVIEW_SOURCE_AI = "ai"
+
+MAX_OVERVIEW_SECTIONS = 12
+MAX_OVERVIEW_TITLE_CHARS = 80
+MAX_OVERVIEW_TEXT_CHARS = 4_000
+MAX_OVERVIEW_ITEMS = 20
+MAX_OVERVIEW_ITEM_CHARS = 600
+MAX_OVERVIEW_EVIDENCE = 8
+# Total budget across every section. Sized against the row's other occupants
+# (~10 KB of analysis on a slim row) with the 400 KB item ceiling far above —
+# a normal overview lands around 2-4 KB, so this only ever catches a runaway.
+MAX_OVERVIEW_CHARS = 24_000
+
+_SEGMENT_ID_RE = re.compile(r"^seg_\d+$")
+
+
+def _evidence_ids(v, valid_ids=None):
+    """Model-supplied segment references -> the subset that actually exists.
+
+    NEVER trusted as given. A model asked for evidence will happily return
+    "seg_999999" for a 40-segment meeting, and an ID that resolves to nothing
+    is worse than no ID: the app would offer a "jump to this moment" action
+    that silently goes nowhere.
+
+    `valid_ids` is the set derived from the real transcript. When it is None
+    (no timestamps available — a non-diarized STT result, or an old row whose
+    segments could not be read) the shape is still enforced but membership
+    cannot be, so well-formed IDs pass through; there is nothing to check them
+    against, and dropping them all would strip grounding from every legacy
+    recording. An INVALID id is always dropped, never repaired and never
+    allowed to fail the surrounding section — the section's text is useful
+    with no evidence, and useless if a bad reference discards it.
+    """
+    out, seen = [], set()
+    for raw in (v if isinstance(v, list) else []):
+        ident = s(raw)
+        if not ident or not _SEGMENT_ID_RE.match(ident):
+            continue
+        if valid_ids is not None and ident not in valid_ids:
+            continue
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(ident)
+        if len(out) >= MAX_OVERVIEW_EVIDENCE:
+            break
+    return out
+
+
+def _overview_section(raw, index, valid_ids=None):
+    """One coerced section, or None when it carries no content.
+
+    `kind` follows the CONTENT, not the model's label for it: a section that
+    declared itself "text" but returned only items is stored as a list, and
+    vice versa. The model gets the harder half (what to say) and this decides
+    the half that has an objectively right answer, so the app never has to
+    render a "text" section whose `content` is empty.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    title = s(raw.get("title"))[:MAX_OVERVIEW_TITLE_CHARS]
+    content = s(raw.get("content"))[:MAX_OVERVIEW_TEXT_CHARS]
+    items = [i[:MAX_OVERVIEW_ITEM_CHARS]
+             for i in slist(raw.get("items"))][:MAX_OVERVIEW_ITEMS]
+
+    # No title, or nothing to say under it -> not a section. This is the rule
+    # that keeps filler out: a model padding to look thorough emits exactly
+    # this shape (a heading with nothing under it), and it is dropped here.
+    if not title or (not content and not items):
+        return None
+
+    kind = clamp(raw.get("kind"), set(OVERVIEW_KINDS), "")
+    if items and not content:
+        kind = OVERVIEW_KIND_LIST
+    elif content and not items:
+        kind = OVERVIEW_KIND_TEXT
+    elif not kind:
+        # Both present and no usable declaration: prefer the list, which is
+        # the denser rendering, and keep the prose as the section's lead-in.
+        kind = OVERVIEW_KIND_LIST
+
+    # Positional id. Same reasoning as transcript_store.segment_id: derived
+    # from order, so it is stable for a given generation without the model
+    # being trusted to invent unique keys (it reliably repeats "section_1").
+    return {
+        "id": f"section_{index}",
+        "title": title,
+        "kind": kind,
+        "content": content,
+        "items": items,
+        "source": OVERVIEW_SOURCE_AI,
+        "evidence_segment_ids": _evidence_ids(
+            raw.get("evidence_segment_ids"), valid_ids),
+    }
+
+
+def empty_overview():
+    """Fresh overview; never shares mutable lists."""
+    return {"sections": []}
+
+
+def coerce_overview(obj, valid_ids=None):
+    """Strict coerce the model's overview into the bounded section list.
+
+    Accepts either {"sections": [...]} or a bare list, because those are the
+    two shapes a model actually returns for this field and rejecting the second
+    would throw away a perfectly good answer over an envelope.
+
+    De-duplicates on TITLE: the failure mode worth guarding is a model emitting
+    "Next Steps" twice with the content split across both, which renders as two
+    half-empty cards. The first occurrence keeps its position and absorbs the
+    second's items — the same "fuller copy wins" rule merge_highlights uses.
+    """
+    if isinstance(obj, dict):
+        raw_sections = obj.get("sections")
+    elif isinstance(obj, list):
+        raw_sections = obj
+    else:
+        return empty_overview()
+
+    if not isinstance(raw_sections, list):
+        return empty_overview()
+
+    sections, by_title, total = [], {}, 0
+    for raw in raw_sections:
+        section = _overview_section(raw, len(sections), valid_ids)
+        if section is None:
+            continue
+
+        key = section["title"].strip().lower()
+        prior = by_title.get(key)
+        if prior is not None:
+            # Fold into the copy already holding this title.
+            if not prior["content"]:
+                prior["content"] = section["content"]
+            for item in section["items"]:
+                if len(prior["items"]) >= MAX_OVERVIEW_ITEMS:
+                    break
+                if item not in prior["items"]:
+                    prior["items"].append(item)
+            if prior["items"] and prior["kind"] == OVERVIEW_KIND_TEXT \
+                    and not prior["content"]:
+                prior["kind"] = OVERVIEW_KIND_LIST
+            continue
+
+        size = len(section["title"]) + len(section["content"]) + \
+            sum(len(i) for i in section["items"])
+        # Budget check AFTER the de-dupe fold, so a duplicate can't consume it.
+        if total + size > MAX_OVERVIEW_CHARS:
+            break
+        total += size
+
+        by_title[key] = section
+        sections.append(section)
+        if len(sections) >= MAX_OVERVIEW_SECTIONS:
+            break
+
+    return {"sections": sections}
+
+
+def overview_empty(o):
+    """True when the overview has no sections worth storing.
+
+    Same role as highlights_empty: an all-empty result is indistinguishable
+    from "never generated", and storing it would make a cache serve emptiness
+    forever instead of regenerating.
+    """
+    if not isinstance(o, dict):
+        return True
+    return not o.get("sections")
+
+
+def overview_text(o, limit=None):
+    """The overview flattened to plain text — for prompts and legacy readers.
+
+    ONE definition, because three different callers need this and three
+    slightly different flattenings would be three slightly different meetings.
+    Used by prompts.analysis_context (the Chat/document digest) and by the
+    compatibility `summary` derivation.
+    """
+    if not isinstance(o, dict):
+        return ""
+    parts = []
+    for section in o.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        title = s(section.get("title"))
+        if not title:
+            continue
+        block = [f"{title}:"]
+        content = s(section.get("content"))
+        if content:
+            block.append(content)
+        for item in slist(section.get("items")):
+            block.append(f"- {item}")
+        parts.append("\n".join(block))
+    text = "\n\n".join(parts)
+    if limit and len(text) > limit:
+        text = text[:limit].rstrip()
+    return text
 
 
 def _dedupe_tasks(tasks):
@@ -205,7 +460,8 @@ def _dedupe_tasks(tasks):
             out.append(t)
         else:
             prior = seen[norm]
-            for field in ("assignee", "due_date", "priority"):
+            for field in ("assignee", "assignee_speaker_id", "due_date",
+                          "priority", "confidence", "evidence"):
                 if t.get(field) and not prior.get(field):
                     prior[field] = t[field]
     return out
@@ -215,19 +471,24 @@ def empty_analysis():
     """Fresh dict with every field; never shares mutable lists."""
     return {
         "title": "",
-        "summary": "",
-        "highlights": [],
+        "overview": empty_overview(),
         "tasks": [],
         "participants": [],
     }
 
 
-def coerce_analysis(obj, roster=None):
+def coerce_analysis(obj, roster=None, valid_ids=None):
     """Strict coerce a parsed Groq object into the fixed analysis schema.
 
-    Builds the result key-by-key from the five known fields, so a model that
-    still emits a removed field (agenda, decisions, …) has it DROPPED here
-    rather than passed through to the caller's DynamoDB write.
+    Builds the result key-by-key from the four known fields, so a model that
+    still emits a removed field (summary, highlights, agenda, …) has it DROPPED
+    here rather than passed through to the caller's DynamoDB write.
+
+    `valid_ids` is the set of transcript segment IDs that actually exist (see
+    transcript_store.with_segment_ids). Evidence references — on overview
+    sections and on tasks alike — are checked against it and the invalid ones
+    removed. Pass None when the segment list is unavailable; the shape is still
+    enforced, only membership is not.
 
     `roster` — the speaker labels actually present in the transcript (see
     speaker_roster). When given and non-empty, `participants` is REPLACED by the
@@ -246,12 +507,18 @@ def coerce_analysis(obj, roster=None):
             "participants": _roster_filtered([], roster),
         }
     tasks = obj_list(obj.get("tasks"), TASK_SPEC, required=("task",))
+    if valid_ids is not None:
+        # Re-check what TASK_SPEC could only shape-check: obj_list has no
+        # access to the transcript. A task NEVER fails over a bad reference —
+        # the reference is dropped and the commitment is kept.
+        for t in tasks:
+            t["evidence_segment_ids"] = _evidence_ids(
+                t.get("evidence_segment_ids"), valid_ids)
     participants = obj_list(obj.get("participants"), PARTICIPANT_SPEC,
                             required=("speaker",))
     return {
         "title": s(obj.get("title")),
-        "summary": s(obj.get("summary")),
-        "highlights": slist(obj.get("highlights"))[:MAX_HIGHLIGHTS],
+        "overview": coerce_overview(obj.get("overview"), valid_ids),
         "tasks": _dedupe_tasks(tasks),
         "participants": _roster_filtered(participants, roster or []),
     }
@@ -265,19 +532,49 @@ def merge_analyses(partials, roster=None):
     the map_reduce OVERFLOW path, for a transcript that genuinely exceeds the
     model's context window; a meeting that fits is analyzed in one pass and
     never comes through here.
+
+    The OVERVIEW merges by section TITLE, which is the only join key available:
+    each chunk chose its own sections, and two chunks that both wrote "Pricing"
+    are describing one topic split across the meeting, not two topics. Sections
+    only one chunk produced are kept as-is — a subject discussed once is still a
+    subject. Content is concatenated rather than re-summarized, because merging
+    prose without the transcript in hand can only lose information; the reduce
+    CALL rewrites it properly when it succeeds, and this is the fallback for
+    when it does not.
     """
     merged = empty_analysis()
-    seen_highlights = set()
     speakers = set()
+    sections_by_title = {}
+    merged_sections = []
 
     for p in partials:
         if not isinstance(p, dict):
             continue
-        for item in p.get("highlights", []):
-            norm = item.strip().lower()
-            if norm and norm not in seen_highlights:
-                seen_highlights.add(norm)
-                merged["highlights"].append(item)
+        for section in (p.get("overview") or {}).get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            title = s(section.get("title"))
+            if not title:
+                continue
+            key = title.strip().lower()
+            prior = sections_by_title.get(key)
+            if prior is None:
+                prior = {**section, "title": title}
+                prior["items"] = list(section.get("items") or [])
+                prior["evidence_segment_ids"] = list(
+                    section.get("evidence_segment_ids") or [])
+                sections_by_title[key] = prior
+                merged_sections.append(prior)
+                continue
+            content = s(section.get("content"))
+            if content and content not in prior.get("content", ""):
+                prior["content"] = (prior.get("content", "") + " " + content).strip()
+            for item in section.get("items") or []:
+                if item not in prior["items"]:
+                    prior["items"].append(item)
+            for ident in section.get("evidence_segment_ids") or []:
+                if ident not in prior["evidence_segment_ids"]:
+                    prior["evidence_segment_ids"].append(ident)
         # tasks[] is collected RAW here (every occurrence across every
         # chunk, no pre-filtering) and de-duplicated once at the end via
         # _dedupe_tasks — which, unlike a plain "keep first occurrence"
@@ -295,14 +592,13 @@ def merge_analyses(partials, roster=None):
                 speakers.add(spk.lower())
                 merged["participants"].append(pt)
 
-    merged["highlights"] = merged["highlights"][:MAX_HIGHLIGHTS]
+    # Re-coerce so the merged sections get fresh positional ids and are
+    # re-bounded: concatenating chunks can push a section past the per-section
+    # and total budgets that coerce_overview enforces.
+    merged["overview"] = coerce_overview({"sections": merged_sections})
     merged["tasks"] = _dedupe_tasks(merged["tasks"])
     merged["title"] = next((p.get("title") for p in partials
                             if isinstance(p, dict) and p.get("title")), "")
-    merged["summary"] = " ".join(
-        p["summary"].strip() for p in partials
-        if isinstance(p, dict) and p.get("summary")
-    ).strip()
     # Same structural guarantee as the single-pass path: a name that never had a
     # speaker turn is not a participant, however many segments volunteered it.
     merged["participants"] = _roster_filtered(merged["participants"],
@@ -326,17 +622,32 @@ HL_DEADLINE_SPEC = {
     "what": ("what", s),
     "when": ("when", s),
 }
-HL_NUMBER_SPEC = {
-    "label": ("label", s),
-    "value": ("value", s),
-    "kind": ("kind", lambda x: clamp(
-        x, {"money", "quantity", "percentage", "measurement", "duration"},
-        "quantity")),
-}
-
-# The six highlight sections, in the order the UI renders them.
+# ---------------------------------------------------------------------------
+# The structured extraction. FOUR sections, down from six.
+#
+# This is no longer a user-facing "meeting highlights" view — the Dynamic
+# Overview above is what a reader now sees. What survives here is only the
+# TYPED data that machine consumers need in rows rather than prose, and each
+# remaining section is kept because something reads it:
+#
+#   decisions      -> mom_schema._build_decisions      (MoM "Decisions")
+#   action_items   -> mom_schema._build_points         (MoM "Meeting Points")
+#   deadlines      -> mom_schema._build_followups      (MoM "Follow-ups") AND
+#                     app calendar.tsx (deadline markers on the month grid)
+#   open_questions -> mom_schema._build_followups      (MoM "Follow-ups")
+#
+# `important_numbers` and `risks` were REMOVED: nothing consumed them in rows.
+# Their content is not lost — a meeting's figures and risks now land in the
+# Overview, where they read as part of the meeting's own story instead of as
+# two more template sections. Do not reintroduce them here without a consumer;
+# a coercer that emits a field starts writing it back to DynamoDB.
+#
+# The tuple ORDER is still load-bearing: highlights_empty and merge_highlights
+# both iterate it, and old rows carrying the two removed keys stay readable
+# because coercion builds the result key-by-key and simply never looks at them.
+# ---------------------------------------------------------------------------
 HIGHLIGHT_SECTIONS = ("decisions", "action_items", "deadlines",
-                      "important_numbers", "open_questions", "risks")
+                      "open_questions")
 
 
 def empty_highlights():
@@ -359,10 +670,7 @@ def coerce_highlights(obj):
                                  required=("task",)),
         "deadlines": obj_list(obj.get("deadlines"), HL_DEADLINE_SPEC,
                               required=("what",)),
-        "important_numbers": obj_list(obj.get("important_numbers"),
-                                      HL_NUMBER_SPEC, required=("value",)),
         "open_questions": slist(obj.get("open_questions")),
-        "risks": slist(obj.get("risks")),
     }
 
 
@@ -384,24 +692,18 @@ def merge_highlights(partials):
             return (item.get("task") or "").strip().lower()
         if section == "deadlines":
             return (item.get("what") or "").strip().lower()
-        if section == "important_numbers":
-            # Same value under two labels is two different facts ("₹5000
-            # deposit" vs "₹5000 balance"), so the label is part of identity.
-            return ((item.get("label") or "").strip().lower(),
-                    (item.get("value") or "").strip().lower())
         return str(item).strip().lower()
 
     for p in partials:
         if not isinstance(p, dict):
             continue
-        for section in ("open_questions", "risks"):
+        for section in ("open_questions",):
             for item in p.get(section, []):
                 norm = item.strip().lower()
                 if norm and norm not in seen[section]:
                     seen[section][norm] = True
                     merged[section].append(item)
-        for section in ("decisions", "action_items", "deadlines",
-                        "important_numbers"):
+        for section in ("decisions", "action_items", "deadlines"):
             for item in p.get(section, []):
                 if not isinstance(item, dict):
                     continue
@@ -761,71 +1063,52 @@ def crm_identifier_found(ident):
 
 
 # ---------------------------------------------------------------------------
-# THE UNIFIED ANALYSIS — one model reply carrying what three calls used to.
+# THE UNIFIED ANALYSIS — one model reply, one transcript read.
 #
 # Shape (prompts.unified_analysis_system):
-#     {title, summary, highlights, tasks, participants,   <- coerce_analysis
-#      meeting_highlights: {...6 sections...},             <- coerce_highlights
-#      crm_identifiers: {object_name: {...} | null}}       <- coerce_crm_identifier
+#     {title, overview: {sections: [...]},     <- coerce_analysis/coerce_overview
+#      tasks, participants,                     <- coerce_analysis
+#      meeting_highlights: {...4 sections...}}  <- coerce_highlights
 #
-# Deliberately built by DELEGATING to the three existing coercers rather than
+# Deliberately built by DELEGATING to the existing coercers rather than
 # reimplementing their rules. Each carries protections that took production
 # failures to find — the roster filter that stops a mentioned name becoming an
 # attendee, the load-bearing-field drop that keeps empty rows out of the
-# workspace, the grounding check that stops a hallucinated record id reaching
-# Salesforce. A fresh unified coercer would have had to re-earn all of that.
+# workspace. A fresh unified coercer would have had to re-earn all of that.
 #
-# So the ONLY new logic here is the split: pull the three sub-objects out of one
-# reply and hand each to the coercer that already owns it. A model that omits a
+# So the ONLY new logic here is the split: pull the sub-objects out of one reply
+# and hand each to the coercer that already owns it. A model that omits a
 # section gets that section's documented empty value, exactly as if its own call
 # had failed — which is what keeps the unified call's failure modes a subset of
 # the old ones rather than a new set.
+#
+# CRM IDENTIFIER EXTRACTION WAS REMOVED from this path. It made every analysis
+# carry per-mapping extraction rules for a feature that is not yet built out,
+# and it is the one output whose failure mode is writing a real customer's
+# meeting onto a stranger's Salesforce record. The coercers below it
+# (coerce_crm_identifier, normalize_crm_identifier and their grounding checks)
+# are DELIBERATELY KEPT: the manual identifier path and the Salesforce push
+# still use them, and they are where the anti-hallucination work lives when
+# integration extraction is designed properly.
 # ---------------------------------------------------------------------------
 def empty_unified():
     """Fresh dict with every unified field; never shares mutable values."""
     return {**empty_analysis(),
-            "meeting_highlights": empty_highlights(),
-            "crm_identifiers": {}}
+            "meeting_highlights": empty_highlights()}
 
 
-def coerce_unified(obj, roster=None, mappings=None):
-    """Strict coerce ONE unified Groq reply into the three sub-schemas.
-
-    `mappings` bounds which crm_identifiers keys are accepted: only objects the
-    user actually configured. A model that volunteers an extra key (or echoes
-    the example) can therefore never introduce a CRM link for an object nobody
-    mapped — the same "configuration decides, not the model" rule the separate
-    per-mapping calls got for free by construction.
-    """
+def coerce_unified(obj, roster=None, valid_ids=None):
+    """Strict coerce ONE unified Groq reply into its sub-schemas."""
     if not isinstance(obj, dict):
         return {**empty_unified(),
                 "participants": _roster_filtered([], roster or [])}
 
-    out = coerce_analysis(obj, roster)
+    out = coerce_analysis(obj, roster, valid_ids)
     out["meeting_highlights"] = coerce_highlights(obj.get("meeting_highlights"))
-
-    # Only configured objects, and only entries that survive the grounding
-    # check. `source` marks provenance for the merge in the pipeline (a MANUAL
-    # value is never overwritten by an extraction).
-    found = {}
-    raw = obj.get("crm_identifiers")
-    if isinstance(raw, dict):
-        allowed = {str((m or {}).get("object") or "").strip()
-                   for m in (mappings or [])}
-        allowed.discard("")
-        for object_name, value in raw.items():
-            name = str(object_name or "").strip()
-            if not name or (allowed and name not in allowed):
-                continue
-            ident = coerce_crm_identifier(value)
-            if crm_identifier_found(ident):
-                ident["source"] = "ai"
-                found[name] = ident
-    out["crm_identifiers"] = found
     return out
 
 
-def merge_unified(partials, roster=None, mappings=None):
+def merge_unified(partials, roster=None):
     """Fold per-chunk unified analyses into one — the OVERFLOW path only.
 
     Reached only when a transcript exceeds the single-pass budget and
@@ -833,30 +1116,9 @@ def merge_unified(partials, roster=None, mappings=None):
     its OWN existing merge, for the same reason coerce_unified delegates: the
     de-dupe rules ("fuller copy wins", first-mention-keeps-position) are already
     correct and differ per section.
-
-    crm_identifiers takes the FIRST grounded value per object across chunks and
-    keeps the highest confidence — an identifier is stated once, usually in the
-    opening minutes, so an early chunk's explicit statement outranks a later
-    chunk's inference about the same record.
     """
     dicts = [p for p in partials if isinstance(p, dict)]
     merged = merge_analyses(dicts, roster)
     merged["meeting_highlights"] = merge_highlights(
         [p.get("meeting_highlights") or {} for p in dicts])
-
-    identifiers = {}
-    for p in dicts:
-        for name, ident in (p.get("crm_identifiers") or {}).items():
-            if not crm_identifier_found(ident):
-                continue
-            prior = identifiers.get(name)
-            if prior is None:
-                identifiers[name] = ident
-                continue
-            # Prefer an explicit statement over an inferred one; otherwise the
-            # earlier chunk wins (it saw the identification, not a callback).
-            if (CRM_IDENT_CONFIDENCE_SCORE.get(ident.get("confidence"), 0.0)
-                    > CRM_IDENT_CONFIDENCE_SCORE.get(prior.get("confidence"), 0.0)):
-                identifiers[name] = ident
-    merged["crm_identifiers"] = identifiers
     return merged

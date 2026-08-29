@@ -24,6 +24,10 @@ export default function MeetingLayout() {
         }}
       >
         <Stack.Screen name="index" options={{ title: "Meeting" }} />
+        {/* The transcript is its own screen, not a tab on index — see that
+            file's header for why. Pushed (not modal) so the back gesture
+            returns to the meeting the user came from. */}
+        <Stack.Screen name="transcript" options={{ title: "Transcript" }} />
         <Stack.Screen name="assistant" options={{ title: "Assistant", presentation: "modal" }} />
         <Stack.Screen name="task/index" options={{ title: "Tasks" }} />
         <Stack.Screen name="task/[taskId]/index" options={{ title: "Task Detail" }} />

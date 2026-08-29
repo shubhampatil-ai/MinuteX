@@ -27,6 +27,16 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
+// Mirrors dedupById() in lib/contact-picker.tsx.
+function dedupById(contacts) {
+  const seen = new Set();
+  return contacts.filter((c) => {
+    if (seen.has(c.id)) return false;
+    seen.add(c.id);
+    return true;
+  });
+}
+
 // --- the rule, as implemented in lib/contact-picker.tsx -------------------
 function buildSections({ meetingContacts = [], folderContacts = [], all = [], search = "" }) {
   const folderIds = new Set(folderContacts.map((c) => c.id));
@@ -40,7 +50,7 @@ function buildSections({ meetingContacts = [], folderContacts = [], all = [], se
   const out = [];
   const seen = new Set();
 
-  const meetingMatches = meetingContacts.filter(matches);
+  const meetingMatches = dedupById(meetingContacts.filter(matches));
   if (meetingMatches.length) {
     out.push({ kind: "heading", label: "In this meeting" });
     for (const c of meetingMatches) {
@@ -49,7 +59,9 @@ function buildSections({ meetingContacts = [], folderContacts = [], all = [], se
     }
   }
 
-  const folderMatches = folderContacts.filter((c) => matches(c) && !seen.has(c.id));
+  const folderMatches = dedupById(
+    folderContacts.filter((c) => matches(c) && !seen.has(c.id))
+  );
   if (folderMatches.length) {
     out.push({ kind: "heading", label: "Folder Contacts" });
     for (const c of folderMatches) {
@@ -65,7 +77,9 @@ function buildSections({ meetingContacts = [], folderContacts = [], all = [], se
   // page. The meeting/folder tiers are small in-memory arrays, so they are
   // filtered locally. Tests therefore pass an `all` that reflects what the
   // server would have returned for the given search.
-  const rest = all.filter((c) => !seen.has(c.id) && !folderIds.has(c.id));
+  const rest = dedupById(
+    all.filter((c) => !seen.has(c.id) && !folderIds.has(c.id))
+  );
   if (rest.length) {
     out.push({ kind: "heading", label: "All Contacts" });
     for (const c of rest) out.push({ kind: "contact", contact: c });
@@ -203,5 +217,45 @@ describe("stale-search reset", () => {
   it("leaves an already-clean state clean", () => {
     const after = openPicker({ query: "", debounced: "" });
     assert.deepEqual(after, { query: "", debounced: "" });
+  });
+});
+
+// --- duplicate keys -------------------------------------------------------
+//
+// REGRESSION. The picker's rows key on contact.id, and `meetingContacts` is
+// built from speaker->contact MAPPINGS:
+//
+//   p.participants.map((x) => x.contact)
+//
+// One person tagged as two speakers (Speaker 0 and Speaker 2 are both Priya,
+// routine in a diarized meeting) therefore arrives here TWICE. The tier
+// filters guarded against duplicates from EARLIER tiers but not within a
+// tier, so both rows were emitted with the same key and React logged
+// "Encountered two children with the same key" on every render of the sheet.
+describe("duplicate contacts in one tier", () => {
+  it("shows one row per person when a contact is tagged as two speakers", () => {
+    const secs = buildSections({ meetingContacts: [priya, priya] });
+    assert.deepEqual(ids(secs), ["c4"]);
+  });
+
+  it("emits unique keys for every tier", () => {
+    const secs = buildSections({
+      meetingContacts: [priya, priya, rahul],
+      folderContacts: [rahul, neha, neha],
+      all: [amit, amit, priya],
+    });
+    const keys = ids(secs);
+    assert.deepEqual(keys, [...new Set(keys)], "contact keys must be unique");
+    assert.deepEqual(keys, ["c4", "c1", "c2", "c3"]);
+  });
+
+  it("keeps a duplicated contact in its most specific tier only", () => {
+    const secs = buildSections({
+      meetingContacts: [priya, priya],
+      folderContacts: [priya],
+      all: [priya],
+    });
+    assert.deepEqual(ids(secs), ["c4"]);
+    assert.deepEqual(headings(secs), ["In this meeting"]);
   });
 });

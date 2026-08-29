@@ -140,6 +140,19 @@ export type RecSession = {
   extraFiles?: string[];
   /** Container/extension, as the upload pipeline's `format` key. */
   format: string;
+  /**
+   * Which recording engine produced this session.
+   *
+   *   "aac"  expo-audio / MediaRecorder (the original path)
+   *   "wav"  the experimental native AudioRecord recorder
+   *
+   * Persisted with the session because finalize and merge behaviour differ
+   * between the two, and a session recovered from its sidecar after a relaunch
+   * has to be finalized the way it was recorded — not the way the current
+   * preference says. Absent on sessions written before the WAV engine existed,
+   * which is why every read treats undefined as "aac".
+   */
+  engine?: "aac" | "wav";
   /** Best-known duration in seconds (see reconcileDuration). */
   duration: number;
   /** Bytes on disk at last check — for the low-storage + sanity checks. */
@@ -276,7 +289,26 @@ export function listSessions(): RecSession[] {
 export function deleteSession(id: string, format?: string): void {
   const s = format ? null : loadSession(id);
   const fmt = format ?? s?.format ?? "m4a";
-  for (const f of [sidecarFor(id), new File(recordingsDir(), `${id}.${fmt}`)]) {
+  // The WAV engine names its output `{id}_final.wav` and its segments
+  // `{id}_segment_NNN.wav` rather than `{id}.{fmt}`, because the uploadable
+  // file is the MERGE of several. They are found by listing rather than by
+  // reconstructing names, since the segment count is not known here — and
+  // missing one would leave audio behind for the orphan sweep to re-adopt as a
+  // phantom recording of the same meeting.
+  const extra: File[] = [];
+  if (fmt === "wav") {
+    try {
+      for (const entry of recordingsDir().list()) {
+        if (!(entry instanceof File)) continue;
+        if (entry.name === `${id}_final.wav` || entry.name.startsWith(`${id}_segment_`)) {
+          extra.push(entry);
+        }
+      }
+    } catch {
+      // Directory unreadable — the named deletes below still run.
+    }
+  }
+  for (const f of [sidecarFor(id), new File(recordingsDir(), `${id}.${fmt}`), ...extra]) {
     try {
       if (f.exists) f.delete();
     } catch {
@@ -636,8 +668,34 @@ export function sweepOrphanAudio(): RecSession[] {
       if (entry.name.endsWith(".json")) continue;
       const dot = entry.name.lastIndexOf(".");
       if (dot <= 0) continue;
-      const id = entry.name.slice(0, dot);
+      let id = entry.name.slice(0, dot);
       const format = entry.name.slice(dot + 1);
+
+      // WAV-engine filenames are `{id}_final.wav` and `{id}_segment_NNN.wav`,
+      // so the stem is NOT the session id. Left unmapped, a rescued
+      // `abc_final.wav` would be adopted under the id "abc_final" — a phantom
+      // recording sitting next to the real session, and one that a later
+      // deleteSession("abc") could never clean up.
+      //
+      // Segments are skipped outright: they are only ever intermediate. If the
+      // merge succeeded they were deleted; if it failed the parent session
+      // still lists them and finalize already chose the longest as a fallback.
+      // Adopting one would show the user a fragment as though it were the
+      // meeting.
+      if (format === "wav") {
+        const seg = id.match(/^(.+)_segment_\d+$/);
+        if (seg) {
+          // Parent gone. The audio is real, so rescue it under the parent id
+          // rather than the segment name — but only the FIRST such segment, or
+          // several orphans of one recording would each claim the same id and
+          // overwrite each other's sidecar.
+          id = seg[1];
+        } else {
+          const fin = id.match(/^(.+)_final$/);
+          if (fin) id = fin[1];
+        }
+      }
+
       if (known.has(id)) continue;
       // A "-merged" file belongs to a session that already exists (concatSegments
       // writes it), so adopting it would create a phantom SECOND recording of
@@ -670,6 +728,10 @@ export function sweepOrphanAudio(): RecSession[] {
         attempts: 0,
       };
       saveSession(s);
+      // Mark it known immediately. Without this, a second orphan mapping to the
+      // same id (two segments of one abandoned WAV recording) would overwrite
+      // the sidecar just written and the first rescue would be lost.
+      known.add(id);
       adopted.push(s);
       recLog("recovery.result", {
         note: "adopted orphan audio",

@@ -56,26 +56,50 @@ def main():
     check("unified prompt composes", len(plain) > 1000)
     check("unified prompt asks for meeting_highlights",
           "meeting_highlights" in plain)
-    check("no CRM section for an unconfigured user",
+    check("unified prompt asks for the dynamic overview", '"overview"' in plain)
+    # CRM extraction left the analysis path entirely — no mapping can put it
+    # back, which is the point.
+    check("no CRM extraction in the analysis prompt",
           "crm_identifiers" not in plain)
-    with_crm = prompts.unified_analysis_system(
-        ("Speaker 0",),
-        [{"object": "Site_Visit__c", "object_label": "Site Visit",
-          "label": "Site Visit Number", "lookup_field": "Name"}])
-    check("CRM section appears when mapped",
-          "crm_identifiers" in with_crm and "Site_Visit__c" in with_crm)
+    # THE dynamic-overview guarantee: no section catalogue anywhere in the
+    # prompt. A model handed example headings reproduces them, and every
+    # meeting then comes out on the same template.
+    check("prompt names no fixed sections",
+          not any(h in plain for h in ('"Executive Summary"', '"Highlights"',
+                                       '"Decisions"', '"Risks"',
+                                       '"Next Steps"')))
+    check("prompt states that sections are the model's choice",
+          "There is NO predefined list of sections" in plain)
 
     # The coercer, including the roster rule that keeps a merely-mentioned name
     # out of the attendee list.
     roster = ai_schema.speaker_roster("Speaker 0: hi\n\nSpeaker 1: hello")
     coerced = ai_schema.coerce_unified(
-        {"title": "t", "summary": "s", "highlights": [], "tasks": [],
+        {"title": "t", "tasks": [],
+         "overview": {"sections": [{"title": "Pricing", "content": "c"}]},
          "participants": [{"speaker": "Rakesh", "summary": "never spoke"}],
-         "meeting_highlights": {}, "crm_identifiers": {}},
-        roster, [])
+         "meeting_highlights": {}},
+        roster)
     labels = [p["speaker"] for p in coerced["participants"]]
     check("roster replaces model participants", labels == roster)
+    check("overview coerces to bounded sections",
+          [s["id"] for s in coerced["overview"]["sections"]] == ["section_0"])
     check("merge_unified exists", callable(ai_schema.merge_unified))
+
+    # Evidence grounding: a segment id the transcript cannot support is dropped
+    # WITHOUT taking its section down with it.
+    grounded = ai_schema.coerce_overview(
+        {"sections": [{"title": "A", "content": "x",
+                       "evidence_segment_ids": ["seg_1", "seg_999"]}]},
+        valid_ids={"seg_1"})
+    check("invalid evidence ids are dropped",
+          grounded["sections"][0]["evidence_segment_ids"] == ["seg_1"])
+
+    # Segment ids are DERIVED at read time, so the back catalogue is groundable
+    # with no migration.
+    ids = [s["id"] for s in transcript_store.with_segment_ids(
+        [{"speaker": "0", "text": "a"}, {"speaker": "1", "text": "b"}])]
+    check("segment ids are derived positionally", ids == ["seg_0", "seg_1"])
 
     # The STT parser both Lambdas share.
     text, segs, lang = stt_result.parse({

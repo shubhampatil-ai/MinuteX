@@ -17,7 +17,9 @@ import {
   ViewStyle, TextStyle,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
+import { Image } from "expo-image";
 import { Icon } from "./icons";
+import { avatarColorFor, initialsOf } from "./task-model";
 import { CAPS, ELEV, FONT, R, S, TABULAR, useTheme, ColorScale } from "./theme";
 
 // ---- Gradient / RawGradient -------------------------------------------------
@@ -446,6 +448,74 @@ export function IconCircle({
       }, style]}
     >
       <Icon name={name as any} tintColor={tint ?? C.primary} size={iconSize ?? Math.round(size * 0.5)} />
+    </View>
+  );
+}
+
+// ---- Avatar: one person's photo, or their coloured initials ----------------
+//
+// The SINGLE place a person is drawn as a circle. Four screens previously each
+// built this by hand (contacts list, contact detail, the picker's three lists,
+// the profile masthead), which is why adding photos would otherwise have meant
+// four different fallback behaviours.
+//
+// `photoUri` is a presigned, EXPIRING URL (`avatar_view_url` from the API) or a
+// device-local file:// path for a phone contact not yet imported. Either way it
+// can fail to load — the URL may have expired while the list sat on screen, or
+// the OS may have revoked the local path — so a load error falls back to
+// initials rather than leaving a blank disc. That fallback is the reason this
+// holds state at all.
+export function Avatar({
+  name, photoUri, size = 42, fontSize, style,
+}: {
+  name: string;
+  /** "" / undefined means "no photo" — draw initials. */
+  photoUri?: string;
+  size?: number;
+  /** Defaults to a proportion of `size`; override to match a specific spec. */
+  fontSize?: number;
+  style?: ViewStyle;
+}) {
+  // WHICH uri failed, not merely "one did". A new URL deserves a fresh attempt
+  // — re-signing produces a different URL for the same image, and a boolean
+  // flag would keep the photo hidden for as long as the component stayed
+  // mounted after one expired load. Comparing against the current uri resets
+  // that for free, with no effect and no cascading render.
+  const [failedUri, setFailedUri] = useState<string | undefined>(undefined);
+
+  const showPhoto = !!photoUri && failedUri !== photoUri;
+  return (
+    <View
+      style={[{
+        width: size, height: size, borderRadius: size / 2,
+        backgroundColor: avatarColorFor(name),
+        alignItems: "center", justifyContent: "center",
+        overflow: "hidden",
+      }, style]}
+    >
+      {showPhoto ? (
+        <Image
+          source={{ uri: photoUri }}
+          style={{ width: size, height: size }}
+          contentFit="cover"
+          // The initials stay mounted underneath, so a slow image reveals them
+          // first rather than an empty circle — and a failed one needs no
+          // separate placeholder.
+          transition={150}
+          onError={() => setFailedUri(photoUri)}
+          accessibilityIgnoresInvertColors
+        />
+      ) : (
+        <Text
+          style={{
+            fontFamily: FONT.bold,
+            fontSize: fontSize ?? Math.round(size * 0.36),
+            color: "#fff",
+          }}
+        >
+          {initialsOf(name)}
+        </Text>
+      )}
     </View>
   );
 }

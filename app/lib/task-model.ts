@@ -92,7 +92,10 @@ export function avatarColorFor(name: string): string {
   return AVATAR_COLORS[h % AVATAR_COLORS.length];
 }
 
-function apiAssigneeToAssignee(a: ApiTaskAssignee | null): Assignee | null {
+/** Exported for the rename path: refreshTaskAssignees (lib/meeting-context)
+ * takes ONLY the assignee off a re-fetched task, so it needs the same
+ * conversion taskFromApiTask does rather than a second copy of it. */
+export function apiAssigneeToAssignee(a: ApiTaskAssignee | null): Assignee | null {
   if (!a || !a.name) return null;
   return {
     name: a.name,

@@ -505,7 +505,22 @@ RETIRED_ANALYSIS_ATTRS = (
     "decisions",
     "pending_discussions",
     "action_items",
+    # The flat 3-7 string list the old fixed schema produced. Superseded by
+    # `overview`, whose sections carry the same ground in the shape this
+    # meeting actually warranted. NOT accompanied by `summary`, which is
+    # deliberately still written (derived, see analyze_and_persist) because
+    # the meetings list and the Salesforce push both need one short string.
+    "highlights",
+    # Never written by this pipeline again — CRM extraction left the analysis
+    # path. Deliberately ABSENT from this tuple even so: a stored crm_records
+    # value may be a user's MANUAL, confirmed link to a real Salesforce
+    # record, and reprocessing a recording must not silently unlink it.
 )
+
+# How much of the overview the derived `summary` preview carries. Sized for
+# the meetings list's 3-line snippet with room for search to still be useful,
+# not to reproduce the overview — the app reads the overview itself for that.
+SUMMARY_PREVIEW_CHARS = 600
 
 
 # ---------------------------------------------------------------------------
@@ -525,32 +540,45 @@ RETIRED_ANALYSIS_ATTRS = (
 # analysis that used it; SUMMARY_REDUCE_SYSTEM itself is very much still there.
 
 
-def _note_partial(text_value, covered, total, what):
+def _note_partial_overview(overview, covered, total):
     """Disclose a truncated analysis in the text the user actually reads.
 
-    A brief that silently covers 60% of a meeting is worse than one that admits
-    it — the reader would otherwise trust it as complete. Only reached when the
-    deadline cut the tail off.
+    An overview that silently covers 60% of a meeting is worse than one that
+    admits it — the reader would otherwise trust it as complete. Only reached
+    when the deadline cut the tail off.
+
+    The note goes on the FIRST section rather than into a section of its own:
+    a "Coverage" section would be a fixed section appearing in every truncated
+    meeting, which is precisely the template behaviour the dynamic overview
+    exists to remove, and coerce_overview would be entitled to drop it.
     """
-    if covered >= total:
-        return text_value
-    note = (f"[Note: this {what} covers the first {covered} of {total} "
+    if covered >= total or not isinstance(overview, dict):
+        return overview
+    sections = overview.get("sections") or []
+    if not sections:
+        return overview
+    note = (f"[Note: this overview covers the first {covered} of {total} "
             f"segments of the recording. The full transcript is available "
             f"below.]")
-    return (f"{text_value} {note}".strip())
+    first = dict(sections[0])
+    first["content"] = f"{first.get('content', '')} {note}".strip()
+    return {**overview, "sections": [first] + list(sections[1:])}
 
 
-def analyze_meeting(transcript, mappings=()):
-    """THE analysis: title, summary, highlights, tasks, participants,
-    meeting_highlights AND any configured CRM identifiers — in ONE Groq call.
+def analyze_meeting(transcript, valid_ids=None):
+    """THE analysis: title, the dynamic overview, tasks, participants and the
+    structured meeting_highlights — in ONE Groq call.
 
-    Replaces three stages that each re-sent the same transcript:
+    Replaces stages that each re-sent the same transcript:
         summarize()               title/summary/highlights/tasks/participants
-        extract_highlights()      the six structured sections
-        extract_crm_identifiers() one more call PER configured mapping
-    A normal meeting therefore went out as 3+ requests over identical source
+        extract_highlights()      the structured sections
+    A normal meeting therefore went out as 2+ requests over identical source
     text, each paying its own TPM window and its own latency. It is now one
     request, and the whole analysis either lands together or degrades together.
+
+    `valid_ids` is the set of transcript segment ids that actually exist, used
+    to validate the model's evidence references. A reference the transcript
+    cannot support is dropped — see ai_schema._evidence_ids.
 
     The reason those calls were originally SEPARATE was real — asking one call
     for prose and for exact extractions made the extractions weaker — so the
@@ -558,8 +586,8 @@ def analyze_meeting(transcript, mappings=()):
     proven wording (see prompts.unified_analysis_system) and adds a final
     extraction-fidelity instruction in the recency position, which is where
     instructions actually hold. The unified reply is then split back apart and
-    validated by the SAME three coercers as before (ai_schema.coerce_unified),
-    so every downstream shape is byte-identical to what the three calls wrote.
+    validated by the SAME coercers as before (ai_schema.coerce_unified), so
+    every downstream shape stays what its consumers already parse.
 
     groq_client.analyze() sends the COMPLETE transcript in a single call
     whenever it fits the model's context window (true for the large majority of
@@ -591,7 +619,7 @@ def analyze_meeting(transcript, mappings=()):
     # non-attendee, a team or an external party.
     roster = ai_schema.speaker_roster(transcript)
     print(f"[groq] analyze: {len(roster)} speaker(s) in the transcript: "
-          f"{roster}; {len(mappings)} CRM mapping(s)")
+          f"{roster}")
 
     analysis, covered, total = groq_client.analyze(
         transcript,
@@ -599,39 +627,39 @@ def analyze_meeting(transcript, mappings=()):
         # model who the speakers are beats asking it to work that out from prose,
         # and it means the contribution blurbs land on the right speakers rather
         # than being dropped by the filter for naming someone else.
-        map_prompt=prompts.unified_analysis_system(roster, mappings),
+        map_prompt=prompts.unified_analysis_system(roster),
         # OVERFLOW ONLY — a transcript past the single-pass budget. Still built
         # on SUMMARY_REDUCE_SYSTEM, which is NOT retired.
-        reduce_prompt=prompts.unified_reduce_system(mappings),
-        merge=lambda partials: ai_schema.merge_unified(partials, roster, mappings),
-        coerce=lambda obj: ai_schema.coerce_unified(obj, roster, mappings),
-        # The whole analysis is now ONE call, so it gets the whole analysis
-        # budget instead of the old 60/40 summary-vs-highlights split.
+        reduce_prompt=prompts.unified_reduce_system(),
+        merge=lambda partials: ai_schema.merge_unified(partials, roster),
+        coerce=lambda obj: ai_schema.coerce_unified(obj, roster, valid_ids),
+        # The whole analysis is ONE call, so it gets the whole analysis budget
+        # instead of the old summary-vs-highlights split.
         deadline_seconds=GROQ_DEADLINE_SECONDS,
         label="analyze",
         key=key,
-        # A 200 whose "summary" came back empty is exactly the production
+        # A 200 whose overview came back empty is exactly the production
         # failure this pipeline exists to avoid — retry once (still cheaper
         # and safer than a reduce over partial JSONs) before falling back to
         # map_reduce.
-        is_usable=lambda a: bool((a.get("summary") or "").strip()),
+        is_usable=lambda a: not ai_schema.overview_empty(a.get("overview")),
     )
     # A reduce that came back empty is worse than nothing to show for it.
-    if not analysis.get("summary") and total > 1:
-        print("[groq] analyze: empty summary after reduce")
-    analysis["summary"] = _note_partial(analysis.get("summary", ""),
-                                        covered, total, "brief")
+    if ai_schema.overview_empty(analysis.get("overview")) and total > 1:
+        print("[groq] analyze: empty overview after reduce")
+    analysis["overview"] = _note_partial_overview(
+        analysis.get("overview") or ai_schema.empty_overview(), covered, total)
     hl = analysis.get("meeting_highlights") or {}
+    sections = (analysis.get("overview") or {}).get("sections") or []
     print(f"[groq] analyze ok ({covered}/{total} segments): "
           f"title={analysis['title']!r}, "
-          f"{len(analysis['summary'])} char summary, "
-          f"{len(analysis['highlights'])} highlights, "
+          f"{len(sections)} overview section(s) "
+          f"{[s.get('title') for s in sections]}, "
           f"{len(analysis['tasks'])} tasks, "
           f"{len(analysis['participants'])} participants, "
           + ", ".join(f"{len(hl.get(k, []))} {k}"
                       for k in ai_schema.HIGHLIGHT_SECTIONS)
-          + f", {len(analysis.get('crm_identifiers') or {})} crm id(s) "
-          f"(model={groq_client.GROQ_MODEL})")
+          + f" (model={groq_client.GROQ_MODEL})")
     return analysis
 
 
@@ -907,36 +935,33 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     # Step 2: analyze with Groq — ONE call over the full transcript producing
-    # EVERYTHING: title, summary, highlights, tasks, participants, the
-    # structured meeting_highlights and any configured CRM identifiers.
+    # EVERYTHING: title, the dynamic overview, tasks, participants and the
+    # structured meeting_highlights.
     # Failure here is non-fatal — we still keep the transcript + timestamps.
     #
-    # The CRM config is read FIRST because it shapes the prompt: an
-    # unconfigured user's prompt has no crm_identifiers section at all, so they
-    # pay nothing for a feature they don't use. A config read that fails must
-    # never cost a user their summary, so it degrades to "no mappings" (the
-    # common case anyway) rather than raising.
+    # The segment ids are derived the SAME way the read path derives them
+    # (transcript_store.with_segment_ids), so an evidence reference the model
+    # returns is validated against exactly the ids the app will later resolve.
+    # Deriving them separately here would let the two drift apart, and a
+    # reference that validates at write time but resolves to nothing at read
+    # time is the one failure the validation exists to prevent.
     _upsert(key, {"status": "generating_ai"})
-    try:
-        mappings = _crm_mappings_for_user(user_id)
-    except Exception as err:  # noqa: BLE001
-        print(f"[crm] could not read mappings for {key} — analyzing without "
-              f"identifier extraction: {err}")
-        mappings = []
+    valid_ids = {seg["id"] for seg in transcript_store.with_segment_ids(timestamps)
+                 if isinstance(seg, dict) and seg.get("id")}
 
     analysis = ai_schema.empty_unified()
     status = "complete"
     try:
-        analysis = analyze_meeting(transcript, mappings)
-        if not analysis.get("summary", "").strip():
-            # analyze_meeting() can return NORMALLY with an empty summary (e.g.
+        analysis = analyze_meeting(transcript, valid_ids)
+        if ai_schema.overview_empty(analysis.get("overview")):
+            # analyze_meeting() can return NORMALLY with an empty overview (e.g.
             # map_reduce's reduce step came back blank without Groq itself
-            # raising — see the "empty summary after reduce" log inside it).
-            # That is functionally the same failure as an exception: no summary
-            # to show. Treating it as success wrote status="complete" with
-            # summary="" to DynamoDB, which the app can't tell apart from
-            # "still generating" and shows an infinite "writing the summary"
-            # state for. Degrade the same way an exception would.
+            # raising — see the "empty overview after reduce" log inside it).
+            # That is functionally the same failure as an exception: nothing to
+            # show. Treating it as success wrote status="complete" with an empty
+            # overview to DynamoDB, which the app can't tell apart from "still
+            # generating" and shows an infinite progress state for. Degrade the
+            # same way an exception would.
             print(f"[groq] analyze returned empty for {key} — "
                   f"treating as failed, persisting transcript only")
             status = "transcribed"
@@ -945,17 +970,17 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
         analysis = ai_schema.empty_unified()
         status = "transcribed"
 
-    # The three outputs now arrive TOGETHER, so they no longer degrade
-    # independently — there is one call to fail, not three. That trade is
-    # deliberate and it is a net gain: the old independent degradation existed
-    # because two extra calls could each be rate-limited on their own, and
-    # removing the extra calls removes those failure modes outright rather than
-    # handling them. What remains is the same fallback that always mattered
-    # most: a failed analysis still persists the transcript (status
-    # "transcribed"), and the workspace can still regenerate highlights on
-    # demand (POST /recordings/ai/highlights/{key+}) or the user can reprocess.
+    # The outputs now arrive TOGETHER, so they no longer degrade independently —
+    # there is one call to fail, not several. That trade is deliberate and it is
+    # a net gain: the old independent degradation existed because extra calls
+    # could each be rate-limited on their own, and removing the extra calls
+    # removes those failure modes outright rather than handling them. What
+    # remains is the same fallback that always mattered most: a failed analysis
+    # still persists the transcript (status "transcribed"), and the workspace
+    # can still regenerate highlights on demand (POST
+    # /recordings/ai/highlights/{key+}) or the user can reprocess.
     highlights = analysis.get("meeting_highlights") or ai_schema.empty_highlights()
-    crm_records = analysis.get("crm_identifiers") or {}
+    overview = analysis.get("overview") or ai_schema.empty_overview()
 
     # Step 3: UPSERT one item keyed by audio_s3_key. An UpdateItem (not
     # put_item, which would REPLACE the row) so the ownership/metadata
@@ -984,8 +1009,6 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
         "recorded_at": recorded_at,
         "recording_id": recording_id,
         "s3_key": key,
-        "summary": analysis["summary"],
-        "highlights": analysis["highlights"],
         # Stored as `ai_tasks`, NOT `tasks` — `tasks` is a DIFFERENT,
         # already-deployed DynamoDB attribute: the persisted map behind
         # Task Detail/Assign/Notify (see lambda-userapi's Tasks section,
@@ -996,6 +1019,27 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
         # the task CRUD routes.
         "ai_tasks": analysis["tasks"],
         "participants": analysis["participants"],
+        # The DYNAMIC OVERVIEW — the primary user-facing analysis, replacing
+        # the fixed `summary` string and `highlights` list. Written
+        # unconditionally (unlike meeting_highlights below) because an empty
+        # overview already degraded this row to status="transcribed" above, so
+        # reaching here means there is something to store; and because a
+        # REPROCESS that legitimately produces fewer sections must overwrite
+        # the old ones rather than leaving a stale mix of both generations.
+        "overview": overview,
+        # `summary` is now DERIVED from the overview, not generated. It costs
+        # no extra tokens and makes no claim the overview doesn't already
+        # make — it is a flattened PREVIEW, kept because two shipped surfaces
+        # need one short string per meeting and neither can render sections:
+        #   * the meetings list, which shows a 3-line snippet under each row
+        #     and searches it (app/src/app/(tabs)/index.tsx);
+        #   * the Salesforce push's Summary content target, which writes into
+        #     a single long-text field.
+        # Bounded to a preview length rather than the whole overview: the list
+        # view reads this attribute for EVERY row it returns, so its size is
+        # multiplied across the page.
+        "summary": ai_schema.overview_text(overview, limit=SUMMARY_PREVIEW_CHARS),
+        "ai_version": ai_schema.AI_VERSION,
         "language": language,
         "status": status,
         "created_at": existing.get("created_at") or created_at,
@@ -1019,28 +1063,6 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # invalidate old rows without a migration.
     if not ai_schema.highlights_empty(highlights):
         fields["meeting_highlights"] = highlights
-        fields["ai_version"] = ai_schema.AI_VERSION
-
-    # crm_records is MERGED, and only for objects an identifier was actually
-    # found for — a stronger requirement than the highlights cache. By the
-    # time a recording is reprocessed the user may have corrected an
-    # identifier by hand or already linked it to a Salesforce record;
-    # overwriting that would silently relink a confirmed meeting to a
-    # different record. So:
-    #   * "found nothing" is a no-op, never a write of null;
-    #   * a MANUAL value is never overwritten by a fresh extraction;
-    #   * objects the user has since unconfigured keep whatever they had
-    #     rather than being dropped behind the user's back.
-    if crm_records:
-        merged = dict(existing.get("crm_records") or {})
-        for object_name, ident in crm_records.items():
-            prior = merged.get(object_name)
-            if isinstance(prior, dict) and prior.get("source") == "manual":
-                print(f"[crm] keeping manual {object_name} identifier over "
-                      f"a fresh extraction")
-                continue
-            merged[object_name] = ident
-        fields["crm_records"] = merged
 
     # Reprocessing a recording invalidates any documents generated from the
     # OLD transcript — that is exactly the condition the document cache

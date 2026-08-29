@@ -49,6 +49,16 @@ export type Participant = {
 };
 
 export type TimestampSeg = {
+  /** Stable id for this segment ("seg_0"), DERIVED server-side from position
+   *  (transcript_store.with_segment_ids) and present on every recording
+   *  including the back catalogue. It is what the AI's evidence references
+   *  point at, so it is how "jump to the moment this came from" resolves.
+   *
+   *  Optional because a response from an older backend has none. Ordering,
+   *  boundaries, start/end and text are unchanged by its addition — the app
+   *  still aligns transcript lines to timestamps by POSITION and seeks on
+   *  `start`. */
+  id?: string;
   speaker: string;
   start: number;
   end: number;
@@ -83,7 +93,7 @@ export type RecordingSummary = {
   folder_id?: string;
 };
 
-// A recording in Trash: the same summary the Desk renders, plus when it was
+// A recording in Trash: the same summary MinuteX renders, plus when it was
 // deleted. `status` still carries the PIPELINE status it had when it was
 // trashed (complete, failed, …) — trashing never overwrites it, which is what
 // lets Restore put the recording back exactly as it was.
@@ -113,10 +123,53 @@ export type MeetingHighlights = {
   decisions: HighlightDecision[];
   action_items: HighlightAction[];
   deadlines: HighlightDeadline[];
-  important_numbers: HighlightNumber[];
   open_questions: string[];
-  risks: string[];
+  // Present only on a recording analysed before these two sections were
+  // dropped from the extraction (their content now lands in the dynamic
+  // overview instead). Optional so a current response type-checks, and still
+  // read where a legacy row is rendered.
+  important_numbers?: HighlightNumber[];
+  risks?: string[];
 };
+
+// ---------------------------------------------------------------------------
+// THE DYNAMIC OVERVIEW — the primary AI meeting analysis.
+//
+// Replaces the fixed `summary` string + `highlights` list. The MODEL chooses
+// the sections per meeting: their titles, their number, their order, and
+// whether each is prose or a list. A technical review yields "Architecture
+// Concerns"; a sales call yields "Objections". There is no section taxonomy
+// anywhere in the app — the renderer takes `sections` and renders whatever
+// arrived (see lib/meeting-overview.tsx). Do NOT add per-title special cases:
+// a switch on section.title would reintroduce the fixed template this
+// replaced, and would silently stop rendering any title not in the switch.
+//
+// Bounded server-side (ai_schema.MAX_OVERVIEW_*), so a section count and text
+// length are always sane. Absent on a recording analysed before this shipped —
+// the app falls back to `summary`/`highlights` for those.
+// ---------------------------------------------------------------------------
+export type OverviewSectionKind = "text" | "list";
+
+export type OverviewSection = {
+  /** Stable within one generation ("section_0"). The list key, and what a
+   *  future per-section edit or comment would point at. */
+  id: string;
+  title: string;
+  kind: OverviewSectionKind | string;
+  /** Prose. Empty for a `list` section. */
+  content: string;
+  /** Bullets. Empty for a `text` section. */
+  items: string[];
+  /** Provenance. Only "ai" today; the field exists so a user edit has
+   *  somewhere to record itself. */
+  source: string;
+  /** Transcript segment ids backing this section ("seg_12"), VALIDATED
+   *  server-side against the real transcript — an id that resolves to nothing
+   *  is removed before it reaches the app. May be empty. */
+  evidence_segment_ids: string[];
+};
+
+export type MeetingOverview = { sections: OverviewSection[] };
 
 // The eight AI document types. Mirrors prompts.DOCUMENT_KEYS on the backend —
 // which also ADVERTISES the list via GET .../documents, so the workspace
@@ -178,6 +231,10 @@ export type RecordingDetail = RecordingSummary & {
   transcript: string;
   timestamps: TimestampSeg[];
   participants: Participant[];
+  // THE PRIMARY ANALYSIS — dynamic sections chosen per meeting. See
+  // MeetingOverview above. Absent on a recording analysed before it shipped,
+  // in which case the app falls back to `summary` + `highlights`.
+  overview?: MeetingOverview | null;
   // Short-lived presigned S3 GET url for playback. Null if the backend
   // couldn't generate one (e.g. bucket misconfigured) — playback UI should
   // hide itself rather than error in that case.
@@ -292,7 +349,11 @@ export type UserProfile = {
   user_id: string;
   email: string;
   name: string;
+  /** The stored S3 KEY, not a URL. Send it back on PATCH /me; never render it. */
   avatar_url: string;
+  /** A short-lived presigned GET, re-signed by the backend on every read.
+   * This is the one to render. "" means no photo — fall back to initials. */
+  avatar_view_url: string;
   created_at: string;
 };
 
@@ -556,6 +617,41 @@ export async function updateMe(
     body: patch,
   });
   return res.user;
+}
+
+// ---- Avatars (profile + contact photos) -----------------------------------
+//
+// Three steps, same shape as the recording upload: presign here, PUT the bytes
+// to S3, then store the returned KEY on the row (updateMe / updateContact).
+// Splitting it that way means an abandoned upload leaves an unreferenced S3
+// object rather than a profile pointing at bytes that never arrived.
+//
+// The stored value is a key, never a URL: objects stay private and the backend
+// re-signs a short-lived GET (`avatar_view_url`) on every read. Do not persist
+// an avatar_view_url anywhere — it expires. See lib/avatars.ts for the
+// pick -> upload -> save flow that wraps this.
+export type AvatarUploadTicket = {
+  upload_url: string;   // presigned S3 PUT — send the image bytes here
+  key: string;          // store THIS on the user/contact row
+  expires_in: number;
+  /** Advisory only — deliberately NOT signed, for the same React Native
+   * reason documented on UploadTicket.content_type. Send no Content-Type. */
+  content_type: string;
+};
+
+export async function requestAvatarUpload(params: {
+  /** jpg | jpeg | png | webp | heic */
+  format: string;
+  /** "user" (default) is your own profile photo; "contact" needs contact_id. */
+  scope?: "user" | "contact";
+  contact_id?: string;
+  /** Bytes, if known — the backend rejects oversize before the PUT. */
+  size?: number;
+}): Promise<AvatarUploadTicket> {
+  return request<AvatarUploadTicket>("/avatars/upload-request", {
+    method: "POST",
+    body: params,
+  });
 }
 
 export async function changePassword(
@@ -835,7 +931,7 @@ export async function getTrash(): Promise<TrashedRecording[]> {
   return res.recordings ?? [];
 }
 
-// POST /recordings/restore/{key} — back to the Desk with its transcript and
+// POST /recordings/restore/{key} — back to MinuteX with its transcript and
 // AI artifacts intact. Nothing is re-transcribed; nothing was ever removed.
 export async function restoreRecording(key: string): Promise<void> {
   await request(`/recordings/restore/${encodeURIComponent(key)}`, {
@@ -1038,6 +1134,129 @@ export async function runQuickAction(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Minutes of Meeting — the STRUCTURED, editable MoM.
+//
+// Mirrors lambda-shared/mom_schema.py. The structure is the source of truth;
+// `documents.minutes_of_meeting` is a Markdown MIRROR the backend rewrites on
+// every save, which is why every write route below also returns the refreshed
+// `document` — the Documents list can be updated from the same response
+// rather than needing a second fetch.
+//
+// There is deliberately NO route per editing operation. The editor holds the
+// whole structure in memory (it must, to render it), the document is small,
+// and one PUT means one ownership check and one place that can forget to
+// refresh the mirror. See save_mom's docstring on the backend.
+// ---------------------------------------------------------------------------
+
+/** Where a piece of MoM content came from — the whole basis of edit
+ * preservation. `ai` may be replaced by a regeneration; the other two never
+ * are. See mergeGenerated on the backend. */
+export type MomSource = "ai" | "user_edited" | "user_added";
+
+/** `fields` is a label/value list, `table` a grid, `text` prose, `list`
+ * bullets. The editor renders one UI per kind. */
+export type MomSectionKind = "fields" | "table" | "text" | "list";
+
+export type MomField = {
+  id: string;
+  label: string;
+  value: string;
+  visible: boolean;
+  source: MomSource;
+};
+
+export type MomColumn = { id: string; label: string; source: MomSource };
+
+/** Cells are keyed by COLUMN ID, never by position — deleting a middle column
+ * would otherwise shift every later value one place left. */
+export type MomRow = {
+  id: string;
+  cells: Record<string, string>;
+  visible: boolean;
+  source: MomSource;
+};
+
+export type MomListItem = {
+  id: string;
+  text: string;
+  visible: boolean;
+  source: MomSource;
+};
+
+/** One section. Which of fields/columns+rows/text/items is populated is
+ * determined by `kind`; the others are absent. `role` is the stable catalogue
+ * identity a regeneration matches on, "" for a user-added section — which is
+ * why renaming a section does not make the next generation duplicate it. */
+export type MomSection = {
+  id: string;
+  kind: MomSectionKind;
+  title: string;
+  visible: boolean;
+  source: MomSource;
+  role: string;
+  fields?: MomField[];
+  columns?: MomColumn[];
+  rows?: MomRow[];
+  text?: string;
+  items?: MomListItem[];
+};
+
+export type Mom = {
+  title: string;
+  subtitle: string;
+  sections: MomSection[];
+  /** Tombstones. A section/field/row the user deleted stays deleted across
+   * regenerations — an absence alone would be indistinguishable from an older
+   * client simply not sending it. */
+  deleted_ids: string[];
+  mom_version: string;
+  generated_at: string;
+  updated_at: string;
+  transcript_fingerprint: string;
+  speaker_mapping_version: number;
+};
+
+export type MomResponse = {
+  mom: Mom;
+  document: AiDocument | null;
+  exists?: boolean;
+  regenerated?: boolean;
+};
+
+/** Read the stored MoM. A pure read: `exists: false` means the user has never
+ * generated one, and nothing is written. */
+export async function getMom(key: string): Promise<MomResponse> {
+  const res = await request<MomResponse>(aiPath("mom", key));
+  return { ...res, exists: res.exists ?? false };
+}
+
+/**
+ * Build the MoM from the meeting's existing analysis, or REGENERATE it.
+ *
+ * Costs no Groq call — the backend arranges data the pipeline already
+ * produced. A second call merges fresh AI content over the stored structure,
+ * preserving user edits, ordering, deletions and hidden flags, so the app does
+ * not need to warn before calling it the way document regeneration does.
+ */
+export async function generateMom(key: string): Promise<MomResponse> {
+  return request<MomResponse>(aiPath("mom", key), { method: "POST", body: {} });
+}
+
+/** Save the whole edited structure. The one write path for every editor
+ * operation — add/edit/delete a section, field, row, column or list item, and
+ * reordering. Returns the refreshed Markdown mirror alongside it. */
+export async function saveMom(key: string, mom: Mom): Promise<MomResponse> {
+  return request<MomResponse>(aiPath("mom", key), { method: "PUT", body: { mom } });
+}
+
+/** Discard the structure and start over. Leaves the mirrored document in the
+ * Documents list — resetting the editor must not destroy a document the user
+ * may have already exported. */
+export async function deleteMom(key: string): Promise<void> {
+  await request(aiPath("mom", key), { method: "DELETE" });
+}
+
 export async function getAiChat(
   key: string
 ): Promise<{ chat_history: ChatTurn[]; suggestions: ChatSuggestionGroup[] }> {
@@ -1064,6 +1283,44 @@ export async function sendAiChat(
 
 export async function clearAiChat(key: string): Promise<void> {
   await request(aiPath("chat", key), { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------
+// MinuteX Assistant — the WORKSPACE-wide AI.
+//
+// Distinct from sendAiChat above: that one asks about ONE meeting's
+// transcript, this one asks about the user's whole workspace and is answered
+// by the backend calling its own task tools.
+//
+// Note what is NOT sent: no user_id, no contact_id, no organization_id. The
+// backend derives identity from the Bearer token that request() already
+// attaches, and IGNORES any identity in the body — so "my tasks" resolves to
+// the signed-in account and nothing the client does can change that. Sending
+// an identity here would not widen access; it would just be dead weight.
+// ---------------------------------------------------------------------------
+export type AssistantReply = {
+  reply: string;
+  // Which backend tools answered this turn. Useful for debugging and for a
+  // future "sources" affordance; safe to ignore.
+  tools_used: string[];
+};
+
+export async function sendAIMessage(
+  message: string,
+  history?: ChatTurn[]
+): Promise<AssistantReply> {
+  const res = await request<{ reply?: string; tools_used?: string[] }>("/ai/chat", {
+    method: "POST",
+    body: history?.length ? { message, history } : { message },
+  });
+  return { reply: res.reply ?? "", tools_used: res.tools_used ?? [] };
+}
+
+// Starter prompts, served by the backend so the catalogue lives in one place
+// rather than being hardcoded in the app (same reason getAiChat returns its).
+export async function getAISuggestions(): Promise<string[]> {
+  const res = await request<{ suggestions?: string[] }>("/ai/suggestions");
+  return res.suggestions ?? [];
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1385,12 @@ export type ApiTask = {
   assignee_name?: string;
   assignee_name_legacy?: string;
   assignee_speaker_id?: string;
+  // The speaker this task came from, rendered through the meeting's CURRENT
+  // speaker_names — "Speaker 2" while unnamed, "Siddhesh Gawade" after a
+  // rename. Resolved SERVER-side (lambda-userapi's _public_task_v2) because
+  // the cross-meeting Task Tracker has no recording loaded and so cannot map
+  // the label itself. Empty when the task never came from a speaker.
+  speaker_name?: string;
   resolution_status?: TaskResolutionStatus;
   folder_id?: string;
   source_recording_id?: string;
@@ -1145,11 +1408,25 @@ export function needsAssigneeResolution(t: ApiTask): boolean {
   );
 }
 
-/** The best label for a task's assignee, and whether it is a real identity. */
+/** The best label for a task's assignee, and whether it is a real identity.
+ *
+ * `speaker_name` outranks `assignee_name_legacy` because the legacy field is
+ * the VERBATIM AI extraction ("Speaker 2") — kept for provenance, not for
+ * display — while speaker_name is that same speaker read through the
+ * meeting's current names. This is what makes a rename reach every task with
+ * no writes: the backend recomputes it per request (see ApiTask.speaker_name).
+ *
+ * `assignee_name` still wins over both: it is only set once a real Contact is
+ * attached, and renaming the speaker who happened to say the sentence must
+ * never re-point a task someone assigned by hand. */
 export function assigneeLabel(t: ApiTask): { name: string; confirmed: boolean } {
   const confirmed = t.resolution_status === "RESOLVED";
   const name =
-    t.assignee_name || t.assignee_name_legacy || t.assignee?.name || "";
+    t.assignee_name ||
+    (t.assignee_contact_id ? "" : t.speaker_name) ||
+    t.assignee_name_legacy ||
+    t.assignee?.name ||
+    "";
   return { name, confirmed: confirmed && !!name };
 }
 
@@ -1231,9 +1508,26 @@ export type ApiContact = {
   // Set when this person also has a MinuteX account — the prerequisite for
   // in-app notification. Empty means no account exists for their email.
   minutex_user_id: string;
+  /** The contact's OWN photo as a stored S3 key — "" when it has none (which
+   * includes the case where the rendered photo belongs to their MinuteX
+   * profile). Send it back on PATCH; never render it. */
+  avatar_url: string;
+  /** The photo to RENDER: a short-lived presigned GET. "" means this person
+   * has no photo from any source and initials should be drawn instead. */
+  avatar_view_url: string;
+  /** WHERE avatar_view_url came from. Not cosmetic — the two cases differ in
+   * who can change the photo, so the contact screen says which it is:
+   *   "own"     the owner set it (picked, or imported from their phone)
+   *   "minutex" it is this person's own MinuteX profile photo, which they
+   *             maintain, so it updates itself and the owner cannot edit it
+   *   ""        no photo
+   */
+  avatar_source: ContactAvatarSource;
   created_at: string;
   updated_at: string;
 };
+
+export type ContactAvatarSource = "" | "own" | "minutex";
 
 // Folder appearance is a TOKEN, never a hex colour or a raw icon name: the
 // backend stores the token and the app owns what it looks like, so the palette
@@ -1427,6 +1721,11 @@ export type CreateContactInput = {
   company?: string;
   role?: string;
   notes?: string;
+  /** An S3 key from requestAvatarUpload, uploaded before this call. The phone
+   * import uses it to carry the device address-book photo onto the new
+   * contact. On a create that resolves to an EXISTING person, the backend only
+   * fills a gap with it — it never overwrites a photo already there. */
+  avatar_url?: string;
   /** Create and associate with this folder in one call. */
   folder_id?: string;
   /** "Yes, this really is a different person" — bypasses the name-ambiguity
@@ -1565,6 +1864,9 @@ export type TaskDetail = {
     title: string;
     recorded_at: string;
     folder_id: string;
+    // The meeting's speaker_names, so the detail screen can name the speaker
+    // a task came from without a second call to getParticipants.
+    speaker_names?: Record<string, string>;
   };
 };
 

@@ -86,6 +86,13 @@
           "contactsPermission": "MinuteX uses your contacts so you can assign meeting tasks to people you know."
         }
       ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "MinuteX uses your photos so you can set a profile picture for yourself and for the people you meet with.",
+          "cameraPermission": "MinuteX uses your camera so you can take a profile picture."
+        }
+      ],
       "./plugins/withAndroidAppQueries",
       "expo-sharing"
     ],

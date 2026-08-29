@@ -32,7 +32,7 @@
 #
 # BACKWARD COMPATIBLE BY CONSTRUCTION: every row written before this has no
 # `recording_status` at all, and MISSING MEANS ACTIVE. No backfill, no
-# migration, and no existing recording changes behaviour. The Desk filter tests
+# migration, and no existing recording changes behaviour. MinuteX filter tests
 # one exact string ("trashed"), so complete/failed/uploading/transcribing/
 # generating_ai all keep listing exactly as before.
 #
@@ -256,7 +256,7 @@ echo ">> Done. Verify with:"
 echo "     python -m pytest tests/test_ai_workspace.py -k \"Trash or SoftDelete or Restore or Permanent\""
 echo ">> Then in the app:"
 echo "     * open a meeting -> ⋯ -> Move to Trash (nothing is destroyed)"
-echo "     * or long-press any brief on The Desk"
+echo "     * or long-press any brief on MinuteX"
 echo "     * a failed brief also shows Move to Trash inline, on the card"
 echo "     * Settings -> Privacy & data -> Trash: Restore / Delete permanently"
 echo "   Only 'Delete permanently' removes data. A recording still uploading"

@@ -17,6 +17,7 @@ Two contracts callers rely on:
   * Prose templates (documents, quick actions, chat) return MARKDOWN, because
     that is what the app renders, copies, shares and exports.
 """
+import re
 
 # ---------------------------------------------------------------------------
 # The shared foundation. Every prompt below opens with this.
@@ -75,9 +76,26 @@ def _prose_system(body):
 # ===========================================================================
 # STAGE 1 — the whole meeting analysis, from the FULL transcript, in ONE call.
 #
-# Five fields: title, summary, highlights, tasks, participants. That is the
-# entire schema — the older agenda/key_points/decisions/pending_discussions/
-# action_items fields were removed, and nothing here may reintroduce them.
+# Four fields: title, overview, tasks, participants. That is the entire schema.
+#
+# THE DYNAMIC OVERVIEW replaced the fixed `summary` + `highlights` pair. The
+# reason is a product one: every meeting was being poured into the same mould,
+# so a hardware design review and a price negotiation came out as the same
+# document with different nouns. What a reader needs from those two is not the
+# same shape, and the old schema could not express that difference.
+#
+# So the MODEL now chooses the sections — their titles, their number, their
+# order, and whether each is prose or a list. There is deliberately NO section
+# catalogue in this file. Not as a default, not as a fallback, not as an
+# "example list" — a model given examples reproduces them, which is exactly the
+# template behaviour being removed. The prompt describes the JOB ("what would
+# someone who missed this meeting need to know?") and the QUALITY BAR, and
+# leaves the taxonomy to the meeting.
+#
+# What is NOT delegated is grounding. Sections are free; facts are not. Every
+# anti-hallucination rule the old prompt earned is retained verbatim below,
+# because the failure mode they fix (a plausible-sounding meeting that did not
+# happen) gets MORE dangerous when the model also picks the headings.
 #
 # ONE generation stage. The model reads the complete transcript and writes the
 # final analysis directly; there is no segment-summary-then-reduce step in the
@@ -86,18 +104,14 @@ def _prose_system(body):
 # free tier's 12K TPM, and reducing summaries into a summary is lossy twice
 # over: once per segment, once in the merge.
 #
-# The instructions below target INFORMATION DENSITY at a SHORT length — both
-# halves, because each was a separate regression. Capping the summary ("at most
-# 5", a character limit) made the model drop the numbers, constraints and
-# reasons a non-attendee actually needs; removing every bound made it write a
-# business-analysis essay whose bulk was generic commentary ("the meeting
-# highlights the importance of...") rather than meeting content.
-#
-# The current rule is therefore a WORD target (~120-250 for a normal meeting,
-# explicitly not a hard cap) paired with an explicit instruction about WHICH
-# text to cut: commentary goes, facts stay. The "prefer the actual value over
-# 'pricing was discussed'" line is load-bearing on its own — asking for
-# "detail" alone produced topic labels instead of the values themselves.
+# The instructions below target INFORMATION DENSITY — a regression fixed by
+# exact wording and carried over intact. Removing every bound made the model
+# write a business-analysis essay whose bulk was generic commentary ("the
+# meeting highlights the importance of...") rather than meeting content, and
+# the "prefer the actual value over 'pricing was discussed'" line is
+# load-bearing on its own: asking for "detail" alone produced topic labels
+# instead of the values themselves. Both rules now apply per SECTION rather
+# than to one summary blob.
 #
 # PARTICIPANTS vs TASK ASSIGNEES are INDEPENDENT, and the two rules below say so
 # in as many words. Conflating them was a real defect: a name that appears only
@@ -122,93 +136,131 @@ SUMMARY_SYSTEM = _json_system(
     'such as "Meeting Summary", "Discussion", or "Team Meeting". Prefer 4-10 '
     "words. Do not include information that is not supported by the "
     "transcript. No trailing punctuation.\n"
-    '- "summary": string. Write a concise, information-dense summary of the '
-    "entire meeting for someone who did not attend it.\n"
-    "  The summary should communicate the essential meeting context and "
-    "outcomes: why the meeting happened; the main issues or topics discussed; "
-    "the most important facts and supporting details; what was agreed or "
-    "decided; important commitments or next steps; and important unresolved "
-    "issues, risks or dependencies.\n"
-    "  Organize the summary around the main topics of the meeting rather than "
-    "narrating the conversation speaker by speaker.\n"
-    "  Preserve specific information when it materially helps the reader "
-    "understand the meeting, including important numbers, prices, percentages, "
-    "quantities, dates, deadlines, technical parameters, requirements, "
-    "constraints, configurations, payment terms, targets, product names, API "
-    "names and other concrete details.\n"
-    "  Prefer concrete facts over generic descriptions. If the transcript "
+    '- "overview": object with ONE field, "sections": an array of section '
+    "objects. THIS IS THE MOST IMPORTANT PART OF YOUR ANSWER — it is what a "
+    "person who missed the meeting will actually read.\n"
+    '  Each section is EXACTLY {"title": string, "kind": "text" | "list", '
+    '"content": string, "items": array of strings, "evidence_segment_ids": '
+    "array of strings}.\n"
+    "\n"
+    "  HOW TO CHOOSE THE SECTIONS — read this carefully.\n"
+    "  There is NO predefined list of sections, and no section is required. "
+    "YOU decide what this particular meeting needs, based only on what was "
+    "actually discussed in it.\n"
+    "  Work in this order:\n"
+    "  1. Determine what this meeting was actually FOR — its real purpose.\n"
+    "  2. Identify the distinct subjects that genuinely occupied the meeting, "
+    "and what was concluded, decided, questioned or left unresolved in each.\n"
+    "  3. Choose the smallest set of sections that lets a non-attendee "
+    "understand the meeting properly, and give each a title that names what "
+    "it actually contains, in the meeting's own vocabulary.\n"
+    "  Two different meetings should produce DIFFERENT sections. A technical "
+    "review, a customer negotiation, a hiring debrief and a project check-in "
+    "have little in common, and their overviews should have little in common "
+    "either. If your sections would fit any meeting equally well, they are "
+    "wrong — go back to the transcript and name what THIS meeting was about.\n"
+    "  Use as many sections as the meeting genuinely earns, and no more. A "
+    "short single-topic meeting may need only one or two. A dense multi-topic "
+    "meeting may need several. Never add a section to look thorough.\n"
+    "\n"
+    "  RULES FOR SECTIONS:\n"
+    "  - Never emit a section that is empty, near-empty or padded. If you "
+    "have nothing substantive to put under a heading, the heading does not "
+    "belong in the output.\n"
+    "  - Never create a section for something that was not discussed. "
+    "Absence is not a section: if no decisions were made, there is no "
+    "decisions section — do NOT add one saying none were made.\n"
+    "  - Do not repeat the same information across sections. Each fact "
+    "belongs in the one section where it matters most.\n"
+    "  - Do not add a section that merely restates the whole meeting again "
+    "after the other sections have already covered it.\n"
+    "  - Order sections so the most important comes first.\n"
+    "  - A title names a SUBJECT, not a document part. Keep it short.\n"
+    "\n"
+    "  kind, content and items:\n"
+    '  - Use "text" with `content` filled and `items` [] for explanation, '
+    "narrative, context or reasoning that needs connected sentences.\n"
+    '  - Use "list" with `items` filled and `content` "" for a set of '
+    "discrete parallel points (findings, requirements, concerns, "
+    "commitments).\n"
+    "  - Choose per section, by what that section's content actually is.\n"
+    "\n"
+    "  WHAT TO WRITE INSIDE A SECTION — this decides whether the overview is "
+    "worth reading at all:\n"
+    "  - Preserve the specifics. Numbers, prices, percentages, quantities, "
+    "dates, deadlines, technical parameters, requirements, constraints, "
+    "configurations, payment terms, targets, product names, model names and "
+    "API names all belong in the output EXACTLY as spoken.\n"
+    "  - Prefer the actual value over a description of the topic. Write "
+    '"only 4 of 31 walk-ins converted", never "conversion was weak". Write '
+    '"quoted 4.2 lakh against a 3.8 lakh budget", never "pricing was '
+    'discussed". A statement a reader could have guessed WITHOUT the meeting '
+    "is worthless — every sentence must carry something only this transcript "
+    "could tell them.\n"
+    "  - Prefer concrete facts over generic descriptions. If the transcript "
     "contains an important specific value, preserve that value instead of "
     'replacing it with a vague phrase such as "pricing was discussed", "costs '
     'increased", "a deadline was set", or "technical limitations were '
     'discussed".\n'
-    "  Preserve the relationship between important facts when the transcript "
-    "provides the context. For example, explain when a pricing decision was "
-    "connected to a sales problem or when a technical decision was driven by a "
-    "specific constraint.\n"
-    "  Clearly distinguish: facts that were reported; proposals or options that "
-    "were discussed; confirmed decisions or agreements; commitments or planned "
-    "work; and unresolved issues. Never turn a proposal, possibility, "
-    "assumption or discussion into a confirmed decision. Do not invent, infer "
-    "or assume information that is not supported by the transcript.\n"
-    "  IMPORTANT: This is a meeting summary, not a business-analysis or "
-    "consulting report. Do NOT add generic management advice, strategic "
-    "lessons, recommendations that participants did not make, theoretical "
-    "explanations, speculation, broad conclusions about what the company "
-    '"must" do, or commentary about the importance of leadership, '
-    "collaboration, communication, adaptability, etc. Only include analysis or "
-    "interpretation when it was actually discussed in the meeting and is "
+    "  - Between them, the sections should cover: why the meeting happened; "
+    "the main issues or topics discussed; the most important facts and "
+    "supporting details; what was agreed or decided; important commitments or "
+    "next steps; and important unresolved issues, risks or dependencies — but "
+    "ONLY where the meeting actually supplies them, and organized into "
+    "whatever sections suit it, NOT one section per item in this list.\n"
+    "  - Preserve the RELATIONSHIP between facts when the transcript gives "
+    "it: why a decision was taken, what constraint drove a technical choice, "
+    "which problem a proposal answers. For example, explain when a pricing "
+    "decision was connected to a sales problem or when a technical decision "
+    "was driven by a specific constraint.\n"
+    "  - Distinguish clearly between facts that were reported; proposals or "
+    "options that were discussed; confirmed decisions or agreements; "
+    "commitments or planned work; and unresolved issues. Never turn a "
+    "proposal, possibility, assumption or discussion into a confirmed "
+    "decision. Do not invent, infer or assume information that is not "
+    "supported by the transcript.\n"
+    "  - IMPORTANT: this is a record of a meeting, and it is not a "
+    "business-analysis or consulting report. Do NOT add generic management "
+    "advice, strategic lessons, recommendations that participants did not "
+    "make, theoretical explanations, speculation, broad conclusions about what "
+    'the company "must" do, or commentary about the importance of leadership, '
+    "collaboration, communication, adaptability, etc. Include analysis or "
+    "interpretation ONLY when it was actually discussed in the meeting and is "
     "materially relevant to the meeting outcome.\n"
-    "  Do not repeatedly restate the same problem, decision or conclusion. Do "
-    'not add a generic introduction or "in conclusion" section. Do NOT use '
+    "  - Do not repeatedly restate the same problem, decision or conclusion. "
+    'Do not add a generic introduction or "in conclusion" section. Do NOT use '
     'phrases such as "the meeting highlights the importance of", "the company '
     'must", "this provides a fascinating glimpse", or similar generic '
     "commentary unless those statements were explicitly part of the meeting "
     "discussion.\n"
-    "  Use concise professional language. Omit greetings, small talk and "
-    "transcription noise.\n"
-    "  LENGTH: for a normal meeting, aim for roughly 120-250 words. For a very "
-    "short meeting, use less. For a long or highly information-dense meeting, "
-    "exceed this range only when necessary to preserve important information. "
-    "Do not pad the summary to reach a word count. Cut length by removing "
-    "COMMENTARY, never by removing FACTS: a specific figure is never replaced "
-    "by a vague phrase (write \"only 4 of 31 walk-ins converted\", not "
-    "\"conversion was weak\"). If it will not all fit, drop the interpretation "
-    "and keep the data.\n"
-    "  The goal is SHORT + INFORMATION-DENSE + FACTUAL + CONTEXTUAL, not LONG "
-    "+ REPETITIVE + ANALYTICAL.\n"
-    "  Do not reproduce transcript sentences verbatim.\n"
-    "  FORMAT — this field is a JSON STRING, so it must be ONE valid quoted "
-    "string: separate paragraphs with the two characters \\n (an escaped "
-    "newline), never with a real line break, and never start the value on the "
-    "line after the colon.\n"
-    "  The summary must never be empty when the transcript contains "
-    "substantive information.\n"
-    '- "highlights": array of strings. Select the 3-7 most important facts or '
-    "outcomes from the entire meeting that a reader should know immediately.\n"
-    "  Prioritize: confirmed decisions or agreements; major outcomes; critical "
-    "requirements; important numbers; significant deadlines; concrete "
-    "commitments; major risks or blockers; and important unresolved issues.\n"
-    "  Each highlight should contain meaningful information, not simply name a "
-    "topic. Prefer specific facts over generic statements. For example —\n"
-    '  Weak: "The company is facing pricing challenges." Better: "Sales '
+    "  - Be concise. Use professional language. Omit greetings, small talk and "
+    "transcription noise. Do not reproduce transcript sentences verbatim; "
+    "write the substance. Cut length by removing COMMENTARY, never by removing "
+    "FACTS: a specific figure is never replaced by a vague phrase (write "
+    '"only 4 of 31 walk-ins converted", not "conversion was weak"). If it '
+    "will not all fit, drop the interpretation and keep the data.\n"
+    "  - The goal for every section is SHORT + INFORMATION-DENSE + FACTUAL + "
+    "CONTEXTUAL, not LONG + REPETITIVE + ANALYTICAL.\n"
+    "  - Each point should carry meaningful information, not simply name a "
+    "topic. For example —\n"
+    '    Weak: "The company is facing pricing challenges." Better: "Sales '
     "reported a 50% shortfall, with the gap between teaser and actual property "
     'pricing identified as a major conversion issue."\n'
-    '  Weak: "Broker incentives were discussed." Better: "The proposed approach '
-    "includes additional commission incentives for channel partners meeting "
-    'specified sales targets."\n'
-    '  Weak: "The team discussed payment plans." Better: "The team discussed a '
-    "more competitive payment structure to address buyer and broker "
-    'objections."\n'
-    "  Preserve important numbers, dates, percentages and technical details "
-    "when they are central to the highlight.\n"
-    "  Do not turn proposals into confirmed decisions. Do not invent "
-    "information. Do not repeat the same information in multiple highlights. Do "
-    "not simply copy the summary. Do not add generic business lessons, "
-    "recommendations, management advice or unsupported interpretation.\n"
-    "  Each highlight should normally be one concise sentence. Derive the "
-    "highlights from the FULL TRANSCRIPT, not from a separately generated "
-    "summary. No bullet symbols. Return [] only when the meeting genuinely "
-    "contains no meaningful highlights.\n"
+    '    Weak: "Broker incentives were discussed." Better: "The proposed '
+    "approach includes additional commission incentives for channel partners "
+    'meeting specified sales targets."\n'
+    '  - FORMAT — this field is a JSON STRING, so `content` must be ONE valid '
+    "quoted string: separate paragraphs with the two characters \\n (an "
+    "escaped newline), never with a real line break, and never start the value "
+    "on the line after the colon.\n"
+    "\n"
+    '  - "evidence_segment_ids": the ids of the transcript segments this '
+    "section is drawn from, copied EXACTLY as the transcript shows them "
+    '(they look like "seg_12"). Include the few segments that most directly '
+    "support the section, not every segment it touches. Use [] when the "
+    "transcript shows no segment ids. NEVER invent, guess, extrapolate or "
+    "renumber an id — an id you did not read in the transcript is worse than "
+    "none, and a wrong one is discarded anyway.\n"
     '- "tasks": array of objects, each EXACTLY {"task": string, "assignee": '
     'string, "due_date": string, "priority": string}. Only real agreed work — '
     "never a discussion, suggestion, recommendation, possibility or question. "
@@ -284,13 +336,41 @@ SUMMARY_SYSTEM = _json_system(
     "A person's presence in participants and responsibility for a task are "
     "INDEPENDENT concepts.\n"
     "\n"
-    "HOW summary AND highlights DIFFER — they are not two lengths of the same "
-    'text. "summary" answers "what happened in this meeting?": the connected '
-    "picture, organized by topic, with the facts that make it understandable. "
-    '"highlights" answers "what are the 3-7 things I absolutely need to know at '
-    "a glance?\": selective, standalone, high-value. Do NOT let highlights "
-    "restate the summary, and do NOT let the summary become a list of the "
-    "highlights.\n"
+    "SPEAKER-ID, EVIDENCE AND CONFIDENCE:\n"
+    '"assignee_speaker_id" links a task to WHO SAID IT, so the app can '
+    "attach a real identity once the user says who each speaker is. It "
+    "must contain a speaker label EXACTLY as the transcript writes it "
+    '(e.g. "Speaker 0") — never a person\'s name, never a team, '
+    "never a guess.\n"
+    '- Self-commitment: "Speaker 0: I\'ll send the proposal tomorrow." -> '
+    'assignee_speaker_id "Speaker 0", assignee "" (no name spoken).\n'
+    '- Explicit assignment to someone else: "Speaker 0: Rahul, send '
+    'the proposal." -> assignee "Rahul", assignee_speaker_id "" — the '
+    "speaker is the one ASSIGNING, not the one responsible. Only set "
+    "assignee_speaker_id when the responsible person is themselves a "
+    "speaker and the transcript makes that identification explicit.\n"
+    '- General discussion: "We should send the proposal." -> no task.\n'
+    'Use "" for assignee_speaker_id whenever the owner is not '
+    "identifiable as a specific speaker label. An empty value is correct "
+    "and expected; a wrong label assigns work to the wrong person.\n"
+    '"evidence" is the VERBATIM sentence from the transcript that '
+    "created the task — copied, not paraphrased, not summarized, and "
+    "not stitched together from separate turns. It is what lets a reader "
+    "check the task against what was actually said. Use \"\" only if no "
+    "single sentence carries it.\n"
+    '"evidence_segment_ids" is WHERE that sentence sits: the ids of the '
+    "segment(s) it came from, copied EXACTLY as the transcript shows "
+    'them (they look like "seg_12"). Usually one id. Use [] when the '
+    "transcript shows no segment ids. NEVER invent, guess or renumber an "
+    "id — a wrong one points the reader at the wrong moment of the "
+    "meeting, and is discarded anyway.\n"
+    '"confidence" is EXACTLY one of "high" | "medium" | "low":\n'
+    "- high: the work is explicit AND the owner is unambiguous.\n"
+    "- medium: the work is clear, but the owner needs context to pin "
+    "down.\n"
+    "- low: the work or its owner is genuinely ambiguous.\n"
+    "Judge only what the transcript supports; do not inflate "
+    "confidence.\n"
     "\n"
     # LAST, and deliberately so. Measured on a 45k-char code-switched
     # transcript: the specificity rules above are stated correctly but get
@@ -299,22 +379,33 @@ SUMMARY_SYSTEM = _json_system(
     # transcript held the actual figures. Restating the single most important
     # requirement in the recency position — where attention is reliably
     # strongest — is what carried the numbers through.
-    "BEFORE YOU ANSWER — the specificity check. Re-read your \"summary\" and "
-    "\"highlights\". For every statement you wrote that merely NAMES a topic "
-    "(\"pricing was discussed\", \"cost and timeline were discussed\", "
-    "\"technical challenges were raised\", \"the team discussed the "
-    "requirements\"), go back to the transcript and replace it with the actual "
-    "content: the figure, the price, the quantity, the model or product name, "
-    "the deadline, the specific requirement, the named constraint. A statement "
-    "a reader could have guessed WITHOUT the meeting is worthless — every "
-    "sentence must carry something only this transcript could tell them. If the "
-    "transcript states a number, a price, a product name or a named limitation "
-    "anywhere near a point you are making, that detail belongs in your output.\n"
+    "BEFORE YOU ANSWER — two checks on your \"overview\".\n"
+    "\n"
+    "1. THE SPECIFICITY CHECK. Re-read every section you wrote. For every "
+    "statement that merely NAMES a topic (\"pricing was discussed\", \"cost "
+    "and timeline were discussed\", \"technical challenges were raised\", "
+    "\"the team discussed the requirements\"), go back to the transcript and "
+    "replace it with the actual content: the figure, the price, the quantity, "
+    "the model or product name, the deadline, the specific requirement, the "
+    "named constraint. A statement a reader could have guessed WITHOUT the "
+    "meeting is worthless — every sentence must carry something only this "
+    "transcript could tell them. If the transcript states a number, a price, a "
+    "product name or a named limitation anywhere near a point you are making, "
+    "that detail belongs in your output.\n"
+    "\n"
+    "2. THE SECTION CHECK. Re-read your section titles as a set and ask: could "
+    "these same titles head the overview of a completely different meeting? If "
+    "yes, they are generic and you have fallen back on a template — rewrite "
+    "them to name what THIS meeting actually covered. Then drop any section "
+    "that is thin, padded, duplicated elsewhere, or that reports the absence "
+    "of something rather than its presence. Fewer, substantive sections are "
+    "always better than more, thinner ones.\n"
     "\n"
     "Do NOT include the transcript, timestamps, or any field not listed above. "
     "If the transcript is too short or empty to analyze, set \"title\" to "
-    '"Insufficient content", say so briefly in "summary", and return empty '
-    "arrays for everything else."
+    '"Insufficient content", return "overview" as {"sections": []}, and '
+    "return empty arrays for everything else. Do NOT write a section "
+    "explaining that there was nothing to analyze."
 )
 
 def summary_system(roster=()):
@@ -376,19 +467,24 @@ SUMMARY_REDUCE_SYSTEM = _json_system(
     "- Keep the segments' distinction between what was AGREED, what was only "
     "proposed, what is required, what was committed to, and what is still "
     "open. Never promote a proposal to a decision while merging.\n"
-    "- \"summary\" is REQUIRED and must never be empty: re-write ONE coherent "
-    "executive summary covering the whole meeting from the segments' own "
-    "summaries — do not merely pick one segment's summary or leave it blank "
-    "because the segments disagree on structure. Organize it by topic, keep it "
-    "information-dense, and cover every segment. It is a JSON STRING: separate "
-    "paragraphs with the two characters \\n, never with a real line break.\n"
-    "- \"highlights\" is the 3 to 7 most important things across the WHOLE "
-    "meeting, not a per-segment concatenation — re-select across all segments "
-    "rather than keeping every segment's highlights. Each one a complete, "
-    "specific sentence.\n"
+    "- \"overview\" is REQUIRED and must never be empty. Re-decide the sections "
+    "for the WHOLE meeting rather than concatenating each segment's sections: "
+    "the segments were split by LENGTH, not by subject, so one subject is "
+    "usually spread across several of them. Merge segments' sections that "
+    "describe the same subject into ONE section under the better title, keep a "
+    "section only one segment produced if that subject genuinely stands alone, "
+    "and drop any section that is thin once merged. The result must read as an "
+    "overview of one meeting, not as a stack of partial overviews. Do not "
+    "invent a section no segment supports.\n"
+    "- Each merged section keeps the same shape: {\"title\", \"kind\" "
+    "(\"text\" or \"list\"), \"content\", \"items\", \"evidence_segment_ids\"}. "
+    "`content` is a JSON STRING: separate paragraphs with the two characters "
+    "\\n, never with a real line break. Carry through the segment ids the "
+    "segments themselves gave; never renumber or invent one.\n"
     "- \"tasks\" merges duplicate commitments across segments into one task "
-    "each, keeping whichever segment named an assignee/due_date/priority if "
-    "any did — never invent one that no segment stated. Keep the FULLER task "
+    "each, keeping whichever segment named an assignee/assignee_speaker_id/"
+    "due_date/priority/confidence/evidence/evidence_segment_ids if any did — "
+    "never invent one that no segment stated. Keep the FULLER task "
     "text when two segments describe the same work at different levels of "
     "detail: the scope (what, on which document/system, under what constraint) "
     "is the part worth keeping. An assignee may be a person who never spoke, a "
@@ -399,19 +495,30 @@ SUMMARY_REDUCE_SYSTEM = _json_system(
     "a task owner or a mention is NOT a participant — participants and task "
     "assignees are independent.\n"
     "\n"
-    "Return EXACTLY these five fields, with the same shapes as the input: "
+    "Return EXACTLY these four fields, with the same shapes as the input: "
     '"title" (string, 4-10 words, naming the actual subject of the meeting), '
-    '"summary" (the executive summary covering the WHOLE meeting, organized by '
-    'topic, never empty), "highlights" (array of 3-7 strings), "tasks" (array '
-    'of {"task","assignee","due_date","priority"}), and "participants" (array '
-    'of {"speaker","summary"}). Do NOT emit any other field.'
+    '"overview" ({"sections": [...]}, covering the WHOLE meeting, never '
+    'empty), "tasks" (array of {"task","assignee","assignee_speaker_id",'
+    '"due_date","priority","confidence","evidence","evidence_segment_ids"}), '
+    'and "participants" (array of {"speaker","summary"}). Do NOT emit any '
+    "other field."
 )
 
-# The six structured-highlight field specs, shared VERBATIM between
+# The structured-extraction field specs, shared VERBATIM between
 # HIGHLIGHTS_SYSTEM (the standalone stage, still used by userApi's on-demand
 # regeneration route) and unified_analysis_system above. One definition so the
 # two can never disagree about the shape they both parse into
 # ai_schema.coerce_highlights.
+#
+# FOUR sections, down from six. `important_numbers` and `risks` were removed
+# along with their (nonexistent) consumers — the meeting's figures and concerns
+# are now carried by the DYNAMIC OVERVIEW, in whatever sections this particular
+# meeting warranted, rather than by two more fixed template buckets. What
+# remains is exactly the typed data a machine reads in ROWS rather than prose:
+# see ai_schema.HIGHLIGHT_SECTIONS for the reader of each one.
+#
+# These are EXTRACTIONS, not presentation. They are deliberately NOT what the
+# user reads, so nothing here should be tuned for how it looks in the app.
 _HIGHLIGHTS_FIELDS = (
     '- "decisions": array of objects, each EXACTLY {"decision": string, '
     '"context": string}. Only what was actually AGREED (e.g. "Approved the '
@@ -426,17 +533,9 @@ _HIGHLIGHTS_FIELDS = (
     'string}. Every date, time or milestone mentioned — "when" EXACTLY as '
     'spoken ("next Tuesday", "end of Q3", "15th March"). Do not resolve '
     "relative dates to calendar dates. [] if none.\n"
-    '- "important_numbers": array of objects, each EXACTLY {"label": string, '
-    '"value": string, "kind": string}. Every money amount, quantity, '
-    "percentage, measurement and duration. value keeps the unit and currency "
-    'exactly as spoken ("4.2 lakh", "₹85,000", "18%", "1200 sq ft", "6 '
-    'weeks"). kind is one of "money" | "quantity" | "percentage" | '
-    '"measurement" | "duration". [] if none.\n'
     '- "open_questions": array of strings. Unresolved questions and '
     "undecided discussions — what someone asked or raised that got no answer. "
     "[] if none.\n"
-    '- "risks": array of strings. Stated concerns, blockers, dependencies and '
-    "objections. Only what was actually raised. [] if none.\n"
 )
 
 
@@ -480,8 +579,7 @@ HIGHLIGHTS_REDUCE_SYSTEM = _json_system(
     "\n"
     'Return EXACTLY these fields with the same shapes: "decisions" '
     '({"decision","context"}), "action_items" ({"task","owner","deadline"}), '
-    '"deadlines" ({"what","when"}), "important_numbers" '
-    '({"label","value","kind"}), "open_questions" (strings), "risks" (strings).'
+    '"deadlines" ({"what","when"}), "open_questions" (strings).'
 )
 
 # ===========================================================================
@@ -526,74 +624,83 @@ _IDENTIFIER_HINTS = {
 }
 
 
-def unified_analysis_system(roster=(), mappings=()):
+def unified_analysis_system(roster=()):
     """The ONE analysis prompt: everything the pipeline needs in a single call.
 
-    Replaces THREE separate Groq calls (summary, meeting_highlights, and one
-    CRM-identifier call PER configured mapping) with one request over one copy
-    of the transcript. On a normal meeting that is 3+ transcript sends reduced
-    to 1 — the same token bill's worth of latency and TPM spend, three times
-    over, for outputs that all read the same source text.
+    Replaces the separate summary and meeting_highlights calls with one request
+    over one copy of the transcript. On a normal meeting that is 2+ transcript
+    sends reduced to 1 — the same token bill's worth of latency and TPM spend,
+    twice over, for outputs that read the same source text.
 
     COMPOSED from the existing prompts rather than rewritten:
-        summary_system(roster)      title / summary / highlights / tasks /
-                                    participants — including every specificity
-                                    and participants-vs-assignees rule
-        HIGHLIGHTS_SYSTEM's body    the six structured meeting_highlights
+        summary_system(roster)      title / overview / tasks / participants —
+                                    including every specificity and
+                                    participants-vs-assignees rule
+        _HIGHLIGHTS_FIELDS          the four structured meeting_highlights
                                     sections
-        crm_identifier_system()'s   the per-mapping identifier rules
-        rules
     Each of those texts encodes production regressions that were fixed by exact
     wording (topic labels instead of figures; mentioned names promoted to
-    attendees; hallucinated record ids). Re-authoring them from scratch for the
-    merge would have quietly discarded that tuning, so the merge reuses the
-    proven text and only adds what is genuinely new: the envelope that says
-    these fields now arrive together, and the reminder that the extraction
-    fields must not degrade just because prose is being written in the same
-    breath.
+    attendees). Re-authoring them from scratch for the merge would have quietly
+    discarded that tuning, so the merge reuses the proven text and only adds
+    what is genuinely new: the envelope that says these fields arrive together,
+    and the reminder that the extraction fields must not degrade just because
+    prose is being written in the same breath.
 
-    `mappings` is the user's configured CRM mappings (possibly empty). When
-    empty, NO crm_identifiers section is requested at all — an unconfigured
-    user's prompt is byte-identical to the pre-CRM one, so they pay nothing for
-    a feature they don't use.
+    CRM identifier extraction was REMOVED from this prompt. It made every
+    analysis carry per-mapping extraction rules for a feature not yet built
+    out, and it is the one output whose failure mode is attaching a real
+    customer's meeting to a stranger's Salesforce record.
+
+    crm_identifier_system() below is now UNCALLED — no Lambda reaches it. It is
+    kept, with ai_schema's coerce/normalize/grounding helpers, because those
+    four pieces are where the anti-hallucination work for record identifiers
+    lives (the grounding check that refuses a value the model cannot quote, and
+    the spoken-digit normalizer). Re-deriving them when integration extraction
+    is designed properly would mean re-earning them; they are still covered by
+    tests. Manual identifier entry and the Salesforce push are unaffected —
+    they never went through this prompt.
     """
     body = summary_system(roster)
 
-    # The structured extraction sections. Nested under one key so the six
+    # The structured extraction sections. Nested under one key so the four
     # sections keep their existing shapes (ai_schema.coerce_highlights parses
     # exactly this) while travelling inside the unified object.
+    #
+    # Framed explicitly as MACHINE-READ data, because the overview above is now
+    # the human-facing output and a model that thinks it is writing two
+    # summaries will write the same thing twice. What it must not do is skip
+    # the extraction because "the overview already says it" — these are read as
+    # ROWS (a MoM table, a calendar deadline marker), not as prose.
     body += (
         "\n\n"
         "ADDITIONALLY, include a \"meeting_highlights\" object with EXACTLY "
-        "these six fields:\n"
+        "these four fields:\n"
         + _HIGHLIGHTS_FIELDS
         + "Every array is [] when the meeting contains nothing of that kind. An "
         "empty array is CORRECT and expected — never pad a section to look "
         "complete.\n"
         "\n"
-        "\"highlights\" (the flat array above) and \"meeting_highlights\" (this "
-        "object) are DIFFERENT outputs and are both required: the first is the "
-        "3-7 things a reader must know at a glance, the second is the complete "
-        "structured extraction. Do not omit one because you produced the other, "
-        "and do not copy one into the other verbatim.\n"
+        "\"overview\" and \"meeting_highlights\" are DIFFERENT outputs and "
+        "both are required. The overview is what a PERSON reads: your own "
+        "sections, written to explain the meeting. meeting_highlights is "
+        "structured data other software reads as rows — a document generator "
+        "builds tables from it and a calendar plots its deadlines. Produce both "
+        "properly: do not skip the extraction because the overview covers the "
+        "same ground, and do not degrade the overview into a copy of these four "
+        "lists.\n"
     )
-
-    if mappings:
-        body += "\n\n" + _crm_identifiers_field(mappings)
 
     # LAST — after every field spec, in the recency position. Writing prose and
     # doing exact extraction in ONE call is precisely the condition under which
-    # a model gets sloppy about the extraction half (the reason these were three
+    # a model gets sloppy about the extraction half (the reason these were
     # separate calls originally), so the final instruction is about protecting
     # it.
     body += (
         "\n\n"
         "BEFORE YOU ANSWER — the extraction check. You are producing prose and "
         "exact extractions in the same reply. The prose must not soften the "
-        "extractions: every number, date, deadline and identifier in "
-        "\"meeting_highlights\""
-        + (" and \"crm_identifiers\"" if mappings else "")
-        + " must be the value the transcript actually states, copied exactly as "
+        "extractions: every number, date and deadline in \"meeting_highlights\" "
+        "must be the value the transcript actually states, copied exactly as "
         "spoken, not a paraphrase and not a rounded figure. Re-read the "
         "transcript for the numbers and dates specifically, and confirm each "
         "one you emit appears in it. An extraction you are not certain of "
@@ -603,7 +710,7 @@ def unified_analysis_system(roster=(), mappings=()):
 
 
 # OVERFLOW ONLY — the reduce step for the UNIFIED shape.
-def unified_reduce_system(mappings=()):
+def unified_reduce_system():
     """SUMMARY_REDUCE_SYSTEM extended to the unified shape.
 
     Reached ONLY on the overflow path, for a transcript that genuinely exceeds
@@ -615,85 +722,22 @@ def unified_reduce_system(mappings=()):
     and its rules about merging segments of one meeting are exactly right here
     too. This only adds the sections the unified shape carries beyond it.
     """
-    body = SUMMARY_REDUCE_SYSTEM + (
+    return SUMMARY_REDUCE_SYSTEM + (
         "\n\n"
         "The segment analyses ALSO carry a \"meeting_highlights\" object with "
-        "the six sections decisions / action_items / deadlines / "
-        "important_numbers / open_questions / risks. Merge it too, into one "
-        "\"meeting_highlights\" object of the same shape:\n"
-        "- Merge duplicates: the same commitment or number often recurs across "
-        "segments. Keep it once, with the most complete owner/deadline "
+        "the four sections decisions / action_items / deadlines / "
+        "open_questions. Merge it too, into one \"meeting_highlights\" object "
+        "of the same shape:\n"
+        "- Merge duplicates: the same commitment or deadline often recurs "
+        "across segments. Keep it once, with the most complete owner/deadline "
         "available.\n"
         "- If a later segment answers an earlier open question, move it to "
         "decisions and drop it from open_questions.\n"
-        "- Keep EVERY distinct number, deadline and decision the segments "
-        "state. Unlike the prose fields, these sections are extractions: "
-        "merging them must never drop one to be shorter.\n"
+        "- Keep EVERY distinct deadline and decision the segments state. Unlike "
+        "the overview, these sections are extractions: merging them must never "
+        "drop one to be shorter.\n"
         "- Never invent anything absent from the segments.\n"
     )
-    if mappings:
-        body += (
-            "\n"
-            "The segments may also carry \"crm_identifiers\". Merge it by "
-            "keeping, for each key, the single entry whose evidence quote "
-            "actually contains the value, preferring \"explicit\" over "
-            "\"probable\". Use null for a key no segment found. NEVER invent an "
-            "identifier while merging, and never carry one across keys.\n"
-        )
-    return body
-
-
-def _crm_identifiers_field(mappings):
-    """The "crm_identifiers" field spec, one entry per configured mapping.
-
-    Same rules as crm_identifier_system()'s standalone prompt — return null
-    unless the value was SPOKEN, quote the sentence it came from, coarse 3-way
-    confidence — restated here for the merged call. The stakes are why the
-    wording stays strict: this value decides WHICH Salesforce record a meeting
-    is pushed onto, so a hallucinated one writes real meeting notes onto a
-    stranger's record. `evidence` is the audit trail that makes a wrong
-    extraction catchable before anything is pushed, and requiring a verbatim
-    quote measurably suppresses invention.
-
-    Generic by construction: built from the customer's OWN mapping (their object
-    label, their lookup field), so nothing here names a specific object.
-    """
-    lines = [
-        '- "crm_identifiers": object. For EACH key listed below, either an '
-        'object {"value": string, "confidence": "explicit"|"probable", '
-        '"evidence": string} or null.\n'
-    ]
-    for mapping in mappings:
-        object_name = str(mapping.get("object") or "").strip()
-        if not object_name:
-            continue
-        label = (mapping.get("label") or mapping.get("lookup_field")
-                 or "identifier")
-        object_label = mapping.get("object_label") or object_name
-        hint = _IDENTIFIER_HINTS.get(
-            str(mapping.get("lookup_field_type") or "").lower())
-        lines.append(
-            f'  * "{object_name}": the {label} identifying which '
-            f"{object_label} record this meeting is about"
-            + (f" — {hint}" if hint else "")
-            + ".\n"
-        )
-    lines.append(
-        "  RULES for every entry:\n"
-        "  - Use null unless the identifier was ACTUALLY SPOKEN in the "
-        "transcript. Most meetings mention none, and null is the correct, "
-        "expected answer — never pattern-complete a plausible-looking id.\n"
-        "  - \"evidence\" must be the transcript sentence containing the value, "
-        "quoted verbatim. If you cannot quote a sentence containing it, the "
-        "answer is null.\n"
-        "  - \"confidence\" is \"explicit\" when the speaker stated it "
-        "outright, \"probable\" when you are inferring it from context.\n"
-        "  - Spoken digits are normalized to the written form (\"one two three\" "
-        "-> \"123\"), but nothing else about the value is changed.\n"
-        "  - Never invent, complete or correct an identifier, and never carry "
-        "one over from your general knowledge.\n"
-    )
-    return "".join(lines)
 
 
 def crm_identifier_system(label, object_label="", field_type=""):
@@ -1231,6 +1275,81 @@ CUSTOM_DOCUMENT_SYSTEM = _prose_system(
     "the document rather than inventing content to fill the gap."
 )
 
+# ---------------------------------------------------------------------------
+# THE AI ASSISTANT — the cross-meeting agent ("what's overdue?", "what did we
+# decide with Acme?"). Distinct from CHAT_SYSTEM below, which answers about ONE
+# meeting from a context block: this one answers across the user's whole
+# workspace by CALLING TOOLS (see userApi's AI_TOOL_SCHEMAS).
+#
+# The security model is STRUCTURAL, not prompt-based, and that is the important
+# thing to preserve here: no tool schema exposes a user_id, contact_id or email
+# parameter, so the model has nowhere to put someone else's identity even if it
+# tried. Every tool resolves the caller from the JWT server-side. The prompt
+# below therefore does not need to (and must not be trusted to) enforce
+# tenancy — it only needs to stop the model ASKING the user for identity it
+# already has, which was the actual observed failure.
+# ---------------------------------------------------------------------------
+ASSISTANT_SYSTEM = (
+    "You are the MinuteX Assistant. You help one signed-in user with their own "
+    "meetings, tasks and contacts by calling the tools provided to you.\n"
+    "\n"
+    "ABSOLUTE RULES:\n"
+    "- Answer ONLY from tool results. Never invent a task, meeting, person, "
+    "date or number, and never fill a gap with a plausible value.\n"
+    "- If the tools return nothing, say plainly that you found nothing. Do NOT "
+    "speculate and do NOT describe what usually happens.\n"
+    "- Never ask the user who they are, for their email, or for an id. You are "
+    "already acting for the authenticated user and the tools resolve that "
+    "themselves.\n"
+    "- Never claim to have done something you have no tool for. You can read "
+    "and search; say so plainly when something is outside what you can do.\n"
+    "\n"
+    "HOW TO ANSWER:\n"
+    "- Call a tool whenever the answer depends on the user's actual data, "
+    "which is almost always. Do not guess to save a call.\n"
+    "- Be direct and short: a sentence or two, or a tight list when the answer "
+    "genuinely is a list. No preamble, no restating the question.\n"
+    "- Lead with the answer, then the supporting detail.\n"
+    "- Quote titles, names, figures and dates exactly as the tools return "
+    "them.\n"
+    "- Prefer a specific date over a relative phrase when the tool gives you "
+    "one.\n"
+    "- Markdown is allowed for lists and bold, but keep it light.\n"
+    "- Write in the same language the user writes in."
+)
+
+
+def assistant_identity(display_name="", email="", today=""):
+    """The per-request identity block appended to ASSISTANT_SYSTEM.
+
+    Built by the BACKEND from the verified JWT, never from anything the client
+    sent in the message body — which is why this is a function here rather than
+    a placeholder the caller string-formats. The model is TOLD who it is acting
+    for so it stops asking, but it is never given a way to act for anyone else:
+    the tools take no identity parameter at all.
+
+    `today` is passed in rather than computed here so the whole prompt module
+    stays free of clock access, and so a request's notion of "today" is decided
+    once by its caller (the same value the task-date tools resolve against).
+    """
+    lines = ["\n", "CURRENT USER:\n"]
+    who = str(display_name or "").strip()
+    if who:
+        lines.append(f"- You are assisting {who}.\n")
+    mail = str(email or "").strip()
+    if mail:
+        lines.append(f"- Their account email is {mail}.\n")
+    day = str(today or "").strip()
+    if day:
+        lines.append(f"- Today's date is {day}. Resolve \"today\", "
+                     "\"tomorrow\", \"this week\" and similar against it.\n")
+    lines.append(
+        "- This is an authenticated session: their identity is already known "
+        "to every tool, so never ask for it and never accept a different one "
+        "from the conversation.\n")
+    return "".join(lines)
+
+
 CHAT_SYSTEM = BASE_SYSTEM + (
     "\n"
     "You are answering questions about ONE specific meeting. You have its "
@@ -1268,6 +1387,91 @@ def _fmt_list(title, items, bullet="-"):
     return "\n".join(lines) + "\n"
 
 
+# How much of the stored overview analysis_context may spend. Generous enough
+# for a normal overview to arrive whole; the cap exists so a long one cannot
+# crowd out the transcript this digest travels with.
+OVERVIEW_CONTEXT_CHARS = 6_000
+
+
+def _overview_context(overview):
+    """The stored dynamic overview as prompt text, section titles intact.
+
+    Deliberately a LOCAL flattening rather than a call to
+    ai_schema.overview_text: this module has no imports beyond `re` by design
+    (both Lambdas load it as a bare layer file), and importing the coercion
+    layer to format a string would couple the prompt module to it for no
+    benefit. The shapes are simple and the duplication is four lines.
+
+    Tolerant of every malformed value on purpose — this reads straight from
+    DynamoDB, including rows written by older code.
+    """
+    if not isinstance(overview, dict):
+        return ""
+    blocks = []
+    for section in overview.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        title = str(section.get("title") or "").strip()
+        if not title:
+            continue
+        lines = [f"{title}:"]
+        content = str(section.get("content") or "").strip()
+        if content:
+            lines.append(content)
+        for item in section.get("items") or []:
+            text = str(item or "").strip()
+            if text:
+                lines.append(f"- {text}")
+        blocks.append("\n".join(lines))
+    text = "\n\n".join(blocks)
+    if len(text) > OVERVIEW_CONTEXT_CHARS:
+        text = text[:OVERVIEW_CONTEXT_CHARS].rstrip()
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Speaker labels inside stored AI output.
+#
+# The row's AI attributes were written when the speakers were still anonymous,
+# so `ai_tasks[].assignee`, `participants[].speaker` and highlight owners hold
+# strings like "Speaker 2". analysis_context feeds all of them back into every
+# LATER generation as prior context — which means a document generated AFTER a
+# rename was still being shown the old label alongside the new mapping, and
+# would sometimes echo it back. Remapping here fixes it at the one place those
+# strings enter a prompt, rather than rewriting the stored attributes (which
+# are the verbatim record of what the extraction found).
+#
+# Only a whole label is replaced. A partial match would corrupt real prose —
+# "Speaker 1" must not rewrite the "Speaker 12" beside it, which is why the
+# pattern anchors both ends.
+# ---------------------------------------------------------------------------
+
+_SPEAKER_LABEL_RE = re.compile(r"^\s*speaker[\s_-]*(.+?)\s*$", re.IGNORECASE)
+
+
+def resolve_speaker_text(text, speaker_names):
+    """A stored "Speaker N" string rendered with the user's name for N.
+
+    Anything that is not a bare speaker label — a real name the AI heard, a
+    team name, an empty value — is returned UNCHANGED. That is the point: this
+    only ever upgrades a label to a name, never reinterprets prose.
+    """
+    raw = str(text or "").strip()
+    if not raw or not isinstance(speaker_names, dict) or not speaker_names:
+        return raw
+    # An exact key hit covers non-numeric labels ("agent") and any label the
+    # map stores verbatim.
+    if raw in speaker_names and speaker_names[raw]:
+        return str(speaker_names[raw])
+    m = _SPEAKER_LABEL_RE.match(raw)
+    if m:
+        label = m.group(1).strip()
+        named = speaker_names.get(label)
+        if named:
+            return str(named)
+    return raw
+
+
 def analysis_context(rec, meeting_highlights=None):
     """Compact text digest of a recording's stored AI analysis.
 
@@ -1276,12 +1480,13 @@ def analysis_context(rec, meeting_highlights=None):
     sections appear — an empty heading would read to the model as "there were
     no decisions", which is a claim we don't want to make on its behalf.
 
-    Covers the analysis schema as it now stands: title, summary, highlights,
-    tasks, participants. The removed agenda/key_points/decisions/
-    pending_discussions/action_items attributes are NOT read, including from
-    rows written before their removal — a stale agenda list is not worth the
-    tokens it costs the transcript, and `summary` already carries the same
-    ground in prose.
+    Covers the analysis schema as it now stands: title, overview, tasks,
+    participants — falling back to the pre-overview `summary`/`highlights`
+    attributes ONLY for a row that has no overview, so a current recording is
+    never described to the model twice. The removed agenda/key_points/
+    decisions/pending_discussions/action_items attributes are NOT read, not
+    even from rows that still carry them: a stale agenda list is not worth the
+    tokens it costs the transcript.
 
     `meeting_highlights` is the SEPARATE structured extraction (decisions/
     action_items/deadlines/important_numbers/open_questions/risks, a dict, from
@@ -1306,11 +1511,32 @@ def analysis_context(rec, meeting_highlights=None):
     if lang and lang != "unknown":
         parts.append(f"LANGUAGE: {lang}\n")
 
-    summary = (rec.get("summary") or "").strip()
-    if summary:
-        parts.append(f"EXECUTIVE SUMMARY:\n{summary}\n")
+    # THE MEETING OVERVIEW — the current primary analysis. Emitted with its own
+    # section titles intact rather than flattened into one blob: the titles are
+    # the model's own judgement about what this meeting was about, and they
+    # orient a later generation far more cheaply than the prose alone does.
+    #
+    # BOUNDED, because this digest rides along with every document and chat
+    # call and every token spent here is one the transcript does not get. The
+    # cap is generous enough for a normal overview to arrive whole and exists
+    # to stop a long one crowding out the source text.
+    overview_text = _overview_context(rec.get("overview"))
+    if overview_text:
+        parts.append(f"MEETING OVERVIEW:\n{overview_text}\n")
+    else:
+        # Legacy rows, analysed before the overview existed. Read only when
+        # there is no overview, so a current recording never sends both.
+        summary = (rec.get("summary") or "").strip()
+        if summary:
+            parts.append(f"EXECUTIVE SUMMARY:\n{summary}\n")
+        parts.append(_fmt_list("HIGHLIGHTS", rec.get("highlights") or []))
 
-    parts.append(_fmt_list("HIGHLIGHTS", rec.get("highlights") or []))
+    # Read BEFORE the blocks below, which resolve stored "Speaker N" strings
+    # through it (see resolve_speaker_text). The map itself is emitted further
+    # down, after the analysis it explains.
+    names = rec.get("speaker_names") or {}
+    if not isinstance(names, dict):
+        names = {}
 
     ai_tasks = rec.get("ai_tasks") or []
     if ai_tasks:
@@ -1319,8 +1545,11 @@ def analysis_context(rec, meeting_highlights=None):
             if not isinstance(t, dict):
                 continue
             bits = [t.get("task") or ""]
-            if t.get("assignee"):
-                bits.append(f"assignee: {t['assignee']}")
+            # The assignee may be a stored "Speaker 2" — show the model who
+            # that is now, not who they were at extraction time.
+            assignee = resolve_speaker_text(t.get("assignee"), names)
+            if assignee:
+                bits.append(f"assignee: {assignee}")
             if t.get("due_date"):
                 bits.append(f"due: {t['due_date']}")
             if t.get("priority"):
@@ -1334,26 +1563,34 @@ def analysis_context(rec, meeting_highlights=None):
         for p in people:
             if not isinstance(p, dict):
                 continue
-            who = p.get("speaker") or ""
+            who = resolve_speaker_text(p.get("speaker"), names)
             what = p.get("summary") or ""
             lines.append(f"- {who}: {what}" if what else f"- {who}")
         parts.append("\n".join(lines) + "\n")
 
     # Speaker names the USER supplied. Given to the model so a document says
-    # "Ravi" where the transcript only ever says "Speaker 0".
-    names = rec.get("speaker_names") or {}
-    if isinstance(names, dict) and names:
+    # "Ravi" where the transcript only ever says "Speaker 0". Still emitted
+    # even though the blocks above are already resolved: the TRANSCRIPT below
+    # is verbatim and does say "Speaker 0", so the model needs the mapping to
+    # read it.
+    if names:
         mapped = ", ".join(f"Speaker {k} is {v}" for k, v in names.items())
         parts.append(f"SPEAKER NAMES (user-provided): {mapped}\n")
 
     if meeting_highlights:
-        parts.append(highlights_context(meeting_highlights))
+        parts.append(highlights_context(meeting_highlights, names))
 
     return "\n".join(p for p in parts if p)
 
 
-def highlights_context(h):
-    """Text digest of stored meeting_highlights."""
+def highlights_context(h, speaker_names=None):
+    """Text digest of stored meeting_highlights.
+
+    `speaker_names` resolves a stored "Speaker N" owner to the user's name,
+    for the same reason analysis_context does it for ai_tasks assignees — this
+    text is prior context for later generations, so a stale label here becomes
+    a stale label in a freshly generated document.
+    """
     if not isinstance(h, dict):
         return ""
     parts = []
@@ -1366,8 +1603,9 @@ def highlights_context(h):
         if not isinstance(a, dict) or not a.get("task"):
             continue
         bits = [a["task"]]
-        if a.get("owner"):
-            bits.append(f"owner: {a['owner']}")
+        owner = resolve_speaker_text(a.get("owner"), speaker_names)
+        if owner:
+            bits.append(f"owner: {owner}")
         if a.get("deadline"):
             bits.append(f"deadline: {a['deadline']}")
         acts.append(" | ".join(bits))

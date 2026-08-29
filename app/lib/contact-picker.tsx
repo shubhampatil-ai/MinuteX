@@ -24,16 +24,17 @@ import {
 import { Icon } from "./icons";
 import { S, R, CAPS, FONT, useTheme, ColorScale } from "./theme";
 import {
-  Button, EmptyState, ErrorText, KeyboardAwareSheet, SearchBar, TextField,
+  Avatar, Button, EmptyState, ErrorText, KeyboardAwareSheet, SearchBar,
+  TextField,
 } from "./ui";
 import {
   ApiContact, ApiError, ambiguousCandidates, createContact, getContacts,
   isAmbiguousContact,
 } from "./api";
-import { initialsOf, avatarColorFor } from "./task-model";
 import {
   ContactPickResult, requestContactsPermissionDetailed, searchPhoneContacts,
 } from "./contacts";
+import { uploadPhoneContactPhoto } from "./avatars";
 
 const SEARCH_DEBOUNCE_MS = 300;
 const PAGE_SIZE = 50;
@@ -41,6 +42,18 @@ const PAGE_SIZE = 50;
 type Section =
   | { kind: "heading"; label: string; hint?: string }
   | { kind: "contact"; contact: ApiContact; inFolder: boolean };
+
+// One row per PERSON, keeping first appearance. Callers pass speaker→contact
+// mappings, where the same person legitimately appears more than once (one
+// contact tagged as several speakers), and every list here keys on contact.id.
+function dedupById(contacts: ApiContact[]): ApiContact[] {
+  const seen = new Set<string>();
+  return contacts.filter((c) => {
+    if (seen.has(c.id)) return false;
+    seen.add(c.id);
+    return true;
+  });
+}
 
 export type ContactPickerProps = {
   visible: boolean;
@@ -111,6 +124,17 @@ export function ContactPicker({
     };
   }, [query, debounced]);
 
+  // `onClose` is an inline arrow at every call site, so it is a NEW function
+  // on every parent render. Depending on it directly made `load` unstable,
+  // which re-fired the load effect below, which setState'd, which re-rendered
+  // the parent — an unbounded render loop that fired at mount, because this
+  // sheet is always mounted and only `visible` toggles. Reading it through a
+  // ref keeps the latest callback without making it a render-loop input.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   const load = useCallback(
     async (search: string) => {
       setLoading(true);
@@ -126,7 +150,7 @@ export function ContactPicker({
         // of retrying inside a modal can fix that. Close and send them to
         // login, the same thing every full screen in the app does.
         if (e instanceof ApiError && e.status === 401) {
-          onClose();
+          onCloseRef.current();
           router.replace("/login");
           return;
         }
@@ -137,7 +161,7 @@ export function ContactPicker({
         setLoading(false);
       }
     },
-    [onClose, router]
+    [router]
   );
 
   useEffect(() => {
@@ -202,7 +226,12 @@ export function ContactPicker({
     const out: Section[] = [];
     const seen = new Set<string>();
 
-    const meetingMatches = meetingContacts.filter(matches);
+    // Dedup WITHIN this tier too, not just against later ones. The meeting's
+    // participants are speaker→contact MAPPINGS, so one person tagged as two
+    // speakers (Speaker 0 and Speaker 2 are both Priya — routine in a diarized
+    // meeting) arrives here twice. Both rows would key on contact.id and React
+    // would warn about duplicate keys and may drop one of them.
+    const meetingMatches = dedupById(meetingContacts.filter(matches));
     if (meetingMatches.length) {
       out.push({
         kind: "heading", label: "In this meeting", hint: "Tagged here",
@@ -213,8 +242,8 @@ export function ContactPicker({
       });
     }
 
-    const folderMatches = folderContacts.filter(
-      (c) => matches(c) && !seen.has(c.id)
+    const folderMatches = dedupById(
+      folderContacts.filter((c) => matches(c) && !seen.has(c.id))
     );
     if (folderMatches.length) {
       out.push({
@@ -228,7 +257,11 @@ export function ContactPicker({
       });
     }
 
-    const rest = all.filter((c) => !seen.has(c.id) && !folderIds.has(c.id));
+    // `all` is paginated, so a contact can arrive twice if the underlying set
+    // shifts between page fetches.
+    const rest = dedupById(
+      all.filter((c) => !seen.has(c.id) && !folderIds.has(c.id))
+    );
     if (rest.length) {
       out.push({ kind: "heading", label: "All Contacts" });
       rest.forEach((c) =>
@@ -313,26 +346,56 @@ export function ContactPicker({
   }, [phoneMode, phoneDenied, debounced]);
 
   /** Turn ONE device contact into a MinuteX contact. This is the only point at
-   * which any address-book data leaves the device. */
+   * which any address-book data leaves the device.
+   *
+   * NOT force:true. Forcing here was creating the duplicates the rest of this
+   * sheet works to prevent: importing "Rahul Patil" when a MinuteX contact of
+   * that name already existed made a SECOND record, and that twin then showed
+   * up twice everywhere a contact is chosen — speaker mapping, task assignment,
+   * the contacts list. An email or phone match still resolves silently to the
+   * existing person (the backend answers 200 existing:true), because those are
+   * strong identifiers. A NAME-only collision comes back 409, and the right
+   * answer is the same one the create form gives: show the candidates and let
+   * the user say "that's them" or "different person". */
   const importFromPhone = useCallback(
     async (pick: ContactPickResult) => {
       setPhoneBusy(true);
       setCreateError("");
       try {
+        // The address-book photo, if this person has one. Uploaded BEFORE the
+        // create so the contact is written already carrying it, in one call —
+        // and best-effort inside uploadPhoneContactPhoto, because the user
+        // asked to import a PERSON: a thumbnail that will not upload must not
+        // fail the import, it just leaves them on initials.
+        //
+        // The device URI itself is never stored. It is local to this phone and
+        // the OS can revoke it, so it would be a dangling path everywhere else.
+        const avatarKey = await uploadPhoneContactPhoto(pick.photoUri);
         const { contact } = await createContact({
           name: pick.name,
           email: pick.email || undefined,
           phone: pick.phone || undefined,
+          avatar_url: avatarKey || undefined,
           folder_id: folderId || undefined,
-          // A phone contact whose name already exists is almost always the
-          // SAME person the user means, and they picked this row deliberately —
-          // so a name collision here should not dead-end them. An email/phone
-          // match still returns the existing contact rather than duplicating.
-          force: true,
         });
         onPick(contact);
         onClose();
       } catch (e) {
+        if (isAmbiguousContact(e)) {
+          // Hand the decision to the create form, pre-filled from the device
+          // row so "Create as a different person" carries the phone contact's
+          // details rather than an empty form the user must retype.
+          setNewName(pick.name);
+          setNewEmail(pick.email || "");
+          setNewPhone(pick.phone || "");
+          setCandidates(ambiguousCandidates(e));
+          setCreateError(
+            "You already have a contact with this name. Pick them, or confirm this is a different person."
+          );
+          setPhoneMode(false);
+          setCreating(true);
+          return;
+        }
         setCreateError(
           e instanceof ApiError ? e.message : "Could not import that contact."
         );
@@ -364,9 +427,8 @@ export function ContactPicker({
         accessibilityRole="button"
         accessibilityLabel={`Select ${c.name}`}
       >
-        <View style={[st.avatar, { backgroundColor: avatarColorFor(c.name) }]}>
-          <Text style={st.avatarTxt}>{initialsOf(c.name)}</Text>
-        </View>
+        <Avatar name={c.name} photoUri={c.avatar_view_url} size={36}
+          fontSize={13} />
         <View style={{ flex: 1 }}>
           <Text style={st.name} numberOfLines={1}>{c.name}</Text>
           {!!sub && <Text style={st.sub} numberOfLines={1}>{sub}</Text>}
@@ -443,13 +505,8 @@ export function ContactPicker({
                       />
                     ) : (
                       <FlatList
-                        // Same constraint as the contacts list below: the sheet
-                        // is height-capped, so this list needs an explicit
-                        // shrinkable, zero-floor height or it has no bounded
-                        // viewport to virtualize against.
-                        style={{ flexShrink: 1, minHeight: 0 }}
                         data={phoneRows}
-                        keyExtractor={(c, i) => `${c.name}-${c.email ?? c.phone ?? i}`}
+                        keyExtractor={(c) => c.id}
                         keyboardShouldPersistTaps="handled"
                         renderItem={({ item }) => (
                           <Pressable
@@ -459,16 +516,15 @@ export function ContactPicker({
                             accessibilityRole="button"
                             accessibilityLabel={`Import ${item.name}`}
                           >
-                            <View
-                              style={[
-                                st.avatar,
-                                { backgroundColor: avatarColorFor(item.name) },
-                              ]}
-                            >
-                              <Text style={st.avatarTxt}>
-                                {initialsOf(item.name)}
-                              </Text>
-                            </View>
+                            {/* The DEVICE photo, straight from the address
+                                book — a local URI, shown before any upload so
+                                the user recognises who they are importing. */}
+                            <Avatar
+                              name={item.name}
+                              photoUri={item.photoUri}
+                              size={36}
+                              fontSize={13}
+                            />
                             <View style={{ flex: 1 }}>
                               <Text style={st.name} numberOfLines={1}>
                                 {item.name}
@@ -537,11 +593,8 @@ export function ContactPicker({
                       onClose();
                     }}
                   >
-                    <View
-                      style={[st.avatar, { backgroundColor: avatarColorFor(c.name) }]}
-                    >
-                      <Text style={st.avatarTxt}>{initialsOf(c.name)}</Text>
-                    </View>
+                    <Avatar name={c.name} photoUri={c.avatar_view_url}
+                      size={36} fontSize={13} />
                     <View style={{ flex: 1 }}>
                       <Text style={st.name}>{c.name}</Text>
                       {!!(c.email || c.company) && (
@@ -689,11 +742,6 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
       flexDirection: "row", alignItems: "center", gap: S.md,
       paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: C.border,
     },
-    avatar: {
-      width: 36, height: 36, borderRadius: 18, alignItems: "center",
-      justifyContent: "center",
-    },
-    avatarTxt: { fontFamily: FONT.bold, fontSize: 13, color: "#fff" },
     name: { fontFamily: FONT.bold, fontSize: 14.5, color: C.text },
     sub: { fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 1 },
     badge: {

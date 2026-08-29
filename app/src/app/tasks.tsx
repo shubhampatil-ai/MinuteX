@@ -1,81 +1,169 @@
-// src/app/tasks.tsx — the Task Tracker: every commitment, across every meeting.
+// src/app/tasks.tsx — the Task Action Center: what to do next, not what exists.
 //
-// This is the screen the first-class Task table exists for. Tasks used to live
-// inside a recording row, which meant "what do I owe this week" was
-// unanswerable without opening meetings one at a time.
+// This screen answers one question — "what should I act on?" — and everything
+// on it is arranged to answer it in the order a person actually asks: what is
+// late, what is due, what is unassigned, what came out of my meetings.
 //
-// Every filter here is applied SERVER-side (see getAllTasks) and the list is
-// paged. That is not premature optimization: a task list grows without bound,
-// and the alternative — download everything, filter on the phone — degrades
-// exactly as an account becomes valuable.
+// WHAT IT KEPT FROM THE PREVIOUS TASK TRACKER, and why none of it was
+// negotiable:
 //
-// The one piece of judgement in this screen is how it treats an UNRESOLVED
-// assignee. The AI hears "Rahul, send the proposal" and records the name and
-// the speaker, but never guesses which Rahul. So those tasks are shown with a
-// clear "Needs assignee" affordance instead of a name that looks confirmed —
-// because a task that silently belongs to the wrong person is worse than one
-// that visibly belongs to nobody yet.
-import { useCallback, useMemo, useState } from "react";
+//   * SERVER-SIDE FILTERING AND CURSOR PAGING. A task list grows without
+//     bound; downloading it to filter on the phone degrades exactly as an
+//     account becomes valuable. Every filter chip still maps to a TaskFilters
+//     field that getAllTasks sends to the backend, and the list is still 50 a
+//     page behind a cursor.
+//   * THE THREE-STATE ASSIGNEE. An unresolved AI name is never dressed as a
+//     confirmed person — see TaskCard in lib/task-action-center.tsx. Resolve
+//     still goes to /task/[id], which owns the candidate flow.
+//   * TRUTHFUL CAPABILITIES. Nothing here claims a backend that does not
+//     exist. The AI chips run a local action and say so; Reassign opens the
+//     real resolution screen; Snooze is a real PATCH of due_date; the
+//     completion checkbox is a real PATCH of status.
+//
+// WHAT IS COMPUTED VS FETCHED. The health cards, weekly progress, deadlines
+// and meeting insight are all derived in lib/task-insights.ts from the tasks
+// this screen has LOADED — there is no aggregate endpoint. Because that is a
+// page rather than the whole account, the summary sections read from a
+// separate, wider "insight" fetch (see loadInsights) that asks for open work
+// specifically, and the health cards label themselves as counting loaded work.
+// That is the honest version of a statistic the backend cannot yet give us.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ActivityIndicator, FlatList, Pressable, RefreshControl, StyleSheet, Text,
-  View,
+  ActivityIndicator, Alert, FlatList, RefreshControl, StyleSheet, Text, View,
 } from "react-native";
 import { Stack, useFocusEffect, useRouter } from "expo-router";
-import { Icon } from "../../lib/icons";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { S, useTheme, ColorScale } from "../../lib/theme";
+import { Button, EmptyState, ErrorText } from "../../lib/ui";
 import {
-  S, R, ELEV, CAPS, FONT, useTheme, ColorScale,
-} from "../../lib/theme";
-import {
-  Button, Chip, EmptyState, ErrorText, SkeletonCard,
-} from "../../lib/ui";
-import {
-  ApiError, ApiFolder, ApiTask, TaskFilters, TaskStatusV2, assigneeLabel,
-  getAllTasks, getFolders, needsAssigneeResolution,
+  ApiError, ApiFolder, ApiTask, RecordingSummary, TaskFilters, getAllTasks,
+  getFolders, getMe, getRecordings, patchTaskById,
 } from "../../lib/api";
-import { avatarColorFor, initialsOf } from "../../lib/task-model";
+import {
+  ActionCenterSkeleton, AIPromptKey, AttentionFilters, MeetingTaskInsight,
+  MinuteXAIActionCard, QuickAddTaskButton, SectionHeader, ShowMoreRow, TaskCard,
+  TaskHeader, TaskHealthCards, TaskSearchBar, UpcomingDeadlines,
+  WeeklyProgressCard,
+} from "../../lib/task-action-center";
+import { SwipeableRow } from "../../lib/swipeable-row";
+import { QuickAddTaskSheet } from "../../lib/quick-add-task-sheet";
+import {
+  addDays, computeCounts, dueKeyOf, greetingFor, isClosed, meetingInsights,
+  needsAssignment, rankForAttention, toDayKey, upcomingDeadlines,
+  weeklyProgress,
+} from "../../lib/task-insights";
 
 const PAGE_SIZE = 50;
+// How many attention rows show before the list collapses behind "Show all".
+//
+// WHY COLLAPSE AT ALL. This screen's job is "what should I act on?", and the
+// answer is the TOP of a ranked list — not all of it. Rendering every loaded
+// task inline pushed "This week", "Upcoming deadlines" and "From your
+// meetings" below the fold, so the further someone got through their work the
+// less of the screen they could actually see. Five is the most that fits above
+// those sections on a phone while still showing more than a token preview.
+const COLLAPSED_ROWS = 5;
+// How many tasks the derived sections (health, week, deadlines, insight) read.
+// One extra page, requested once per focus, so a summary is not computed from
+// whatever the user happened to scroll to. Still a bounded request.
+const INSIGHT_PAGE = 100;
 
-// The filter presets, kept as data so adding one is a single entry rather than
-// another branch in the render.
-type Preset = {
-  key: string;
+// The attention filters (§7). Each carries the SERVER-side filter it maps to,
+// so selecting one narrows the query rather than the rendered array. `needs`
+// is the exception and says so: resolution_status is not a query parameter the
+// backend exposes, so it is applied to the loaded page after the fetch — the
+// one place this screen filters client-side, and only because no server filter
+// exists for it.
+type FilterKey = "all" | "overdue" | "mine" | "needs";
+
+const FILTERS: {
+  key: FilterKey;
   label: string;
   filters: Omit<TaskFilters, "limit" | "cursor">;
-};
-
-const PRESETS: Preset[] = [
-  { key: "open", label: "Open", filters: { status: "Open" } },
-  { key: "overdue", label: "Overdue", filters: { overdue: true } },
-  { key: "mine", label: "Assigned to me", filters: { assigned_to_me: true } },
-  {
-    key: "progress",
-    label: "In Progress",
-    filters: { status: "In Progress" },
-  },
-  { key: "done", label: "Completed", filters: { status: "Completed" } },
+  clientOnly?: boolean;
+}[] = [
   { key: "all", label: "All", filters: {} },
+  { key: "overdue", label: "Overdue", filters: { overdue: true } },
+  { key: "mine", label: "My tasks", filters: { assigned_to_me: true } },
+  { key: "needs", label: "Needs assignment", filters: {}, clientOnly: true },
 ];
+
+/** Case-insensitive substring match across the fields a person would search
+ * BY: what the task says, who owes it, and which speaker it came from. The
+ * assignee is matched through every shape it can take — a resolved contact
+ * name, an unresolved AI name, or a speaker label — because from the outside
+ * those are all just "who is this for?".
+ *
+ * Client-side by necessity: GET /tasks has no text-search parameter (see
+ * TaskFilters), so this narrows what is already loaded and the UI says so. */
+function matchesQuery(tasks: ApiTask[], query: string): ApiTask[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return tasks;
+  return tasks.filter((t) => {
+    const haystack = [
+      t.title || t.task || "",
+      t.description || "",
+      t.assignee?.name || "",
+      t.assignee_name || "",
+      t.assignee_name_legacy || "",
+      t.speaker_name || "",
+    ];
+    return haystack.some((h) => h.toLowerCase().includes(q));
+  });
+}
 
 export default function TasksScreen() {
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C, T), [C, T]);
   const router = useRouter();
+  const insets = useSafeAreaInsets();
 
-  const [preset, setPreset] = useState("open");
-  const [folderId, setFolderId] = useState("");
-  const [folders, setFolders] = useState<ApiFolder[]>([]);
+  const [filter, setFilter] = useState<FilterKey>("all");
+  const [query, setQuery] = useState("");
+  const [expanded, setExpanded] = useState(false);
   const [tasks, setTasks] = useState<ApiTask[]>([]);
   const [cursor, setCursor] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
+  const [busyId, setBusyId] = useState("");
+
+  // Context for the derived sections and for naming a task's folder.
+  const [insightTasks, setInsightTasks] = useState<ApiTask[]>([]);
+  const [folders, setFolders] = useState<ApiFolder[]>([]);
+  const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
+  const [me, setMe] = useState<{ name: string; avatar_url: string } | null>(null);
+  const [aiNote, setAiNote] = useState("");
+  const [quickAdd, setQuickAdd] = useState(false);
+
+  const listRef = useRef<FlatList<ApiTask>>(null);
+  // Read by loadMore, which must not re-create itself (and re-arm
+  // onEndReached) every time the collapse state flips.
+  const collapsedRef = useRef(false);
+
+  // ONE clock, shared by every derived figure, so a task cannot read as
+  // overdue in the health card and due-today on its own card.
+  //
+  // It is state rather than a bare `new Date()` because this screen is a tab
+  // destination people leave open: everything here is DAY-based, so a session
+  // held past midnight would otherwise keep calling yesterday "today" and
+  // showing a task that just became overdue as due-soon. The timer re-arms for
+  // the next local midnight and nothing else — no polling, one wakeup a day.
+  const [now, setNow] = useState(() => new Date());
+
+  useEffect(() => {
+    const midnight = new Date(now);
+    midnight.setHours(24, 0, 0, 0);
+    const ms = Math.max(1000, midnight.getTime() - now.getTime());
+    const t = setTimeout(() => setNow(new Date()), ms);
+    return () => clearTimeout(t);
+  }, [now]);
 
   const activeFilters = useMemo<TaskFilters>(() => {
-    const p = PRESETS.find((x) => x.key === preset) ?? PRESETS[0];
-    return { ...p.filters, ...(folderId ? { folder_id: folderId } : {}) };
-  }, [preset, folderId]);
+    const f = FILTERS.find((x) => x.key === filter) ?? FILTERS[0];
+    return f.filters;
+  }, [filter]);
 
   const load = useCallback(
     async (filters: TaskFilters, isRefresh = false) => {
@@ -87,7 +175,9 @@ export default function TasksScreen() {
         setTasks(res.tasks);
         setCursor(res.next_cursor);
       } catch (e) {
-        setError(e instanceof ApiError ? e.message : "Could not load tasks.");
+        setError(
+          e instanceof ApiError ? e.message : "Couldn't load your tasks."
+        );
         setTasks([]);
         setCursor("");
       } finally {
@@ -98,19 +188,50 @@ export default function TasksScreen() {
     []
   );
 
+  // The wider read the summary sections derive from, plus the cheap context
+  // lists. All best-effort: a failure here degrades the summaries, and must
+  // never take the task list down with it.
+  const loadInsights = useCallback(async () => {
+    try {
+      const res = await getAllTasks({ limit: INSIGHT_PAGE });
+      setInsightTasks(res.tasks);
+    } catch {
+      setInsightTasks([]);
+    }
+    getFolders()
+      .then((r) => setFolders(r.folders))
+      .catch(() => setFolders([]));
+    getRecordings()
+      .then(setRecordings)
+      .catch(() => setRecordings([]));
+    getMe()
+      .then((u) => setMe({ name: u.name, avatar_url: u.avatar_url }))
+      .catch(() => setMe(null));
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
+      // Returning to the screen re-reads the clock as well as the data: the
+      // midnight timer only fires while this screen is mounted and focused.
+      setNow(new Date());
       load(activeFilters);
-      // The folder chips are a stable, cheap list — fetched alongside so the
-      // filter row is populated without a second visible loading state.
-      getFolders()
-        .then((r) => setFolders(r.folders))
-        .catch(() => setFolders([]));
     }, [load, activeFilters])
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      loadInsights();
+    }, [loadInsights])
   );
 
   const loadMore = useCallback(async () => {
     if (!cursor || loadingMore) return;
+    // Do not page while the list is COLLAPSED. Only five rows render then, so
+    // the footer sits close to the viewport and onEndReached fires immediately
+    // — fetching page after page of tasks nobody can see, on someone's mobile
+    // data. Expanding (or searching, which needs the full loaded set) is what
+    // signals they actually want more.
+    if (collapsedRef.current) return;
     setLoadingMore(true);
     try {
       const res = await getAllTasks({
@@ -127,276 +248,537 @@ export default function TasksScreen() {
     }
   }, [activeFilters, cursor, loadingMore]);
 
-  const renderTask = ({ item }: { item: ApiTask }) => {
-    const { name, confirmed } = assigneeLabel(item);
-    const needsPerson = needsAssigneeResolution(item);
-    const done = item.status === "Completed";
-    const cancelled = item.status === "Cancelled";
-    return (
-      <Pressable
-        style={st.card}
-        onPress={() =>
-          router.push({
-            pathname: "/task/[id]",
-            params: { id: item.id },
-          } as any)
-        }
-        accessibilityRole="button"
-        accessibilityLabel={`Open task ${item.task}`}
+  // ---- Derived data (all of it from lib/task-insights) --------------------
+
+  // Summaries prefer the wider insight read, falling back to the visible page
+  // before it arrives so the cards are never blank after the list has painted.
+  const summarySource = insightTasks.length ? insightTasks : tasks;
+
+  const counts = useMemo(
+    () =>
+      computeCounts(summarySource, now, {
+        partial: summarySource.length >= INSIGHT_PAGE,
+      }),
+    [summarySource, now]
+  );
+  const week = useMemo(() => weeklyProgress(summarySource, now), [summarySource, now]);
+  const deadlines = useMemo(
+    () => upcomingDeadlines(summarySource, now, 3),
+    [summarySource, now]
+  );
+
+  const folderNames = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const f of folders) m.set(f.id, f.name);
+    return m;
+  }, [folders]);
+
+  const meetingTitles = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const r of recordings) {
+      if (r.title) m.set(r.audio_s3_key, r.title);
+    }
+    return m;
+  }, [recordings]);
+
+  const insight = useMemo(
+    () => meetingInsights(summarySource, meetingTitles, now, 1)[0] ?? null,
+    [summarySource, meetingTitles, now]
+  );
+
+  // The attention list: server-filtered, then ranked by urgency. "Needs
+  // assignment" narrows the loaded page, which is why it is marked clientOnly
+  // above rather than pretending to be a query.
+  //
+  // rankForAttention drops CLOSED tasks — a finished task is not something
+  // that needs attention. But dropping them outright would mean ticking the
+  // checkbox makes a row vanish with nowhere to see or undo it, so the closed
+  // ones are appended below the open list rather than discarded: still out of
+  // the way, still reachable, and un-tickable back to Open.
+  const matched = useMemo(() => {
+    const base = filter === "needs" ? tasks.filter(needsAssignment) : tasks;
+    const searched = matchesQuery(base, query);
+    const open = rankForAttention(searched, now);
+    const closed = searched.filter((t) => isClosed(t));
+    return [...open, ...closed];
+  }, [tasks, filter, now, query]);
+
+  // What actually renders. Truncation happens LAST — after filtering, search
+  // and ranking — so "Show all 23" counts the tasks that match, and the five
+  // rows on screen are the five most important of them rather than the first
+  // five that happened to load.
+  //
+  // A search always shows every hit. Someone who typed a query has already
+  // narrowed the list themselves; hiding matches behind a second tap would be
+  // answering a question with "some of the answer".
+  const truncated = !expanded && !query && matched.length > COLLAPSED_ROWS;
+  const visible = useMemo(
+    () => (truncated ? matched.slice(0, COLLAPSED_ROWS) : matched),
+    [matched, truncated]
+  );
+
+  // How many tasks the search actually looked at. This is the LOADED page
+  // count, not INSIGHT_PAGE: `matchesQuery` runs over `tasks` (what paging has
+  // fetched), while the summary cards read the wider insight fetch. Reporting
+  // the bigger number here would overstate the search by up to a page.
+  const searchScope = tasks.length;
+
+  // Mirror the truncation state into the ref loadMore reads. In an effect
+  // rather than assigned during render: a render can be thrown away under
+  // concurrent rendering, and writing a ref from one is exactly the kind of
+  // side effect that then leaks a state the committed tree never had.
+  useEffect(() => {
+    collapsedRef.current = truncated;
+  }, [truncated]);
+
+  // Collapsing is only meaningful while there is more than a screenful. When a
+  // filter change or a completed task shrinks the list below the cut, drop the
+  // expanded flag so the control does not linger as a no-op "Show less".
+  useEffect(() => {
+    if (expanded && matched.length <= COLLAPSED_ROWS) setExpanded(false);
+  }, [expanded, matched.length]);
+
+  // ---- Mutations ----------------------------------------------------------
+
+  const openTask = useCallback(
+    (t: ApiTask) => {
+      router.push({ pathname: "/task/[id]", params: { id: t.id } } as never);
+    },
+    [router]
+  );
+
+  /** Open the calendar already showing one day. The week strip is the only
+   * place on this screen that names a specific date, so tapping one should
+   * land on it rather than on whatever month the calendar defaults to. */
+  const openCalendarOn = useCallback(
+    (dayKey: string) => {
+      router.push({
+        pathname: "/calendar",
+        params: { day: dayKey },
+      } as never);
+    },
+    [router]
+  );
+
+  /** Real PATCH of status. update_meeting_task stamps completed_at server-side,
+   * so the weekly figures get a genuine completion time out of this. */
+  const toggleComplete = useCallback(
+    async (t: ApiTask) => {
+      const next = t.status === "Completed" ? "Open" : "Completed";
+      setBusyId(t.id);
+      // Optimistic, then reconciled by the refetch — a checkbox that waits for
+      // a round trip feels broken on a phone.
+      setTasks((prev) =>
+        prev.map((x) => (x.id === t.id ? { ...x, status: next } : x))
+      );
+      try {
+        await patchTaskById(t.id, { status: next });
+        await Promise.all([load(activeFilters, true), loadInsights()]);
+      } catch (e) {
+        setTasks((prev) =>
+          prev.map((x) => (x.id === t.id ? { ...x, status: t.status } : x))
+        );
+        Alert.alert(
+          "Could not update",
+          e instanceof ApiError ? e.message : "Please try again."
+        );
+      } finally {
+        setBusyId("");
+      }
+    },
+    [load, activeFilters, loadInsights]
+  );
+
+  /** Push the due date out by a day. A real mutation: due_date is patchable
+   * (see update_meeting_task), so this persists rather than pretending to. */
+  const snooze = useCallback(
+    async (t: ApiTask) => {
+      const current = dueKeyOf(t);
+      const from = current ? new Date(`${current}T00:00:00`) : new Date();
+      const next = toDayKey(addDays(from, 1));
+      setBusyId(t.id);
+      try {
+        await patchTaskById(t.id, { due: next });
+        await Promise.all([load(activeFilters, true), loadInsights()]);
+      } catch (e) {
+        Alert.alert(
+          "Could not snooze",
+          e instanceof ApiError ? e.message : "Please try again."
+        );
+      } finally {
+        setBusyId("");
+      }
+    },
+    [load, activeFilters, loadInsights]
+  );
+
+  // Reassign and Resolve are the same destination: the task detail screen owns
+  // the candidate list, the folder hint and the contact picker. Duplicating any
+  // of that here would be a second, divergent copy of the identity rules.
+  const openResolve = useCallback(
+    (t: ApiTask) => {
+      router.push({ pathname: "/task/[id]", params: { id: t.id } } as never);
+    },
+    [router]
+  );
+
+  // The AI chips (§4). There is no task-agent endpoint, so each chip performs
+  // the honest LOCAL equivalent and names it. No fabricated reply, no call to
+  // a route that does not exist.
+  const onPrompt = useCallback(
+    (key: AIPromptKey) => {
+      if (key === "prioritize") {
+        setFilter("all");
+        listRef.current?.scrollToOffset({ offset: 0, animated: true });
+        setAiNote(
+          "Sorted by what needs you first: overdue, then due today, then due soon, then tasks still waiting on a name."
+        );
+        return;
+      }
+      if (key === "overdue") {
+        setFilter("overdue");
+        listRef.current?.scrollToOffset({ offset: 0, animated: true });
+        setAiNote(
+          counts.overdue
+            ? `Showing ${counts.overdue} overdue task${counts.overdue === 1 ? "" : "s"}.`
+            : "Nothing is overdue right now."
+        );
+        return;
+      }
+      setAiNote(
+        week.total
+          ? `This week: ${week.completed} of ${week.total} done, ${counts.dueThisWeek} still due, ${counts.overdue} overdue.`
+          : "No tasks are due or completed this week yet."
+      );
+    },
+    [counts, week]
+  );
+
+  const onHealthSelect = useCallback((key: "overdue" | "week" | "done") => {
+    // Only overdue has a real server filter of its own; the other two scroll
+    // to the section that actually explains them rather than faking a query.
+    if (key === "overdue") {
+      setFilter("overdue");
+      listRef.current?.scrollToOffset({ offset: 0, animated: true });
+    }
+  }, []);
+
+  // ---- Empty states (§19) -------------------------------------------------
+
+  const empty = useMemo(() => {
+    // A search that found nothing is NOT "all caught up" — the tasks exist,
+    // they just did not match. Saying otherwise reads as reassurance when it
+    // should read as "try a different word", and it hides the real limit:
+    // only the loaded pages were searched.
+    if (query.trim()) {
+      return {
+        icon: "magnifyingglass",
+        title: `No tasks match "${query.trim()}".`,
+        subtitle:
+          "Only the tasks loaded so far are searched. Pull to refresh or clear the search to see everything.",
+      };
+    }
+    switch (filter) {
+      case "overdue":
+        return {
+          icon: "checkmark.circle",
+          title: "Nothing overdue.",
+          subtitle: "Nice work — you're on track.",
+        };
+      case "mine":
+        return {
+          icon: "person.fill",
+          title: "No tasks assigned to you yet.",
+          subtitle:
+            "Tasks assigned to your MinuteX account will appear here.",
+        };
+      case "needs":
+        return {
+          icon: "checkmark.seal.fill",
+          title: "All AI-extracted assignees are resolved.",
+          subtitle: "Every task names a person the system can identify.",
+        };
+      default:
+        return {
+          icon: "checklist",
+          title: "You're all caught up.",
+          subtitle: "No action items need your attention.",
+        };
+    }
+  }, [filter, query]);
+
+  const renderItem = useCallback(
+    ({ item }: { item: ApiTask }) => (
+      <SwipeableRow
+        onComplete={() => toggleComplete(item)}
+        actions={[
+          {
+            key: "snooze",
+            label: "Snooze",
+            icon: "clock",
+            color: C.warn,
+            onPress: () => snooze(item),
+          },
+          {
+            key: "reassign",
+            label: "Reassign",
+            icon: "person.fill",
+            color: C.primary,
+            onPress: () => openResolve(item),
+          },
+        ]}
+        enabled={busyId !== item.id}
       >
-        <View style={st.cardTop}>
-          <View style={{ flex: 1 }}>
-            <Text
-              style={[
-                st.title,
-                (done || cancelled) && {
-                  textDecorationLine: "line-through",
-                  color: C.textFaint,
-                },
-              ]}
-              numberOfLines={2}
-            >
-              {item.task}
+        <TaskCard
+          task={item}
+          now={now}
+          folderName={folderNames.get(String(item.folder_id || ""))}
+          busy={busyId === item.id}
+          onPress={openTask}
+          onToggleComplete={toggleComplete}
+          onResolve={openResolve}
+        />
+      </SwipeableRow>
+    ),
+    [
+      C, now, folderNames, busyId, openTask, toggleComplete, openResolve, snooze,
+    ]
+  );
+
+  const header = (
+    <View>
+      <TaskHeader
+        greeting={greetingFor(now)}
+        name={me?.name || ""}
+        avatarUrl={me?.avatar_url || undefined}
+        onAvatarPress={() => router.push("/(tabs)/profile" as never)}
+        // The navigator header is hidden so this screen can own its layout,
+        // which makes Back this header's responsibility. canGoBack() guards
+        // the deep-link case where there is nothing to go back to.
+        onBack={router.canGoBack() ? () => router.back() : undefined}
+      />
+
+      {loading && !tasks.length ? (
+        <ActionCenterSkeleton />
+      ) : (
+        <>
+          <MinuteXAIActionCard onPrompt={onPrompt} note={aiNote} />
+
+          <TaskHealthCards counts={counts} onSelect={onHealthSelect} />
+          {counts.partial ? (
+            // Say what the numbers describe. These are derived from the tasks
+            // loaded, not from an account-wide aggregate the backend does not
+            // expose — labelling that is cheaper than being subtly wrong.
+            <Text style={st.partialNote}>
+              Across your {INSIGHT_PAGE} most recent tasks.
             </Text>
-
-            <View style={st.metaRow}>
-              <View
-                style={[
-                  st.statusPill,
-                  { backgroundColor: statusTint(item.status, C).bg },
-                ]}
-              >
-                <Text
-                  style={[
-                    st.statusTxt,
-                    { color: statusTint(item.status, C).fg },
-                  ]}
-                >
-                  {item.status}
-                </Text>
-              </View>
-              {/* Overdue is computed server-side from due date + status, so it
-                  is accurate right now rather than as of the last write. */}
-              {item.is_overdue && (
-                <View style={[st.statusPill, { backgroundColor: C.dangerSoft }]}>
-                  <Text style={[st.statusTxt, { color: C.danger }]}>
-                    Overdue
-                  </Text>
-                </View>
-              )}
-              {!!item.due && <Text style={st.due}>Due {item.due}</Text>}
-            </View>
-          </View>
-
-          {confirmed ? (
-            <View style={[st.avatar, { backgroundColor: avatarColorFor(name) }]}>
-              <Text style={st.avatarTxt}>{initialsOf(name)}</Text>
-            </View>
           ) : null}
-        </View>
 
-        {/* The identity story, stated honestly in each of its three shapes. */}
-        {needsPerson ? (
-          <View style={st.needsRow}>
-            <Icon
-              name="exclamationmark.triangle"
-              size={12}
-              tintColor={C.warn}
+          <SectionHeader
+            title="Needs your attention"
+            // The action mirrors the row at the bottom of the list, so the
+            // control is reachable from either end of a long list. It only
+            // appears when there is something hidden to reveal — a "See all"
+            // that does nothing is worse than no affordance at all.
+            actionLabel={
+              matched.length > COLLAPSED_ROWS
+                ? expanded
+                  ? "Show less"
+                  : `See all ${matched.length}`
+                : undefined
+            }
+            onAction={
+              matched.length > COLLAPSED_ROWS
+                ? () => setExpanded((v) => !v)
+                : undefined
+            }
+          />
+          <AttentionFilters
+            options={FILTERS.map((f) => ({ key: f.key, label: f.label }))}
+            value={filter}
+            onChange={setFilter}
+          />
+          <View style={{ height: S.sm }} />
+          <TaskSearchBar value={query} onChange={setQuery} />
+          {query ? (
+            // Name the set that was searched. There is no server-side text
+            // search, so this is a real limit and hiding it would let someone
+            // conclude a task does not exist when it simply was not loaded.
+            <Text style={st.searchNote}>
+              {matched.length === 0
+                ? `No matches in your ${searchScope} most recent tasks.`
+                : `${matched.length} of your ${searchScope} most recent tasks.`}
+            </Text>
+          ) : null}
+          <View style={{ height: S.md }} />
+
+          {!!error && (
+            <View style={{ gap: S.sm, marginBottom: S.md }}>
+              <ErrorText>{error}</ErrorText>
+              <Button
+                label="Retry"
+                variant="secondary"
+                onPress={() => load(activeFilters)}
+              />
+            </View>
+          )}
+        </>
+      )}
+    </View>
+  );
+
+  // The sections BELOW the list. They live in the footer rather than in a
+  // second ScrollView, because nesting a task list inside a ScrollView breaks
+  // virtualization (§22).
+  const footer =
+    loading && !tasks.length ? (
+      <View style={{ height: S.xxl }} />
+    ) : (
+      <View>
+        {/* The collapse control sits at the TOP of the footer, which is
+            immediately below the last task row — where a person looking for
+            "is there more?" actually looks. Hidden during a search, which
+            already shows every match. */}
+        {matched.length > COLLAPSED_ROWS && !query ? (
+          <ShowMoreRow
+            expanded={expanded}
+            hiddenCount={matched.length - COLLAPSED_ROWS}
+            totalCount={matched.length}
+            onToggle={() => setExpanded((v) => !v)}
+          />
+        ) : null}
+
+        {/* ALWAYS rendered. "View calendar" is the app's entry point to the
+            calendar, so it cannot be conditional on this week containing work
+            — an empty week is exactly when someone wants to go look at the
+            month. The CARD copes with a zero week on its own. */}
+        <SectionHeader
+          title="This week"
+          actionLabel="View calendar"
+          onAction={() => router.push("/calendar" as never)}
+        />
+        <WeeklyProgressCard week={week} onDayPress={openCalendarOn} />
+
+        {deadlines.length > 0 ? (
+          <>
+            <SectionHeader
+              title="Upcoming deadlines"
+              // These three ARE tasks from the list above, so "See all" means
+              // "show me the whole list", not "re-apply the All filter" —
+              // which did nothing when All was already selected.
+              actionLabel="See all"
+              onAction={() => {
+                setFilter("all");
+                setQuery("");
+                setExpanded(true);
+                listRef.current?.scrollToOffset({ offset: 0, animated: true });
+              }}
             />
-            <Text style={st.needsTxt}>
-              {name ? `"${name}" — needs a contact` : "Needs an assignee"}
-            </Text>
-            <Text style={st.needsCta}>Resolve</Text>
+            <UpcomingDeadlines
+              items={deadlines}
+              folderNames={folderNames}
+              onPress={openTask}
+            />
+          </>
+        ) : null}
+
+        {insight ? (
+          <>
+            <SectionHeader title="From your meetings" actionLabel="Recent" />
+            <MeetingTaskInsight
+              insight={insight}
+              onPress={(key) =>
+                router.push({
+                  pathname: "/recording/[key]",
+                  params: { key },
+                } as never)
+              }
+            />
+          </>
+        ) : null}
+
+        {loadingMore ? (
+          <View style={st.footerSpinner}>
+            <ActivityIndicator color={C.primary} />
           </View>
-        ) : confirmed ? (
-          <View style={st.assigneeRow}>
-            <Text style={st.assigneeTxt}>{name}</Text>
-            {!!item.assignee_user_id && (
-              <View style={st.appBadge}>
-                <Icon name="checkmark" size={9} tintColor={C.success} />
-                <Text style={st.appBadgeTxt}>App</Text>
-              </View>
-            )}
-          </View>
-        ) : (
-          <View style={st.assigneeRow}>
-            <Text style={[st.assigneeTxt, { color: C.textFaint }]}>
-              Unassigned
-            </Text>
-          </View>
-        )}
-      </Pressable>
+        ) : null}
+        {/* Clears the FAB. */}
+        <View style={{ height: 96 }} />
+      </View>
     );
-  };
 
   return (
     <View style={st.container}>
-      <Stack.Screen options={{ title: "Tasks" }} />
-      <Text style={st.intro}>
-        Every commitment from every meeting, in one place.
-      </Text>
-
+      <Stack.Screen options={{ headerShown: false }} />
       <FlatList
-        data={tasks}
+        ref={listRef}
+        data={loading && !tasks.length ? [] : visible}
         keyExtractor={(t) => t.id}
-        renderItem={renderTask}
+        renderItem={renderItem}
+        ListHeaderComponent={header}
+        ListFooterComponent={footer}
+        ListEmptyComponent={
+          loading || error ? null : (
+            <EmptyState
+              icon={empty.icon}
+              title={empty.title}
+              subtitle={empty.subtitle}
+            />
+          )
+        }
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
-            onRefresh={() => load(activeFilters, true)}
+            onRefresh={() => {
+              load(activeFilters, true);
+              loadInsights();
+            }}
             tintColor={C.primary}
           />
         }
         onEndReached={loadMore}
         onEndReachedThreshold={0.4}
-        ListHeaderComponent={
-          <View style={{ marginBottom: S.md }}>
-            <Text style={st.filterLabel}>Status</Text>
-            <View style={st.chipRow}>
-              {PRESETS.map((p) => (
-                <Chip
-                  key={p.key}
-                  label={p.label}
-                  active={preset === p.key}
-                  onPress={() => setPreset(p.key)}
-                />
-              ))}
-            </View>
-            {folders.length > 0 && (
-              <>
-                <Text style={st.filterLabel}>Folder</Text>
-                <View style={st.chipRow}>
-                  <Chip
-                    label="Any"
-                    active={!folderId}
-                    onPress={() => setFolderId("")}
-                  />
-                  {folders.map((f) => (
-                    <Chip
-                      key={f.id}
-                      label={f.name}
-                      active={folderId === f.id}
-                      onPress={() => setFolderId(f.id)}
-                    />
-                  ))}
-                </View>
-              </>
-            )}
-            {loading && (
-              <>
-                <SkeletonCard />
-                <SkeletonCard />
-              </>
-            )}
-            {!!error && (
-              <View style={{ gap: S.sm, marginTop: S.sm }}>
-                <ErrorText>{error}</ErrorText>
-                <Button
-                  label="Retry"
-                  variant="secondary"
-                  onPress={() => load(activeFilters)}
-                />
-              </View>
-            )}
-          </View>
-        }
-        ListEmptyComponent={
-          loading || error ? null : (
-            <EmptyState
-              icon="checklist"
-              title="Nothing here"
-              subtitle={
-                preset === "open"
-                  ? "No open tasks. Tasks appear automatically from what people commit to in your meetings."
-                  : "No tasks match these filters."
-              }
-            />
-          )
-        }
-        ListFooterComponent={
-          loadingMore ? (
-            <View style={st.footer}>
-              <ActivityIndicator color={C.primary} />
-            </View>
-          ) : (
-            <View style={{ height: S.xxl }} />
-          )
-        }
-        contentContainerStyle={{ paddingTop: S.sm }}
         showsVerticalScrollIndicator={false}
+        contentContainerStyle={{
+          paddingHorizontal: 20,
+          paddingTop: insets.top + S.sm,
+        }}
+        // Virtualization tuning for a phone: render a screenful either side,
+        // not the whole list.
+        initialNumToRender={8}
+        maxToRenderPerBatch={10}
+        windowSize={9}
+        removeClippedSubviews
+      />
+
+      <QuickAddTaskButton
+        onPress={() => setQuickAdd(true)}
+        bottom={Math.max(insets.bottom, S.lg) + S.md}
+      />
+
+      <QuickAddTaskSheet
+        visible={quickAdd}
+        onClose={() => setQuickAdd(false)}
+        onCreated={() => {
+          load(activeFilters, true);
+          loadInsights();
+        }}
       />
     </View>
   );
 }
 
-function statusTint(status: TaskStatusV2 | string, C: ColorScale) {
-  switch (status) {
-    case "Completed":
-      return { bg: C.successSoft, fg: C.success };
-    case "In Progress":
-      return { bg: C.primarySoft, fg: C.primary };
-    case "Cancelled":
-      return { bg: C.surface2, fg: C.textFaint };
-    default:
-      return { bg: C.warnSoft, fg: C.warn };
-  }
-}
-
 function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
   return StyleSheet.create({
-    container: { flex: 1, backgroundColor: C.bg, paddingHorizontal: 20 },
-    intro: { ...T.caption, marginTop: 2, marginBottom: S.md },
-    filterLabel: {
-      ...CAPS, fontFamily: FONT.bold, fontSize: 10, letterSpacing: 1.3,
-      color: C.textFaint, marginTop: S.sm, marginBottom: 6,
+    container: { flex: 1, backgroundColor: C.bg },
+    partialNote: {
+      ...T.caption,
+      marginTop: 6,
     },
-    chipRow: {
-      flexDirection: "row" as const, flexWrap: "wrap" as const, gap: S.sm,
+    searchNote: {
+      ...T.caption,
+      marginTop: S.sm,
     },
-    card: {
-      backgroundColor: C.surface, borderRadius: R.card, padding: S.lg,
-      marginBottom: S.md, shadowColor: C.shadow, ...ELEV.sm,
-    },
-    cardTop: {
-      flexDirection: "row" as const, alignItems: "flex-start" as const,
-      gap: S.md,
-    },
-    title: { fontFamily: FONT.bold, fontSize: 14.5, color: C.text, lineHeight: 20 },
-    metaRow: {
-      flexDirection: "row" as const, alignItems: "center" as const,
-      flexWrap: "wrap" as const, gap: 6, marginTop: 8,
-    },
-    statusPill: {
-      paddingHorizontal: 8, paddingVertical: 3, borderRadius: R.pill,
-    },
-    statusTxt: { fontFamily: FONT.bold, fontSize: 10.5 },
-    due: { fontFamily: FONT.medium, fontSize: 11.5, color: C.textFaint },
-    avatar: {
-      width: 34, height: 34, borderRadius: 17, alignItems: "center" as const,
-      justifyContent: "center" as const,
-    },
-    avatarTxt: { fontFamily: FONT.bold, fontSize: 12.5, color: "#fff" },
-    assigneeRow: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 6,
-      marginTop: 12, paddingTop: 10, borderTopWidth: 1,
-      borderTopColor: C.border,
-    },
-    assigneeTxt: { fontFamily: FONT.medium, fontSize: 12.5, color: C.textDim },
-    appBadge: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 3,
-      paddingHorizontal: 6, paddingVertical: 2, borderRadius: R.pill,
-      backgroundColor: C.successSoft,
-    },
-    appBadgeTxt: { fontFamily: FONT.bold, fontSize: 9.5, color: C.success },
-    needsRow: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 6,
-      marginTop: 12, paddingTop: 10, borderTopWidth: 1,
-      borderTopColor: C.border,
-    },
-    needsTxt: {
-      fontFamily: FONT.medium, fontSize: 12.5, color: C.warn, flex: 1,
-    },
-    needsCta: { fontFamily: FONT.bold, fontSize: 12, color: C.primary },
-    footer: { paddingVertical: S.lg, alignItems: "center" as const },
+    footerSpinner: { paddingVertical: S.lg, alignItems: "center" },
   });
 }

@@ -33,6 +33,7 @@
 #
 # Run:  python tests/test_workspace_org.py
 # =============================================================
+import copy
 import json
 import sys
 import unittest
@@ -54,9 +55,13 @@ sys.modules["boto3.dynamodb"] = mock.MagicMock()
 _conditions = mock.MagicMock()
 _conditions.Key = fdb.Key
 sys.modules["boto3.dynamodb.conditions"] = _conditions
-_botocore_exc = mock.MagicMock()
+# Reuse the installed stub module when present (conftest.py under
+# pytest) so every file shares ONE ClientError class; install this
+# file's own only when running standalone.
+_botocore_exc = sys.modules.get("botocore.exceptions") \
+    or mock.MagicMock()
 _botocore_exc.ClientError = fdb.ClientError
-sys.modules["botocore"] = mock.MagicMock()
+sys.modules.setdefault("botocore", mock.MagicMock())
 sys.modules["botocore.exceptions"] = _botocore_exc
 sys.modules["botocore.config"] = mock.MagicMock()
 
@@ -135,7 +140,23 @@ class OrgTestCase(unittest.TestCase):
 
     def setUp(self):
         self.t = fdb.build_tables()
+        # The resource-level handle, for _linked_avatar_map's batch_get_item.
+        # Keyed by the table NAMES the Lambda passes, not by our short keys.
+        self.ddb = fdb.FakeResource({t.name: t for t in self.t.values()})
+        # A presigner that returns a real, recognisable STRING. The default
+        # MagicMock would make _avatar_view_url return a Mock, and every
+        # assertion about an avatar URL would pass against an object that is
+        # not a URL at all.
+        self.s3 = mock.MagicMock()
+        self.s3.generate_presigned_url.side_effect = (
+            lambda op, Params=None, ExpiresIn=None:
+            f"https://s3.test/{op}/{(Params or {}).get('Key', '')}"
+        )
         self.patches = [
+            mock.patch.object(api, "_ddb", self.ddb),
+            mock.patch.object(api, "_s3", self.s3),
+            mock.patch.object(api, "BUCKET_NAME", "test-bucket"),
+            mock.patch.object(api, "USERS_TABLE", self.t["users"].name),
             mock.patch.object(api, "_recordings", self.t["recordings"]),
             mock.patch.object(api, "_contacts", self.t["contacts"]),
             mock.patch.object(api, "_folders", self.t["folders"]),
@@ -1372,6 +1393,144 @@ class TestAiTasks(OrgTestCase):
             "GET", "/recordings/ai/tasks/{key+}", key=KEY)))
         self.assertEqual(body["tasks"][0]["resolution_status"], "RESOLVED")
         self.assertEqual(body["tasks"][0]["assignee_contact_id"], cid)
+
+
+class TestRenamedSpeakerReachesTasks(OrgTestCase):
+    """A rename must reach the tasks a speaker owns.
+
+    The rename lands in ONE place — `speaker_names` on the recording — and the
+    task stores the join key (`assignee_speaker_id`). The display name is
+    resolved at READ time from those two, so every task the speaker owns reads
+    correctly on the next request without the rename writing to a single task
+    row. That is what these tests pin: the name moves, nothing is written, and
+    a task a human assigned is never re-pointed.
+    """
+
+    def _ai_task_from_speaker(self, speaker_id="0"):
+        """Re-seed the meeting with an AI task pinned to a SPEAKER rather than
+        a spoken name — the case a rename has to reach."""
+        self.t["recordings"].items[(KEY,)]["ai_tasks"] = [
+            {"task": "Send revised quote",
+             "assignee": f"Speaker {speaker_id}",
+             "assignee_speaker_id": speaker_id,
+             "due_date": "2026-08-21", "priority": "High"}]
+
+    def _rename(self, names):
+        """Rename in the STORE, not on a snapshot: the fake table deep-copies
+        on get_item, so mutating a previously-read row would change nothing
+        that a later request can see."""
+        self.t["recordings"].items[(KEY,)]["speaker_names"] = names
+
+    def _list(self):
+        status, body = parse(call(api.list_meeting_tasks, event(
+            "GET", "/recordings/ai/tasks/{key+}", key=KEY)))
+        self.assertEqual(status, 200)
+        return body["tasks"]
+
+    def test_an_unnamed_speaker_reads_as_its_label(self):
+        self._ai_task_from_speaker()
+        t = self._list()[0]
+        self.assertEqual(t["speaker_name"], "Speaker 0")
+        self.assertEqual(t["assignee"]["name"], "Speaker 0")
+
+    def test_renaming_the_speaker_renames_the_task_assignee(self):
+        """The bug this fixes: the transcript, participants and documents all
+        picked a rename up, and the task went on saying "Speaker 0"."""
+        self._ai_task_from_speaker()
+        self._list()                          # seed while still unnamed
+        tasks_before = copy.deepcopy(self.t["tasks"].items)
+
+        self._rename({"0": "Ravi"})
+        t = self._list()[0]
+        self.assertEqual(t["speaker_name"], "Ravi")
+        self.assertEqual(t["assignee"]["name"], "Ravi")
+
+        # NOTHING was written to reach that name — the whole design.
+        self.assertEqual(self.t["tasks"].items, tasks_before)
+
+    def test_the_stored_extraction_is_untouched_by_a_rename(self):
+        """Resolution is DISPLAY only: the string the AI produced stays on the
+        row, so the extraction remains inspectable and the rename reversible."""
+        self._ai_task_from_speaker()
+        self._list()
+        self._rename({"0": "Ravi"})
+        t = self._list()[0]
+        self.assertEqual(t["assignee_name_legacy"], "Speaker 0")
+        self.assertEqual(t["assignee_speaker_id"], "0")
+
+    def test_clearing_the_name_puts_the_label_back(self):
+        self._ai_task_from_speaker()
+        self._rename({"0": "Ravi"})
+        self.assertEqual(self._list()[0]["assignee"]["name"], "Ravi")
+        self._rename({})
+        self.assertEqual(self._list()[0]["assignee"]["name"], "Speaker 0")
+
+    def test_renaming_again_moves_it_again(self):
+        self._ai_task_from_speaker()
+        self._rename({"0": "Ravi"})
+        self.assertEqual(self._list()[0]["assignee"]["name"], "Ravi")
+        self._rename({"0": "Rahul Verma"})
+        self.assertEqual(self._list()[0]["assignee"]["name"], "Rahul Verma")
+
+    def test_a_rename_never_repoints_a_hand_assigned_task(self):
+        """The guard that matters most. Once a human has said who owns a task,
+        renaming the speaker who happened to say the sentence must not move it
+        — the same rule _resolve_tasks_for_speaker applies when it skips
+        already-resolved tasks."""
+        self.add_user("u-456", "rahul@company.com")
+        _, c = parse(call(api.create_contact, event(
+            "POST", "/contacts", body={"name": "Priya Sharma",
+                                       "email": "priya@company.com"})))
+        contact_id = c["contact"]["id"]
+
+        self._ai_task_from_speaker()
+        task_id = self._list()[0]["id"]
+        status, _ = parse(call(api.resolve_task_assignee, event(
+            "POST", "/tasks/{task_id}/resolve",
+            path={"task_id": task_id}, body={"contact_id": contact_id})))
+        self.assertEqual(status, 200)
+
+        self._rename({"0": "Ravi"})
+        t = self._list()[0]
+        self.assertEqual(t["assignee"]["name"], "Priya Sharma")
+        self.assertEqual(t["resolution_status"], "RESOLVED")
+        # Provenance is still reported, so the UI can say where it came from.
+        self.assertEqual(t["speaker_name"], "Ravi")
+
+    def test_a_task_naming_a_real_person_is_not_a_speaker_task(self):
+        """The default fixture's AI task names "Rahul", not a label — a rename
+        of any speaker must leave it completely alone."""
+        self._rename({"0": "Ravi"})
+        t = self._list()[0]
+        self.assertEqual(t["assignee_name_legacy"], "Rahul")
+        self.assertEqual(t["assignee"]["name"], "Rahul")
+        self.assertEqual(t["speaker_name"], "")
+
+    def test_the_cross_meeting_tracker_resolves_too(self):
+        """GET /tasks has no recording in hand, so it must read speaker_names
+        per meeting itself — otherwise the Task Tracker would be the one screen
+        still showing the old label."""
+        self._ai_task_from_speaker()
+        self._list()
+        self._rename({"0": "Ravi"})
+        status, body = parse(call(api.list_all_tasks, event("GET", "/tasks")))
+        self.assertEqual(status, 200)
+        names = [t["assignee"]["name"] for t in body["tasks"]
+                 if t["assignee"]]
+        self.assertIn("Ravi", names)
+
+    def test_the_task_detail_route_resolves_and_returns_the_map(self):
+        self._ai_task_from_speaker()
+        task_id = self._list()[0]["id"]
+        self._rename({"0": "Ravi"})
+        status, body = parse(call(api.get_task, event(
+            "GET", "/tasks/{task_id}", path={"task_id": task_id})))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["task"]["speaker_name"], "Ravi")
+        self.assertEqual(body["task"]["assignee"]["name"], "Ravi")
+        # Handed to the detail screen so it can name the source speaker
+        # without a second participants call.
+        self.assertEqual(body["recording"]["speaker_names"], {"0": "Ravi"})
 
 
 class TestAmbiguityResolution(OrgTestCase):

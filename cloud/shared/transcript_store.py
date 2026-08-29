@@ -188,12 +188,77 @@ def fetch(s3, bucket, s3_key):
     return transcript, timestamps
 
 
+# ---------------------------------------------------------------------------
+# SEGMENT IDs — derived at read time, never stored.
+#
+# The AI grounding layer needs to point at a specific moment of the meeting
+# ("this claim comes from these turns"), and a stable handle per segment is
+# what makes that checkable. The obvious implementation — write an `id` onto
+# every segment — was rejected: it would mean an S3 migration over every
+# existing transcript object to make old recordings groundable, and a write
+# path that can now disagree with a read path about what a segment is called.
+#
+# The IDs are POSITIONAL instead ("seg_0", "seg_1", ...), so they are a pure
+# function of the segment list and identical for a legacy object and a fresh
+# one. Nothing has to be migrated, and an ID never has to be reconciled.
+#
+# Position is a safe identity here BECAUSE the segment list is immutable in
+# practice: it is written once by the STT stage and only ever replaced
+# wholesale by a re-transcription — which also rewrites the analysis (and its
+# evidence references) in the same invocation, so the two can never drift
+# apart. There is no code path that inserts, deletes or reorders one segment.
+#
+# STRICTLY ADDITIVE. Ordering, boundaries, `start`/`end` and `text` are
+# untouched, because the app aligns transcript lines to timestamps by POSITION
+# and seeks on seg.start — a change to any of those would break tap-to-seek.
+# ---------------------------------------------------------------------------
+SEGMENT_ID_PREFIX = "seg_"
+
+
+def segment_id(index):
+    """The stable ID for the segment at `index`. One definition, used by the
+    writer of evidence references and their validator alike."""
+    return f"{SEGMENT_ID_PREFIX}{index}"
+
+
+def with_segment_ids(timestamps):
+    """`timestamps` with a derived `id` on every segment.
+
+    Returns a new list of shallow-copied segments — the input is never mutated,
+    so a caller holding the raw S3 payload is unaffected. A non-dict element is
+    passed through untouched rather than dropped: this function's job is to add
+    a field, not to validate a shape someone else already tolerates.
+
+    An `id` already present is LEFT ALONE. Nothing writes one today, but that
+    makes the function idempotent, so hydrating twice (or hydrating an item that
+    already went through here) can never renumber a segment out from under an
+    evidence reference that points at it.
+    """
+    if not isinstance(timestamps, list):
+        return []
+    out = []
+    for i, seg in enumerate(timestamps):
+        if not isinstance(seg, dict):
+            out.append(seg)
+            continue
+        if seg.get("id"):
+            out.append(seg)
+            continue
+        out.append({**seg, "id": segment_id(i)})
+    return out
+
+
 def hydrate(s3, bucket, item):
     """Item with `transcript`/`timestamps` filled in, whatever the storage.
 
     The single read path for both layouts:
       * offloaded row (has transcript_s3_key) -> fetched from S3
       * legacy row (inline attributes)        -> returned as-is
+
+    Every segment comes back carrying a derived `id` (see with_segment_ids), on
+    both paths and for objects written long before IDs existed — which is what
+    lets the AI's evidence references resolve against the back catalogue
+    without a migration.
 
     Returns a SHALLOW COPY: the caller's item is left untouched, so a hydrated
     item is never accidentally written back to DynamoDB with the transcript
@@ -206,7 +271,11 @@ def hydrate(s3, bucket, item):
     # Inline content wins. Legacy rows are served without an S3 round-trip,
     # and a row mid-migration that still has both stays readable.
     if (item.get("transcript") or "").strip():
-        return item
+        # Still a COPY, not the caller's item: stamping IDs onto the original
+        # would mutate a dict the caller may be about to write back.
+        out = dict(item)
+        out["timestamps"] = with_segment_ids(item.get("timestamps"))
+        return out
 
     s3_key = item.get("transcript_s3_key")
     if not s3_key or not bucket:
@@ -215,7 +284,7 @@ def hydrate(s3, bucket, item):
     transcript, timestamps = fetch(s3, bucket, s3_key)
     out = dict(item)
     out["transcript"] = transcript
-    out["timestamps"] = timestamps
+    out["timestamps"] = with_segment_ids(timestamps)
     return out
 
 

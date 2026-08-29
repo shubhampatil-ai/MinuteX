@@ -40,7 +40,9 @@ import {
   getTaskDetail, needsAssigneeResolution, patchTaskById, resolveTaskAssignee,
 } from "../../../lib/api";
 import { ContactPicker } from "../../../lib/contact-picker";
+import { DueDatePicker, isPlottableDue } from "../../../lib/due-date-picker";
 import { avatarColorFor, initialsOf } from "../../../lib/task-model";
+import { dayHeading } from "../../../lib/task-insights";
 
 const STATUSES: TaskStatusV2[] = [
   "Open",
@@ -64,6 +66,7 @@ export default function TaskDetailScreen() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [dueOpen, setDueOpen] = useState(false);
   // Ranking context for the assignee picker: who was in this meeting, and who
   // is in its folder. Fetched lazily when the picker opens rather than on every
   // task view — most visits never assign anyone.
@@ -118,6 +121,27 @@ export default function TaskDetailScreen() {
       setBusy(true);
       try {
         await patchTaskById(taskId, { status });
+        await load();
+      } catch (e) {
+        Alert.alert(
+          "Could not update",
+          e instanceof ApiError ? e.message : "Please try again."
+        );
+      } finally {
+        setBusy(false);
+      }
+    },
+    [taskId, load]
+  );
+
+  /** Set (or clear) the due date. The picker only ever emits a real
+   * YYYY-MM-DD, so anything saved here is a date the calendar can plot —
+   * which is the whole point of having a picker rather than a text field. */
+  const setDue = useCallback(
+    async (dayKey: string) => {
+      setBusy(true);
+      try {
+        await patchTaskById(taskId, { due: dayKey });
         await load();
       } catch (e) {
         Alert.alert(
@@ -335,7 +359,11 @@ export default function TaskDetailScreen() {
                 accessibilityLabel="Map speakers for this meeting"
               >
                 <Text style={st.altLink}>
-                  This came from Speaker {task.assignee_speaker_id}. Mapping
+                  {/* Named through the meeting's current speaker_names when
+                      there is a name — a renamed speaker reads as their name
+                      here too, not the raw label the AI extracted. */}
+                  This came from {task.speaker_name
+                    || `Speaker ${task.assignee_speaker_id}`}. Mapping
                   that speaker resolves every task they own →
                 </Text>
               </Pressable>
@@ -401,6 +429,42 @@ export default function TaskDetailScreen() {
             />
           </View>
         )}
+      </View>
+
+      {/* ---------------- DUE DATE ---------------- */}
+      <View style={{ marginTop: S.lg }}>
+        <SectionTitle>Due date</SectionTitle>
+        <Pressable
+          style={st.dueRow}
+          onPress={() => setDueOpen(true)}
+          disabled={busy}
+          accessibilityRole="button"
+          accessibilityLabel={
+            task.due ? `Change due date, currently ${task.due}` : "Set a due date"
+          }
+        >
+          <Icon name="calendar" size={16} tintColor={C.primary} />
+          <View style={{ flex: 1 }}>
+            <Text style={[st.dueValue, !task.due && { color: C.textFaint }]}>
+              {task.due
+                ? isPlottableDue(task.due)
+                  ? dayHeading(task.due, new Date())
+                  : task.due
+                : "No due date"}
+            </Text>
+            {/* A legacy task can carry free text ("Friday") from before dates
+                were picked rather than typed. The backend stores due_date
+                verbatim, so it persists — but the calendar can only plot a
+                real day. Say so, instead of leaving someone wondering why
+                their task never appears there. */}
+            {task.due && !isPlottableDue(task.due) ? (
+              <Text style={st.dueHint}>
+                Not a calendar date — pick one so it shows on the calendar
+              </Text>
+            ) : null}
+          </View>
+          <Icon name="chevron.right" size={15} tintColor={C.textFaint} />
+        </Pressable>
       </View>
 
       {/* ---------------- STATUS ---------------- */}
@@ -498,6 +562,13 @@ export default function TaskDetailScreen() {
         </Card>
       </View>
 
+      <DueDatePicker
+        visible={dueOpen}
+        onClose={() => setDueOpen(false)}
+        value={isPlottableDue(task.due) ? task.due : ""}
+        onChange={setDue}
+      />
+
       <ContactPicker
         visible={pickerOpen}
         onClose={() => setPickerOpen(false)}
@@ -536,6 +607,15 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     pill: { paddingHorizontal: 9, paddingVertical: 4, borderRadius: R.pill },
     pillTxt: { fontFamily: FONT.bold, fontSize: 11 },
     due: { fontFamily: FONT.medium, fontSize: 12, color: C.textFaint },
+    dueRow: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: S.md,
+      backgroundColor: C.surface, borderRadius: R.card, padding: S.lg,
+      shadowColor: C.shadow, ...ELEV.sm,
+    },
+    dueValue: { fontFamily: FONT.semibold, fontSize: 14.5, color: C.text },
+    dueHint: {
+      fontFamily: FONT.regular, fontSize: 11.5, color: C.warn, marginTop: 3,
+    },
     warnHead: {
       flexDirection: "row" as const, alignItems: "center" as const, gap: S.sm,
     },

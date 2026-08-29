@@ -32,7 +32,7 @@ function useStoredBool(key: string, initial: boolean): [boolean, (v: boolean) =>
   }, [key]);
   const set = (v: boolean) => {
     setVal(v);
-    store.setItemAsync(key, v ? "1" : "0").catch(() => {});
+    store.setItemAsync(key, v ? "1" : "0").catch(() => { });
   };
   return [val, set];
 }
@@ -191,8 +191,8 @@ export default function SettingsScreen() {
         label="Salesforce"
         sub={
           sfConnected === null ? "Push meeting notes into your CRM"
-          : sfConnected ? "Connected"
-          : "Not connected"
+            : sfConnected ? "Connected"
+              : "Not connected"
         }
         right={sfConnected ? <Text style={st.granted}>Connected</Text> : undefined}
         onPress={() => router.push("/salesforce")}
@@ -209,10 +209,10 @@ export default function SettingsScreen() {
         label="Bluetooth & nearby devices"
         value={
           bleOk === null ? <Text style={st.dim}>Checking…</Text> :
-          bleOk ? <Text style={st.granted}>Granted</Text> :
-          <Pressable onPress={fixBle}>
-            <Text style={st.action}>{bleBlocked ? "Open settings" : "Grant"}</Text>
-          </Pressable>
+            bleOk ? <Text style={st.granted}>Granted</Text> :
+              <Pressable onPress={fixBle}>
+                <Text style={st.action}>{bleBlocked ? "Open settings" : "Grant"}</Text>
+              </Pressable>
         }
       />
       {/* Surfaced only when it's actually off — Location being on is the
@@ -233,7 +233,7 @@ export default function SettingsScreen() {
 
       {/* Privacy & storage */}
       <SectionRule>Privacy & data</SectionRule>
-      {/* Trash is where a deleted brief actually goes — the Desk only ever
+      {/* Trash is where a deleted brief actually goes — MinuteX only ever
           soft-deletes, so this is the one place a recording can be restored
           or genuinely removed. It belongs under Privacy & data for that
           reason, not under a generic "storage" heading. */}

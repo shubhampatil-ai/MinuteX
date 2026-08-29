@@ -41,13 +41,14 @@ const MAP = {
   "xmark.circle.fill": "cancel",
   "magnifyingglass": "search",
   "ellipsis": "more_horiz",
-  // The Briefing's tab set: the Desk is filed paper, not a house, and the
+  // The Briefing's tab set: MinuteX is filed paper, not a house, and the
   // Actions tab is a checked-off promise.
   "newspaper.fill": "article",
   "checkmark.circle": "task_alt",
   "arrow.left": "arrow_back",
   "arrow.right": "arrow_forward",
   "arrow.up": "arrow_upward",
+  "arrow.down": "arrow_downward",
   "clock.arrow.circlepath": "history",
   "tray.fill": "inbox",
 
@@ -108,6 +109,9 @@ const MAP = {
   "bookmark": "bookmark",
   "pencil": "edit",
   "trash": "delete",
+  // Profile / contact photos (lib/photo-picker.tsx).
+  "photo": "photo_library",
+  "camera": "photo_camera",
   "folder": "folder_open",
   // Folder category icons (lib/folder-appearance.tsx maps stored folder
   // tokens onto these). Small, deliberate set — a folder icon is a

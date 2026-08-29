@@ -1,7 +1,7 @@
 // src/app/folder/[id].tsx — one folder: its meetings and its people.
 //
 // This is a VIEW over All Meetings, not a container. The meetings listed here
-// are the same rows the Desk shows, filtered by folder_id — which is why
+// are the same rows MinuteX shows, filtered by folder_id — which is why
 // "Remove from folder" is worded that way rather than "Delete": it moves the
 // meeting back to General and touches nothing else.
 //
@@ -58,7 +58,7 @@ export default function FolderDetailScreen() {
       else setLoading(true);
       setError("");
       try {
-        // The meeting list comes from the SAME endpoint the Desk uses and is
+        // The meeting list comes from the SAME endpoint MinuteX uses and is
         // filtered by folder here — there is one master collection, and this
         // screen must not imply otherwise by reading a different source.
         const all = await getRecordings();
@@ -363,7 +363,7 @@ export default function FolderDetailScreen() {
       )}
 
       {/* Record straight into this folder. The whole point of the button being
-          HERE rather than only on the Desk: the folder is already the context,
+          HERE rather than only on MinuteX: the folder is already the context,
           so the recording is filed at presign time and never has to be moved.
           General gets one too — it is where an unfiled recording would land
           anyway, so the button is honest there as well. */}

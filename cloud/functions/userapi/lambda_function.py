@@ -267,6 +267,13 @@ TASKS_OWNER_INDEX = os.environ.get("TASKS_OWNER_INDEX", "owner-index")
 TASKS_MEETING_INDEX = os.environ.get("TASKS_MEETING_INDEX", "meeting-index")
 TASKS_FOLDER_INDEX = os.environ.get("TASKS_FOLDER_INDEX", "folder-index")
 TASKS_ASSIGNEE_INDEX = os.environ.get("TASKS_ASSIGNEE_INDEX", "assignee-index")
+# Tasks assigned to a MinuteX ACCOUNT (not a contact). The assignee-index
+# above is keyed on assignee_contact_id — an address-book record, which is
+# not an identity and cannot authenticate — so it cannot answer "tasks
+# assigned to me". assignee_user_id is a SPARSE key (see _TASK_SPARSE_KEYS),
+# so unassigned tasks never enter this index.
+TASKS_ASSIGNEE_USER_INDEX = os.environ.get(
+    "TASKS_ASSIGNEE_USER_INDEX", "assignee-user-index")
 TASKS_DEDUPE_INDEX = os.environ.get("TASKS_DEDUPE_INDEX", "dedupe-index")
 NOTIFICATIONS_USER_INDEX = os.environ.get("NOTIFICATIONS_USER_INDEX",
                                           "user-index")
@@ -3545,6 +3552,9 @@ def delete_mom(event):
 MAX_TASK_TEXT = 300
 MAX_TASK_NOTE_TEXT = 500
 MAX_TASKS = 200
+# Evidence references per task. One or two segments carry a spoken sentence;
+# the cap only stops a runaway model answer from bloating the row.
+MAX_EVIDENCE_SEGMENTS = 8
 TASK_STATUSES = ("Open", "In Progress", "Completed")
 TASK_PRIORITIES = ("Low", "Medium", "High")
 NOTIFY_CHANNELS = ("whatsapp", "email", "sms", "app")
@@ -5459,12 +5469,20 @@ def _speaker_display_name(label, speaker_names):
 
     Numeric labels read as "Speaker 2"; named ones ("agent") stand alone.
     """
-    raw = str(label or "").strip()
+    # Normalized before the lookup because `speaker_names` is keyed on the
+    # COMPACT id ("0"), while a task row written before speaker normalization
+    # existed can still carry the transcript's "Speaker 0". Without this such a
+    # row renders the literal label forever instead of the person's real name,
+    # even after the user maps that speaker.
+    raw = stt_result.normalize_speaker_id(label)
     if not raw:
         return ""
     named = (speaker_names or {}).get(raw)
     if named:
         return str(named)
+    # The display prefix is RE-ADDED here. Normalization is internal only: what
+    # the user reads is unchanged, so an unmapped speaker still reads
+    # "Speaker 0", exactly as before.
     return f"Speaker {raw}" if raw.isdigit() else raw
 
 
@@ -5505,6 +5523,23 @@ def _speaker_names_for_recording(key, cache=None):
     if cache is not None:
         cache[key] = names
     return names
+
+
+def _task_needs_review(row):
+    """True when a human has to confirm this task's assignee.
+
+    ONE definition, computed from state that already exists rather than stored
+    as a fourth flag that could drift. It is exactly the UNRESOLVED case: an
+    assignee was CLAIMED (a spoken name, or a low-confidence match the gate
+    withheld) but not confirmed. Both AI and legacy-migrated tasks reach it,
+    which is correct — a legacy task carrying a bare name needs the same
+    confirmation as a freshly-gated one.
+
+    NONE is deliberately NOT review-worthy: an unassigned task is a normal
+    outcome, not an open question, and treating it as one would fill the queue
+    with work nobody ever claimed.
+    """
+    return row.get("resolution_status") == RESOLUTION_UNRESOLVED
 
 
 def _public_task_v2(row, speaker_names=None):
@@ -5562,6 +5597,18 @@ def _public_task_v2(row, speaker_names=None):
         "source_type": row.get("source_type", TASK_SOURCE_MANUAL),
         "ai_confidence": row.get("ai_confidence", ""),
         "ai_evidence": row.get("ai_evidence", ""),
+        # WHERE the evidence came from, so the app can offer to jump to that
+        # moment of the meeting. Absent on rows with no reference, and on
+        # manual tasks, which is what lets the UI show AI provenance only
+        # where it genuinely exists.
+        "ai_evidence_segment_ids": list(
+            row.get("ai_evidence_segment_ids") or []),
+        # The ONE flag the UI branches on for "this needs a human". Computed
+        # here rather than stored so it can never disagree with the
+        # resolution_status it is derived from — a task resolved by the user
+        # stops needing review the instant they resolve it, with no second
+        # write to keep in step.
+        "needs_review": _task_needs_review(row),
         "notified_via": row.get("notified_via", []),
         "created_at": row.get("created_at", ""),
         "updated_at": row.get("updated_at", ""),
@@ -5692,6 +5739,13 @@ def _find_task_by_fingerprint(user_id, fingerprint):
 
 
 def _owned_task(user_id, task_id):
+    """The task, if this caller CREATED it. 404 otherwise.
+
+    Deliberately still creator-only: this is the predicate for the actions
+    only a creator may perform (deadline, details, assignee, AI resolution).
+    Routes an assignee may also reach use _visible_task / _task_for_status
+    instead — see the permission model below.
+    """
     tid = str(task_id or "").strip()
     if not tid:
         raise ApiError(400, "task id required")
@@ -5699,6 +5753,132 @@ def _owned_task(user_id, task_id):
     if not row or row.get("owner_user_id") != user_id:
         raise ApiError(404, "task not found")
     return row
+
+
+# ---------------------------------------------------------------------------
+# TASK LIFECYCLE PERMISSIONS
+#
+# Two DIFFERENT people have rights over a task, and conflating them is the bug
+# this section exists to prevent:
+#
+#   CREATOR   `owner_user_id`. The authenticated user for a manual task; the
+#             MEETING OWNER for an AI-seeded one (_seed_ai_tasks is handed the
+#             recording row's user_id, never anything off the event). They
+#             control the task's CONFIGURATION — deadline, details, assignee,
+#             AI assignment resolution.
+#
+#   ASSIGNEE  `assignee_user_id`. Only ever written from a Contact linked to a
+#             real MinuteX account (see _new_task_row), so its presence means
+#             "there is an authenticated person here". They EXECUTE the task
+#             and may change exactly one field: status.
+#
+# `assignee_contact_id` is NOT an authorization input. A contact is a record in
+# someone's address book, not an identity that can authenticate — a task
+# assigned to a contact with no MinuteX account simply has no assignee who can
+# act on it, which is correct rather than a gap to paper over.
+#
+# ERROR CODES. An unrelated caller gets 404 from every route, matching
+# _owned_task / _owned_contact / _owned_recording: a 403 would confirm the id
+# exists. An ASSIGNEE attempting a creator-only action gets 403, because they
+# can already see the task — telling a permitted viewer their own task does
+# not exist would be a lie that is very hard to debug.
+# ---------------------------------------------------------------------------
+
+def _task_creator(row):
+    """The user who controls this task's configuration."""
+    return str((row or {}).get("owner_user_id") or "").strip()
+
+
+def _is_task_creator(user_id, row):
+    return bool(user_id) and _task_creator(row) == user_id
+
+
+def _is_task_assignee(user_id, row):
+    """Whether this caller is the task's assignee AS AN ACCOUNT.
+
+    Reuses _task_assignee_user — the same predicate the notification engine
+    uses to decide there is someone to notify — so "can act on this task" and
+    "can receive mail about this task" can never drift apart.
+    """
+    return bool(user_id) and _task_assignee_user(row) == user_id
+
+
+def _visible_task(user_id, task_id):
+    """The task, if this caller may VIEW it: creator or assignee.
+
+    404 for everyone else, so an unrelated caller cannot use this route to
+    discover that a task id exists.
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        raise ApiError(400, "task id required")
+    row = _tasks.get_item(Key={"task_id": tid}).get("Item")
+    if not row or not (_is_task_creator(user_id, row)
+                       or _is_task_assignee(user_id, row)):
+        raise ApiError(404, "task not found")
+    return row
+
+
+def _authorize_task_patch(user_id, row, data):
+    """Reject a patch that touches fields this caller may not change.
+
+    Status is the ONLY field an assignee may modify. Everything else —
+    title, description, due date, priority, assignee, notification record —
+    is the creator's. Checked against the REQUEST BODY rather than against
+    what changed, so a no-op write of a forbidden field is still refused: a
+    client must not be able to probe which fields it can reach.
+
+    Called after the row is loaded and before any update is built, so a denied
+    request writes nothing at all.
+    """
+    if _is_task_creator(user_id, row):
+        return
+    if not _is_task_assignee(user_id, row):
+        # Not creator, not assignee: this row is not theirs to see, let alone
+        # patch. 404 keeps it indistinguishable from a task that never was.
+        raise ApiError(404, "task not found")
+    touched = [f for f in data if f in _TASK_CREATOR_ONLY_FIELDS]
+    if touched:
+        raise ApiError(
+            403,
+            "only the task creator can change "
+            + ", ".join(sorted(touched))
+            + " — the assignee can change status only")
+
+
+def _task_permissions(user_id, row):
+    """What this caller may do with this task, as plain booleans.
+
+    Sent on the task detail response so the app can render the right controls
+    without re-implementing the rule. This is a CONVENIENCE for the UI, never
+    the enforcement point — every mutation route checks for itself, because a
+    client is free to ignore what it is told.
+    """
+    creator = _is_task_creator(user_id, row)
+    assignee = _is_task_assignee(user_id, row)
+    return {
+        "is_creator": creator,
+        "is_assignee": assignee,
+        "can_view": creator or assignee,
+        # The one field an assignee owns.
+        "can_change_status": creator or assignee,
+        # Everything that configures the task belongs to its creator.
+        "can_edit_details": creator,
+        "can_change_deadline": creator,
+        "can_change_assignee": creator,
+        "can_resolve_assignment": creator,
+        "can_delete": creator,
+    }
+
+
+# Every writable field of the patch body EXCEPT status (and `id`, which selects
+# the row rather than changing it). Named explicitly rather than derived as
+# "not status" so a NEW writable field is denied to the assignee by default: a
+# field added here is a decision, a field forgotten is a vulnerability.
+_TASK_CREATOR_ONLY_FIELDS = (
+    "task", "title", "description", "due", "due_date", "priority",
+    "assignee", "assignee_contact_id", "notify_channels", "folder_id",
+)
 
 
 def _write_task(row):
@@ -5722,6 +5902,7 @@ _TASK_SPARSE_KEYS = ("folder_id", "assignee_contact_id", "fingerprint",
 # cursor carrying only the table key is rejected on a GSI query.
 _TASK_INDEX_KEYS = {
     TASKS_OWNER_INDEX: ("owner_user_id", "created_at"),
+    TASKS_ASSIGNEE_USER_INDEX: ("assignee_user_id", "created_at"),
     TASKS_MEETING_INDEX: ("source_recording_id", "created_at"),
     TASKS_FOLDER_INDEX: ("folder_id", "created_at"),
     TASKS_ASSIGNEE_INDEX: ("assignee_contact_id", "created_at"),
@@ -5911,6 +6092,88 @@ def _migrate_embedded_tasks(user_id, key, item):
     return created
 
 
+# ---------------------------------------------------------------------------
+# AI TASK VALIDATION AND CONFIDENCE GATING.
+#
+# THE RULE THIS ENFORCES: MinuteX must never silently assign work to a person
+# it is not sure about. A wrong assignee is worse than no assignee — the real
+# owner never learns the task exists, and the person it landed on has no way to
+# know it was a guess.
+#
+# WHAT IS AND IS NOT A NEW STATE. No new review state was introduced: the Task
+# model already distinguishes RESOLVED / UNRESOLVED / NONE, and UNRESOLVED
+# already means exactly "there is an assignee claim here that a human must
+# confirm". Low-confidence gating therefore DEMOTES a task into the existing
+# UNRESOLVED state rather than inventing a parallel one — which is also why the
+# existing AI_ACTION_REQUIRED notification and the existing
+# resolve-assignee flow light up for it with no extra wiring.
+#
+# CONFIDENCE IS THE MODEL'S CLAIM, GATING IS OURS. `ai_confidence` is stored
+# verbatim as what the model said; the gate below is a separate, deterministic
+# decision about what to DO with that claim. Keeping them apart is deliberate —
+# a stored field that mixed "the model was unsure" with "we downgraded it"
+# could not answer either question later.
+#
+# THE GATE, and why each band behaves as it does:
+#
+#   high    -> trust the resolution as-is. The model says the work and its
+#              owner are both explicit; the speaker chain either found an
+#              account or it did not, and that outcome stands.
+#
+#   medium  -> trust it too. "The work is clear, the owner needs context"
+#              describes ordinary meeting speech, and the resolution chain is
+#              itself evidence-based (a mapped speaker is a fact, not a guess).
+#              Demoting these would bury real assignments under review noise,
+#              which trains people to ignore the review queue.
+#
+#   low     -> NEVER auto-assign. The model is telling us the work or its owner
+#              is genuinely ambiguous. A speaker-derived contact match on an
+#              ambiguous utterance is precisely the case that produces a
+#              confidently-wrong assignee, so the assignment is withheld and
+#              the owner is asked. The task is still CREATED — the work was
+#              discussed and deleting it would lose real information.
+#
+#   ""      -> no claim was made (an older row, or a model answer the enum
+#              refused). Treated like medium: absence of a score is not
+#              evidence of doubt, and demoting every unscored task would put
+#              the entire back catalogue into review.
+#
+# EVIDENCE. A task the model could not quote is not blocked — the work may
+# still be real and the transcript is on the row either way — but it cannot be
+# auto-assigned on a LOW-confidence reading either, which the gate already
+# covers. Evidence is recorded so the user can check the claim; it is not used
+# as a second gate, because a missing quote is a formatting failure, not a
+# statement about who owes the work.
+AI_CONFIDENCE_GATED = (ai_schema.CONFIDENCE_LOW,)
+
+
+def _gate_ai_assignment(raw_confidence, contact, assignee_name):
+    """Decide whether an AI task may keep its resolved assignee.
+
+    Returns (contact, assignee_name, gated) — the values to build the row
+    with, and whether the gate fired. A gated task keeps everything it knows
+    (the speaker id, the spoken name, the evidence) but is NOT handed a
+    Contact, so `_new_task_row` files it as UNRESOLVED and the owner is asked
+    to confirm through the flow that already exists for that state.
+
+    The spoken NAME is preserved rather than dropped: "Rahul" is what the
+    reviewer needs in order to answer the question, and throwing it away would
+    make the review harder than the extraction.
+    """
+    confidence = ai_schema.coerce_confidence(raw_confidence)
+    if confidence not in AI_CONFIDENCE_GATED:
+        return contact, assignee_name, False
+    if contact is None and not assignee_name:
+        # Nothing was claimed, so there is nothing to withhold. This is an
+        # unassigned task, which is a normal outcome and not a review item.
+        return None, "", False
+
+    # Demote. A contact that WAS matched becomes the contact's name, so the
+    # reviewer sees who the system nearly picked and can confirm in one tap.
+    kept_name = assignee_name or (contact or {}).get("name", "")
+    return None, kept_name, True
+
+
 def _seed_ai_tasks(user_id, key, item):
     """Create first-class Tasks from the AI's extracted `ai_tasks`, once.
 
@@ -5939,7 +6202,11 @@ def _seed_ai_tasks(user_id, key, item):
             continue
         c = _contacts.get_item(Key={"contact_id": cid}).get("Item")
         if c and c.get("owner_user_id") == user_id:
-            by_speaker[str(row.get("speaker_id"))] = c
+            # Keyed on the NORMALIZED id. The AI copies the transcript's own
+            # "Speaker 0" label while participant rows hold the compact "0",
+            # and comparing those two directly is what made self-assignment
+            # silently fail. Normalizing BOTH sides is the fix.
+            by_speaker[stt_result.normalize_speaker_id(row.get("speaker_id"))] = c
 
     # The meeting's own day is the only correct anchor for "Friday" or
     # "tomorrow". Resolving against NOW would silently re-point an old
@@ -5957,7 +6224,11 @@ def _seed_ai_tasks(user_id, key, item):
         if not title:
             continue
         assignee_name = str(raw.get("assignee") or "").strip()
-        speaker_id = str(raw.get("assignee_speaker_id") or "").strip()
+        # Normalized at the boundary, so everything downstream — the lookup
+        # below, the stored value, the display map, and the later
+        # _resolve_tasks_for_speaker join — all speak the same dialect.
+        speaker_id = stt_result.normalize_speaker_id(
+            raw.get("assignee_speaker_id"))
         fingerprint = _task_fingerprint(key, title, assignee_name or speaker_id)
         if fingerprint in tombstoned:
             continue  # the user deleted this one; do not resurrect it
@@ -5969,6 +6240,12 @@ def _seed_ai_tasks(user_id, key, item):
         if priority not in TASK_PRIORITIES:
             priority = "Medium"
         spoken_due = raw.get("due_date") or ""
+        # CONFIDENCE GATE, applied after resolution and before the row is
+        # built: a LOW-confidence reading never gets to keep an auto-derived
+        # assignee, however well the speaker chain matched. See
+        # _gate_ai_assignment for why medium and unscored are trusted.
+        gated_contact, gated_name, was_gated = _gate_ai_assignment(
+            raw.get("confidence"), contact, assignee_name)
         row = _new_task_row(
             user_id, title,
             recording_key=key, folder_id=folder_id,
@@ -5977,13 +6254,27 @@ def _seed_ai_tasks(user_id, key, item):
                 spoken_due, anchor),
             priority=priority,
             source_type=TASK_SOURCE_AI,
-            assignee_contact=contact,
-            assignee_name="" if contact else assignee_name,
+            assignee_contact=gated_contact,
+            assignee_name="" if gated_contact else gated_name,
             assignee_speaker_id=speaker_id,
-            ai_confidence=str(raw.get("confidence") or ""),
+            # Stored VERBATIM as the model's own claim — the gate above is a
+            # separate decision and does not rewrite what the model said.
+            ai_confidence=ai_schema.coerce_confidence(raw.get("confidence")),
             ai_evidence=str(raw.get("evidence") or ""),
             fingerprint=fingerprint,
         )
+        # WHERE the evidence sits in the transcript, so the app can offer
+        # "view in transcript" rather than only quoting the line. Already
+        # validated against the real segment list by coerce_analysis, and
+        # written only when present so the attribute stays absent (rather
+        # than an empty list) on rows that have none.
+        segment_ids = [str(i) for i in (raw.get("evidence_segment_ids") or [])
+                       if str(i).strip()][:MAX_EVIDENCE_SEGMENTS]
+        if segment_ids:
+            row["ai_evidence_segment_ids"] = segment_ids
+        if was_gated:
+            print(f"[seed] {key}: low-confidence assignment withheld for "
+                  f"review: {title[:60]!r}")
         try:
             _write_task(row)
         except ClientError as err:
@@ -6029,7 +6320,10 @@ def _resolve_tasks_for_speaker(user_id, key, speaker_id, contact):
     for row in _tasks_for_recording(key):
         if row.get("owner_user_id") != user_id:
             continue
-        if str(row.get("assignee_speaker_id") or "") != str(speaker_id):
+        # Both sides normalized: the row may carry a pre-fix "Speaker 0"
+        # written before this normalization existed, and the caller passes the
+        # participant's compact id. Neither is trusted to already match.
+        if stt_result.normalize_speaker_id(row.get("assignee_speaker_id"))                 != stt_result.normalize_speaker_id(speaker_id):
             continue
         if row.get("assignee_contact_id"):
             continue
@@ -6162,6 +6456,12 @@ def update_meeting_task(event):
     # from a previous build, which only exists in the Tasks table afterwards.
     _migrate_embedded_tasks(user_id, key, item)
     row = _find_task_for_update(user_id, key, task_id)
+    # Reaching this route already required owning the MEETING, and
+    # _find_task_for_update already required owning the TASK — so the caller
+    # is the creator. The check is kept anyway: it is the one place the field
+    # rules live, and a future change that relaxes either predicate must not
+    # silently open every field to an assignee.
+    _authorize_task_patch(user_id, row, data)
     updates, removes = {}, []
 
     if "task" in data or "title" in data:
@@ -6357,6 +6657,11 @@ def list_all_tasks(event):
     if assignee_contact_id:
         _owned_contact(user_id, assignee_contact_id)
 
+    # Set only on the unfiltered path (see below): a second index read whose
+    # rows are merged into the page. None for every explicit filter, each of
+    # which already names the one partition it wants.
+    extra_query = None
+
     if folder_id:
         base = {"IndexName": TASKS_FOLDER_INDEX,
                 "KeyConditionExpression": Key("folder_id").eq(folder_id)}
@@ -6368,47 +6673,127 @@ def list_all_tasks(event):
         base = {"IndexName": TASKS_MEETING_INDEX,
                 "KeyConditionExpression":
                     Key("source_recording_id").eq(recording_key)}
+    elif assigned_to_me:
+        # "Tasks I must execute" — keyed on the ACCOUNT, so it returns work
+        # assigned by OTHER people too. The owner-index cannot answer this:
+        # its partition is the creator, so a task User A created for User B
+        # simply is not in B's partition, and post-filtering would mean a
+        # full table scan.
+        base = {"IndexName": TASKS_ASSIGNEE_USER_INDEX,
+                "KeyConditionExpression":
+                    Key("assignee_user_id").eq(user_id)}
     else:
         base = {"IndexName": TASKS_OWNER_INDEX,
                 "KeyConditionExpression": Key("owner_user_id").eq(user_id)}
+        # The UNFILTERED list must show both directions of a user's work: what
+        # they created AND what was assigned to them. Those live in two
+        # different partitions (creator vs assignee), and a GSI query can only
+        # read one — so the assignee side is read as a SECOND query and merged
+        # below. Without it a task User A created for User B would be missing
+        # from every one of B's views except "My tasks", which is exactly the
+        # gap section 8 calls out.
+        extra_query = {"IndexName": TASKS_ASSIGNEE_USER_INDEX,
+                       "KeyConditionExpression":
+                           Key("assignee_user_id").eq(user_id),
+                       "ScanIndexForward": False}
     base["ScanIndexForward"] = False
 
     cursor = _decode_cursor(qs.get("cursor"))
     if cursor:
         base["ExclusiveStartKey"] = cursor
 
+    def _keep(row):
+        """Every filter that is not expressed as a key condition.
+
+        Shared by both index reads below so the creator side and the assignee
+        side can never apply different rules to the same task.
+        """
+        # EVERY row is re-checked against the caller, including on indexes
+        # not keyed by owner (folder/assignee/meeting): the index is a
+        # lookup path, never an authorization decision.
+        #
+        # The predicate is "may this caller SEE this task" — creator OR
+        # assignee — not "did this caller create it". Checking ownership
+        # alone is what used to hide a task from the very person meant to
+        # do it: User A's task assigned to User B never reached B's list.
+        if not (_is_task_creator(user_id, row)
+                or _is_task_assignee(user_id, row)):
+            return False
+        if status and row.get("status") != status:
+            return False
+        if assigned_to_me and row.get("assignee_user_id") != user_id:
+            return False
+        if overdue_only and not _is_overdue(
+                row.get("due_date"), row.get("status"),
+                row.get("due_date_normalized", "")):
+            return False
+        if due_before:
+            # Compare on the RESOLVED day; a spoken "Friday" is a real
+            # deadline and belongs in a due_before window. Falling back to
+            # the raw value keeps pre-normalization rows behaving as
+            # before rather than dropping out of the filter entirely.
+            due = (str(row.get("due_date_normalized") or "").strip()
+                   or str(row.get("due_date") or ""))
+            if not due or due > due_before:
+                return False
+        return True
+
     out, last_key = [], None
     for _ in range(_SEARCH_MAX_PAGES):
         base["Limit"] = max(limit * 2, 100)
         res = _tasks.query(**base)
-        for row in res.get("Items", []):
-            # EVERY row is re-checked against the caller, including on indexes
-            # not keyed by owner (folder/assignee/meeting): the index is a
-            # lookup path, never an authorization decision.
-            if row.get("owner_user_id") != user_id:
-                continue
-            if status and row.get("status") != status:
-                continue
-            if assigned_to_me and row.get("assignee_user_id") != user_id:
-                continue
-            if overdue_only and not _is_overdue(
-                    row.get("due_date"), row.get("status"),
-                    row.get("due_date_normalized", "")):
-                continue
-            if due_before:
-                # Compare on the RESOLVED day; a spoken "Friday" is a real
-                # deadline and belongs in a due_before window. Falling back to
-                # the raw value keeps pre-normalization rows behaving as
-                # before rather than dropping out of the filter entirely.
-                due = (str(row.get("due_date_normalized") or "").strip()
-                       or str(row.get("due_date") or ""))
-                if not due or due > due_before:
-                    continue
-            out.append(row)
+        out.extend(r for r in res.get("Items", []) if _keep(r))
         last_key = res.get("LastEvaluatedKey")
         if not last_key or len(out) >= limit:
             break
         base["ExclusiveStartKey"] = last_key
+
+    # The assignee half of the unfiltered list, merged in.
+    #
+    # FIRST PAGE ONLY, on purpose. `next_cursor` is an ExclusiveStartKey for
+    # ONE index, so a paginated union of two indexes cannot be resumed
+    # coherently — a cursor into owner-index means nothing to
+    # assignee-user-index. Reading the assignee side only when there is no
+    # incoming cursor keeps the contract honest: the first page is the union
+    # (which is what the dashboard renders), and paging past it continues
+    # through the creator's own tasks exactly as it always has.
+    #
+    # This is a real limit rather than a hidden one — see the comment on
+    # next_cursor below — and it only bites a user with more than one page of
+    # created tasks who ALSO has tasks assigned to them by others.
+    #
+    # Skipped once the creator's own tasks already fill the page: the merge
+    # cannot emit a resumable cursor (see next_cursor below), so merging into
+    # a page that still has more to give would strand the remainder. A user
+    # with a full page of their own tasks reads them normally and finds
+    # assigned work under "My tasks"; the merge exists for the ordinary case
+    # where the first page has room.
+    if extra_query is not None and not cursor and len(out) <= limit:
+        seen = {r.get("task_id") for r in out}
+        extra_query["Limit"] = max(limit * 2, 100)
+        try:
+            extra = _tasks.query(**extra_query)
+        except ClientError as err:
+            # The GSI may not exist yet on an environment that has not run
+            # scripts/44_add_assignee_user_index.sh. Degrading to "creator's
+            # tasks only" is strictly better than 500-ing the whole dashboard,
+            # and it is loud in the logs rather than silent.
+            code = err.response.get("Error", {}).get("Code")
+            if code in ("ValidationException", "ResourceNotFoundException"):
+                print(f"[warn] {TASKS_ASSIGNEE_USER_INDEX} unavailable: {err}")
+                extra = {"Items": []}
+            else:
+                raise
+        for row in extra.get("Items", []):
+            # Deduped by task_id: a task a user created AND is assigned to
+            # appears in both indexes and must be listed once.
+            if row.get("task_id") in seen or not _keep(row):
+                continue
+            seen.add(row.get("task_id"))
+            out.append(row)
+        # Both indexes are sorted newest-first individually; the merged list
+        # has to be re-sorted to keep that order across the two.
+        out.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
 
     # The cursor must resume from the last row we actually RETURNED, not from
     # wherever the index scan happened to stop.
@@ -6422,10 +6807,21 @@ def list_all_tasks(event):
     # Both index key attributes AND the table key go into the cursor, because
     # ExclusiveStartKey on a GSI query needs enough to identify the row in both
     # the index and the base table.
+    #
+    # A MERGED page (the unfiltered union above) cannot emit a row-anchored
+    # cursor at all: its last row may have come from assignee-user-index, and
+    # an ExclusiveStartKey built from that row is meaningless to owner-index —
+    # DynamoDB would reject it, or worse, resume from the wrong place. So the
+    # merged page falls back to the creator index's own LastEvaluatedKey,
+    # which resumes the creator's tasks correctly. Assigned-by-others tasks
+    # are all on page one; "My tasks" (assigned_to_me) pages through them
+    # properly on its own index.
+    merged = (extra_query is not None and not cursor
+              and any(not _is_task_creator(user_id, r) for r in out))
     overflowed = len(out) > limit
     out = out[:limit]
     next_cursor = ""
-    if overflowed and out:
+    if overflowed and out and not merged:
         anchor = out[-1]
         index_name = base.get("IndexName") or ""
         cursor_key = {"task_id": anchor["task_id"]}
@@ -6459,17 +6855,55 @@ def get_task(event):
 
     The task detail screen's one call: the task plus the entities it points at
     (section 13's who / where / why), each ownership-checked in its own right.
+
+    VISIBLE to the creator AND the assignee — the assignee cannot act on work
+    they cannot open. Everyone else gets 404. The related entities below are
+    still resolved against the CALLER, so an assignee sees the task without
+    inheriting any read access to the creator's contacts or folders.
     """
     user_id = _require_auth(event)
     task_id = (event.get("pathParameters") or {}).get("task_id", "")
-    row = _owned_task(user_id, task_id)
+    row = _visible_task(user_id, task_id)
     out = {}
+    # What this caller may DO with the task, decided server-side and sent to
+    # the client so the UI never has to re-derive the rule (and cannot get it
+    # wrong). The backend stays the enforcement point regardless.
+    out["permissions"] = _task_permissions(user_id, row)
+
+    # THE RELATED ENTITIES, AND WHY THE ASSIGNEE SEES A NARROWER SET.
+    #
+    # These records belong to the CREATOR — the contact is a row in their
+    # address book, the folder is their workspace, the meeting is theirs. An
+    # assignee owns none of them, so an ownership-gated read returns nothing
+    # and the task arrives context-free. That is what made the detail screen
+    # tell an assignee "Nobody is assigned to this task": the assignee WAS
+    # set on the row, but the `contact` the UI renders it from was withheld.
+    #
+    # The fix is not to hand the assignee the creator's records. It is to
+    # answer the two questions they legitimately have — "who is this for?"
+    # and "where did it come from?" — from the TASK ROW itself, which already
+    # carries the assignee's display fields, plus a deliberately minimal
+    # projection of the meeting. Nothing here exposes the creator's other
+    # contacts, their folder contents, or the transcript.
+    creator = _is_task_creator(user_id, row)
 
     cid = row.get("assignee_contact_id")
     if cid:
         c = _contacts.get_item(Key={"contact_id": cid}).get("Item")
         if c and c.get("owner_user_id") == user_id:
             out["contact"] = _public_contact(c)
+        elif _is_task_assignee(user_id, row):
+            # The assignee, seeing THEMSELVES. Built from the task row rather
+            # than the creator's contact record: it is the same person, and
+            # this way no address-book row crosses a tenant boundary. The id
+            # is deliberately omitted — it addresses a contact they cannot
+            # open, and offering it would only produce a 404 on tap.
+            out["contact"] = {
+                "id": "",
+                "name": row.get("assignee_name", ""),
+                "email": row.get("assignee_email", ""),
+                "phone": row.get("assignee_phone", ""),
+            }
     fid = row.get("folder_id")
     if fid:
         f = _folders.get_item(Key={"folder_id": fid}).get("Item")
@@ -6483,8 +6917,10 @@ def get_task(event):
     key = row.get("source_recording_id")
     if key:
         rec = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
-        if rec and (rec.get("user_id") == user_id
-                    or rec.get("device_id") in _owned_devices(user_id)):
+        owns_recording = bool(rec) and (
+            rec.get("user_id") == user_id
+            or rec.get("device_id") in _owned_devices(user_id))
+        if owns_recording:
             got = rec.get("speaker_names")
             speaker_names = got if isinstance(got, dict) else {}
             out["recording"] = {"audio_s3_key": key,
@@ -6492,17 +6928,110 @@ def get_task(event):
                                 "recorded_at": rec.get("recorded_at", ""),
                                 "folder_id": str(rec.get("folder_id") or ""),
                                 "speaker_names": speaker_names}
+        elif rec and not creator:
+            # WHERE THIS CAME FROM, for the assignee. A task that arrives with
+            # no provenance reads as if it appeared from nowhere; the meeting
+            # title and date are what make it accountable work rather than an
+            # anonymous instruction.
+            #
+            # TITLE AND DATE ONLY. No audio key (that addresses a recording
+            # they cannot open), no folder, no speaker_names — the assignee
+            # gets the provenance line, never a route into someone else's
+            # meeting. `speaker_names` stays empty, so _public_task_v2 falls
+            # back to the stored assignee string rather than resolving a
+            # speaker label out of the creator's meeting.
+            out["recording"] = {"audio_s3_key": "",
+                                "title": rec.get("title", ""),
+                                "recorded_at": rec.get("recorded_at", ""),
+                                "folder_id": "",
+                                "speaker_names": {}}
+    # WHO GAVE ME THIS WORK. Shown to the assignee, and to them only — the
+    # creator is looking at a task they made and does not need to be told.
+    #
+    # The CREATOR is the assigner. MinuteX does not store an `assigned_by`
+    # separate from `owner_user_id`, and for these tasks the two are the same
+    # person by construction: only the creator can assign or reassign (that is
+    # the permission model), and an AI-seeded task is assigned by the meeting
+    # owner who recorded it. Inventing a second field would be a schema change
+    # to record what owner_user_id already means.
+    #
+    # NAME AND PHOTO ONLY. Not the email — the assignee has no relationship
+    # with the creator's account beyond this task, and an address is contact
+    # detail, not provenance.
+    if not creator:
+        u = _users.get_item(
+            Key={"user_id": _task_creator(row)}).get("Item") or {}
+        if u:
+            out["assigned_by"] = {
+                "name": u.get("name", ""),
+                "avatar_view_url": _avatar_view_url(u.get("avatar_url", "")),
+            }
     out["task"] = _public_task_v2(row, speaker_names)
     return _resp(200, {**out})
+
+
+def _update_task_status_as_assignee(user_id, row, data):
+    """Apply a STATUS-ONLY patch on behalf of the task's assignee.
+
+    Deliberately narrow: it writes `status`, the completion timestamp that
+    belongs to it, and `updated_at`. Nothing else is touched, so every piece
+    of AI provenance on the row — confidence, evidence, evidence segment ids,
+    speaker id, resolution status, deadline provenance, folder — survives an
+    assignee moving the task along, which section 16 requires.
+
+    Status validation goes through _clean_task_status, the SAME helper the
+    creator's path uses, so the two callers can never accept different values.
+    """
+    if "status" not in data:
+        # Nothing this caller is allowed to change was actually sent.
+        raise ApiError(400, "status required")
+    status = _clean_task_status(data["status"])
+    updates = {"status": status, "updated_at": _now_iso()}
+    if status == TASK_STATUS_COMPLETED:
+        # Preserve an existing completion time, exactly as the creator's path
+        # does — re-completing must not move when the work was finished.
+        if not row.get("completed_at"):
+            updates["completed_at"] = _now_iso()
+    else:
+        updates["completed_at"] = ""
+
+    _apply_update(_tasks, {"task_id": row["task_id"]}, updates, [])
+    fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item") or {}
+    # Keep the legacy embedded map in step, the same dual-write every other
+    # task mutation performs.
+    if fresh.get("source_recording_id"):
+        _mirror_task_to_recording(fresh["source_recording_id"], fresh)
+    _audit("task.status_changed_by_assignee", user_id, row["task_id"],
+           status=status)
+    return _resp(200, {"task": _public_task_v2(
+        fresh, _speaker_names_for_recording(fresh.get("source_recording_id")))})
 
 
 def update_task_v2(event):
     """PATCH /tasks/{task_id} — the same mutation as the meeting-scoped route,
     reached by task id alone so the Task Tracker doesn't need to know which
-    meeting a task came from."""
+    meeting a task came from.
+
+    TWO CALLERS, TWO PATHS. The creator goes through the meeting-scoped
+    implementation exactly as before, so edit/reassign/deadline logic stays in
+    one place. The ASSIGNEE cannot: that route begins with _owned_recording,
+    and an assignee does not own the creator's meeting — it would 404 before
+    reaching any task check. So a status-only patch by the assignee is applied
+    here directly, against the same validation helpers, and every other field
+    is refused by _authorize_task_patch before a single write is built.
+    """
     user_id = _require_auth(event)
     task_id = (event.get("pathParameters") or {}).get("task_id", "")
-    row = _owned_task(user_id, task_id)
+    row = _visible_task(user_id, task_id)
+    data = _body(event)
+    # Refuses a forbidden field for BOTH callers, and 404s anyone who is
+    # neither — before any mutation is assembled.
+    _authorize_task_patch(user_id, row, data)
+
+    if not _is_task_creator(user_id, row):
+        # Assignee: status and nothing else (already guaranteed above).
+        return _update_task_status_as_assignee(user_id, row, data)
+
     # Delegate to the meeting-scoped implementation by handing it the shape it
     # expects — one code path for task mutation, not two that can drift.
     forged = dict(event)
@@ -6528,6 +7057,12 @@ def resolve_task_assignee(event):
     for an unresolved task is the ONLY way an unresolved assignee becomes a
     resolved one by name — nothing in this system upgrades a name to an
     identity on its own.
+
+    CREATOR ONLY. Resolving an assignment decides WHO the work belongs to,
+    which is task configuration, not execution — and letting the current
+    assignee reassign would let them hand their work to someone else. The
+    _owned_task predicate below is exactly that check: an assignee gets 404
+    here, since this route never tells a non-creator a task exists.
     """
     user_id = _require_auth(event)
     task_id = (event.get("pathParameters") or {}).get("task_id", "")
@@ -6568,6 +7103,9 @@ def resolve_task_assignee(event):
 
 def suggest_task_assignees(event):
     """GET /tasks/{task_id}/assignee-candidates -> {status, candidates}
+
+    CREATOR ONLY (via _owned_task): these are candidate people from the
+    creator's own address book, and only the creator can act on the answer.
 
     Who an unresolved task's NAME might refer to, ranked by the folder it is
     in. Returns candidates for the user to choose from — it never picks. The
@@ -12162,6 +12700,97 @@ def mark_all_notifications_read(event):
 
 
 # ---------------------------------------------------------------------------
+# EAGER TASK SEEDING — the pipeline's entry point into the task layer.
+#
+# WHY THIS EXISTS. Task seeding used to happen only LAZILY: `_seed_ai_tasks`
+# ran when somebody opened a task list. That made the Tasks table a function of
+# who had browsed where, which is wrong in a specific and damaging way —
+# a meeting could finish processing, extract five real action items, and none
+# of them existed anywhere the product could see:
+#
+#   * GET /tasks (the Task Tracker) showed nothing from that meeting;
+#   * the assignee never got TASK_ASSIGNED, because nothing had been created
+#     to notify them about;
+#   * AI_ACTION_REQUIRED never reached the owner, so an ambiguous assignment
+#     sat unreviewed indefinitely.
+#
+# All three resolved themselves the moment someone opened the meeting, which is
+# exactly what made it easy to miss: the bug is invisible to anyone testing by
+# opening the meeting they just recorded.
+#
+# WHY IT IS AN INVOKE RATHER THAN A COPY. The seeder is not a small function.
+# It reaches Tasks, Contacts, MeetingParticipants, Recordings and the two
+# notification tables, and it carries the fingerprint/tombstone rules, the
+# assignee-resolution chain and the meeting-anchored date normalisation. That
+# logic must exist exactly once. transcribeRecording therefore does NOT
+# reimplement any of it — it asks THIS Lambda to run the seeder it already
+# owns, over the row it has just finished writing.
+#
+# This is the same cross-Lambda shape the pipeline already uses in the other
+# direction (userApi hands the STT analysis to transcribeRecording as a typed
+# async invoke — see the stt.completed section), so it introduces no new
+# infrastructure and no new failure mode, only a second traveller on a proven
+# road.
+#
+# IDEMPOTENCY IS WHAT MAKES THIS SAFE. Nothing here is a new guarantee: the
+# seeder was ALREADY idempotent, because the lazy path could run on every
+# single read. Eager seeding just adds one more caller to a function built to
+# be called repeatedly. The lazy call stays exactly where it was, as the safety
+# net for anything this invoke misses (a legacy row, a failed invoke, a
+# recording that predates this feature).
+INTERNAL_SEED_TASKS_EVENT = "tasks.seed"
+
+
+def handle_seed_tasks_event(event):
+    """Seed one meeting's AI tasks, invoked by the pipeline. NOT an HTTP route.
+
+    There is deliberately no JWT here and no _require_auth: the caller is our
+    own transcribeRecording Lambda, authenticated by IAM at the invoke
+    boundary, and it has no user session to present. The tenant is taken from
+    the RECORDING ROW's stamped `user_id` — the same value _owned_recording
+    checks a JWT against — so this path cannot seed tasks for anyone other than
+    the recording's real owner, and it cannot be reached from the internet at
+    all (API Gateway only ever sends events carrying a routeKey).
+
+    Returns a small dict rather than an HTTP response: the invoke is async and
+    nobody reads the body, but it is what the logs and the tests assert on.
+    """
+    key = str((event or {}).get("audio_s3_key") or "").strip()
+    if not key:
+        print("[seed] no audio_s3_key on the seed event")
+        return {"seeded": 0, "error": "audio_s3_key required"}
+
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item:
+        # The row should exist — the pipeline has just written it — so this is
+        # worth a log line rather than a silent return.
+        print(f"[seed] recording not found: {key}")
+        return {"seeded": 0, "error": "recording not found"}
+
+    # THE TENANT, taken from the row and never from the event. An event that
+    # named its own user_id would be a way to write tasks into someone else's
+    # account, so the field is not read even if present.
+    user_id = str(item.get("user_id") or "").strip()
+    if not user_id:
+        # A legacy recording whose ownership is only resolvable through the
+        # UserDevices join. Seeding needs a definite owner to stamp on the
+        # rows, so this one waits for the lazy path, where the JWT supplies it.
+        print(f"[seed] {key} has no stamped owner — leaving it to the "
+              f"lazy path")
+        return {"seeded": 0, "skipped": "no owner"}
+
+    # The SAME two calls list_meeting_tasks makes, in the same order, for the
+    # same reasons — migration first so a legacy embedded task is not seeded a
+    # second time under a new id. Both are idempotent; that is precisely why
+    # this can also run lazily afterwards without creating anything twice.
+    migrated = _migrate_embedded_tasks(user_id, key, item)
+    seeded = _seed_ai_tasks(user_id, key, item)
+
+    _audit("tasks.seeded", user_id, key, seeded=seeded, migrated=migrated)
+    return {"seeded": seeded, "migrated": migrated, "key": key}
+
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 _ROUTES = {
@@ -12342,6 +12971,14 @@ _ROUTES = {
 
 
 def lambda_handler(event, context):
+    # An INTERNAL invoke from the pipeline, not an HTTP request. Checked first
+    # because it carries no routeKey and would otherwise fall straight through
+    # to the 404 below. Only our own Lambdas can reach this — API Gateway
+    # always sets a routeKey, so no request from the internet can take this
+    # branch.
+    if (event or {}).get("type") == INTERNAL_SEED_TASKS_EVENT:
+        return handle_seed_tasks_event(event)
+
     # HTTP API v2.0: method + matched route template live under requestContext.
     rc = (event.get("requestContext") or {}).get("http") or {}
     method = rc.get("method", "")

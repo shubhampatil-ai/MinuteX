@@ -1600,8 +1600,23 @@ export type ApiTask = {
   folder_id?: string;
   source_recording_id?: string;
   source_type?: TaskSourceType;
+  /** The MODEL's own confidence in this extraction: "high" | "medium" | "low",
+   *  or "" when it made no claim. A fixed enum, never a number — a score like
+   *  0.87 is precision the model did not actually have, so the backend refuses
+   *  it. Render the band, never a percentage. */
   ai_confidence?: string;
+  /** The VERBATIM sentence from the transcript that created this task. What
+   *  lets a reader check the task against what was really said. */
   ai_evidence?: string;
+  /** WHERE that sentence sits — transcript segment ids ("seg_12"), validated
+   *  server-side against the real segment list. Empty when the model gave no
+   *  usable reference, so an affordance built on it must degrade to showing
+   *  the quote alone. */
+  ai_evidence_segment_ids?: string[];
+  /** The ONE flag to branch on for "a human must confirm the assignee".
+   *  Computed server-side from resolution_status so the app and the API can
+   *  never disagree — do NOT re-derive this on the client. */
+  needs_review?: boolean;
   completed_at?: string;
 };
 
@@ -2060,8 +2075,50 @@ export async function getAllTasks(
   return { tasks: res.tasks ?? [], next_cursor: res.next_cursor ?? "" };
 }
 
+/** What the AUTHENTICATED caller may do with a task.
+ *
+ * Computed server-side and sent with the task, so the app renders the right
+ * controls without re-deriving the rule (and so it cannot get it wrong).
+ * This is presentation only — the backend enforces every one of these
+ * independently, and a client that ignores them gets 403/404, not a write.
+ *
+ * The model: the CREATOR (`owner_user_id` — the authenticated user for a
+ * manual task, the MEETING OWNER for an AI-seeded one) controls the task's
+ * configuration. The ASSIGNEE (`assignee_user_id`, set only from a contact
+ * linked to a real MinuteX account) executes it and may change ONLY status.
+ * Everyone else cannot see it at all. */
+export type TaskPermissions = {
+  is_creator: boolean;
+  is_assignee: boolean;
+  can_view: boolean;
+  can_change_status: boolean;
+  can_edit_details: boolean;
+  can_change_deadline: boolean;
+  can_change_assignee: boolean;
+  can_resolve_assignment: boolean;
+  can_delete: boolean;
+};
+
+/** The safe default for a backend that predates the permission model: assume
+ * the caller is the creator, which is what every task was before assignees
+ * could see anything. Never used to GRANT anything server-side. */
+export const CREATOR_PERMISSIONS: TaskPermissions = {
+  is_creator: true, is_assignee: false, can_view: true,
+  can_change_status: true, can_edit_details: true, can_change_deadline: true,
+  can_change_assignee: true, can_resolve_assignment: true, can_delete: true,
+};
+
 export type TaskDetail = {
   task: ApiTask;
+  permissions?: TaskPermissions;
+  /** Who gave this task to the current user. Sent ONLY to an assignee — the
+   * creator is looking at a task they made and needs no attribution.
+   *
+   * This is the task's creator: only a creator can assign or reassign, and an
+   * AI-seeded task is assigned by the meeting owner, so `owner_user_id` IS the
+   * assigner. Name and photo only, never an email — the assignee has no
+   * relationship with that account beyond this one task. */
+  assigned_by?: { name: string; avatar_view_url?: string };
   contact?: ApiContact;
   folder?: ApiFolder;
   recording?: {

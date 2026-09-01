@@ -103,6 +103,13 @@ export function isOverdue(t: ApiTask, now: Date): boolean {
  * UNRESOLVED / AMBIGUOUS states. Re-exported through this module so the
  * dashboard's selectors and its cards agree by construction. */
 export function needsAssignment(t: ApiTask): boolean {
+  // The SERVER's verdict wins when it gives one. `needs_review` is computed
+  // backend-side from resolution_status and now also covers a task whose
+  // assignment the confidence gate withheld — so re-deriving it here would let
+  // the dashboard disagree with the task screen about which tasks are safe.
+  // The local derivation stays as the fallback for an older backend that does
+  // not send the flag yet.
+  if (typeof t.needs_review === "boolean") return t.needs_review;
   return needsAssigneeResolution(t);
 }
 

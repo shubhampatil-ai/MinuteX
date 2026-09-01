@@ -568,7 +568,7 @@ def _note_partial_overview(overview, covered, total):
     return {**overview, "sections": [first] + list(sections[1:])}
 
 
-def analyze_meeting(transcript, valid_ids=None):
+def analyze_meeting(transcript, valid_ids=None, roster_source=None):
     """THE analysis: title, the dynamic overview, tasks, participants and the
     structured meeting_highlights — in ONE Groq call.
 
@@ -620,7 +620,15 @@ def analyze_meeting(transcript, valid_ids=None):
     # result); coercion then leaves the model's list alone rather than dropping
     # every participant. Tasks are never roster-filtered — an assignee may be a
     # non-attendee, a team or an external party.
-    roster = ai_schema.speaker_roster(transcript)
+    # The roster is read from the PLAIN transcript when one is supplied,
+    # because the labelled form the model receives prefixes each line with
+    # "[seg_N] " and speaker_roster's regex is anchored at line start — it
+    # would find nothing and silently empty the participants list. Reading the
+    # roster from the unlabelled text keeps that regex strict (it is a
+    # structural guarantee about build_diarized_text's output, not a loose
+    # match) instead of widening it to tolerate a prefix.
+    roster = ai_schema.speaker_roster(
+        roster_source if roster_source is not None else transcript)
     print(f"[groq] analyze: {len(roster)} speaker(s) in the transcript: "
           f"{roster}")
 
@@ -958,13 +966,20 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # reference that validates at write time but resolves to nothing at read
     # time is the one failure the validation exists to prevent.
     _upsert(key, {"status": "generating_ai"})
-    valid_ids = {seg["id"] for seg in transcript_store.with_segment_ids(timestamps)
-                 if isinstance(seg, dict) and seg.get("id")}
+    # The allow-list of real segment ids, and the transcript rendered WITH those
+    # ids on each line. Both come from transcript_store so the input the model
+    # reads and the validator's allow-list can never disagree about what a valid
+    # reference is. Before this, the model was handed the plain prose transcript
+    # — it had no ids to copy, so every extraction returned
+    # evidence_segment_ids: [] however clearly the prompt asked for them.
+    valid_ids = transcript_store.valid_segment_ids(timestamps)
+    labelled = transcript_store.as_labelled_lines(transcript, timestamps)
 
     analysis = ai_schema.empty_unified()
     status = "complete"
     try:
-        analysis = analyze_meeting(transcript, valid_ids)
+        analysis = analyze_meeting(labelled, valid_ids,
+                                   roster_source=transcript)
         if ai_schema.overview_empty(analysis.get("overview")):
             # analyze_meeting() can return NORMALLY with an empty overview (e.g.
             # map_reduce's reduce step came back blank without Groq itself
@@ -1114,6 +1129,18 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # finished is stt_completed_request_id, written by the webhook's idempotency
     # claim — the reconciler compares the two rather than testing for absence.
     _upsert(key, fields, remove=RETIRED_ANALYSIS_ATTRS)
+
+    # SEED THE TASKS BEFORE ANNOUNCING THE MEETING. Both orderings work, but
+    # this one is better for the user: the completion notification is what
+    # sends them to the meeting, so seeding first makes it far more likely the
+    # tasks are already there when they arrive. It costs nothing — the invoke
+    # is async and returns immediately.
+    #
+    # AFTER the terminal write, never before, for the same reason the
+    # notification is: the seeder reads `ai_tasks` off the row, so the row must
+    # already carry the analysis this run produced.
+    _seed_tasks_for(key, status)
+
     # AFTER the terminal status is persisted, never before: the notification
     # says the meeting is ready, so the row the user lands on must already say
     # so too. `fields` holds the title this write decided, so no read-back is
@@ -1133,6 +1160,83 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
 # creating it if absent, never touching fields it wasn't given (unlike
 # put_item, which replaces the whole item).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# EAGER TASK SEEDING — handing the finished analysis to the task layer.
+#
+# The AI's extracted tasks land on the recording row as `ai_tasks`. Turning
+# those into real, id-bearing, assignable Task rows is userApi's job and its
+# logic lives there (fingerprint dedupe, tombstones, the speaker -> contact ->
+# account resolution chain, meeting-anchored date normalisation, and the two
+# notifications). None of that is reimplemented here — this asks userApi to run
+# the seeder it already owns.
+#
+# WHY THIS RUNS AT ALL. Seeding used to happen only when a user opened a task
+# list, so a processed meeting nobody opened had no tasks anywhere: absent from
+# the Task Tracker, and — because the notifications are raised BY the seeder —
+# no TASK_ASSIGNED for the assignee and no AI_ACTION_REQUIRED for the owner.
+# The work was extracted and then sat invisible until somebody happened to
+# look. Seeding here is what makes "the meeting finished" and "its tasks exist"
+# the same moment.
+#
+# WHY IT IS ASYNC AND NON-BLOCKING. The invoke is "Event" (fire-and-forget) and
+# every failure is swallowed, exactly like _notify above it. That is a
+# deliberate product decision, not laziness, and it rests on the lazy path
+# still being there:
+#
+#   * the transcript and the analysis are already persisted by the time this
+#     runs — they are the expensive, irreplaceable part, and nothing here may
+#     put them at risk;
+#   * raising would fail the invocation, and S3/Lambda would then RETRY THE
+#     WHOLE PIPELINE, re-paying ElevenLabs and Groq for a recording that was
+#     already processed correctly;
+#   * a seed that never happens is not lost work. `_seed_ai_tasks` still runs
+#     on the next task-list read, and being idempotent it produces the same
+#     rows it would have produced here. The cost of a failure is a delay, not
+#     a missing task.
+#
+# So the guarantee is "seeded at completion, or at first read" — never "seeded
+# twice", and never "completion blocked on seeding".
+USERAPI_LAMBDA_NAME = os.environ.get("USERAPI_LAMBDA_NAME", "userApi")
+
+# Must match INTERNAL_SEED_TASKS_EVENT in functions/userapi. A typo here is a
+# silent no-op (userApi would 404 the event), which is why the seeding tests
+# assert on the payload shape rather than only on the outcome.
+SEED_TASKS_EVENT = "tasks.seed"
+
+_lambda_client = boto3.client("lambda", region_name=REGION)
+
+
+def _seed_tasks_for(key, status):
+    """Ask userApi to seed this meeting's AI tasks. Best-effort, never raises.
+
+    Only for a run that produced a usable analysis. A "failed" row has no
+    `ai_tasks` to seed, and asking anyway would spend an invoke to do nothing;
+    "transcribed" (the AI step degraded) is likewise skipped because the
+    analysis that would have carried the tasks is exactly what did not survive.
+    The lazy path covers both if a later reprocess fills them in.
+    """
+    if status != "complete":
+        return False
+
+    payload = {"type": SEED_TASKS_EVENT, "audio_s3_key": key}
+    try:
+        _lambda_client.invoke(
+            FunctionName=USERAPI_LAMBDA_NAME,
+            InvocationType="Event",   # async — nothing here waits for tasks
+            Payload=json.dumps(payload).encode("utf-8"),
+        )
+        print(f"[seed] requested task seeding for {key}")
+        return True
+    except Exception as err:  # noqa: BLE001
+        # Logged, never raised. See the section header: the lazy path is the
+        # retry, and failing the invocation would re-run the whole paid
+        # pipeline for a recording that already succeeded.
+        print(f"[seed] invoke FAILED for {key} — the meeting is still "
+              f"complete and its tasks will be seeded on first read: "
+              f"{type(err).__name__}: {err}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # NOTIFICATIONS — the two events this pipeline raises.
 #

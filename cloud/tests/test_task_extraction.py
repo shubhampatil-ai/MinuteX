@@ -184,7 +184,7 @@ class TestTaskContract(unittest.TestCase):
         A free-form score is noise dressed as precision; anything outside the
         three allowed values degrades to "" (no claim made).
         """
-        for bad in (0.92, "very high", "HIGH", None, "certain", 1):
+        for bad in (0.92, "very high", None, "certain", 1, True):
             with self.subTest(bad=bad):
                 self.assertEqual(
                     self.coerce_one({"task": "x", "confidence": bad})[
@@ -194,6 +194,22 @@ class TestTaskContract(unittest.TestCase):
                 self.assertEqual(
                     self.coerce_one({"task": "x", "confidence": good})[
                         "confidence"], good)
+
+    def test_confidence_casing_is_the_same_claim(self):
+        """"HIGH" and " High " mean what "high" means.
+
+        These used to degrade to "" alongside the genuine noise above, which
+        threw away a real signal: a task whose confidence silently became ""
+        is indistinguishable from one the model never scored, and the
+        assignment gate would then treat a high-confidence extraction as
+        unscored. Casing is a formatting difference, not a different claim —
+        unlike 0.92, which is a DIFFERENT KIND of answer and still degrades.
+        """
+        for variant in ("HIGH", " High ", "Medium", "LOW"):
+            with self.subTest(variant=variant):
+                self.assertEqual(
+                    self.coerce_one({"task": "x", "confidence": variant})[
+                        "confidence"], variant.strip().lower())
 
     def test_missing_new_fields_default_to_empty(self):
         """An older model response (four fields) must still coerce cleanly —
@@ -445,7 +461,12 @@ class TestSeedingChain(unittest.TestCase):
         # kept verbatim to resolve later" (see _new_task_row), and there is no
         # name here. The speaker id is what carries the identity forward.
         self.assertEqual(task["resolution_status"], "NONE")
-        self.assertEqual(task["assignee_speaker_id"], "Speaker 0")
+        # STORED NORMALIZED. The AI copies the transcript's own "Speaker 0"
+        # label, but everything that joins on a speaker — participant rows, the
+        # speaker_names display map, _resolve_tasks_for_speaker — keys on the
+        # compact "0". Storing the raw label is what made this task unmatchable
+        # in production, where participant rows really do hold "0".
+        self.assertEqual(task["assignee_speaker_id"], "0")
 
         row = self.t["tasks"].items[(task["id"],)]
         self.assertEqual(row["ai_confidence"], "high")
@@ -458,7 +479,10 @@ class TestSeedingChain(unittest.TestCase):
         cid = self.mk_contact()
         status, _ = parse(call(api.set_participant, event(
             "PUT", "/recordings/participants/{key+}", key=KEY,
-            body={"speaker_id": "Speaker 0", "contact_id": cid})))
+            # The app sends the COMPACT id, exactly as the participants
+            # screen does — using "Speaker 0" on both sides is what previously
+            # hid the production mismatch this normalization fixes.
+            body={"speaker_id": "0", "contact_id": cid})))
         self.assertEqual(status, 200)
 
         _, after = self.seed()
@@ -473,7 +497,10 @@ class TestSeedingChain(unittest.TestCase):
         cid = self.mk_contact()
         parse(call(api.set_participant, event(
             "PUT", "/recordings/participants/{key+}", key=KEY,
-            body={"speaker_id": "Speaker 0", "contact_id": cid})))
+            # The app sends the COMPACT id, exactly as the participants
+            # screen does — using "Speaker 0" on both sides is what previously
+            # hid the production mismatch this normalization fixes.
+            body={"speaker_id": "0", "contact_id": cid})))
         self.set_ai_tasks([{
             "task": "Send the proposal",
             "assignee_speaker_id": "Speaker 0",

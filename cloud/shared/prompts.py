@@ -279,10 +279,59 @@ SUMMARY_SYSTEM = _json_system(
     "renumber an id — an id you did not read in the transcript is worse than "
     "none, and a wrong one is discarded anyway.\n"
     '- "tasks": array of objects, each EXACTLY {"task": string, "assignee": '
-    'string, "due_date": string, "priority": string}. Only real agreed work — '
+    'string, "assignee_speaker_id": string, "due_date": string, '
+    '"priority": string, "confidence": string, "evidence": string, '
+    '"evidence_segment_ids": array of strings}. Only real agreed work — '
     "never a discussion, suggestion, recommendation, possibility or question. "
     "Only create a task when the transcript indicates actual responsibility or "
     "commitment.\n"
+    # The four fields below were MISSING from this contract while ai_schema's
+    # TASK_SPEC, the Tasks table and the assignment gate all expected them.
+    # The prompt said EXACTLY {task, assignee, due_date, priority}, so the
+    # model complied and every extracted task arrived with no speaker id, no
+    # confidence and no evidence. Measured against a real 11-speaker meeting
+    # AND a 3-speaker single-pass transcript before the fix. Adding a field to
+    # TASK_SPEC without adding it HERE is silently a no-op: the two must
+    # always change together.
+    '  "assignee_speaker_id" links a task to WHO SAID IT, so the app can '
+    "attach a real identity once the user says who each speaker is. It must "
+    "contain a speaker label EXACTLY as the transcript writes it (e.g. "
+    '"Speaker 0") - never a person\'s name, never a team, never a guess.\n'
+    '  - Self-commitment: "Speaker 0: I\'ll send the proposal tomorrow." -> '
+    'assignee_speaker_id "Speaker 0", assignee "" (no name was spoken).\n'
+    '  - Assignment to someone else: "Speaker 0: Rahul, send the proposal." '
+    '-> assignee "Rahul", assignee_speaker_id "" - the speaker is the one '
+    "ASSIGNING, not the one responsible.\n"
+    '  - Use "" for assignee_speaker_id whenever the owner is not identifiable '
+    "as a specific speaker label. An empty value is correct and expected; a "
+    "wrong label assigns work to the wrong person.\n"
+    '  NEVER put a speaker label ("Speaker 2") into "assignee" - that field is '
+    "for a NAME actually spoken in the transcript. When only the speaker is "
+    'known, set assignee_speaker_id and leave assignee "".\n'
+    '  "confidence" is EXACTLY one of "high" | "medium" | "low": high = the '
+    "work is explicit AND the owner is unambiguous; medium = the work is clear "
+    "but the owner needs context; low = the work or its owner is genuinely "
+    "ambiguous. Judge only what the transcript supports; do not inflate it.\n"
+    '  "evidence" is the VERBATIM sentence from the transcript that created '
+    "the task - copied, not paraphrased. It is what lets a reader check the "
+    'task against what was actually said. Use "" only if no single sentence '
+    'carries it. "evidence_segment_ids" holds the ids of the segment(s) that '
+    "sentence came from.\n"
+    "  EVERY transcript line you are given begins with its own segment id in "
+    'square brackets, like "[seg_12] Speaker 0: ...". To fill '
+    'evidence_segment_ids, copy the id from the START of the line (or lines) '
+    "your evidence quote came from - character for character, including the "
+    '"seg_" prefix.\n'
+    '  Example - given the line "[seg_2] Speaker 1: I\'ll send the proposal '
+    'tomorrow.", a task extracted from it has evidence "I\'ll send the '
+    'proposal tomorrow." and evidence_segment_ids ["seg_2"].\n'
+    "  Use SEVERAL ids only when the evidence genuinely spans several lines. "
+    "Usually it is one.\n"
+    '  Use [] when no single line supports the task. NEVER invent, guess, '
+    "renumber or extrapolate an id, and never use a SPEAKER label "
+    '("Speaker 1") or a number ("2") as a segment id - they are different '
+    "things. An id you did not read at the start of a line is discarded "
+    "anyway, so a guess only loses the reference.\n"
     "  task text must preserve the SCOPE of the work, not just name it. "
     'Prefer "Test the open-source PDF-to-Markdown parser against property '
     'brochures and quotation sheets containing complex tables and pricing '

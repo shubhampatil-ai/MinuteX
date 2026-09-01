@@ -57,6 +57,10 @@
 #                               embedded map).
 #     GSI folder-index       folder_id HASH, created_at RANGE   (sparse)
 #     GSI assignee-index     assignee_contact_id HASH, created_at RANGE
+#     GSI assignee-user-index assignee_user_id HASH, created_at RANGE
+#                             "tasks I must DO" — keyed on the MinuteX account,
+#                             not the address-book contact. Sparse: only tasks
+#                             assigned to a linked account are in it.
 #                            (sparse — unresolved tasks carry no contact id
 #                             and correctly do not appear)
 #     GSI dedupe-index       owner_user_id HASH, fingerprint RANGE
@@ -189,6 +193,7 @@ create_table "$TASKS_TABLE" \
    AttributeName=source_recording_id,AttributeType=S
    AttributeName=folder_id,AttributeType=S
    AttributeName=assignee_contact_id,AttributeType=S
+   AttributeName=assignee_user_id,AttributeType=S
    AttributeName=fingerprint,AttributeType=S" \
   "AttributeName=task_id,KeyType=HASH" \
   '[
@@ -206,6 +211,10 @@ create_table "$TASKS_TABLE" \
      "Projection":{"ProjectionType":"ALL"}},
     {"IndexName":"assignee-index",
      "KeySchema":[{"AttributeName":"assignee_contact_id","KeyType":"HASH"},
+                  {"AttributeName":"created_at","KeyType":"RANGE"}],
+     "Projection":{"ProjectionType":"ALL"}},
+    {"IndexName":"assignee-user-index",
+     "KeySchema":[{"AttributeName":"assignee_user_id","KeyType":"HASH"},
                   {"AttributeName":"created_at","KeyType":"RANGE"}],
      "Projection":{"ProjectionType":"ALL"}},
     {"IndexName":"dedupe-index",

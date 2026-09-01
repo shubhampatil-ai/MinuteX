@@ -35,7 +35,8 @@ import {
   Button, Card, ErrorText, Loading, SectionTitle,
 } from "../../../lib/ui";
 import {
-  ApiContact, ApiError, AssigneeCandidate, TaskDetail, TaskStatusV2,
+  ApiContact, ApiError, AssigneeCandidate, CREATOR_PERMISSIONS, TaskDetail,
+  TaskStatusV2,
   assigneeLabel, getAssigneeCandidates, getFolderContacts, getParticipants,
   getTaskDetail, needsAssigneeResolution, patchTaskById, resolveTaskAssignee,
 } from "../../../lib/api";
@@ -227,9 +228,24 @@ export default function TaskDetailScreen() {
     );
   }
 
-  const { task, contact, folder, recording } = detail;
+  const { task, contact, folder, recording, assigned_by: assignedBy } = detail;
+  // WHAT THIS USER MAY DO, decided by the backend and merely rendered here.
+  //
+  // The creator controls the task's configuration; the assignee executes it
+  // and may change only its status. Hiding a control the caller cannot use is
+  // a courtesy, NOT the enforcement point — every one of these actions is
+  // re-checked server-side, so a client that ignored this object would get a
+  // 403 rather than a write. Falling back to CREATOR_PERMISSIONS keeps an
+  // older backend (which sends no `permissions`) behaving exactly as before.
+  const perms = detail.permissions ?? CREATOR_PERMISSIONS;
   const { name, confirmed } = assigneeLabel(task);
-  const needsPerson = needsAssigneeResolution(task);
+  // An unresolved assignee is only the CREATOR's question to answer. For an
+  // assignee the resolution UI would be a prompt they cannot act on, so the
+  // task reads as normally assigned to them instead.
+  const needsPerson = needsAssigneeResolution(task) && perms.can_resolve_assignment;
+  // Only ids the BACKEND validated against this meeting's transcript
+  // reach here - the app never re-derives, repairs or invents a reference.
+  const evidenceIds = task?.ai_evidence_segment_ids ?? [];
 
   return (
     <ScrollView
@@ -263,10 +279,53 @@ export default function TaskDetailScreen() {
         {!!task.due && <Text style={st.due}>Due {task.due}</Text>}
         {task.source_type === "AI" && (
           <View style={[st.pill, { backgroundColor: C.accentSoft }]}>
-            <Text style={[st.pillTxt, { color: C.accent }]}>From meeting</Text>
+            <Text style={[st.pillTxt, { color: C.accent }]}>AI generated</Text>
+          </View>
+        )}
+        {/* The MODEL's own confidence, shown as the band it actually reported.
+            Never a percentage: the backend stores a 3-value enum precisely
+            because a number would be precision the model did not have. Absent
+            for manual tasks and for AI rows the model never scored, which is
+            why this renders nothing rather than "unknown". */}
+        {task.source_type === "AI" && !!task.ai_confidence && (
+          <View
+            style={[
+              st.pill,
+              { backgroundColor: confidenceTint(task.ai_confidence, C).bg },
+            ]}
+          >
+            <Text
+              style={[
+                st.pillTxt,
+                { color: confidenceTint(task.ai_confidence, C).fg },
+              ]}
+            >
+              {confidenceLabel(task.ai_confidence)} confidence
+            </Text>
           </View>
         )}
       </View>
+
+      {/* NEEDS REVIEW. Driven by the server's `needs_review`, never
+          re-derived here — the app and the API must not be able to disagree
+          about whether a task is safe. It says what MinuteX could not do and
+          points at the control that fixes it, rather than being a bare
+          warning the user cannot act on. */}
+      {task.needs_review && (
+        <View style={st.reviewBanner}>
+          <Icon name="exclamationmark.triangle.fill" size={16} tintColor={C.warn} />
+          <View style={{ flex: 1 }}>
+            <Text style={st.reviewTitle}>Needs review</Text>
+            <Text style={st.reviewBody}>
+              MinuteX could not confidently identify who this is for
+              {task.assignee_name_legacy
+                ? ` — it heard “${task.assignee_name_legacy}”.`
+                : "."}{" "}
+              Confirm the assignee below.
+            </Text>
+          </View>
+        </View>
+      )}
 
       {/* ---------------- ASSIGNEE ---------------- */}
       <View style={{ marginTop: S.lg }}>
@@ -370,16 +429,26 @@ export default function TaskDetailScreen() {
             )}
           </Card>
         ) : confirmed && contact ? (
+          // The card is only a LINK when there is a contact record this user
+          // can actually open. An assignee is shown themselves, built from the
+          // task row rather than the creator's address book (which is not
+          // theirs to read), so it carries no id — tapping it would 404.
           <Pressable
             style={st.assigneeCard}
-            onPress={() =>
-              router.push({
-                pathname: "/contact/[id]",
-                params: { id: contact.id },
-              } as any)
+            onPress={
+              contact.id
+                ? () =>
+                    router.push({
+                      pathname: "/contact/[id]",
+                      params: { id: contact.id },
+                    } as any)
+                : undefined
             }
-            accessibilityRole="button"
-            accessibilityLabel={`Open ${contact.name}`}
+            disabled={!contact.id}
+            accessibilityRole={contact.id ? "button" : "text"}
+            accessibilityLabel={
+              contact.id ? `Open ${contact.name}` : `Assigned to ${contact.name}`
+            }
           >
             <View
               style={[st.avatar, { backgroundColor: avatarColorFor(contact.name) }]}
@@ -405,21 +474,25 @@ export default function TaskDetailScreen() {
                   : "No MinuteX account — reach them by email or phone"}
               </Text>
             </View>
-            <Icon name="chevron.right" size={15} tintColor={C.textFaint} />
+            {contact.id ? (
+              <Icon name="chevron.right" size={15} tintColor={C.textFaint} />
+            ) : null}
           </Pressable>
         ) : (
           <Card style={{ gap: S.md }}>
             <Text style={st.warnBody}>Nobody is assigned to this task.</Text>
-            <Button
-              label="Choose a Contact"
-              variant="secondary"
-              onPress={openAssigneePicker}
-              disabled={busy}
-            />
+            {perms.can_change_assignee && (
+              <Button
+                label="Choose a Contact"
+                variant="secondary"
+                onPress={openAssigneePicker}
+                disabled={busy}
+              />
+            )}
           </Card>
         )}
 
-        {confirmed && (
+        {confirmed && perms.can_change_assignee && (
           <View style={{ marginTop: S.sm }}>
             <Button
               label="Reassign"
@@ -434,16 +507,30 @@ export default function TaskDetailScreen() {
       {/* ---------------- DUE DATE ---------------- */}
       <View style={{ marginTop: S.lg }}>
         <SectionTitle>Due date</SectionTitle>
+        {/* READ-ONLY for an assignee. The deadline is the creator's to set —
+            an assignee who could move it could excuse their own lateness. The
+            row still renders (they need to know when it is due), it simply
+            does not open the picker, and it announces itself as a value
+            rather than a button so screen readers do not offer an action that
+            would be refused. */}
         <Pressable
           style={st.dueRow}
-          onPress={() => setDueOpen(true)}
-          disabled={busy}
-          accessibilityRole="button"
+          onPress={perms.can_change_deadline ? () => setDueOpen(true) : undefined}
+          disabled={busy || !perms.can_change_deadline}
+          accessibilityRole={perms.can_change_deadline ? "button" : "text"}
           accessibilityLabel={
-            task.due ? `Change due date, currently ${task.due}` : "Set a due date"
+            !perms.can_change_deadline
+              ? `Due ${task.due || "not set"} — only the task creator can change this`
+              : task.due
+                ? `Change due date, currently ${task.due}`
+                : "Set a due date"
           }
         >
-          <Icon name="calendar" size={16} tintColor={C.primary} />
+          <Icon
+            name="calendar"
+            size={16}
+            tintColor={perms.can_change_deadline ? C.primary : C.textFaint}
+          />
           <View style={{ flex: 1 }}>
             <Text style={[st.dueValue, !task.due && { color: C.textFaint }]}>
               {task.due
@@ -463,13 +550,26 @@ export default function TaskDetailScreen() {
               </Text>
             ) : null}
           </View>
-          <Icon name="chevron.right" size={15} tintColor={C.textFaint} />
+          {perms.can_change_deadline ? (
+            <Icon name="chevron.right" size={15} tintColor={C.textFaint} />
+          ) : null}
         </Pressable>
       </View>
 
       {/* ---------------- STATUS ---------------- */}
       <View style={{ marginTop: S.lg }}>
         <SectionTitle>Status</SectionTitle>
+        {/* Says WHY the other controls are read-only, once, near the one
+            control that is not. Without this an assignee just finds a screen
+            that mostly does not respond — the rule is not a punishment, it is
+            "this task is yours to do, not to redefine". Shown only to an
+            assignee who is not also the creator. */}
+        {!perms.is_creator && perms.is_assignee ? (
+          <Text style={st.roleNote}>
+            This task is assigned to you. You can move it along; its deadline
+            and details stay with whoever created it.
+          </Text>
+        ) : null}
         <View style={st.statusRow}>
           {STATUSES.map((s) => {
             const on = task.status === s;
@@ -506,17 +606,45 @@ export default function TaskDetailScreen() {
       <View style={{ marginTop: S.lg }}>
         <SectionTitle>Where this came from</SectionTitle>
         <Card>
+          {/* WHO GAVE ME THIS. Sent by the backend only to an assignee, so
+              this renders for them and never for the creator (who does not
+              need to be told they made their own task). Answers the first
+              question anyone asks of work that appeared in their list. */}
+          {!!assignedBy?.name && (
+            <View style={st.ctxRow}>
+              <Icon name="person.fill" size={15} tintColor={C.primary} />
+              <View style={{ flex: 1 }}>
+                <Text style={st.ctxLabel}>Assigned by</Text>
+                <Text style={st.ctxValue}>{assignedBy.name}</Text>
+              </View>
+            </View>
+          )}
+          {/* WHERE THE TASK CAME FROM.
+              For the creator this is a link into their meeting. For an
+              ASSIGNEE the backend sends the title and date but no audio key —
+              the meeting is not theirs to open — so the same row renders as
+              provenance rather than navigation. Showing it matters: a task
+              that arrives with no origin reads as an anonymous instruction,
+              and the meeting is what makes it accountable work. */}
           {!!recording && (
             <Pressable
               style={st.ctxRow}
-              onPress={() =>
-                router.push({
-                  pathname: "/recording/[key]",
-                  params: { key: recording.audio_s3_key },
-                } as any)
+              onPress={
+                recording.audio_s3_key
+                  ? () =>
+                      router.push({
+                        pathname: "/recording/[key]",
+                        params: { key: recording.audio_s3_key },
+                      } as any)
+                  : undefined
               }
-              accessibilityRole="button"
-              accessibilityLabel="Open source meeting"
+              disabled={!recording.audio_s3_key}
+              accessibilityRole={recording.audio_s3_key ? "button" : "text"}
+              accessibilityLabel={
+                recording.audio_s3_key
+                  ? "Open source meeting"
+                  : `From the meeting ${recording.title || "Untitled meeting"}`
+              }
             >
               <Icon name="waveform" size={15} tintColor={C.primary} />
               <View style={{ flex: 1 }}>
@@ -524,8 +652,21 @@ export default function TaskDetailScreen() {
                 <Text style={st.ctxValue} numberOfLines={2}>
                   {recording.title || "Untitled meeting"}
                 </Text>
+                {/* The date is the other half of "where did this come
+                    from", and it is the only context an assignee gets in
+                    place of being able to open the meeting. */}
+                {!!recording.recorded_at && (
+                  <Text style={st.ctxSub}>
+                    {new Date(recording.recorded_at).toLocaleDateString(
+                      undefined,
+                      { day: "numeric", month: "short", year: "numeric" }
+                    )}
+                  </Text>
+                )}
               </View>
-              <Icon name="chevron.right" size={14} tintColor={C.textFaint} />
+              {recording.audio_s3_key ? (
+                <Icon name="chevron.right" size={14} tintColor={C.textFaint} />
+              ) : null}
             </Pressable>
           )}
           {!!folder && (
@@ -556,6 +697,34 @@ export default function TaskDetailScreen() {
               <View style={{ flex: 1 }}>
                 <Text style={st.ctxLabel}>What was said</Text>
                 <Text style={st.evidence}>&ldquo;{task.ai_evidence}&rdquo;</Text>
+                {/* Offered ONLY when the backend stored segment ids it
+                    validated against this meeting's transcript. A button that
+                    scrolled nowhere would be worse than no button, and older
+                    tasks (and any extraction the model gave no usable
+                    reference for) legitimately have none — they still show the
+                    quote above. */}
+                {evidenceIds.length > 0 && !!recording ? (
+                  <Pressable
+                    onPress={() =>
+                      router.push({
+                        pathname: "/recording/[key]/transcript",
+                        params: {
+                          key: recording.audio_s3_key,
+                          evidence: evidenceIds.join(","),
+                        },
+                      } as never)
+                    }
+                    hitSlop={6}
+                    style={({ pressed }) => [
+                      st.viewEvidence, pressed && { opacity: 0.6 },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="View this evidence in the transcript"
+                  >
+                    <Icon name="magnifyingglass" size={13} tintColor={C.primary} />
+                    <Text style={st.viewEvidenceTxt}>View in transcript</Text>
+                  </Pressable>
+                ) : null}
               </View>
             </View>
           )}
@@ -581,6 +750,28 @@ export default function TaskDetailScreen() {
       />
     </ScrollView>
   );
+}
+
+/** The colour role for a confidence band. Low is deliberately WARN, not
+ *  danger: a low-confidence extraction is a thing to check, not a failure —
+ *  and the task itself may be perfectly real even when its owner is unclear. */
+function confidenceTint(level: string, C: ColorScale) {
+  switch (level) {
+    case "high":
+      return { bg: C.successSoft, fg: C.success };
+    case "medium":
+      return { bg: C.primarySoft, fg: C.primary };
+    case "low":
+      return { bg: C.warnSoft, fg: C.warn };
+    default:
+      return { bg: C.surface2, fg: C.textFaint };
+  }
+}
+
+/** "high" -> "High". The backend's enum is the source of truth; this only
+ *  capitalises it for display and never maps it onto a different vocabulary. */
+function confidenceLabel(level: string): string {
+  return level ? level.charAt(0).toUpperCase() + level.slice(1) : "";
 }
 
 function statusTint(status: TaskStatusV2 | string, C: ColorScale) {
@@ -664,6 +855,13 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
       marginTop: 1,
     },
     notifyLine: { fontFamily: FONT.medium, fontSize: 11.5, marginTop: 4 },
+    ctxSub: {
+      fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 2,
+    },
+    roleNote: {
+      fontFamily: FONT.regular, fontSize: 12.5, color: C.textFaint,
+      lineHeight: 18, marginBottom: S.sm,
+    },
     statusRow: {
       flexDirection: "row" as const, flexWrap: "wrap" as const, gap: S.sm,
     },
@@ -683,6 +881,23 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     },
     ctxValue: {
       fontFamily: FONT.bold, fontSize: 13.5, color: C.text, marginTop: 2,
+    },
+    reviewBanner: {
+      flexDirection: "row", alignItems: "flex-start", gap: S.md,
+      backgroundColor: C.warnSoft,
+      borderRadius: R.card, borderWidth: 1, borderColor: C.warn + "40",
+      padding: S.md, marginTop: S.lg,
+    },
+    reviewTitle: {
+      fontFamily: FONT.bold, fontSize: 13, color: C.warn, marginBottom: 2,
+    },
+    reviewBody: { fontFamily: FONT.regular, fontSize: 13, color: C.text, lineHeight: 18 },
+    viewEvidence: {
+      flexDirection: "row", alignItems: "center", gap: 6, marginTop: 8,
+      alignSelf: "flex-start",
+    },
+    viewEvidenceTxt: {
+      fontFamily: FONT.semibold, fontSize: 13, color: C.primary,
     },
     evidence: {
       fontFamily: FONT.regular, fontSize: 13, color: C.textDim, marginTop: 3,

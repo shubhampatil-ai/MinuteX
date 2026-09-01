@@ -176,6 +176,33 @@ def _roster_filtered(participants, roster):
                     "summary": (got or {}).get("summary", "")})
     return out
 
+CONFIDENCE_HIGH = "high"
+CONFIDENCE_MEDIUM = "medium"
+CONFIDENCE_LOW = "low"
+CONFIDENCE_LEVELS = (CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW)
+
+
+def coerce_confidence(value):
+    """An AI confidence label reduced to the fixed enum, or "" for no claim.
+
+    Case- and whitespace-insensitive, unlike the generic `clamp`: the model is
+    asked for lowercase and usually complies, but "High" and " high " are the
+    SAME claim and dropping them threw away a real signal — a task whose
+    confidence silently became "" is indistinguishable from one the model never
+    scored, and the gating below would then treat a high-confidence extraction
+    as unscored.
+
+    A NUMBER is deliberately refused. Some models answer 0.87 despite the
+    prompt; mapping that onto a band would be inventing a threshold nobody
+    chose, and the whole point of the 3-value enum is that it carries only what
+    the model actually meant. "" (no claim) is the honest reading.
+    """
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return ""
+    text = s(value).strip().lower()
+    return text if text in CONFIDENCE_LEVELS else ""
+
+
 # `assignee_speaker_id`, `confidence` and `evidence` are NOT decoration: the
 # Tasks layer reads all three off each raw row (_seed_ai_tasks). Because
 # obj_list builds every element STRICTLY from this spec, a field missing here
@@ -196,8 +223,7 @@ TASK_SPEC = {
         x, {"Low", "Medium", "High"}, "") or None),
     # A fixed enum, not a free number: a model asked for a 0-1 score returns
     # noise dressed as precision. Unrecognised -> "" (no claim made).
-    "confidence": ("confidence", lambda x: clamp(
-        x, {"high", "medium", "low"}, "")),
+    "confidence": ("confidence", lambda x: coerce_confidence(x)),
     "evidence": ("evidence", s),
     # The verbatim quote above says WHAT created the task; this says WHERE it
     # is, so the app can jump to that moment of the audio. Coerced permissively

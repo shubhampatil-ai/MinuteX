@@ -20,6 +20,12 @@
 // picker ranks: people tagged in THIS meeting, then this folder's contacts,
 // then every contact — plus create-new and import-from-phone, which together
 // replace the manual-entry and phone-contacts paths this file used to own.
+//
+// ASSIGNING ENDS HERE. This screen used to redirect into Notify Assignee on
+// success, which conflated two independent decisions: who owns the task, and
+// whether to message them about it. Notifying is genuinely optional — most
+// reassignments are bookkeeping — so picking someone now returns to the task,
+// where "Notify Assignee" remains one tap away for the times it is wanted.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
@@ -29,7 +35,7 @@ import { ContactPicker } from "../../../../../../lib/contact-picker";
 import { useMeeting } from "../../../../../../lib/meeting-context";
 import { avatarColorFor, initialsOf } from "../../../../../../lib/task-model";
 import {
-  ApiContact, ApiError, assignTaskToContact, getParticipants,
+  ApiContact, ApiError, getParticipants,
 } from "../../../../../../lib/api";
 
 function buildStyles(C: ColorScale) {
@@ -74,7 +80,11 @@ export default function AssignScreen() {
   const router = useRouter();
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
-  const { getTask } = useMeeting();
+  // Assign through the CONTEXT, not the API directly. The meeting's task list
+  // is fetched once per meeting, so a write that bypasses it leaves the old
+  // assignee on screen when this flow pops back — which is exactly what made
+  // reassignment look like it did nothing.
+  const { getTask, assignTaskToContact } = useMeeting();
   const task = getTask(taskId);
 
   // Opens immediately: this screen exists to pick someone, so making the user
@@ -117,12 +127,13 @@ export default function AssignScreen() {
         // A real contact_id, not a name: this is what makes the task RESOLVED,
         // filterable by assignee, and notification-ready when the contact has a
         // MinuteX account.
-        await assignTaskToContact(String(key), String(taskId), contact.id);
-        // Assignment and notification are one continuous flow, as before.
-        router.replace({
-          pathname: "/recording/[key]/task/[taskId]/notify",
-          params: { key: String(key), taskId: String(taskId) },
-        });
+        await assignTaskToContact(String(taskId), contact);
+        // Assigning is DONE at this point. Notifying is a separate, optional
+        // decision, so this goes back to the task — where "Notify Assignee"
+        // still sits for the user who wants it. Forcing the notify screen here
+        // made every reassignment feel like an unfinished, half-committed
+        // action and gave no way out but the back button.
+        router.back();
       } catch (e) {
         setError(
           e instanceof ApiError ? e.message : "Could not assign that task."
@@ -132,7 +143,7 @@ export default function AssignScreen() {
         setBusy(false);
       }
     },
-    [key, taskId, router, setPickerOpen]
+    [taskId, router, assignTaskToContact, setPickerOpen]
   );
 
   if (!task) return null;

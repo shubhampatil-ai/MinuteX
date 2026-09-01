@@ -289,6 +289,29 @@ export default function TaskDetailScreen() {
           style={{ marginTop: S.xl }}
         />
 
+        {/* Notify Assignee — multi-channel deep-link handoff (WhatsApp / Email
+            / SMS / in-app acknowledgement).
+
+            An EXPLICIT action, not a forced step. Assign To used to redirect
+            here the moment someone was picked, which conflated two independent
+            decisions — who owns the task, and whether to message them about it
+            — and left every reassignment feeling half-finished. Most
+            reassignments are bookkeeping, so notifying is offered here and
+            chosen, never imposed. Assigned tasks only: the channels are the
+            assignee's contact details, so there is nothing to send without
+            one. */}
+        {task.assignee ? (
+          <Button
+            label="Notify Assignee"
+            variant="secondary"
+            onPress={() => router.push({
+              pathname: "/recording/[key]/task/[taskId]/notify",
+              params: { key, taskId },
+            })}
+            style={{ marginTop: S.md }}
+          />
+        ) : null}
+
         {/* Email the task to its assignee, through the user's own Gmail.
             Explicitly triggered communication — distinct from Notify Assignee,
             which is a multi-channel deep-link handoff and the seed of the

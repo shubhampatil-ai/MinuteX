@@ -273,6 +273,12 @@ export default function ParticipantsScreen() {
         }
         folderContacts={folderContacts}
         folderId={folderId}
+        // You are almost always IN your own meeting, and "Speaker 0" is very
+        // often you. Without this the only way to say so was to type your own
+        // name and email in by hand — and a typo in that email silently broke
+        // the link to your account, which is what every task notification
+        // depends on.
+        allowSelf
         title={pickerFor ? `Who is Speaker ${pickerFor}?` : "Select Contact"}
       />
 

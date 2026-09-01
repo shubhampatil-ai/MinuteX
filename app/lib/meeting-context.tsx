@@ -25,11 +25,12 @@ import {
   getTasks, createTask as apiCreateTask, updateTask as apiUpdateTask,
   deleteTask as apiDeleteTask, listAiDocuments, updateStaleDocuments,
   getSalesforceConfig, lookupCrmRecord, syncCrmRecord,
-  type CrmMapping, type CrmCandidate, type CrmLookupResult,
+  assignTaskToContact as apiAssignTaskToContact,
+  type CrmMapping, type CrmCandidate, type CrmLookupResult, type ApiContact,
 } from "./api";
 import type { GeneratedDoc } from "./meeting-documents";
 import {
-  taskFromApiTask, assigneeToApi, apiAssigneeToAssignee, nextId,
+  taskFromApiTask, assigneeToApi, apiAssigneeToAssignee, avatarColorFor, nextId,
   type Task, type TaskStatus,
   type Assignee, type NotifyChannel, type Attachment,
 } from "./task-model";
@@ -92,6 +93,9 @@ type MeetingCtxValue = {
   updateTask: (id: string, patch: Partial<Task>) => void;
   setTaskStatus: (id: string, status: TaskStatus) => void;
   assignTask: (id: string, assignee: Assignee) => void;
+  /** Assign to a REAL contact (resolved identity). Returns a promise so the
+   *  caller can wait for the write before navigating away. */
+  assignTaskToContact: (id: string, contact: ApiContact) => Promise<void>;
   recordNotification: (id: string, channels: NotifyChannel[]) => void;
   addSubtask: (id: string, title: string) => void;
   toggleSubtask: (id: string, subtaskId: string) => void;
@@ -590,6 +594,36 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
       .catch(() => { /* already alerted */ });
   }, [applyTaskPatch, meetingKey, tasks, pushTaskActivity, logActivity]);
 
+  // Assign to a REAL contact. Distinct from assignTask above, which writes a
+  // legacy NAME the backend must store as UNRESOLVED: this sends a contact_id,
+  // so the task ends up with a resolved identity that can actually be filtered
+  // and notified.
+  //
+  // The local list is patched from the SERVER's echo of the task, not from the
+  // contact we sent — a reassignment must show what was actually persisted,
+  // and this list is only fetched once per meeting (tasksLoadedRef), so a
+  // write that skips it leaves the old assignee on screen until the provider
+  // remounts. That was the reassign-does-nothing bug.
+  const assignTaskToContact = useCallback(async (id: string, contact: ApiContact) => {
+    const t = tasks.find((x) => x.id === id);
+    const optimistic: Assignee = {
+      name: contact.name,
+      email: contact.email || undefined,
+      phone: contact.phone || undefined,
+      avatarColor: avatarColorFor(contact.name),
+      source: "manual",
+    };
+    let saved: Assignee | null = optimistic;
+    await applyTaskPatch(id, { assignee: optimistic }, async () => {
+      const fresh = await apiAssignTaskToContact(meetingKey, id, contact.id);
+      saved = apiAssigneeToAssignee(fresh.assignee);
+    }, "Couldn't assign task");
+    // Reconcile with what the server actually stored.
+    setTasks((prev) => prev.map((x) => (x.id === id ? { ...x, assignee: saved } : x)));
+    pushTaskActivity(id, `Assigned to ${contact.name}`);
+    logActivity(`Task assigned to ${contact.name}: ${t?.task ?? ""}`);
+  }, [applyTaskPatch, meetingKey, tasks, pushTaskActivity, logActivity]);
+
   const recordNotification = useCallback((id: string, channels: NotifyChannel[]) => {
     const t = tasks.find((x) => x.id === id);
     const nextChannels = Array.from(new Set([...(t?.notifiedVia ?? []), ...channels]));
@@ -633,7 +667,8 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
     setCrmRecord, chooseCrmCandidate, confirmCrmRecord, syncCrmRecordNow,
     crmMappings, crmAmbiguity,
     documentsNeedingUpdate, updateAllDocuments,
-    tasks, getTask, addTask, updateTask, setTaskStatus, assignTask, recordNotification,
+    tasks, getTask, addTask, updateTask, setTaskStatus, assignTask,
+    assignTaskToContact, recordNotification,
     addSubtask, toggleSubtask, addAttachment, removeAttachment,
     activity, logActivity,
   }), [
@@ -641,7 +676,8 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
     setCrmRecord, chooseCrmCandidate, confirmCrmRecord, syncCrmRecordNow,
     crmMappings, crmAmbiguity,
     documentsNeedingUpdate, updateAllDocuments,
-    tasks, getTask, addTask, updateTask, setTaskStatus, assignTask, recordNotification,
+    tasks, getTask, addTask, updateTask, setTaskStatus, assignTask,
+    assignTaskToContact, recordNotification,
     addSubtask, toggleSubtask, addAttachment, removeAttachment, activity, logActivity,
   ]);
 

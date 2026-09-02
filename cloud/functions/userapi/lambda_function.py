@@ -226,6 +226,8 @@ import groq_client
 import integrations
 import mom_schema
 import notification_schema
+import pageindex
+import pageindex_store
 import spoken_dates
 import prompts
 import share_schema
@@ -2049,6 +2051,9 @@ def permanently_delete_recording(event):
 
       * the audio object in S3, at the key that IS the primary key;
       * the transcript object, at transcript_store.s3_key_for(key);
+      * the PageIndex tree, at pageindex_store.s3_key_for(key) — its pointer
+        lives on the row and dies with it, so leaving the object would orphan
+        it exactly as an un-deleted transcript would;
       * the DynamoDB row — and with it EVERY AI artifact, because documents,
         tasks, chat history, highlights, speaker names and crm_records are all
         attributes ON that row rather than separate tables. One delete_item
@@ -2086,7 +2091,8 @@ def permanently_delete_recording(event):
         # (a recording that never got past upload has none) must not stop the
         # audio delete.
         for what, s3_key in (("audio", key),
-                             ("transcript", transcript_store.s3_key_for(key))):
+                             ("transcript", transcript_store.s3_key_for(key)),
+                             ("pageindex", pageindex_store.s3_key_for(key))):
             try:
                 _s3.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
             except Exception as err:  # noqa: BLE001 — see the docstring
@@ -3088,6 +3094,362 @@ def regenerate_highlights(event):
                        "segments_covered": covered, "segments_total": total})
 
 
+# ===========================================================================
+# MEETING RETRIEVAL — grounded context for the AI, from anywhere in a meeting.
+#
+# THE PROBLEM THIS SOLVES. `chat` below used to build its context with
+# prompts.build_context(..., transcript_budget_chars=...), which head-truncates:
+# a transcript longer than one TPM window is cut to its FIRST N characters and
+# the model is told the record is partial. On a 15-minute meeting that never
+# fires. On a two-hour one it means "what did we decide about pricing at the
+# end?" is unanswerable — the model is holding the first thirty-five minutes,
+# and the rest is in S3, unread.
+#
+# So the transcript is indexed into a per-meeting PageIndex tree (see
+# shared/pageindex.py) and the question is used to RETRIEVE the sections that
+# bear on it, wherever in the meeting they fall.
+#
+# WHEN RETRIEVAL RUNS. Only when it has to. If the whole labelled transcript
+# fits the budget it is all sent, exactly as before — retrieval can only lose
+# information in that case, and it would cost an extra Groq round-trip to do
+# it. Retrieval engages precisely in the case the old code got wrong.
+#
+# THE ONE ENTRY POINT. `retrieve_meeting_context` is the only way into this,
+# and it takes the ALREADY-AUTHORIZED item from _owned_recording — it is never
+# handed a bare meeting_id. That ordering (authorize, then retrieve) is what
+# makes it impossible to reach another user's index through this path: there is
+# no code path that resolves an index from a key alone.
+# ===========================================================================
+
+# How many retrieved segments are turned into `sources` on the response. Four
+# is what a chat bubble can show without becoming a citation list; the answer
+# itself is grounded in everything retrieved, not just these.
+MAX_CHAT_SOURCES = 4
+
+# Deadline split for the two-call retrieval path. The navigation call is small
+# (a table of contents and a question) and must not eat the budget the ANSWER
+# needs — a fast retrieval followed by a killed answer is strictly worse than
+# no retrieval at all, because the user waited and got nothing.
+RETRIEVAL_DEADLINE_SECONDS = int(os.environ.get("PAGEINDEX_RETRIEVAL_DEADLINE", "7"))
+
+
+def _speaker_names(item):
+    names = item.get("speaker_names")
+    return names if isinstance(names, dict) else {}
+
+
+def _authoritative_mom(item):
+    """The user-reviewed MoM as Markdown, or "".
+
+    Sent to the model ABOVE the transcript and marked authoritative (see
+    prompts.MOM_CONTEXT_RULES) so a correction the user made in the minutes
+    wins over what the audio literally says.
+
+    Read from the stored STRUCTURE and re-rendered rather than from the
+    mirrored document, because the structure is the source of truth
+    (mom_schema) and the mirror is refreshed from it — going to the structure
+    means the model cannot see a mirror that a failed write left stale.
+    """
+    mom = _stored_mom(item)
+    if not mom:
+        return ""
+    try:
+        return mom_schema.render_markdown(mom) or ""
+    except Exception as err:  # noqa: BLE001
+        print(f"[pageindex] MoM render failed: {err}")
+        return ""
+
+
+def _ensure_index(key, item, fingerprint, deadline=None):
+    """The meeting's PageIndex tree, building it if needed. None if unavailable.
+
+    LAZY GENERATION. An index that is missing (an old meeting, a build that
+    failed, a pipeline that skipped it) is built here, on the first question
+    that needs it. That is what keeps "no index" from being a user-visible
+    error: the feature repairs itself on demand and the user just gets an
+    answer (Part 23).
+
+    SINGLE-FLIGHT. The build is behind pageindex_store.claim(), a conditional
+    write only one caller can win. A caller that loses returns None and falls
+    back for that one request rather than duplicating the work.
+
+    NEVER RAISES. Every failure returns None, and None means "answer the old
+    way" — which still works. An index is an optimisation over a fallback that
+    is already correct, so no failure in here is worth a 500.
+    """
+    stale_pointer = False
+    if pageindex_store.is_fresh(item, fingerprint):
+        tree = pageindex_store.load(_s3, BUCKET_NAME, item)
+        if tree:
+            return tree
+        # Pointer says ready, object is gone or corrupt. Rebuild rather than
+        # trust a record we just failed to honour — and claim with force, or the
+        # claim would be refused for the very freshness we have just disproved
+        # and this meeting could never recover.
+        stale_pointer = True
+
+    owner = item.get("user_id") or ""
+    if not pageindex_store.claim(_recordings, key, fingerprint, owner,
+                                 force=stale_pointer):
+        return None
+
+    try:
+        tree = pageindex_store.build_for(
+            item, item.get("timestamps") or [], item.get("transcript") or "",
+            groq=groq_client, deadline=deadline)
+    except Exception as err:  # noqa: BLE001
+        print(f"[pageindex] build FAILED for {key}: {err}")
+        pageindex_store.mark_failed(_recordings, key, fingerprint, str(err))
+        return None
+
+    if not tree.get("nodes"):
+        # A transcript too short to cut into nodes is not a failure — it is a
+        # meeting that never needed retrieval. Recorded as ready so we do not
+        # re-attempt on every question.
+        pageindex_store.save(_s3, BUCKET_NAME, _recordings, key, tree,
+                             fingerprint, owner)
+        return None
+
+    pageindex_store.save(_s3, BUCKET_NAME, _recordings, key, tree,
+                         fingerprint, owner)
+    return tree
+
+
+def _navigate(tree, question, item, deadline):
+    """Ask the model which sections to read. Returns (node ids, mode).
+
+    On ANY failure — Groq down, a deadline hit, an unparseable reply — this
+    falls back to a SPREAD of nodes across the meeting rather than to nothing.
+    Evenly spaced beats the first N: the first N is the head-truncation
+    behaviour this whole module exists to replace, so degrading into it would
+    be the one fallback that reproduces the bug.
+    """
+    toc = pageindex.table_of_contents(tree, _speaker_names(item))
+    try:
+        reply = groq_client.complete(
+            prompts.RETRIEVAL_SYSTEM,
+            prompts.retrieval_request(question, toc),
+            label="pageindex-retrieval", json_mode=True, temperature=0.0,
+            deadline=deadline,
+        )
+        node_ids = pageindex.parse_node_ids(reply, tree)
+        if node_ids:
+            return node_ids, "llm"
+    except groq_client.GroqError as err:
+        print(f"[pageindex] navigation failed, spreading instead: {err}")
+    except Exception as err:  # noqa: BLE001
+        print(f"[pageindex] navigation error, spreading instead: {err}")
+
+    nodes = tree.get("nodes") or []
+    if not nodes:
+        return [], "none"
+    step = max(1, len(nodes) // 6)
+    return [n["node_id"] for n in nodes[::step]][:6], "spread"
+
+
+def _fit_segments(segments, budget_chars, names):
+    """Retrieved segments trimmed to the context budget. (lines, kept, cut).
+
+    Trimmed from the END so the best-first ordering of the navigator's picks is
+    honoured: the sections it ranked highest survive. Segments are dropped
+    WHOLE — a half segment would be text no `seg_N` can address, which would
+    break the evidence link for the one line most likely to be cited.
+    """
+    kept, used = [], 0
+    for seg in segments:
+        line = pageindex.render_segments([seg], names)
+        if used + len(line) > budget_chars and kept:
+            return pageindex.render_segments(kept, names), kept, True
+        kept.append(seg)
+        used += len(line) + 1
+    return pageindex.render_segments(kept, names), kept, False
+
+
+def retrieve_meeting_context(item, key, question, system_prompt):
+    """Grounded context for ONE meeting question. THE retrieval entry point.
+
+    `item` must be an ALREADY-AUTHORIZED, hydrated recording (what
+    _owned_recording returns). This function does not take a meeting id and
+    cannot resolve one — authorization happens before retrieval, structurally,
+    not by remembering to check.
+
+    Returns (context, sources, metrics). `sources` is the public evidence
+    array — segment ids the app already knows how to deep-link. `metrics` is
+    for the log line, never for the response body.
+
+    THE TWO PATHS, and why the choice is made on size alone:
+      * transcript FITS the budget -> send all of it. Retrieval could only
+        subtract, and the model answering from the complete record is strictly
+        better than answering from a chosen part of it.
+      * transcript does NOT fit -> retrieve. This is the case the old code
+        answered with the first N characters.
+    """
+    started = time.monotonic()
+    names = _speaker_names(item)
+    transcript = item.get("transcript") or ""
+    timestamps = item.get("timestamps") or []
+    highlights = item.get("meeting_highlights")
+    highlights = highlights if isinstance(highlights, dict) else None
+    mom = _authoritative_mom(item)
+
+    # The budget must account for the MoM: it rides in the same window as the
+    # transcript, and on a heavily-edited meeting it is not small.
+    budget = _transcript_budget_chars(system_prompt + mom)
+    labelled = transcript_store.as_labelled_lines(transcript, timestamps)
+
+    metrics = {"retrieval_mode": "full", "retrieved_segments": 0,
+               "nodes_selected": 0, "retrieval_ms": 0}
+
+    if len(labelled) <= budget:
+        # Whole meeting fits. Note this is now the LABELLED transcript, so even
+        # this path can cite segment ids — evidence is not a retrieval-only
+        # feature.
+        context = prompts.build_grounded_context(
+            item, labelled, highlights=highlights, mom_markdown=mom)
+        metrics["retrieved_segments"] = len(timestamps)
+        metrics["retrieval_ms"] = int((time.monotonic() - started) * 1000)
+        return context, [], metrics
+
+    fingerprint = _row_fingerprint(item)
+    tree = _ensure_index(key, item, fingerprint,
+                         deadline=time.monotonic() + RETRIEVAL_DEADLINE_SECONDS)
+
+    if not tree:
+        # NO INDEX AND WE COULD NOT MAKE ONE. Fall back to the old behaviour
+        # rather than failing the question: a head-truncated answer is what the
+        # user got yesterday, and it is not nothing. The MoM still rides along,
+        # so the authoritative-minutes fix holds even on this path.
+        metrics["retrieval_mode"] = "fallback"
+        metrics["retrieval_ms"] = int((time.monotonic() - started) * 1000)
+        context = prompts.build_context(
+            item, highlights=highlights, transcript_budget_chars=budget)
+        if mom:
+            context = ("=== MINUTES OF MEETING (user-reviewed, authoritative) "
+                       "===\n" + mom.strip() + "\n\n" + context)
+        return context, [], metrics
+
+    node_ids, mode = _navigate(tree, question, item,
+                               time.monotonic() + RETRIEVAL_DEADLINE_SECONDS)
+    segments = pageindex.segments_for_nodes(tree, timestamps, node_ids)
+    lines, kept, truncated = _fit_segments(segments, budget - len(mom), names)
+
+    context = prompts.build_grounded_context(
+        item, lines, highlights=highlights, mom_markdown=mom,
+        truncated=truncated)
+
+    metrics.update({
+        "retrieval_mode": f"pageindex:{mode}",
+        "retrieved_segments": len(kept),
+        "nodes_selected": len(node_ids),
+        "retrieval_ms": int((time.monotonic() - started) * 1000),
+        "extract_truncated": truncated,
+    })
+    return context, pageindex.evidence_from_segments(kept, MAX_CHAT_SOURCES), metrics
+
+
+# ---------------------------------------------------------------------------
+# The model cites its evidence on a trailing SOURCES line (see
+# prompts.GROUNDED_CHAT_RULES). It is stripped from the prose before the user
+# sees it and turned into the structured `sources` array instead — the app
+# renders a tappable source row, not a line of raw ids.
+# ---------------------------------------------------------------------------
+_SOURCES_LINE = re.compile(r"\n*^\s*SOURCES:\s*(.*?)\s*$",
+                           re.IGNORECASE | re.MULTILINE)
+
+
+def _log_ai_metrics(route, key, item, metrics, system, message, reply, llm_ms):
+    """One structured line per AI request, for CloudWatch Insights.
+
+    WHY A SINGLE LINE OF JSON. These fields only answer questions when they can
+    be correlated — "what did retrieval cost on the meetings where the answer
+    was wrong?" needs mode, token count and latency from the SAME request. Split
+    across several prints they cannot be joined; as one JSON object an Insights
+    query filters and aggregates them directly.
+
+    TOKEN COUNTS ARE ESTIMATES, and labelled so in the field names via the
+    `est_` prefix. Groq returns real usage on the response, but groq_client.
+    complete() hands back only the message text, and widening that return type
+    would touch every caller in both Lambdas — too much blast radius for
+    telemetry. est_tokens() is the same estimator the budgeting already trusts
+    to decide what fits, so the numbers are consistent with the decisions made
+    from them, which matters more here than absolute accuracy.
+
+    NO TRANSCRIPT CONTENT. Sizes and counts only — never the question, never the
+    answer, never a retrieved line. These logs are retained and broadly
+    readable, and a meeting's contents must not leak into them.
+    """
+    try:
+        payload = {
+            "evt": "ai_request",
+            "route": route,
+            "meeting_id": key,
+            "index_status": pageindex_store.meta(item).get("status") or "none",
+            "transcript_fingerprint": _row_fingerprint(item),
+            "est_context_tokens": groq_client.est_tokens(system),
+            "est_input_tokens": groq_client.est_tokens(system + message),
+            "est_output_tokens": groq_client.est_tokens(reply),
+            "llm_ms": llm_ms,
+            "total_ms": metrics.get("retrieval_ms", 0) + llm_ms,
+        }
+        payload.update(metrics)
+        payload["est_total_tokens"] = (payload["est_input_tokens"]
+                                       + payload["est_output_tokens"])
+        print("[ai_metrics] " + json.dumps(payload, default=str))
+    except Exception as err:  # noqa: BLE001
+        # Telemetry must never be able to fail a request that already succeeded.
+        print(f"[ai_metrics] logging failed: {err}")
+
+
+def _ddb_safe(sources):
+    """Sources with their float timestamps as Decimal, for storage.
+
+    boto3's resource layer raises "Float types are not supported" outright, so
+    writing a source array straight from pageindex.evidence_from_segments (which
+    produces floats, correctly — it also feeds the JSON response, where Decimal
+    is what would break) would 500 the whole chat request at the very last
+    write, AFTER Groq had already been paid for the answer. Converted here at
+    the boundary, the same way _as_duration does for an upload.
+
+    Rounded to 2dp: these are seek positions in seconds, and the app does
+    Number(...) on them for playback — centisecond precision is already more
+    than the player can act on.
+    """
+    out = []
+    for src in sources or []:
+        row = dict(src)
+        for field in ("start_time", "end_time"):
+            try:
+                row[field] = Decimal(str(round(float(src.get(field) or 0), 2)))
+            except (TypeError, ValueError, InvalidOperation):
+                row[field] = Decimal("0")
+        out.append(row)
+    return out
+
+
+def _split_sources(reply, retrieved_sources):
+    """(prose, sources) — the SOURCES line removed and resolved.
+
+    The model's cited ids are matched against what was actually RETRIEVED, so a
+    hallucinated or out-of-context id cannot become a source row that scrolls
+    nowhere. When it cites nothing usable, the retrieved segments stand as the
+    sources anyway: the answer did come from them, and a working "view in
+    transcript" is more useful than a missing one.
+    """
+    match = _SOURCES_LINE.search(reply or "")
+    if not match:
+        return (reply or "").strip(), retrieved_sources
+
+    prose = _SOURCES_LINE.sub("", reply, count=1).strip()
+    raw = match.group(1) or ""
+    if raw.strip().lower() in ("none", "-", ""):
+        return prose, []
+
+    cited = [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
+    by_id = {s["segment_id"]: s for s in retrieved_sources}
+    picked = [by_id[c] for c in cited if c in by_id]
+    return prose, (picked or retrieved_sources)
+
+
 # ---------------------------------------------------------------------------
 # AI Chat — "Ask MinuteX"
 # ---------------------------------------------------------------------------
@@ -3121,17 +3483,25 @@ def _clean_history(raw):
 
 
 def chat(event):
-    """POST /recordings/{key+}/chat {message, history?} -> {reply, chat_history}.
+    """POST /recordings/{key+}/chat {message, history?} -> {reply, chat_history, sources}.
 
     Reuses the shared Groq client with the chat prompt from prompts.py. Context
-    is the stored analysis + highlights + as much transcript as the TPM window
-    allows (prompts.build_context handles the ordering and labels any
-    truncation, so the model knows when its record is partial).
+    now comes from retrieve_meeting_context (see the Meeting Retrieval section
+    above) rather than from prompts.build_context directly: a transcript that
+    fits the budget is still sent whole, and one that does not is RETRIEVED
+    against instead of head-truncated, so a question about the end of a long
+    meeting is answerable.
+
+    `sources` is new and ADDITIVE — the segment ids the answer rests on, in the
+    same shape the transcript deep-link already consumes. An older app build
+    ignores the extra key; a newer one renders tappable sources.
 
     Generated documents are deliberately NOT included in the context: they are
     derived from the same transcript and analysis already present, so sending
     them would spend the TPM budget restating what the model can already see —
     exactly the "do not resend unnecessary data" constraint in spec section 6.
+    The MoM is the ONE exception, because the user can edit it and their
+    correction must outrank the transcript (see _authoritative_mom).
     """
     _, key, item = _owned_recording(event)
     data = _body(event)
@@ -3150,17 +3520,23 @@ def chat(event):
     if not history:
         history = _clean_history(_stored_chat(item))
 
-    highlights = item.get("meeting_highlights")
-    context = prompts.build_context(
-        item,
-        highlights=highlights if isinstance(highlights, dict) else None,
-        transcript_budget_chars=_transcript_budget_chars(prompts.CHAT_SYSTEM),
-    )
+    # The system prompt is assembled BEFORE retrieval because the retrieval
+    # budget is computed against it — the meeting content and the instructions
+    # share one context window, so the rules' own size has to be subtracted
+    # before deciding how much transcript fits.
+    system_rules = prompts.CHAT_SYSTEM + prompts.GROUNDED_CHAT_RULES
+    if _stored_mom(item):
+        system_rules += prompts.MOM_CONTEXT_RULES
+
+    context, retrieved, metrics = retrieve_meeting_context(
+        item, key, message, system_rules)
+
     # The meeting content goes in the SYSTEM turn, not the user turn: it is
     # standing context for the whole conversation, and keeping the user turn to
     # just the question is what lets history stay meaningful across turns.
-    system = prompts.CHAT_SYSTEM + "\n\n" + context
+    system = system_rules + "\n\n" + context
 
+    llm_started = time.monotonic()
     try:
         reply = groq_client.complete(
             system, message, label="chat", json_mode=False, temperature=0.3,
@@ -3169,15 +3545,34 @@ def chat(event):
         )
     except groq_client.GroqError as err:
         _groq_error(err, "a reply")
+    llm_ms = int((time.monotonic() - llm_started) * 1000)
 
     reply = (reply or "").strip()
     if not reply:
         raise ApiError(502, "Unable to generate a reply. Please retry.")
 
+    reply, sources = _split_sources(reply, retrieved)
+    if not reply:
+        # The model answered with nothing but a SOURCES line. Rare, but a blank
+        # bubble is worse than an honest one.
+        raise ApiError(502, "Unable to generate a reply. Please retry.")
+
+    _log_ai_metrics("chat", key, item, metrics, system, message, reply, llm_ms)
+
     now = _now_iso()
+    assistant_turn = {"role": "assistant",
+                      "content": reply[:MAX_DOCUMENT_CHARS], "at": now}
+    # Sources ride ON the stored turn, so reopening the screen restores the
+    # tappable source rows instead of showing an answer whose evidence
+    # evaporated. Written only when there are any, keeping the stored shape
+    # identical to before for the full-transcript path — an older app parsing
+    # this history sees exactly the turns it always did.
+    if sources:
+        assistant_turn["sources"] = _ddb_safe(sources)
+
     turns = _stored_chat(item) + [
         {"role": "user", "content": message, "at": now},
-        {"role": "assistant", "content": reply[:MAX_DOCUMENT_CHARS], "at": now},
+        assistant_turn,
     ]
     # Trim oldest-first so the item can't grow without bound.
     turns = turns[-(MAX_CHAT_TURNS * 2):]
@@ -3186,7 +3581,8 @@ def chat(event):
         UpdateExpression="SET chat_history = :h, updated_at = :now",
         ExpressionAttributeValues={":h": turns, ":now": now},
     )
-    return _resp(200, {"reply": reply, "chat_history": turns})
+    return _resp(200, {"reply": reply, "chat_history": turns,
+                       "sources": sources})
 
 
 def get_chat(event):
@@ -3324,10 +3720,39 @@ def _mom_tasks(user_id, key):
     return rows
 
 
+def _self_tagged_attendee_names(user_id, key):
+    """Names of people recorded as PRESENT but not speaking, for the MoM.
+
+    Read from the participant rows rather than the transcript, because that is
+    the only place this fact exists — a non-speaking attendee leaves no trace
+    in the audio by definition. Best-effort: a Minutes document missing one
+    attendee line beats failing to generate.
+    """
+    try:
+        rows = _participant_rows(key)
+    except ClientError as err:
+        print(f"[mom] participant read failed for {key}: "
+              f"{type(err).__name__}: {err}")
+        return []
+    names = []
+    for row in rows:
+        if not _is_self_speaker(row.get("speaker_id")):
+            continue
+        if row.get("owner_user_id") != user_id:
+            continue
+        c = _contacts.get_item(
+            Key={"contact_id": row.get("contact_id", "")}).get("Item")
+        if c and c.get("owner_user_id") == user_id and c.get("name"):
+            names.append(c["name"])
+    return names
+
+
 def _build_fresh_sections(user_id, key, item):
     names = item.get("speaker_names") or {}
     tasks = [_public_task_v2(r, names) for r in _mom_tasks(user_id, key)]
-    return mom_schema.build_sections(item, tasks=tasks, speaker_names=names)
+    return mom_schema.build_sections(
+        item, tasks=tasks, speaker_names=names,
+        attendees=_self_tagged_attendee_names(user_id, key))
 
 
 def _persist_mom(key, item, mom, regenerated=False):
@@ -5217,13 +5642,66 @@ def move_recording_to_folder(event):
 # ---------------------------------------------------------------------------
 # Meeting participants — speaker label -> Contact
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ATTENDANCE WITHOUT SPEECH.
+#
+# MeetingParticipants is keyed (audio_s3_key, speaker_id), which modelled
+# participation as speaker->contact and ONLY that. Someone who attended without
+# speaking — or anyone in a meeting diarization produced no labels for — had no
+# way to record that they were there.
+#
+# A non-speaking attendee is stored in the SAME table under a reserved
+# speaker_id: "self:<contact_id>". No new table, no schema change, no
+# migration.
+#
+# WHY THIS CANNOT COLLIDE WITH A REAL SPEAKER. Diarization labels come from
+# stt_result._speaker_label, which strips a "speaker_" prefix and otherwise
+# passes the provider's id through — in production these are compact ("0",
+# "1", "2", "7"). A colon never appears in one, and "self:" is not a prefix any
+# provider label can produce. Verified against the live table before choosing
+# this representation.
+#
+# TWO RULES MAKE IT ATTENDANCE RATHER THAN SPEECH, and both are enforced by
+# NOT calling something rather than by a flag:
+#
+#   * it is never written into the recording's `speaker_names` map, so
+#     _speaker_labels (which falls back to that map) can never surface it as a
+#     speaker, and no generated document can name it as one;
+#   * it never reaches _resolve_tasks_for_speaker, so tagging yourself as
+#     present cannot make the AI assign you work you never agreed to.
+# ---------------------------------------------------------------------------
+SELF_SPEAKER_PREFIX = "self:"
+
+
+def _self_speaker_id(contact_id):
+    """The reserved key for "this contact attended, but did not speak".
+
+    Derived from the contact id rather than random, which is what makes the
+    write idempotent for free: the same person tagging themselves twice —
+    a double tap, a retry, a second visit — lands on the same primary key and
+    overwrites one row instead of accumulating duplicates.
+    """
+    return f"{SELF_SPEAKER_PREFIX}{str(contact_id or '').strip()}"
+
+
+def _is_self_speaker(speaker_id):
+    return str(speaker_id or "").startswith(SELF_SPEAKER_PREFIX)
+
+
 def _public_participant(row, contact=None):
+    speaker_id = row.get("speaker_id", "")
+    attendance_only = _is_self_speaker(speaker_id)
     out = {
-        "speaker_id": row.get("speaker_id", ""),
+        "speaker_id": speaker_id,
         "contact_id": row.get("contact_id", ""),
         "participant_role": row.get("participant_role", ""),
         "created_at": row.get("created_at", ""),
         "updated_at": row.get("updated_at", ""),
+        # The ONE thing the app needs to know about the distinction: this
+        # person was present but is not a voice in the transcript. Exposed as a
+        # boolean rather than making every client parse the sentinel — the
+        # storage shape stays an implementation detail.
+        "attendance_only": attendance_only,
     }
     if contact is not None:
         out["contact"] = _public_contact(contact)
@@ -5258,7 +5736,14 @@ def list_participants(event):
             if c and c.get("owner_user_id") == user_id:
                 contact = c
         participants.append(_public_participant(row, contact))
-    participants.sort(key=lambda p: _speaker_sort_key(p["speaker_id"]))
+    # Speakers first in speaker order, then attendance-only rows by name.
+    # _speaker_sort_key already puts non-numeric labels after numeric ones, so
+    # the sentinel sorts last without a special case — but the explicit key
+    # keeps that a decision rather than an accident of string ordering.
+    participants.sort(key=lambda p: (
+        1 if p.get("attendance_only") else 0,
+        _speaker_sort_key(p["speaker_id"]),
+    ))
 
     folder_id = str(item.get("folder_id") or "")
     folder_contacts = []
@@ -5272,6 +5757,12 @@ def list_participants(event):
         "participants": participants,
         "speakers": _speaker_labels(item),
         "speaker_names": item.get("speaker_names") or {},
+        # PROCESSING STATE, so the screen can tell "no speakers YET" from "no
+        # speakers, ever". Without it the empty state promised that voices
+        # would appear once transcribing finished — on recordings that had
+        # already finished, which is a promise it could not keep. The row is
+        # already read for the ownership check, so this costs nothing.
+        "recording_status": str(item.get("status") or ""),
         "folder_id": folder_id,
         "folder_contacts": folder_contacts,
     })
@@ -5325,24 +5816,61 @@ def set_participant(event):
     document kept saying "Speaker 0".
 
     `contact_id: null` clears the mapping.
+
+    ATTENDANCE WITHOUT A SPEAKER. Send `attendance_only: true` (with a
+    contact_id and NO speaker_id) to record that someone was present without
+    claiming they spoke. The row is stored under the reserved
+    "self:<contact_id>" key, and the two speaker side effects below — the
+    speaker_names sync and the AI task resolution — are deliberately SKIPPED
+    for it. See the SELF_SPEAKER_PREFIX block for why that is what makes this
+    attendance rather than invented speech.
+
+    Ownership is unchanged and applies to both shapes: _owned_recording means
+    only the meeting's owner can add or remove anyone, on their own meeting.
     """
     user_id, key, item = _owned_recording(event, hydrate=False)
     data = _body(event)
 
+    attendance_only = bool(data.get("attendance_only"))
     speaker_id = str(data.get("speaker_id") or "").strip()[:MAX_SPEAKER_NAME]
-    if not speaker_id:
+    if not speaker_id and not attendance_only:
         raise ApiError(400, "speaker_id required")
-
     raw_contact = data.get("contact_id")
-    if raw_contact is None or str(raw_contact).strip() == "":
+    clearing = raw_contact is None or str(raw_contact).strip() == ""
+    # A caller must not be able to hand-craft the reserved key and have it
+    # treated as a speaker MAPPING — that is the one way the sentinel could be
+    # used to fake a speaker. The prefix is ours to write, never theirs.
+    #
+    # Scoped to writes: CLEARING by the reserved key is how an attendance row
+    # is removed, and the app is handed that key by the API rather than
+    # building one. Rejecting it here would make attendance addable but never
+    # removable.
+    if (speaker_id and _is_self_speaker(speaker_id)
+            and not attendance_only and not clearing):
+        raise ApiError(400, "speaker_id must not start with "
+                            f"{SELF_SPEAKER_PREFIX!r}")
+
+    if clearing:
+        if not speaker_id:
+            raise ApiError(400, "speaker_id required to clear a mapping")
         _meeting_participants.delete_item(
             Key={"audio_s3_key": key, "speaker_id": speaker_id})
-        _sync_speaker_name_from_contact(user_id, key, item, speaker_id, None)
+        # An attendance row was never in speaker_names, so there is nothing
+        # there to unwind — and calling this for one would bump
+        # speaker_mapping_version, marking every generated document stale over
+        # a change that touched no name in them.
+        if not _is_self_speaker(speaker_id):
+            _sync_speaker_name_from_contact(user_id, key, item, speaker_id,
+                                            None)
         _audit("meeting.participant_cleared", user_id, key,
                speaker_id=speaker_id)
         return _resp(200, {"cleared": True, "speaker_id": speaker_id})
 
     contact = _owned_contact(user_id, str(raw_contact).strip())
+    # Attendance is keyed by the CONTACT, not by a speaker slot: that is what
+    # makes a double tap idempotent rather than duplicating a person.
+    if attendance_only:
+        speaker_id = _self_speaker_id(contact["contact_id"])
     now = _now_iso()
     row = {
         "audio_s3_key": key,
@@ -5354,7 +5882,29 @@ def set_participant(event):
         "created_at": now,
         "updated_at": now,
     }
+    # Preserve the original created_at on a re-tag, so "when were they added"
+    # stays true across repeat taps rather than resetting on each one.
+    if attendance_only:
+        prior = _meeting_participants.get_item(
+            Key={"audio_s3_key": key, "speaker_id": speaker_id}).get("Item")
+        if prior and prior.get("created_at"):
+            row["created_at"] = prior["created_at"]
     _meeting_participants.put_item(Item=row)
+
+    # THE TWO SPEAKER SIDE EFFECTS, SKIPPED FOR ATTENDANCE.
+    #
+    # Writing speaker_names would make the sentinel a label _speaker_labels
+    # surfaces and every generated document renders — inventing a speaker.
+    # Resolving tasks would assign the AI's work to someone whose only claim is
+    # "I was in the room". Both are the difference between attendance and
+    # speech, and both are enforced by not running rather than by a flag a
+    # later change could forget to check.
+    if attendance_only:
+        _audit("meeting.attendee_self_tagged", user_id, key,
+               contact_id=contact["contact_id"])
+        return _resp(200, {"participant": _public_participant(row, contact),
+                           "tasks_resolved": 0})
+
     _sync_speaker_name_from_contact(user_id, key, item, speaker_id, contact)
 
     # Mapping a speaker is the event that can resolve AI tasks assigned to that
@@ -6315,7 +6865,14 @@ def _resolve_tasks_for_speaker(user_id, key, speaker_id, contact):
     Only tasks whose assignee_speaker_id matches are touched, and only ones
     not already resolved to a contact: a user who hand-assigned a task keeps
     their choice.
+
+    ATTENDANCE ROWS NEVER GET HERE. set_participant already returns before
+    calling this for a self-tag; the guard below makes the rule true of the
+    FUNCTION rather than of one call site, so a future caller cannot let "I
+    was in the room" assign somebody work the AI attributed to a voice.
     """
+    if _is_self_speaker(speaker_id):
+        return 0
     resolved = 0
     for row in _tasks_for_recording(key):
         if row.get("owner_user_id") != user_id:
@@ -6927,24 +7484,39 @@ def get_task(event):
                                 "title": rec.get("title", ""),
                                 "recorded_at": rec.get("recorded_at", ""),
                                 "folder_id": str(rec.get("folder_id") or ""),
-                                "speaker_names": speaker_names}
-        elif rec and not creator:
+                                "speaker_names": speaker_names,
+                                # The full meeting screen. Stated rather than
+                                # implied by the absence of the assignee
+                                # marker, so the app switches on one field.
+                                "access": "owner"}
+        elif rec and not creator and not _is_trashed(rec):
             # WHERE THIS CAME FROM, for the assignee. A task that arrives with
             # no provenance reads as if it appeared from nowhere; the meeting
             # title and date are what make it accountable work rather than an
             # anonymous instruction.
             #
-            # TITLE AND DATE ONLY. No audio key (that addresses a recording
-            # they cannot open), no folder, no speaker_names — the assignee
-            # gets the provenance line, never a route into someone else's
-            # meeting. `speaker_names` stays empty, so _public_task_v2 falls
-            # back to the stored assignee string rather than resolving a
-            # speaker label out of the creator's meeting.
-            out["recording"] = {"audio_s3_key": "",
+            # THE KEY IS SENT, and it addresses a real route for them: the
+            # read-only notes view at /recordings/shared-with-me/{key+} (see
+            # the Assignee Meeting Access section). It is NOT a route into the
+            # owner's meeting screen — that one still gates on _owned_recording
+            # and 404s for this caller, which is why `access` below tells the
+            # app which of the two screens the key is good for.
+            #
+            # STILL NO FOLDER AND NO speaker_names. The folder is the owner's
+            # workspace and addresses a screen the assignee cannot open, and
+            # an empty speaker_names is what makes _public_task_v2 fall back to
+            # the stored assignee string instead of resolving a speaker label
+            # out of the creator's meeting.
+            out["recording"] = {"audio_s3_key": key,
                                 "title": rec.get("title", ""),
                                 "recorded_at": rec.get("recorded_at", ""),
                                 "folder_id": "",
-                                "speaker_names": {}}
+                                "speaker_names": {},
+                                # Read-only notes, not the full meeting. The
+                                # server enforces this either way; the field
+                                # exists so the app routes to the right screen
+                                # instead of guessing from who is calling.
+                                "access": "assignee"}
     # WHO GAVE ME THIS WORK. Shown to the assignee, and to them only — the
     # creator is looking at a task they made and does not need to be told.
     #
@@ -10627,6 +11199,159 @@ def _shared_mom(user_id, key, item):
     return mom
 
 
+# ===========================================================================
+# ASSIGNEE MEETING ACCESS — read-only notes for the person doing the work.
+#
+# THE PROBLEM. A task extracted from a meeting arrives in the assignee's list
+# with a title, a deadline and nothing else. get_task already sends the
+# meeting's TITLE and DATE as provenance, but a title is not context:
+# "Prepare the quotation by Friday" does not say which vendor, what was
+# agreed, or what the number is supposed to cover. The assignee had to go and
+# ask the person who recorded the meeting, which is exactly the coordination
+# this product exists to remove.
+#
+# THE GRANT IS DERIVED, NOT STORED. There is no grants table and no share row
+# behind this. Access is recomputed on every request from one question: does
+# this caller currently assignee-own a task whose source_recording_id is this
+# key? Three consequences, all of them the reason for the design:
+#
+#   * REASSIGNMENT REVOKES INSTANTLY. Moving the task to someone else rewrites
+#     assignee_user_id, so the next request from the old assignee finds no
+#     task and 404s. A stored grant would have to be swept, and the day the
+#     sweep is forgotten is the day a former assignee still reads the meeting.
+#   * DELETING THE TASK REVOKES TOO, for the same reason and for free.
+#   * NOTHING TO REVOKE BY HAND, so no owner-facing revoke UI has to exist
+#     for the feature to be safe.
+#
+# WHAT COMES OUT. share_schema.public_payload() — the SAME assembler the
+# public share page uses, deliberately, rather than a second payload builder
+# for this route. That module's contract is that it can only emit the keys it
+# explicitly writes, so no future attribute on the recording row
+# (owner_user_id, device_id, the raw S3 key, CRM records, chat history,
+# folder membership) can reach an assignee by being forgotten here. A
+# parallel builder would be a deny-list by another name and would drift from
+# the share page within one release.
+#
+# NOTES ONLY. The synthetic config below pins transcript_enabled and
+# audio_enabled to FALSE — they are not toggles, and no request field can
+# turn them on. This route is therefore strictly narrower than a public share
+# link the owner could create anyway, and it never mints a presigned URL:
+# the audio gateway (/share/{token}/audio) has no counterpart here, because
+# there is no token and no audio in the payload to point at.
+#
+# 404, NEVER 403, matching _owned_recording and _owned_task: a caller with no
+# task in this meeting must not learn that the meeting exists.
+# ===========================================================================
+
+def _assignee_share_config():
+    """The synthetic share config an assignee's meeting view renders under.
+
+    Not stored and never user-supplied: the FIXED visibility of this route.
+    Built through coerce_config so it is validated by the same code path as a
+    real share and picks up any future toggle at its default, rather than
+    being a hand-rolled dict that silently lacks the new key.
+
+    transcript/audio are pinned OFF *after* coercion, so a change to the
+    module defaults can widen a public share without widening this.
+    """
+    config = share_schema.coerce_config({})
+    config["transcript_enabled"] = False
+    config["audio_enabled"] = False
+    return config
+
+
+def _assignee_tasks_in_recording(user_id, key):
+    """This caller's tasks sourced from this meeting. [] when there are none.
+
+    Queried on assignee-user-index — the ACCOUNT, not assignee_contact_id: a
+    contact is an address-book row, not an identity that can authenticate,
+    the same distinction the whole task permission model rests on.
+
+    The index is keyed by assignee alone, so every row is still re-checked
+    against BOTH the caller and the recording key. An index is a lookup path,
+    never an authorization decision.
+    """
+    if not user_id or not key:
+        return []
+    try:
+        res = _tasks.query(
+            IndexName=TASKS_ASSIGNEE_USER_INDEX,
+            KeyConditionExpression=Key("assignee_user_id").eq(user_id),
+        )
+    except ClientError as err:
+        print(f"[assignee-view] task lookup failed for {key}: "
+              f"{type(err).__name__}: {err}")
+        return []
+    return [row for row in res.get("Items", [])
+            if str(row.get("source_recording_id") or "") == key
+            and _is_task_assignee(user_id, row)]
+
+
+def _assignee_readable_recording(event):
+    """(user_id, key, item) when the caller may READ this meeting's notes.
+
+    The assignee counterpart to _owned_recording, deliberately shaped like it
+    so the two read the same at every call site. 404 for a caller with no
+    task here, for a meeting that does not exist, and for one in the Trash —
+    a trashed meeting stops being readable through a task exactly as it stops
+    being readable through a share link.
+
+    The OWNER is allowed through too: they can already open the meeting
+    properly, and rejecting them would make the route lie about a recording
+    the caller demonstrably owns.
+    """
+    user_id = _require_auth(event)
+    key = _url_unquote((event.get("pathParameters") or {}).get("key", ""))
+    if not key:
+        raise ApiError(400, "recording key required")
+
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item or _is_trashed(item):
+        raise ApiError(404, "recording not found")
+
+    owns = item.get("user_id") == user_id or \
+        item.get("device_id") in _owned_devices(user_id)
+    if not owns and not _assignee_tasks_in_recording(user_id, key):
+        raise ApiError(404, "recording not found")
+    return user_id, key, item
+
+
+def get_assignee_meeting(event):
+    """GET /recordings/shared-with-me/{key+} -> {meeting, access}
+
+    The read-only meeting an ASSIGNEE opens from their task. Notes only: no
+    transcript, no audio, no presigned URL — and no route here can write.
+
+    The MoM is resolved against the recording's OWNER, not the caller. The
+    stored structure and its fresh-build fallback both belong to the owner's
+    meeting, and building them as the assignee would produce an empty
+    document. That is a read of the owner's content on the assignee's behalf,
+    which is the point of the route; what it can EMIT is still bounded by
+    public_payload and the pinned-off toggles above.
+    """
+    user_id, key, item = _assignee_readable_recording(event)
+
+    # Hydrated because the MoM fallback builds its sections from the
+    # transcript. The transcript still cannot LEAVE: transcript_enabled is
+    # False, so public_payload never copies it into the response.
+    item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+    owner_id = str(item.get("user_id") or "")
+    config = _assignee_share_config()
+    mom = _shared_mom(owner_id, key, item)
+
+    # audio_url is not merely omitted from the response — it is never
+    # GENERATED. A presign is a bearer credential, and minting one the payload
+    # then drops would still put it in this Lambda's memory and in any future
+    # log line. Hence audio_url=None here, on top of audio_enabled being False.
+    meeting = share_schema.public_payload(item, mom, config, audio_url=None)
+    return _resp(200, {
+        "meeting": meeting,
+        # Lets the app pick the right screen without re-deriving the rule.
+        # Enforcement stays here regardless of what any client does.
+        "access": "owner" if owner_id == user_id else "assignee",
+    })
+
+
 def create_share(event):
     """POST /recordings/share/{key+} -> {share_id, url, expires_at, share}
 
@@ -12930,6 +13655,11 @@ _ROUTES = {
     # the token alone. See the Meeting Share section above.
     ("POST", "/recordings/share/{key+}"): create_share,
     ("GET", "/recordings/shares/{key+}"): list_shares,
+    # A task ASSIGNEE reading the meeting their work came from. JWT-
+    # authenticated like the owner routes, but authorized on the task
+    # assignment rather than on ownership, and read-only by construction —
+    # see the Assignee Meeting Access section above.
+    ("GET", "/recordings/shared-with-me/{key+}"): get_assignee_meeting,
     ("PATCH", "/shares/{share_id}"): update_share,
     ("DELETE", "/shares/{share_id}"): revoke_share,
     ("GET", "/share/{token}"): public_share,

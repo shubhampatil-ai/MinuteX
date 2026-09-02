@@ -235,6 +235,13 @@ function RootContent() {
         <Stack.Screen name="pair" options={{ title: "Pair device" }} />
         <Stack.Screen name="claim" options={{ title: "Link device" }} />
         <Stack.Screen name="recording/[key]" options={{ headerShown: false }} />
+        {/* The READ-ONLY meeting a task assignee opens from their task. A
+            sibling of recording/[key] rather than a screen inside it: that
+            directory's _layout mounts MeetingProvider, which fetches the
+            owner-only recording route and would 404 for exactly the users
+            this screen serves. See the file header for why read-only is a
+            separate screen instead of a flag. */}
+        <Stack.Screen name="meeting/[key]/shared" options={{ title: "Meeting" }} />
         {/* Organization layer — folders, contacts and the cross-meeting task
             tracker. All three are top-level destinations rather than tabs: the
             bottom bar is deliberately three items, and these are places you go

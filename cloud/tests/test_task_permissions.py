@@ -573,13 +573,42 @@ class TestAssigneeContext(PermissionHarness):
         self.assertTrue(body["recording"]["recorded_at"])
 
     def test_but_not_a_route_into_the_creators_meeting(self):
-        """Title and date only — no audio key, folder, or speaker names."""
+        """The key is sent, and it opens the READ-ONLY notes — nothing more.
+
+        This test used to assert audio_s3_key == "": the assignee was given no
+        key at all, so the meeting row on the task screen could not be tapped.
+        The key is now sent deliberately, because an assignee may open the
+        meeting's NOTES at /recordings/shared-with-me/{key+} (see
+        test_assignee_meeting_access.py for that route's own boundary tests).
+
+        What has NOT changed is the thing this test exists to protect: holding
+        the key must not open the CREATOR's meeting screen, with its audio,
+        transcript and AI surfaces. `access` says which of the two the key is
+        good for, and get_recording — the route backing the full screen — is
+        asserted below to still refuse.
+        """
         self.as_user(USER_B)
         _, body = self.get_task()
-        self.assertEqual(body["recording"]["audio_s3_key"], "")
+        self.assertEqual(body["recording"]["audio_s3_key"], KEY)
+        self.assertEqual(body["recording"]["access"], "assignee")
+        # Unchanged: the folder is the creator's workspace, and empty
+        # speaker_names keeps _public_task_v2 on the stored assignee string.
         self.assertEqual(body["recording"]["folder_id"], "")
         self.assertEqual(body["recording"]["speaker_names"], {})
         self.assertNotIn("folder", body)
+
+    def test_the_key_does_not_unlock_the_full_meeting_route(self):
+        """The other half of the rule above, enforced where it matters.
+
+        An assignee now holds a real recording key. get_recording is what
+        backs the owner's meeting screen (presigned audio, transcript, every
+        AI route), and it must keep 404ing for them — the widened access is
+        the notes route alone.
+        """
+        self.as_user(USER_B)
+        status, _ = parse(call(api.get_recording, event(
+            "GET", "/recordings/{key+}", key=KEY)))
+        self.assertEqual(status, 404)
 
     def test_assignee_is_told_who_assigned_it(self):
         self.t["users"].put_item(Item={"user_id": USER_A,

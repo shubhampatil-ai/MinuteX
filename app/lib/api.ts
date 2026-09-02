@@ -218,10 +218,28 @@ export type AiDocumentSlot = {
   fresh: boolean;
 };
 
+// Where an AI answer came from: a segment of THIS meeting's transcript.
+//
+// The same `seg_N` identity a task's evidence already uses, so a chat source
+// and a task's "View in transcript" resolve through the ONE navigation
+// mechanism (/recording/[key]/transcript?evidence=seg_N) rather than each
+// having their own.
+export type ChatSource = {
+  segment_id: string;
+  speaker_id?: string;
+  start_time: number;
+  end_time: number;
+};
+
 export type ChatTurn = {
   role: "user" | "assistant";
   content: string;
   at?: string;
+  /** Present on assistant turns the backend could ground. Absent on user
+   *  turns, on answers the model declined to cite, and on every turn stored
+   *  before grounding shipped — so the UI must treat "no sources" as the
+   *  ordinary case and simply render no source row. */
+  sources?: ChatSource[];
 };
 
 export type ChatSuggestionGroup = { group: string; prompts: string[] };
@@ -1479,11 +1497,23 @@ export async function sendAiChat(
   key: string,
   message: string,
   history?: ChatTurn[]
-): Promise<{ reply: string; chat_history: ChatTurn[] }> {
-  return request(aiPath("chat", key), {
+): Promise<{ reply: string; chat_history: ChatTurn[]; sources: ChatSource[] }> {
+  const res = await request<{
+    reply?: string;
+    chat_history?: ChatTurn[];
+    sources?: ChatSource[];
+  }>(aiPath("chat", key), {
     method: "POST",
     body: history?.length ? { message, history } : { message },
   });
+  // `sources` is additive: an older backend does not send it, and an answer
+  // the model could not ground has none. Defaulted here so no caller has to
+  // distinguish those two cases from an empty list — they render identically.
+  return {
+    reply: res.reply ?? "",
+    chat_history: res.chat_history ?? [],
+    sources: res.sources ?? [],
+  };
 }
 
 export async function clearAiChat(key: string): Promise<void> {
@@ -1780,6 +1810,14 @@ export type ApiParticipant = {
   created_at: string;
   updated_at: string;
   contact?: ApiContact;
+  /** Present but NOT a voice in the transcript — someone who self-tagged as
+   * having attended without speaking.
+   *
+   * The backend decides this and sends it as a boolean; the storage shape
+   * behind it (a reserved speaker_id) is deliberately not something the app
+   * parses. An attendance row is never a speaker: it is not in speaker_names,
+   * no generated document names it as one, and it never resolves an AI task. */
+  attendance_only?: boolean;
 };
 
 /** Returned as a 409 when a contact name matches people we already know
@@ -1995,6 +2033,10 @@ export type ParticipantsResponse = {
   /** The diarization labels this transcript actually contains. */
   speakers: string[];
   speaker_names: Record<string, string>;
+  /** Where the recording is in the pipeline, so an empty speaker list can be
+   * read correctly: still processing (voices may yet appear) versus finished
+   * with none found (they will not). Optional — an older backend omits it. */
+  recording_status?: RecordingStatus | string;
   folder_id: string;
   /** Offered FIRST in the picker — a shortcut, never a restriction. Any global
    * contact can still be chosen. */
@@ -2036,6 +2078,25 @@ export async function setParticipant(
       contact_id: contactId,
       participant_role: participantRole,
     },
+  });
+}
+
+/** Record that someone ATTENDED this meeting without speaking.
+ *
+ * Same route and same table as speaker mapping — the backend stores it under
+ * a reserved key derived from the contact, which is what makes a repeat tap
+ * land on the same row instead of adding the person twice.
+ *
+ * Deliberately NOT a speaker mapping: it creates no transcript segments, does
+ * not claim a speaker label, and cannot cause an AI task to be assigned to
+ * them. Attendance is a statement about the room, not about the audio. */
+export async function tagAttendee(
+  key: string,
+  contactId: string
+): Promise<{ participant?: ApiParticipant; tasks_resolved?: number }> {
+  return request(`/recordings/participants/${encodeURIComponent(key)}`, {
+    method: "PUT",
+    body: { contact_id: contactId, attendance_only: true },
   });
 }
 
@@ -2129,11 +2190,80 @@ export type TaskDetail = {
     // The meeting's speaker_names, so the detail screen can name the speaker
     // a task came from without a second call to getParticipants.
     speaker_names?: Record<string, string>;
+    /** WHICH MEETING SCREEN this key opens.
+     *
+     * "owner"    the full meeting — audio, transcript, AI, editing.
+     * "assignee" the READ-ONLY notes at /meeting/[key]/shared, and only that.
+     *            The full route still 404s for this caller.
+     *
+     * Sent by the backend so the app switches on one field instead of
+     * re-deriving "am I the creator?" client-side. Absent on older responses,
+     * which the caller must read as "owner" — that was the only case that
+     * ever carried a key before this field existed. */
+    access?: "owner" | "assignee";
   };
 };
 
 export async function getTaskDetail(taskId: string): Promise<TaskDetail> {
   return request<TaskDetail>(`/tasks/${encodeURIComponent(taskId)}`);
+}
+
+// ===========================================================================
+// THE MEETING AN ASSIGNEE MAY READ.
+//
+// A task assignee is not the meeting's owner and cannot open it: every route
+// under /recordings/{key+} gates on ownership and 404s for them. But a task
+// with no context — "prepare the revised quotation by Friday", and nothing
+// about which vendor or what was agreed — is not actionable, so the backend
+// exposes the meeting's NOTES on a separate, read-only route.
+//
+// WHAT THIS IS NOT. It is not the meeting detail response with fields
+// stripped. The backend assembles it through the same builder the public
+// share page uses, and it contains no transcript, no audio URL and no S3
+// key — not hidden, absent. There is deliberately no mutating counterpart to
+// this call anywhere in this file.
+// ===========================================================================
+
+/** One MoM section as the read-only view receives it. The four kinds are the
+ *  MoM schema's, NOT the Overview's two — a shared meeting can carry either,
+ *  so the screen renders both shapes. */
+export type SharedMeetingSection = {
+  kind: "text" | "list" | "fields" | "table" | string;
+  title: string;
+  text?: string;
+  items?: string[];
+  fields?: { label: string; value: string }[];
+  columns?: string[];
+  rows?: string[][];
+};
+
+export type SharedMeeting = {
+  title: string;
+  recorded_at: string;
+  duration: number | null;
+  language: string;
+  /** The AI's own Overview sections — what the owner's Overview tab shows.
+   *  Preferred when non-empty. */
+  overview: OverviewSection[];
+  /** The MoM structure. Populated ONLY when `overview` is empty, so the same
+   *  content can never render twice under two sets of headings. */
+  sections: SharedMeetingSection[];
+  /** Always null on this route. Present in the type because the payload is
+   *  the share assembler's, and pinning them as null documents that the
+   *  absence is the CONTRACT rather than a backend that happened to omit
+   *  them — a future non-null here is a bug, not a feature. */
+  transcript: null;
+  audio_url: null;
+  speaker_blocks: never[];
+  expires_at: string | null;
+};
+
+export async function getSharedMeeting(
+  key: string
+): Promise<{ meeting: SharedMeeting; access: "owner" | "assignee" }> {
+  return request<{ meeting: SharedMeeting; access: "owner" | "assignee" }>(
+    `/recordings/shared-with-me/${encodeURIComponent(key)}`
+  );
 }
 
 export async function patchTaskById(

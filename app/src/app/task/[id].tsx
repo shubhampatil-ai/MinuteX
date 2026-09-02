@@ -619,56 +619,87 @@ export default function TaskDetailScreen() {
               </View>
             </View>
           )}
-          {/* WHERE THE TASK CAME FROM.
-              For the creator this is a link into their meeting. For an
-              ASSIGNEE the backend sends the title and date but no audio key —
-              the meeting is not theirs to open — so the same row renders as
-              provenance rather than navigation. Showing it matters: a task
-              that arrives with no origin reads as an anonymous instruction,
-              and the meeting is what makes it accountable work. */}
-          {!!recording && (
-            <Pressable
-              style={st.ctxRow}
-              onPress={
-                recording.audio_s3_key
-                  ? () =>
-                      router.push({
-                        pathname: "/recording/[key]",
-                        params: { key: recording.audio_s3_key },
-                      } as any)
-                  : undefined
-              }
-              disabled={!recording.audio_s3_key}
-              accessibilityRole={recording.audio_s3_key ? "button" : "text"}
-              accessibilityLabel={
-                recording.audio_s3_key
-                  ? "Open source meeting"
-                  : `From the meeting ${recording.title || "Untitled meeting"}`
-              }
-            >
-              <Icon name="waveform" size={15} tintColor={C.primary} />
-              <View style={{ flex: 1 }}>
-                <Text style={st.ctxLabel}>Meeting</Text>
-                <Text style={st.ctxValue} numberOfLines={2}>
-                  {recording.title || "Untitled meeting"}
-                </Text>
-                {/* The date is the other half of "where did this come
-                    from", and it is the only context an assignee gets in
-                    place of being able to open the meeting. */}
-                {!!recording.recorded_at && (
-                  <Text style={st.ctxSub}>
-                    {new Date(recording.recorded_at).toLocaleDateString(
-                      undefined,
-                      { day: "numeric", month: "short", year: "numeric" }
-                    )}
+          {/* WHERE THE TASK CAME FROM — and, now, a way in.
+              BOTH roles get a tappable row, but to DIFFERENT screens, chosen
+              by the backend's `access` field rather than by re-deriving "am I
+              the creator?" here:
+
+                owner     -> /recording/[key], the full meeting (audio,
+                             transcript, AI, editing).
+                assignee  -> /meeting/[key]/shared, the read-only notes. The
+                             full route still 404s for them; sending them
+                             there would produce a dead end.
+
+              `access` is absent on responses from an older backend, and the
+              fallback treats that as "owner" — before this field existed, a
+              key was only ever sent to the owner, so that is what an
+              unlabelled key means. An assignee on an old backend gets no key
+              at all and the row stays inert, exactly as it did before. */}
+          {!!recording && (() => {
+            const readOnly = recording.access === "assignee";
+            const target = readOnly
+              ? "/meeting/[key]/shared"
+              : "/recording/[key]";
+            const canOpen = !!recording.audio_s3_key;
+            return (
+              <Pressable
+                style={st.ctxRow}
+                onPress={
+                  canOpen
+                    ? () =>
+                        router.push({
+                          pathname: target,
+                          params: { key: recording.audio_s3_key },
+                        } as any)
+                    : undefined
+                }
+                disabled={!canOpen}
+                accessibilityRole={canOpen ? "button" : "text"}
+                accessibilityLabel={
+                  canOpen
+                    ? readOnly
+                      ? "Open meeting notes, view only"
+                      : "Open source meeting"
+                    : `From the meeting ${recording.title || "Untitled meeting"}`
+                }
+              >
+                <Icon name="waveform" size={15} tintColor={C.primary} />
+                <View style={{ flex: 1 }}>
+                  <Text style={st.ctxLabel}>Meeting</Text>
+                  <Text style={st.ctxValue} numberOfLines={2}>
+                    {recording.title || "Untitled meeting"}
                   </Text>
-                )}
-              </View>
-              {recording.audio_s3_key ? (
-                <Icon name="chevron.right" size={14} tintColor={C.textFaint} />
-              ) : null}
-            </Pressable>
-          )}
+                  <View style={st.ctxSubRow}>
+                    {/* The date is the other half of "where did this come
+                        from". */}
+                    {!!recording.recorded_at && (
+                      <Text style={st.ctxSub}>
+                        {new Date(recording.recorded_at).toLocaleDateString(
+                          undefined,
+                          { day: "numeric", month: "short", year: "numeric" }
+                        )}
+                      </Text>
+                    )}
+                    {/* Says what the tap will give them BEFORE they take it.
+                        Without this, an assignee taps expecting the recording,
+                        finds notes only, and reads it as the app failing to
+                        load rather than as the boundary it is. */}
+                    {readOnly && canOpen && (
+                      <>
+                        {!!recording.recorded_at && (
+                          <Text style={st.ctxSub}>·</Text>
+                        )}
+                        <Text style={st.ctxTag}>View only</Text>
+                      </>
+                    )}
+                  </View>
+                </View>
+                {canOpen ? (
+                  <Icon name="chevron.right" size={14} tintColor={C.textFaint} />
+                ) : null}
+              </Pressable>
+            );
+          })()}
           {!!folder && (
             <Pressable
               style={st.ctxRow}
@@ -857,6 +888,16 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     notifyLine: { fontFamily: FONT.medium, fontSize: 11.5, marginTop: 4 },
     ctxSub: {
       fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 2,
+    },
+    // The date and the "View only" tag sit on one line. A row rather than two
+    // stacked Texts so the tag reads as a qualifier ON the meeting, not as
+    // another fact about it.
+    ctxSubRow: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: 6,
+      flexWrap: "wrap" as const,
+    },
+    ctxTag: {
+      fontFamily: FONT.semibold, fontSize: 12, color: C.textDim, marginTop: 2,
     },
     roleNote: {
       fontFamily: FONT.regular, fontSize: 12.5, color: C.textFaint,

@@ -18,7 +18,7 @@ import {
 } from "react-native";
 import Animated, { FadeInDown, LinearTransition } from "react-native-reanimated";
 import { ELEV, FONT, R, S, useTheme } from "./theme";
-import { Button, Card, SectionRule } from "./ui";
+import { Button, Card, KeyboardAwareSheet, SectionRule } from "./ui";
 import { Icon } from "./icons";
 import { Markdown } from "./document-renderer";
 import { canExportPdf, copyDocument, exportPdf } from "./export-doc";
@@ -654,25 +654,27 @@ function DocumentSheet({
 
       {mode === "rename" ? (
         <Modal visible transparent animationType="fade" onRequestClose={() => setMode("view")}>
-          <View style={st.sheetBackdrop}>
-            <Pressable style={{ flex: 1 }} onPress={() => setMode("view")} />
-            <View style={st.promptSheet}>
-              <Text style={T.headlineSm}>Rename document</Text>
-              <TextInput
-                style={st.renameInput}
-                value={draftLabel}
-                onChangeText={setDraftLabel}
-                autoFocus
-                maxLength={80}
-                returnKeyType="done"
-                onSubmitEditing={saveRename}
-              />
-              <View style={{ flexDirection: "row", gap: S.sm, marginTop: 20 }}>
-                <Button label="Cancel" variant="secondary" style={{ flex: 1 }} onPress={() => setMode("view")} disabled={busy === "save"} />
-                <Button label="Save" style={{ flex: 1 }} onPress={saveRename} loading={busy === "save"} />
+          <KeyboardAwareSheet>
+            <View style={st.sheetBackdrop}>
+              <Pressable style={{ flex: 1 }} onPress={() => setMode("view")} />
+              <View style={st.promptSheet}>
+                <Text style={T.headlineSm}>Rename document</Text>
+                <TextInput
+                  style={st.renameInput}
+                  value={draftLabel}
+                  onChangeText={setDraftLabel}
+                  autoFocus
+                  maxLength={80}
+                  returnKeyType="done"
+                  onSubmitEditing={saveRename}
+                />
+                <View style={{ flexDirection: "row", gap: S.sm, marginTop: 20 }}>
+                  <Button label="Cancel" variant="secondary" style={{ flex: 1 }} onPress={() => setMode("view")} disabled={busy === "save"} />
+                  <Button label="Save" style={{ flex: 1 }} onPress={saveRename} loading={busy === "save"} />
+                </View>
               </View>
             </View>
-          </View>
+          </KeyboardAwareSheet>
         </Modal>
       ) : null}
     </Modal>

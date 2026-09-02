@@ -40,7 +40,8 @@ import {
   getFolders, getMe, getRecordings, patchTaskById,
 } from "../../lib/api";
 import {
-  ActionCenterSkeleton, AIPromptKey, AttentionFilters, MeetingTaskInsight,
+  ActionCenterSkeleton, AIPromptKey, AttentionFilters, HealthKey,
+  MeetingTaskInsight,
   MinuteXAIActionCard, QuickAddTaskButton, SectionHeader, ShowMoreRow, TaskCard,
   TaskHeader, TaskHealthCards, TaskSearchBar, UpcomingDeadlines,
   WeeklyProgressCard,
@@ -49,6 +50,7 @@ import { SwipeableRow } from "../../lib/swipeable-row";
 import { QuickAddTaskSheet } from "../../lib/quick-add-task-sheet";
 import {
   addDays, computeCounts, dueKeyOf, greetingFor, isClosed, meetingInsights,
+  daysUntil,
   needsAssignment, rankForAttention, toDayKey, upcomingDeadlines,
   weeklyProgress,
 } from "../../lib/task-insights";
@@ -74,7 +76,9 @@ const INSIGHT_PAGE = 100;
 // backend exposes, so it is applied to the loaded page after the fetch — the
 // one place this screen filters client-side, and only because no server filter
 // exists for it.
-type FilterKey = "all" | "overdue" | "mine" | "needs";
+type FilterKey =
+  | "all" | "overdue" | "mine" | "others" | "needs"
+  | "today" | "upcoming" | "progress" | "done";
 
 const FILTERS: {
   key: FilterKey;
@@ -83,10 +87,75 @@ const FILTERS: {
   clientOnly?: boolean;
 }[] = [
   { key: "all", label: "All", filters: {} },
+  // Deadline groups. `today` and `upcoming` ride on the SERVER's due_before
+  // window (already supported by GET /tasks) and are then narrowed client-side
+  // to the exact day — the API has no "due on" parameter, and adding one for a
+  // view this small would be a backend change the requirement rules out.
+  { key: "today", label: "Today", filters: {}, clientOnly: true },
+  { key: "upcoming", label: "Upcoming", filters: {}, clientOnly: true },
   { key: "overdue", label: "Overdue", filters: { overdue: true } },
+  // Review queue — the confidence gate's output, and the one filter that
+  // matters most now that low-confidence assignments are withheld.
+  { key: "needs", label: "Needs review", filters: {}, clientOnly: true },
+  // Ownership. Both directions, because "what did I hand off?" is as real a
+  // question as "what do I owe?".
   { key: "mine", label: "My tasks", filters: { assigned_to_me: true } },
-  { key: "needs", label: "Needs assignment", filters: {}, clientOnly: true },
+  { key: "others", label: "Assigned to others", filters: {}, clientOnly: true },
+  // Status. These ARE server filters — GET /tasks has always accepted
+  // `status`, it was simply never exposed to the user.
+  { key: "progress", label: "In progress", filters: { status: "In Progress" } },
+  { key: "done", label: "Completed", filters: { status: "Completed" } },
 ];
+
+/** The client half of the filter set.
+ *
+ * Every filter that CAN be a server query already is one (status, overdue,
+ * assigned_to_me — see FILTERS above). These four cannot be, and each for a
+ * specific reason rather than convenience:
+ *
+ *   today / upcoming     GET /tasks has `due_before` but no "due ON a day",
+ *                        so an exact-day window has to be applied here.
+ *   needs                the review flag is derived from resolution_status,
+ *                        which is not an index key.
+ *   others               "assigned to someone who is not me" is the negation
+ *                        of assigned_to_me, and DynamoDB cannot express a
+ *                        negated key condition.
+ *
+ * All four narrow the loaded page only, which is why they are marked
+ * clientOnly and why the screen says so in its empty state.
+ */
+function narrowLocally(
+  tasks: ApiTask[],
+  filter: FilterKey,
+  now: Date,
+  myUserId: string
+): ApiTask[] {
+  switch (filter) {
+    case "needs":
+      return tasks.filter(needsAssignment);
+    case "today":
+      return tasks.filter((t) => {
+        if (isClosed(t)) return false;
+        const d = daysUntil(dueKeyOf(t), now);
+        return d === 0;
+      });
+    case "upcoming":
+      return tasks.filter((t) => {
+        if (isClosed(t)) return false;
+        const d = daysUntil(dueKeyOf(t), now);
+        return d !== null && d > 0;
+      });
+    case "others":
+      // Assigned to a REAL person who is not the caller. An unassigned task is
+      // not "assigned to others" — it is assigned to nobody, and lumping the
+      // two together would make this filter a dumping ground.
+      return tasks.filter(
+        (t) => !!t.assignee_user_id && t.assignee_user_id !== myUserId
+      );
+    default:
+      return tasks;
+  }
+}
 
 /** Case-insensitive substring match across the fields a person would search
  * BY: what the task says, who owes it, and which speaker it came from. The
@@ -134,6 +203,7 @@ export default function TasksScreen() {
   const [folders, setFolders] = useState<ApiFolder[]>([]);
   const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
   const [me, setMe] = useState<{ name: string; avatar_url: string } | null>(null);
+  const [myUserId, setMyUserId] = useState("");
   const [aiNote, setAiNote] = useState("");
   const [quickAdd, setQuickAdd] = useState(false);
 
@@ -205,7 +275,13 @@ export default function TasksScreen() {
       .then(setRecordings)
       .catch(() => setRecordings([]));
     getMe()
-      .then((u) => setMe({ name: u.name, avatar_url: u.avatar_url }))
+      .then((u) => {
+        setMe({ name: u.name, avatar_url: u.avatar_url });
+        // Kept so "Assigned to others" can be expressed as "has a real
+        // assignee who is not me" — GET /tasks can filter FOR me
+        // (assigned_to_me) but cannot express the negation.
+        setMyUserId(u.user_id ?? "");
+      })
       .catch(() => setMe(null));
   }, []);
 
@@ -296,12 +372,12 @@ export default function TasksScreen() {
   // ones are appended below the open list rather than discarded: still out of
   // the way, still reachable, and un-tickable back to Open.
   const matched = useMemo(() => {
-    const base = filter === "needs" ? tasks.filter(needsAssignment) : tasks;
+    const base = narrowLocally(tasks, filter, now, myUserId);
     const searched = matchesQuery(base, query);
     const open = rankForAttention(searched, now);
     const closed = searched.filter((t) => isClosed(t));
     return [...open, ...closed];
-  }, [tasks, filter, now, query]);
+  }, [tasks, filter, now, query, myUserId]);
 
   // What actually renders. Truncation happens LAST — after filtering, search
   // and ranking — so "Show all 23" counts the tasks that match, and the five
@@ -422,6 +498,20 @@ export default function TasksScreen() {
     [router]
   );
 
+  /** Open the meeting a task came from. Same route the meetings list uses —
+   *  there is one meeting screen and this reuses it rather than adding a
+   *  task-specific view of the same thing. */
+  const openMeeting = useCallback(
+    (t: ApiTask) => {
+      const key = String(t.source_recording_id || "");
+      if (!key) return;
+      router.push({
+        pathname: "/recording/[key]", params: { key },
+      } as never);
+    },
+    [router]
+  );
+
   // The AI chips (§4). There is no task-agent endpoint, so each chip performs
   // the honest LOCAL equivalent and names it. No fabricated reply, no call to
   // a route that does not exist.
@@ -454,11 +544,13 @@ export default function TasksScreen() {
     [counts, week]
   );
 
-  const onHealthSelect = useCallback((key: "overdue" | "week" | "done") => {
-    // Only overdue has a real server filter of its own; the other two scroll
-    // to the section that actually explains them rather than faking a query.
-    if (key === "overdue") {
-      setFilter("overdue");
+  const onHealthSelect = useCallback((key: HealthKey) => {
+    // Overdue and Needs Review both map onto a real filter, so tapping the
+    // number takes you to exactly the tasks it counted. "Due this week" and
+    // "Completed" have no single equivalent filter and scroll to the section
+    // that explains them rather than faking a query.
+    if (key === "overdue" || key === "review") {
+      setFilter(key === "review" ? "needs" : "overdue");
       listRef.current?.scrollToOffset({ offset: 0, animated: true });
     }
   }, []);
@@ -479,6 +571,36 @@ export default function TasksScreen() {
       };
     }
     switch (filter) {
+      case "today":
+        return {
+          icon: "calendar.badge.clock",
+          title: "Nothing due today.",
+          subtitle: "Only the tasks loaded so far are checked — pull to refresh for more.",
+        };
+      case "upcoming":
+        return {
+          icon: "calendar",
+          title: "Nothing scheduled ahead.",
+          subtitle: "Tasks with a resolved deadline in the future appear here.",
+        };
+      case "others":
+        return {
+          icon: "person.2.fill",
+          title: "Nothing assigned to anyone else.",
+          subtitle: "Tasks you have handed to a teammate will show up here.",
+        };
+      case "progress":
+        return {
+          icon: "hourglass",
+          title: "Nothing in progress.",
+          subtitle: "Move a task to In Progress to see it here.",
+        };
+      case "done":
+        return {
+          icon: "checkmark.circle.fill",
+          title: "Nothing completed yet.",
+          subtitle: "Completed tasks stay here so you can look back on them.",
+        };
       case "overdue":
         return {
           icon: "checkmark.circle",
@@ -533,15 +655,18 @@ export default function TasksScreen() {
           task={item}
           now={now}
           folderName={folderNames.get(String(item.folder_id || ""))}
+          meetingTitle={meetingTitles.get(String(item.source_recording_id || ""))}
           busy={busyId === item.id}
           onPress={openTask}
           onToggleComplete={toggleComplete}
           onResolve={openResolve}
+          onOpenMeeting={openMeeting}
         />
       </SwipeableRow>
     ),
     [
-      C, now, folderNames, busyId, openTask, toggleComplete, openResolve, snooze,
+      C, now, folderNames, meetingTitles, busyId, openTask, toggleComplete,
+      openResolve, openMeeting, snooze,
     ]
   );
 

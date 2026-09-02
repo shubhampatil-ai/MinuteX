@@ -529,6 +529,10 @@ def build_tables():
                      "meeting-index": ("source_recording_id", "created_at"),
                      "folder-index": ("folder_id", "created_at"),
                      "assignee-index": ("assignee_contact_id", "created_at"),
+                     # "tasks I must DO" — keyed on the MinuteX ACCOUNT, which
+                     # is what lets an assignee see work created by someone
+                     # else. Sparse, exactly as in the real table.
+                     "assignee-user-index": ("assignee_user_id", "created_at"),
                      "dedupe-index": ("owner_user_id", "fingerprint")}),
         "users": FakeTable(
             "Users", "user_id",

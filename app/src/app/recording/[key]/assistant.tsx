@@ -6,10 +6,11 @@
 // "Ask MinuteX" anymore, just the floating Assistant button that opens here.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, Pressable,
-  ScrollView, Share, StyleSheet, Text, TextInput, View,
+  ActivityIndicator, Alert, Animated, Easing, Keyboard, Modal,
+  Platform, Pressable, ScrollView, Share, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { Stack, useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ELEV, FONT, R, S, useTheme, ColorScale } from "../../../../lib/theme";
 import { RawGradient } from "../../../../lib/ui";
 import { Icon } from "../../../../lib/icons";
@@ -19,7 +20,7 @@ import { Tasks } from "../../../../lib/meeting-tasks";
 import { CreateDocumentSheet, type GeneratedDoc } from "../../../../lib/meeting-documents";
 import { MomEditorScreen } from "../../../../lib/mom-editor";
 import {
-  ApiError, ChatTurn, getAiChat, isNotReady, isRetryable, sendAiChat,
+  ApiError, ChatSource, ChatTurn, getAiChat, isNotReady, isRetryable, sendAiChat,
 } from "../../../../lib/api";
 import { canExportPdf, copyDocument, exportPdf } from "../../../../lib/export-doc";
 import { exportDocx } from "../../../../lib/docx-export";
@@ -59,6 +60,13 @@ function buildStyles(C: ColorScale) {
       justifyContent: "center" as const, marginTop: 2,
     },
     bubbleAi: { flex: 1, backgroundColor: C.surface, borderWidth: 1, borderColor: C.border, borderRadius: R.card, borderTopLeftRadius: 4, padding: 13 },
+    // Sources sit INSIDE the answer bubble, under a hairline. Attached to the
+    // claim they support rather than floating beside it, which is what makes
+    // them read as evidence for this answer and not as a separate suggestion.
+    sourcesWrap: { marginTop: 11, paddingTop: 9, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: C.border },
+    sourcesLabel: { fontFamily: FONT.semibold, fontSize: 10.5, letterSpacing: 0.3, color: C.textFaint, textTransform: "uppercase" as const, marginBottom: 7 },
+    sourceRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6, paddingVertical: 4 },
+    sourceTxt: { fontFamily: FONT.medium, fontSize: 12, color: C.primary },
     composerWrap: {
       borderTopWidth: 1, borderTopColor: C.border, backgroundColor: C.surface,
       paddingHorizontal: 14, paddingTop: 10,
@@ -77,6 +85,10 @@ function buildStyles(C: ColorScale) {
     },
     errBox: { backgroundColor: C.dangerSoft, borderRadius: R.md, padding: S.md, marginTop: 12 },
     working: { flexDirection: "row" as const, alignItems: "center" as const, gap: S.sm, paddingVertical: 14, marginLeft: 36 },
+    // The three pulsing dots. Sized and spaced to sit on the same optical line
+    // as the label beside them rather than reading as punctuation.
+    dotRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 4 },
+    dot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.primary },
     docCard: {
       width: 148, backgroundColor: C.surface, borderWidth: 1, borderColor: C.border,
       borderRadius: R.card, padding: 13, marginRight: S.sm, shadowColor: C.shadow, ...ELEV.sm,
@@ -97,8 +109,154 @@ function docVisual(type: string) {
   return DOC_VISUAL[type] ?? { icon: "doc.richtext", color: "#7C5CFF" };
 }
 
+// A source timestamp, in the same M:SS / H:MM:SS form the transcript and the
+// player already use — a different format here would read as a different kind
+// of number.
+function clock(seconds: number) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = h ? String(m).padStart(2, "0") : String(m);
+  return `${h ? `${h}:` : ""}${mm}:${String(s).padStart(2, "0")}`;
+}
+
+/** Three dots breathing in sequence, while the assistant works.
+ *
+ * WHY AN ANIMATION AT ALL. A grounded answer on a long meeting takes two Groq
+ * round-trips (retrieve, then answer) where it used to take one, so the wait
+ * got longer at exactly the moment the screen had nothing to say about it. A
+ * static spinner reads as "possibly stuck"; something that moves reads as
+ * "working". The dots are the cheap, conventional signal for that.
+ *
+ * useNativeDriver so the animation runs on the UI thread — it must keep moving
+ * while JS is busy parsing a long response, which is precisely when a
+ * JS-driven animation would stutter and undo the reassurance.
+ */
+function ThinkingDots({ st }: { st: ReturnType<typeof buildStyles> }) {
+  // useRef, not useState: these are animation handles, and re-creating them on
+  // every render would restart the loop and produce a visible stutter.
+  const dots = useRef([new Animated.Value(0.35), new Animated.Value(0.35),
+                       new Animated.Value(0.35)]).current;
+
+  useEffect(() => {
+    const loops = dots.map((v, i) =>
+      Animated.loop(Animated.sequence([
+        // Staggered start, so the three read as a wave rather than a blink.
+        Animated.delay(i * 160),
+        Animated.timing(v, { toValue: 1, duration: 380, useNativeDriver: true,
+                             easing: Easing.out(Easing.quad) }),
+        Animated.timing(v, { toValue: 0.35, duration: 380, useNativeDriver: true,
+                             easing: Easing.in(Easing.quad) }),
+        Animated.delay((2 - i) * 160),
+      ])));
+    loops.forEach((l) => l.start());
+    // Stopped on unmount: a loop left running holds the component alive and
+    // keeps burning frames after the answer has arrived.
+    return () => loops.forEach((l) => l.stop());
+  }, [dots]);
+
+  return (
+    <View style={st.dotRow}>
+      {dots.map((v, i) => (
+        <Animated.View key={i} style={[st.dot, { opacity: v, transform: [{ scale: v }] }]} />
+      ))}
+    </View>
+  );
+}
+
+/** What the assistant says it is doing, and when.
+ *
+ * The phases are NOT a fake progress bar — they mirror the two calls the
+ * backend actually makes. A meeting whose transcript fits the context budget
+ * is answered in ONE call with no retrieval step, so claiming to "search the
+ * transcript" there would be theatre. `willRetrieve` decides which script runs,
+ * from the same size test the backend uses.
+ *
+ * Timings are deliberately shorter than the real steps: a label that advances
+ * slightly early reads as progress, whereas one that lags behind reality reads
+ * as stuck. The last phase has no timer — it stays until the answer lands,
+ * however long that takes.
+ */
+const RETRIEVE_PHASES = [
+  { at: 0, label: "Searching the meeting…" },
+  { at: 2600, label: "Reading the relevant sections…" },
+  { at: 6000, label: "Writing the answer…" },
+];
+// The COMMON path in production: one Groq call with the whole transcript.
+// Paced for that single call rather than for the two-call retrieval wait —
+// "Writing the answer" at 3s on a one-call request would still be true, but
+// arriving at 2s reads as more responsive on the request people actually make.
+const DIRECT_PHASES = [
+  { at: 0, label: "Reading the meeting…" },
+  { at: 2000, label: "Writing the answer…" },
+];
+
+function useThinkingLabel(sending: boolean, willRetrieve: boolean) {
+  const phases = willRetrieve ? RETRIEVE_PHASES : DIRECT_PHASES;
+  const [label, setLabel] = useState(phases[0].label);
+
+  useEffect(() => {
+    if (!sending) return;
+    setLabel(phases[0].label);
+    const timers = phases.slice(1).map((p) =>
+      setTimeout(() => setLabel(p.label), p.at));
+    return () => timers.forEach(clearTimeout);
+    // `phases` is derived from willRetrieve, so depending on that is enough and
+    // avoids re-running this on every render from a fresh array identity.
+  }, [sending, willRetrieve]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  return label;
+}
+
+/** Where an answer came from, as tappable rows under it.
+ *
+ * REUSES THE EXISTING NAVIGATION, deliberately. Tapping a source pushes
+ * /recording/[key]/transcript?evidence=seg_N — the identical route, param and
+ * highlight/seek behaviour a task's "View in transcript" already uses. A second
+ * mechanism for the same job would be two things to keep working, and the
+ * transcript screen already does everything needed here.
+ *
+ * Renders NOTHING when there are no sources: an ungrounded answer, an older
+ * stored turn and an older backend all produce that case, and it is ordinary
+ * rather than an error worth reporting to the user.
+ */
+function Sources({ sources, recordingKey, C, st }: {
+  sources?: ChatSource[];
+  recordingKey: string;
+  C: ColorScale;
+  st: ReturnType<typeof buildStyles>;
+}) {
+  const router = useRouter();
+  if (!sources?.length) return null;
+  return (
+    <View style={st.sourcesWrap}>
+      <Text style={st.sourcesLabel}>Sources</Text>
+      {sources.map((src) => (
+        <Pressable
+          key={src.segment_id}
+          onPress={() =>
+            router.push({
+              pathname: "/recording/[key]/transcript",
+              params: { key: recordingKey, evidence: src.segment_id },
+            } as never)
+          }
+          hitSlop={6}
+          style={({ pressed }) => [st.sourceRow, pressed && { opacity: 0.6 }]}
+          accessibilityRole="button"
+          accessibilityLabel={`View this source in the transcript at ${clock(src.start_time)}`}
+        >
+          <Icon name="waveform" size={12} tintColor={C.primary} />
+          <Text style={st.sourceTxt}>Transcript — {clock(src.start_time)}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+
 export default function AssistantScreen() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
   const { key, rec, documents, addDocument, setDocuments, tasks, activity, logActivity } = useMeeting();
@@ -113,6 +271,76 @@ export default function AssistantScreen() {
   const [openDocIndex, setOpenDocIndex] = useState<number | null>(null);
   const lastAsked = useRef("");
   const scrollRef = useRef<ScrollView>(null);
+
+  // Will this question need the two-call retrieval path?
+  //
+  // Mirrors the backend's own test (userApi's retrieve_meeting_context: does
+  // the labelled transcript fit the context budget?) closely enough to pick
+  // the right wording. It is ONLY used to choose a label, so being wrong on a
+  // borderline meeting costs nothing — the phases still advance and the answer
+  // is unaffected. Deliberately not exposed by the API: a round-trip to find
+  // out what to say while waiting for a round-trip would be absurd.
+  //
+  // THE THRESHOLD. Measured against the DEPLOYED config, not the code default.
+  // With GROQ_TPM_LIMIT=300000 in production the binding constraint is the
+  // model's 131k context window, not the TPM quota, which puts the budget near
+  // 369k chars — so retrieval engages only past roughly eight hours of talk,
+  // and virtually every real meeting takes the one-call path. 300k is set
+  // deliberately BELOW that budget: overshooting means promising a search that
+  // does not happen, while undershooting only costs a slightly generic label on
+  // a meeting nobody records.
+  //
+  // If the Groq plan is ever downgraded this becomes wrong in the harmless
+  // direction (it under-predicts retrieval), which is why it is a constant here
+  // and not a second budget calculation to keep in sync.
+  const willRetrieve = (rec?.transcript?.length ?? 0) > 300000;
+  const thinkingLabel = useThinkingLabel(sending, willRetrieve);
+
+  // ---- Keyboard height, measured rather than inferred ---------------------
+  //
+  // The composer is pinned to the bottom of the screen, which is exactly where
+  // the keyboard appears, so something has to lift it. KeyboardAvoidingView is
+  // the usual answer and it does NOT work on this screen.
+  //
+  // WHY NOT KeyboardAvoidingView. It derives its inset from
+  //   frame.y + frame.height - (keyboardFrame.screenY - keyboardVerticalOffset)
+  // where `frame` comes from its own onLayout. That subtraction only means
+  // anything if both terms are in the same coordinate space. This screen is
+  // registered with presentation: "modal" (see _layout.tsx), so under
+  // react-native-screens it lives in its own native container and its onLayout
+  // frame is container-relative while the keyboard's screenY is window-relative.
+  // The two disagree, the difference collapses toward zero, and you get no
+  // padding — silently, with no error and nothing visibly wrong in the code.
+  // That is why every other screen in the app is fine with the shared wrapper
+  // and this one was not.
+  //
+  // Tracking endCoordinates.height directly skips the measurement entirely:
+  // the OS tells us how tall the keyboard is, and we pad by that. Nothing here
+  // depends on window resizing either, so it is also correct under the enforced
+  // edge-to-edge of Android 15+, where the OS no longer resizes the window.
+  //
+  // ANDROID USES keyboardDidShow, NOT keyboardWillShow — the "will" events are
+  // iOS-only, so listening for them on Android silently never fires.
+  const [kbHeight, setKbHeight] = useState(0);
+  useEffect(() => {
+    const showEvent = Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
+    const hideEvent = Platform.OS === "ios" ? "keyboardWillHide" : "keyboardDidHide";
+    const show = Keyboard.addListener(showEvent, (e) => {
+      setKbHeight(e.endCoordinates?.height ?? 0);
+      // Lifting the composer shortens the scroll view, which would otherwise
+      // leave the newest message hidden behind the keyboard in an existing
+      // conversation. Runs after the lift has laid out.
+      requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: true }));
+    });
+    const hide = Keyboard.addListener(hideEvent, () => setKbHeight(0));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
+
+  // The keyboard's reported height spans from the bottom of the SCREEN, so on a
+  // device with a gesture bar it already covers the area `insets.bottom` also
+  // accounts for. Subtracting it prevents padding by that strip twice; clamped
+  // at 0 so a device without one is unaffected.
+  const composerLift = kbHeight > 0 ? Math.max(kbHeight - insets.bottom, 0) : 0;
 
   useEffect(() => {
     if (!key) return;
@@ -170,11 +398,10 @@ export default function AssistantScreen() {
         }}
       />
 
-      <KeyboardAvoidingView
-        style={{ flex: 1 }}
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
-        keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
-      >
+      {/* A plain View, deliberately — see the composerLift note above for why
+          KeyboardAvoidingView cannot measure this screen correctly. The lift is
+          applied to the composer itself at the bottom of this tree. */}
+      <View style={{ flex: 1 }}>
         <ScrollView
           ref={scrollRef}
           contentContainerStyle={st.scrollBody}
@@ -218,15 +445,17 @@ export default function AssistantScreen() {
                 </RawGradient>
                 <View style={st.bubbleAi}>
                   <Markdown text={t.content} />
+                  <Sources sources={t.sources} recordingKey={key} C={C} st={st} />
                 </View>
               </View>
             )
           ))}
 
           {sending ? (
-            <View style={st.working}>
-              <ActivityIndicator color={C.primary} size="small" />
-              <Text style={T.bodyDim}>Reading the meeting…</Text>
+            <View style={st.working} accessibilityRole="progressbar"
+                  accessibilityLabel={thinkingLabel}>
+              <ThinkingDots st={st} />
+              <Text style={T.bodyDim}>{thinkingLabel}</Text>
             </View>
           ) : null}
 
@@ -304,8 +533,11 @@ export default function AssistantScreen() {
           ) : null}
         </ScrollView>
 
-        {/* ---- Fixed chat input ---- */}
-        <View style={st.composerWrap}>
+        {/* ---- Fixed chat input ----
+            marginBottom (not paddingBottom) so composerWrap's own border and
+            background stop at the top of the keyboard instead of the surface
+            stretching down behind it. */}
+        <View style={[st.composerWrap, { marginBottom: composerLift }]}>
           <View style={st.composerRow}>
             <Pressable onPress={() => setCreateOpen(true)} hitSlop={8} accessibilityLabel="Create document">
               <Icon name="plus" tintColor={C.textDim} size={22} />
@@ -336,7 +568,7 @@ export default function AssistantScreen() {
           </View>
           <View style={{ height: S.sm }} />
         </View>
-      </KeyboardAvoidingView>
+      </View>
 
       <CreateDocumentSheet
         visible={createOpen}

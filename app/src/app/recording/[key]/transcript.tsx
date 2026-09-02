@@ -17,12 +17,12 @@
 // MeetingProvider is mounted by the parent _layout.tsx, so this screen shares
 // the same recording and the same speaker map as Meeting Detail — a rename made
 // here is already applied when the user navigates back.
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text,
   TextInput, View,
 } from "react-native";
-import { Stack } from "expo-router";
+import { Stack, useLocalSearchParams } from "expo-router";
 import { S, R, FONT, useTheme, ColorScale } from "../../../../lib/theme";
 import { Button, KeyboardAwareSheet } from "../../../../lib/ui";
 import { AudioPlayerProvider } from "../../../../lib/audio-player";
@@ -65,6 +65,17 @@ function buildStyles(C: ColorScale) {
 
 export default function TranscriptScreen() {
   const { C } = useTheme();
+  // Segment ids arrive as a comma-joined param from a task's "View evidence".
+  // A param rather than context because the transcript is reached by a normal
+  // route push and must keep working when opened with no evidence at all.
+  const { evidence } = useLocalSearchParams<{ evidence?: string }>();
+  const evidenceIds = useMemo(
+    () => String(evidence ?? "").split(",").map((x) => x.trim()).filter(Boolean),
+    [evidence]);
+  const scrollRef = useRef<ScrollView>(null);
+  // Guards against re-scrolling on every layout pass — the user must be able
+  // to scroll away and stay there.
+  const scrolled = useRef(false);
   const st = useMemo(() => buildStyles(C), [C]);
   const { rec, loading, error, reload, renameSpeaker } = useMeeting();
 
@@ -137,6 +148,7 @@ export default function TranscriptScreen() {
     <AudioPlayerProvider url={rec.audio_url}>
       <Stack.Screen options={{ title: "Transcript" }} />
       <ScrollView
+        ref={scrollRef}
         style={st.container}
         contentContainerStyle={{ paddingBottom: 40 }}
         showsVerticalScrollIndicator={false}
@@ -151,6 +163,14 @@ export default function TranscriptScreen() {
           onRenameSpeaker={openRename}
           search={search}
           onSearchChange={setSearch}
+          highlightIds={evidenceIds}
+          onHighlightLayout={(y) => {
+            if (scrolled.current) return;
+            scrolled.current = true;
+            // A little above the block, so the reader sees the line BEFORE it
+            // too — evidence read without its lead-in is easy to misjudge.
+            scrollRef.current?.scrollTo({ y: Math.max(0, y - 80), animated: true });
+          }}
         />
       </ScrollView>
 

@@ -29,7 +29,7 @@ import {
 import { avatarColorFor, initialsOf } from "./task-model";
 import {
   Deadline, MeetingInsight, TaskCounts, WeeklyProgress, describeInsight,
-  dueKeyOf, isOverdue, shortDate,
+  dueKeyOf, isOverdue, needsAssignment, shortDate,
 } from "./task-insights";
 
 // ---------------------------------------------------------------------------
@@ -334,18 +334,32 @@ function buildAIStyles(C: ColorScale) {
 // ---------------------------------------------------------------------------
 // TaskHealthCards (§5)
 // ---------------------------------------------------------------------------
+export type HealthKey = "overdue" | "week" | "done" | "review";
+
 export const TaskHealthCards = memo(function TaskHealthCards({
   counts, onSelect,
-}: { counts: TaskCounts; onSelect: (key: "overdue" | "week" | "done") => void }) {
+}: { counts: TaskCounts; onSelect: (key: HealthKey) => void }) {
   const { C } = useTheme();
   const st = useMemo(() => buildHealthStyles(C), [C]);
   const cells: {
-    key: "overdue" | "week" | "done";
+    key: HealthKey;
     value: number;
     label: string;
     color: string;
   }[] = [
     { key: "overdue", value: counts.overdue, label: "Overdue", color: C.danger },
+    // Needs Review earns a cell ONLY when there is something to review. A
+    // permanent "0 needs review" would take a quarter of the row to say
+    // nothing, and — worse — would train people to read past the one number
+    // that means "the AI is unsure who owes this".
+    ...(counts.needsAssignment
+      ? [{
+        key: "review" as const,
+        value: counts.needsAssignment,
+        label: "Needs review",
+        color: C.warn,
+      }]
+      : []),
     { key: "week", value: counts.dueThisWeek, label: "Due this week", color: C.warn },
     { key: "done", value: counts.completed, label: "Completed", color: C.success },
   ];
@@ -465,10 +479,17 @@ export type TaskCardProps = {
   task: ApiTask;
   now: Date;
   folderName?: string;
+  /** The source meeting's title, resolved by the screen from the recordings it
+   *  already loads — so the card costs no extra fetch. Absent for a manual
+   *  task, which correctly shows no source. */
+  meetingTitle?: string;
   busy?: boolean;
   onPress: (task: ApiTask) => void;
   onToggleComplete: (task: ApiTask) => void;
   onResolve: (task: ApiTask) => void;
+  /** Open the meeting this task came from. Optional: when absent the source
+   *  still renders, just not as a link. */
+  onOpenMeeting?: (task: ApiTask) => void;
 };
 
 function taskCardsEqual(a: TaskCardProps, b: TaskCardProps) {
@@ -478,6 +499,8 @@ function taskCardsEqual(a: TaskCardProps, b: TaskCardProps) {
   return (
     a.task === b.task &&
     a.folderName === b.folderName &&
+    a.meetingTitle === b.meetingTitle &&
+    a.onOpenMeeting === b.onOpenMeeting &&
     a.busy === b.busy &&
     a.now.getDate() === b.now.getDate() &&
     a.onPress === b.onPress &&
@@ -487,13 +510,18 @@ function taskCardsEqual(a: TaskCardProps, b: TaskCardProps) {
 }
 
 export const TaskCard = memo(function TaskCard({
-  task, now, folderName, busy, onPress, onToggleComplete, onResolve,
+  task, now, folderName, meetingTitle, busy, onPress, onToggleComplete,
+  onResolve, onOpenMeeting,
 }: TaskCardProps) {
   const { C } = useTheme();
   const st = useMemo(() => buildTaskCardStyles(C), [C]);
 
   const { name, confirmed } = assigneeLabel(task);
-  const needsPerson = needsAssigneeResolution(task);
+  // The SERVER's verdict, via the shared helper. Calling
+  // needsAssigneeResolution directly here would miss a task whose assignment
+  // the confidence gate withheld, and the card would then show a confident
+  // assignee for a row the detail screen flags as needing review.
+  const needsPerson = needsAssignment(task);
   const overdue = isOverdue(task, now);
   const done = task.status === "Completed";
   const cancelled = task.status === "Cancelled";
@@ -562,6 +590,15 @@ export const TaskCard = memo(function TaskCard({
             ) : (
               <Pill label={task.status} bg={tint.bg} fg={tint.fg} />
             )}
+            {/* AI provenance at a glance. The card deliberately does NOT show
+                the confidence band — the "needs a contact" row below already
+                carries the only consequence a low-confidence reading has, and
+                a second badge on every AI row would be noise on a list whose
+                job is triage. The band is on the detail screen, where the
+                user is actually deciding. */}
+            {task.source_type === "AI" ? (
+              <Pill label="AI" bg={C.accentSoft} fg={C.accent} />
+            ) : null}
           </View>
 
           {meta.length ? (
@@ -611,6 +648,29 @@ export const TaskCard = memo(function TaskCard({
               </Text>
             </View>
           )}
+
+          {/* WHERE this came from. Only for tasks that actually have a source
+              meeting — a manually typed task has none and must not be given a
+              fake provenance line. */}
+          {meetingTitle ? (
+            <Pressable
+              onPress={
+                onOpenMeeting ? () => onOpenMeeting(task) : undefined
+              }
+              disabled={!onOpenMeeting}
+              hitSlop={6}
+              style={({ pressed }) => [st.sourceRow, pressed && { opacity: 0.6 }]}
+              accessibilityRole={onOpenMeeting ? "button" : undefined}
+              accessibilityLabel={
+                onOpenMeeting ? `Open meeting ${meetingTitle}` : undefined
+              }
+            >
+              <Icon name="waveform" size={11} tintColor={C.textFaint} />
+              <Text style={st.sourceTxt} numberOfLines={1}>
+                {meetingTitle}
+              </Text>
+            </Pressable>
+          ) : null}
         </View>
       </View>
     </Pressable>
@@ -620,6 +680,14 @@ taskCardsEqual);
 
 function buildTaskCardStyles(C: ColorScale) {
   return StyleSheet.create({
+    sourceRow: {
+      flexDirection: "row", alignItems: "center", gap: 5, marginTop: 6,
+      alignSelf: "flex-start",
+    },
+    sourceTxt: {
+      fontFamily: FONT.medium, fontSize: 11.5, color: C.textFaint,
+      flexShrink: 1,
+    },
     card: {
       backgroundColor: C.surface,
       borderRadius: R.card,

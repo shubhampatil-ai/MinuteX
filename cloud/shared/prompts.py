@@ -28,7 +28,15 @@ import re
 #   * "state what's missing" — silence reads as "there was no budget", which
 #     is a different claim from "the budget wasn't discussed".
 #   * "names verbatim" — product/API names were being helpfully "corrected".
-#   * "same language" — a Hindi meeting was being answered in English.
+#   * "always English" - a deliverable is read, forwarded and exported by
+#     people who were not in the room, so the OUTPUT language is a product
+#     decision and not the transcript's to make. This replaced an earlier
+#     "answer in the transcript's language", under which a Hindi meeting
+#     produced a Hindi document its English-reading recipients could not
+#     use. Proper nouns and direct quotes are carved out so that
+#     translating can never silently rewrite a name, a product or a figure.
+#     SCOPE: generated DELIVERABLES only. CHAT_SYSTEM and ASSISTANT_SYSTEM
+#     deliberately mirror the USER's language instead - see each.
 # ---------------------------------------------------------------------------
 BASE_SYSTEM = (
     "You are the MinuteX AI Meeting Assistant. You create factual, "
@@ -51,7 +59,16 @@ BASE_SYSTEM = (
     "- Never repeat transcript sentences verbatim; write the substance.\n"
     "- Merge duplicate ideas; state each point once.\n"
     "- Maintain professional business language.\n"
-    "- Write in the SAME language as the transcript.\n"
+    "- ALWAYS WRITE IN ENGLISH. This is absolute and it OVERRIDES the "
+    "language of the transcript: a meeting held in Hindi, Marathi, "
+    "Hinglish or any other language still produces an ENGLISH document. "
+    "Translate the substance faithfully - do not summarise more loosely "
+    "because you are translating, and never append the original-language "
+    "text alongside the English.\n"
+    "- The ONE exception is PROPER NOUNS AND DIRECT QUOTES: keep every "
+    "person, company, product, API and place name exactly as spoken, and "
+    "if you quote a speaker word-for-word, keep the quote in the original "
+    "language and put the English rendering after it in parentheses.\n"
 )
 
 # Prose deliverables are rendered, copied and exported as Markdown.
@@ -262,10 +279,59 @@ SUMMARY_SYSTEM = _json_system(
     "renumber an id — an id you did not read in the transcript is worse than "
     "none, and a wrong one is discarded anyway.\n"
     '- "tasks": array of objects, each EXACTLY {"task": string, "assignee": '
-    'string, "due_date": string, "priority": string}. Only real agreed work — '
+    'string, "assignee_speaker_id": string, "due_date": string, '
+    '"priority": string, "confidence": string, "evidence": string, '
+    '"evidence_segment_ids": array of strings}. Only real agreed work — '
     "never a discussion, suggestion, recommendation, possibility or question. "
     "Only create a task when the transcript indicates actual responsibility or "
     "commitment.\n"
+    # The four fields below were MISSING from this contract while ai_schema's
+    # TASK_SPEC, the Tasks table and the assignment gate all expected them.
+    # The prompt said EXACTLY {task, assignee, due_date, priority}, so the
+    # model complied and every extracted task arrived with no speaker id, no
+    # confidence and no evidence. Measured against a real 11-speaker meeting
+    # AND a 3-speaker single-pass transcript before the fix. Adding a field to
+    # TASK_SPEC without adding it HERE is silently a no-op: the two must
+    # always change together.
+    '  "assignee_speaker_id" links a task to WHO SAID IT, so the app can '
+    "attach a real identity once the user says who each speaker is. It must "
+    "contain a speaker label EXACTLY as the transcript writes it (e.g. "
+    '"Speaker 0") - never a person\'s name, never a team, never a guess.\n'
+    '  - Self-commitment: "Speaker 0: I\'ll send the proposal tomorrow." -> '
+    'assignee_speaker_id "Speaker 0", assignee "" (no name was spoken).\n'
+    '  - Assignment to someone else: "Speaker 0: Rahul, send the proposal." '
+    '-> assignee "Rahul", assignee_speaker_id "" - the speaker is the one '
+    "ASSIGNING, not the one responsible.\n"
+    '  - Use "" for assignee_speaker_id whenever the owner is not identifiable '
+    "as a specific speaker label. An empty value is correct and expected; a "
+    "wrong label assigns work to the wrong person.\n"
+    '  NEVER put a speaker label ("Speaker 2") into "assignee" - that field is '
+    "for a NAME actually spoken in the transcript. When only the speaker is "
+    'known, set assignee_speaker_id and leave assignee "".\n'
+    '  "confidence" is EXACTLY one of "high" | "medium" | "low": high = the '
+    "work is explicit AND the owner is unambiguous; medium = the work is clear "
+    "but the owner needs context; low = the work or its owner is genuinely "
+    "ambiguous. Judge only what the transcript supports; do not inflate it.\n"
+    '  "evidence" is the VERBATIM sentence from the transcript that created '
+    "the task - copied, not paraphrased. It is what lets a reader check the "
+    'task against what was actually said. Use "" only if no single sentence '
+    'carries it. "evidence_segment_ids" holds the ids of the segment(s) that '
+    "sentence came from.\n"
+    "  EVERY transcript line you are given begins with its own segment id in "
+    'square brackets, like "[seg_12] Speaker 0: ...". To fill '
+    'evidence_segment_ids, copy the id from the START of the line (or lines) '
+    "your evidence quote came from - character for character, including the "
+    '"seg_" prefix.\n'
+    '  Example - given the line "[seg_2] Speaker 1: I\'ll send the proposal '
+    'tomorrow.", a task extracted from it has evidence "I\'ll send the '
+    'proposal tomorrow." and evidence_segment_ids ["seg_2"].\n'
+    "  Use SEVERAL ids only when the evidence genuinely spans several lines. "
+    "Usually it is one.\n"
+    '  Use [] when no single line supports the task. NEVER invent, guess, '
+    "renumber or extrapolate an id, and never use a SPEAKER label "
+    '("Speaker 1") or a number ("2") as a segment id - they are different '
+    "things. An id you did not read at the start of a line is discarded "
+    "anyway, so a guess only loses the reference.\n"
     "  task text must preserve the SCOPE of the work, not just name it. "
     'Prefer "Test the open-source PDF-to-Markdown parser against property '
     'brochures and quotation sheets containing complex tables and pricing '
@@ -1257,6 +1323,9 @@ CUSTOM_TITLE_SYSTEM = (
     "3 to 6 words, Title Case, no trailing punctuation, no quotes. "
     'Example: "create a project status report" -> "Project Status Report". '
     'Example: "convert into jira tickets" -> "Jira Tickets". '
+    "Always write the title in ENGLISH, even when the request is written in "
+    "another language - it labels the document alongside built-in English "
+    "labels. Keep proper nouns as given. "
     "Respond with ONLY the title text, nothing else."
 )
 
@@ -1315,7 +1384,11 @@ ASSISTANT_SYSTEM = (
     "- Prefer a specific date over a relative phrase when the tool gives you "
     "one.\n"
     "- Markdown is allowed for lists and bold, but keep it light.\n"
-    "- Write in the same language the user writes in."
+    "- Write in the same language the user writes in. This prompt does "
+    "NOT inherit BASE_SYSTEM's always-English rule, and that is "
+    "deliberate: this is a conversation, not a generated document. If "
+    "asked to draft something someone else will read, write the draft in "
+    "English unless another language was requested."
 )
 
 
@@ -1367,7 +1440,14 @@ CHAT_SYSTEM = BASE_SYSTEM + (
     "- Quote figures and names exactly as spoken.\n"
     "- Markdown is allowed for lists and bold, but keep it light.\n"
     "- If asked to draft something (email, message, summary), produce the "
-    "draft directly with no commentary around it."
+    "draft directly with no commentary around it.\n"
+    "- LANGUAGE - this REPLACES the always-English rule above, which "
+    "governs generated documents and not this conversation: reply in the "
+    "language the USER wrote their question in. A question asked in Hindi "
+    "gets a Hindi answer even though the document generators would "
+    "produce English. If they ask you to DRAFT a document, email or "
+    "message, write that draft in English unless they asked for another "
+    "language - a draft is a deliverable someone else will read."
 )
 
 
@@ -1509,7 +1589,14 @@ def analysis_context(rec, meeting_highlights=None):
             pass
     lang = (rec.get("language") or "").strip()
     if lang and lang != "unknown":
-        parts.append(f"LANGUAGE: {lang}\n")
+        # Labelled SPOKEN and paired with the output language on purpose. As a
+        # bare "LANGUAGE: hi" this read as an instruction, and a hint sitting
+        # beside the transcript beats a rule far away in the system prompt --
+        # which is how Hindi meetings kept producing Hindi documents.
+        parts.append(f"SPOKEN LANGUAGE OF THE SOURCE AUDIO: {lang}\n")
+        parts.append("(This describes the SOURCE RECORDING only. It is not "
+                     "an instruction about the language to write in - your "
+                     "system prompt decides that.)\n")
 
     # THE MEETING OVERVIEW — the current primary analysis. Emitted with its own
     # section titles intact rather than flattened into one blob: the titles are
@@ -1653,5 +1740,148 @@ def build_context(rec, highlights=None, transcript_budget_chars=None,
                                 "meeting and is not in the analysis, say the "
                                 "transcript available to you is partial.]")
             blocks.append("=== TRANSCRIPT ===\n" + transcript)
+
+    return "\n\n".join(blocks) if blocks else "(No meeting content available.)"
+
+
+# ===========================================================================
+# GROUNDED RETRIEVAL — the prompts behind PageIndex-backed Meeting AI.
+#
+# WHY THESE EXIST. build_context() above sends the analysis plus the FIRST N
+# characters of the transcript. That is correct for a short meeting, where N is
+# the whole thing, and quietly broken for a long one: ask a two-hour meeting
+# "what did we settle on at the end?" and the model is holding the first
+# thirty-five minutes. It answers honestly that its record is partial, which is
+# the right behaviour given what it was handed and the wrong outcome for the
+# user, because the answer was sitting in S3 the whole time.
+#
+# The fix is two calls instead of one:
+#
+#   1. NAVIGATE. Show the model the meeting's table of contents (one line per
+#      node, from pageindex.table_of_contents) and ask which sections bear on
+#      the question. Cheap — a 2-hour meeting's whole index is ~30 short lines.
+#   2. ANSWER. Send only those sections' transcript, in full, with their
+#      [seg_N] labels intact so the answer can cite them.
+#
+# Retrieval runs ONLY when the transcript does not fit (see
+# build_grounded_context). When it fits, the whole thing is sent and the
+# navigation call is skipped entirely — retrieval could only lose information
+# there, and it would cost a round-trip to do it.
+# ===========================================================================
+
+RETRIEVAL_SYSTEM = (
+    "You are a retrieval planner for a meeting transcript. You do NOT answer "
+    "the user's question — you only decide WHERE in the meeting the answer "
+    "would be found.\n"
+    "\n"
+    "You are given a table of contents. Each line is one section:\n"
+    "  node_<n> [start–end] (speakers): what that section is about\n"
+    "\n"
+    "Return JSON only: {\"nodes\": [\"node_3\", \"node_11\"]}\n"
+    "\n"
+    "RULES:\n"
+    "- Choose the sections MOST likely to contain the answer, best first.\n"
+    "- Choose between 1 and 6 sections. Never return an empty list — if "
+    "nothing looks relevant, return your best guesses anyway; the next stage "
+    "decides whether the content actually answers the question, and it can "
+    "only do that for sections you hand it.\n"
+    "- Section descriptions are short and were written without knowing this "
+    "question. Treat them as hints, not as a full record: prefer including a "
+    "plausible section over excluding it.\n"
+    "- Pay attention to WHEN the user says something happened. \"at the "
+    "start\", \"early on\" means the first sections; \"at the end\", \"finally\", "
+    "\"we wrapped up with\" means the LAST sections. Use the timestamps.\n"
+    "- Return node ids exactly as written. Invent nothing."
+)
+
+
+def retrieval_request(question, toc):
+    """The user turn for the navigation call."""
+    return (f"MEETING TABLE OF CONTENTS:\n{toc}\n\n"
+            f"QUESTION: {question}\n\n"
+            "Which sections should be read to answer this? JSON only.")
+
+
+# What the answering model is told about its evidence, appended to CHAT_SYSTEM
+# only on the retrieval path. Not part of CHAT_SYSTEM itself because on the
+# full-transcript path there is no "retrieved" subset to caveat, and a rule
+# describing one would be a lie the model reasons from.
+GROUNDED_CHAT_RULES = (
+    "\n"
+    "WHAT YOU ARE LOOKING AT:\n"
+    "- The transcript below is the RELEVANT EXTRACT of a longer meeting, "
+    "selected for this question. It is not the whole meeting, and the parts "
+    "you were given may not be the parts that matter — say so if the extract "
+    "does not contain the answer, rather than guessing from what it does "
+    "contain.\n"
+    "- Every line is prefixed with its segment id, like [seg_42]. Those ids "
+    "are how the user jumps to that moment of the recording.\n"
+    "- END your reply with a line of the form:\n"
+    "  SOURCES: seg_12, seg_13\n"
+    "  listing the segment ids your answer actually rests on (at most 4, most "
+    "important first). Cite ONLY ids that appear in the extract below. If you "
+    "could not answer from the extract, write SOURCES: none\n"
+    "- The SOURCES line is stripped before the user sees your reply, so do not "
+    "refer to it in your prose."
+)
+
+
+# The user-edited MoM, when there is one.
+#
+# WHY IT IS SENT SEPARATELY AND MARKED AUTHORITATIVE. The MoM starts as AI
+# output but the user can edit it, and once they have, it is the corrected
+# record while the transcript still contains what was originally SAID. Someone
+# who fixes "$10,000" to "$8,000" in the minutes and then asks the assistant
+# about the figure must not be told $10,000 again just because that is what the
+# audio says.
+#
+# The cheap fix is this one: keep the mutable document OUT of the index and
+# hand it to the model at answer time, ranked above the transcript. Rebuilding
+# the transcript's PageIndex whenever the MoM is edited would be the expensive
+# fix and would also be wrong — the transcript did not change, and the index
+# describes the transcript.
+MOM_CONTEXT_RULES = (
+    "\n"
+    "AUTHORITATIVE MINUTES:\n"
+    "- The minutes below have been reviewed and possibly CORRECTED by the "
+    "user. Where they disagree with the transcript, THE MINUTES ARE RIGHT — "
+    "the transcript records what was said, the minutes record what was "
+    "settled.\n"
+    "- Answer from the minutes when they cover the question. Mention the "
+    "correction only if the user asks about the discrepancy."
+)
+
+
+def build_grounded_context(rec, retrieved_lines, highlights=None,
+                           mom_markdown="", truncated=False):
+    """The user-content block for a RETRIEVAL-backed chat answer.
+
+    Same ordering principle as build_context — dense authoritative material
+    first, raw transcript last — with one addition: the user-edited minutes sit
+    ABOVE the transcript extract, because when the two disagree the minutes win
+    and the model reads top-down.
+
+    `truncated` marks the case where even the retrieved sections overflowed the
+    budget and the tail was dropped. It is labelled for the same reason
+    build_context labels its own truncation: a model that does not know its
+    record is partial will fill the gap confidently.
+    """
+    blocks = []
+    ctx = analysis_context(rec, highlights)
+    if ctx:
+        blocks.append("=== MEETING ANALYSIS (already generated) ===\n" + ctx)
+
+    if (mom_markdown or "").strip():
+        blocks.append("=== MINUTES OF MEETING (user-reviewed, authoritative) ===\n"
+                      + mom_markdown.strip())
+
+    if (retrieved_lines or "").strip():
+        block = ("=== RELEVANT TRANSCRIPT EXTRACT ===\n" + retrieved_lines)
+        if truncated:
+            block += ("\n\n[EXTRACT TRUNCATED — more of these sections exist "
+                      "than fit here. If the answer seems to continue past the "
+                      "end of this extract, say the record you were given is "
+                      "partial.]")
+        blocks.append(block)
 
     return "\n\n".join(blocks) if blocks else "(No meeting content available.)"

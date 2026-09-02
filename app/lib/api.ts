@@ -218,10 +218,28 @@ export type AiDocumentSlot = {
   fresh: boolean;
 };
 
+// Where an AI answer came from: a segment of THIS meeting's transcript.
+//
+// The same `seg_N` identity a task's evidence already uses, so a chat source
+// and a task's "View in transcript" resolve through the ONE navigation
+// mechanism (/recording/[key]/transcript?evidence=seg_N) rather than each
+// having their own.
+export type ChatSource = {
+  segment_id: string;
+  speaker_id?: string;
+  start_time: number;
+  end_time: number;
+};
+
 export type ChatTurn = {
   role: "user" | "assistant";
   content: string;
   at?: string;
+  /** Present on assistant turns the backend could ground. Absent on user
+   *  turns, on answers the model declined to cite, and on every turn stored
+   *  before grounding shipped — so the UI must treat "no sources" as the
+   *  ordinary case and simply render no source row. */
+  sources?: ChatSource[];
 };
 
 export type ChatSuggestionGroup = { group: string; prompts: string[] };
@@ -817,6 +835,211 @@ export async function syncCrmRecord(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Integrations — connecting MinuteX to external applications.
+//
+// The app NEVER sees a provider credential. It asks the backend for an
+// authorize URL, opens it (lib/integrations.ts owns that browser round-trip),
+// and afterwards re-reads status. Access tokens, refresh tokens and client
+// secrets exist only server-side; nothing in these types can carry one,
+// because the backend assembles its responses field by field.
+// ---------------------------------------------------------------------------
+
+// The four states the backend reports. NOT_CONNECTED is what the ABSENCE of a
+// connection means; the other three are stored. The app must branch on this
+// rather than on "did we get an account address back" — a revoked connection
+// still has one.
+export type IntegrationStatusValue =
+  | "NOT_CONNECTED" | "CONNECTED" | "REAUTH_REQUIRED" | "ERROR";
+
+export type Integration = {
+  provider: string;
+  name: string;
+  category: string;
+  description: string;
+  /** Whether this provider can actually be connected yet. Server-driven, so
+   *  the day WhatsApp ships every installed build lights that card up without
+   *  an app update — and an old build can never offer a connect button for
+   *  something the backend cannot honour. */
+  available: boolean;
+  /** True for Salesforce: listed here so the Integrations screen is a complete
+   *  picture, but connected through its own existing screen rather than the
+   *  generic flow. The card routes there instead of calling connect. */
+  managed_elsewhere: boolean;
+  status: IntegrationStatusValue;
+  connected: boolean;
+  /** The connected account as the user knows it — a Gmail address today. */
+  account_identifier: string;
+  account_name: string;
+  scopes: string[];
+  connected_at: string;
+  updated_at: string;
+  /** Why the connection is unusable. Present only when status is
+   *  REAUTH_REQUIRED or ERROR, and always user-facing wording. */
+  message: string;
+};
+
+// The backend's "your MinuteX session is fine, but this INTEGRATION cannot
+// serve the request" answers (HTTP 409 + one of these codes).
+//
+// Deliberately NOT 401, for exactly the reason SALESFORCE_RECONNECT_CODE
+// documents above: a 401 makes `request` below clear the stored JWT and bounce
+// the user to /login, and a dead Gmail token must never sign anyone out of
+// MinuteX. Reconnecting Gmail is the fix; signing out never was.
+export const INTEGRATION_NOT_CONNECTED_CODE = "integration_not_connected";
+export const INTEGRATION_REAUTH_CODE = "integration_reauth_required";
+
+/** True when this error means "the integration is unusable" — either never
+ *  connected or needing reconnection. The single check every Gmail-dependent
+ *  screen uses, so no screen invents its own. */
+export function isIntegrationUnavailable(e: unknown): boolean {
+  return e instanceof ApiError
+    && (e.code === INTEGRATION_NOT_CONNECTED_CODE
+      || e.code === INTEGRATION_REAUTH_CODE);
+}
+
+export function isIntegrationReauth(e: unknown): boolean {
+  return e instanceof ApiError && e.code === INTEGRATION_REAUTH_CODE;
+}
+
+export async function getIntegrations(): Promise<Integration[]> {
+  const res = await request<{ integrations: Integration[] }>("/integrations");
+  return res.integrations ?? [];
+}
+
+export async function getIntegration(provider: string): Promise<Integration> {
+  const res = await request<{ integration: Integration }>(
+    `/integrations/${encodeURIComponent(provider)}`
+  );
+  return res.integration;
+}
+
+/** The provider's consent URL. Opening it is lib/integrations.ts's job. */
+export async function getIntegrationAuthorizeUrl(
+  provider: string
+): Promise<string> {
+  const res = await request<{ authorize_url: string }>(
+    `/integrations/${encodeURIComponent(provider)}/connect`,
+    { method: "POST" }
+  );
+  return res.authorize_url;
+}
+
+export async function disconnectIntegration(provider: string): Promise<void> {
+  await request(`/integrations/${encodeURIComponent(provider)}`, {
+    method: "DELETE",
+  });
+}
+
+// ---- Gmail ----------------------------------------------------------------
+
+/** One person an email can go to. `contact_id` is what the backend resolves
+ *  the address from — sending a contact_id alongside a different email is
+ *  ignored server-side, which is what stops the picker being a way to mail an
+ *  arbitrary address under a contact's name. */
+export type EmailRecipient = {
+  contact_id?: string;
+  name?: string;
+  email?: string;
+};
+
+/** A participant the backend resolved (or could not) for a meeting. */
+export type ResolvedRecipient = {
+  contact_id: string;
+  name: string;
+  email: string;
+  speaker_id: string;
+};
+
+export type MeetingRecipients = {
+  recipients: ResolvedRecipient[];
+  /** Participants mapped to a contact with NO email address. Shown next to the
+   *  person it applies to, so the user learns before pressing Send rather than
+   *  after — and the backend refuses the send if any are selected. */
+  unresolved: ResolvedRecipient[];
+  meeting_title: string;
+};
+
+/** Attachment types the backend accepts. Matches ATTACHMENT_TYPES in
+ *  cloud/shared/email_message.py — an allow-list on both sides. */
+export type EmailAttachmentType = "pdf" | "docx" | "md" | "txt";
+
+/** An attachment, rendered BY THE APP.
+ *
+ *  The PDF and DOCX renderers live here (lib/mom-pdf.ts, lib/mom-docx.ts) and
+ *  produce exactly what the user previews. Re-implementing them server-side
+ *  would mean two renderers that drift, and a recipient receiving a document
+ *  that differs from the preview — so the bytes travel base64 with the send
+ *  request instead. The backend validates them as untrusted input. */
+export type EmailAttachment = {
+  type: EmailAttachmentType;
+  filename: string;
+  content_base64: string;
+};
+
+export type SendEmailResult = {
+  sent: boolean;
+  message_id: string;
+  thread_id: string;
+  recipient_count: number;
+};
+
+export type SendEmailInput = {
+  recipients: EmailRecipient[];
+  subject?: string;
+  body?: string;
+  cc?: string[];
+  attachments?: EmailAttachment[];
+};
+
+/** Participants of a meeting, already resolved to addresses by the backend.
+ *  Requires a usable Gmail connection — throws with an integration code
+ *  otherwise, which is the server-side half of the visibility rule. */
+export async function getMeetingEmailRecipients(
+  key: string
+): Promise<MeetingRecipients> {
+  return request<MeetingRecipients>(
+    `/integrations/gmail/recipients/${encodeURIComponent(key)}`
+  );
+}
+
+/** Send meeting material (MoM, summary, highlights, action items) by Gmail. */
+export async function sendMeetingEmail(
+  key: string, input: SendEmailInput
+): Promise<SendEmailResult> {
+  return request<SendEmailResult>(
+    `/integrations/gmail/send/meeting/${encodeURIComponent(key)}`,
+    { method: "POST", body: input }
+  );
+}
+
+/** Send one task's details by Gmail. Explicitly triggered — this is
+ *  communication, not a notification engine: nothing schedules or batches. */
+export async function sendTaskEmail(
+  taskId: string, input: Partial<SendEmailInput> = {}
+): Promise<SendEmailResult> {
+  return request<SendEmailResult>(
+    `/integrations/gmail/send/task/${encodeURIComponent(taskId)}`,
+    { method: "POST", body: input }
+  );
+}
+
+/** A general email through the user's Gmail — follow-up communication that is
+ *  not tied to one meeting or task.
+ *
+ *  Named sendGmailEmail, not sendEmail, because lib/contacts.ts already
+ *  exports a sendEmail(): a mailto: deep link that opens whatever mail app the
+ *  phone has and needs no Gmail connection. Two functions called sendEmail
+ *  with completely different requirements — one gated on an OAuth connection,
+ *  one not — is a mistake waiting to be made at a call site. */
+export async function sendGmailEmail(
+  input: SendEmailInput
+): Promise<SendEmailResult> {
+  return request<SendEmailResult>("/integrations/gmail/send", {
+    method: "POST", body: input,
+  });
+}
+
 export async function getRecordings(): Promise<RecordingSummary[]> {
   const res = await request<{ recordings: RecordingSummary[] }>("/recordings");
   return res.recordings ?? [];
@@ -1274,11 +1497,23 @@ export async function sendAiChat(
   key: string,
   message: string,
   history?: ChatTurn[]
-): Promise<{ reply: string; chat_history: ChatTurn[] }> {
-  return request(aiPath("chat", key), {
+): Promise<{ reply: string; chat_history: ChatTurn[]; sources: ChatSource[] }> {
+  const res = await request<{
+    reply?: string;
+    chat_history?: ChatTurn[];
+    sources?: ChatSource[];
+  }>(aiPath("chat", key), {
     method: "POST",
     body: history?.length ? { message, history } : { message },
   });
+  // `sources` is additive: an older backend does not send it, and an answer
+  // the model could not ground has none. Defaulted here so no caller has to
+  // distinguish those two cases from an empty list — they render identically.
+  return {
+    reply: res.reply ?? "",
+    chat_history: res.chat_history ?? [],
+    sources: res.sources ?? [],
+  };
 }
 
 export async function clearAiChat(key: string): Promise<void> {
@@ -1395,8 +1630,23 @@ export type ApiTask = {
   folder_id?: string;
   source_recording_id?: string;
   source_type?: TaskSourceType;
+  /** The MODEL's own confidence in this extraction: "high" | "medium" | "low",
+   *  or "" when it made no claim. A fixed enum, never a number — a score like
+   *  0.87 is precision the model did not actually have, so the backend refuses
+   *  it. Render the band, never a percentage. */
   ai_confidence?: string;
+  /** The VERBATIM sentence from the transcript that created this task. What
+   *  lets a reader check the task against what was really said. */
   ai_evidence?: string;
+  /** WHERE that sentence sits — transcript segment ids ("seg_12"), validated
+   *  server-side against the real segment list. Empty when the model gave no
+   *  usable reference, so an affordance built on it must degrade to showing
+   *  the quote alone. */
+  ai_evidence_segment_ids?: string[];
+  /** The ONE flag to branch on for "a human must confirm the assignee".
+   *  Computed server-side from resolution_status so the app and the API can
+   *  never disagree — do NOT re-derive this on the client. */
+  needs_review?: boolean;
   completed_at?: string;
 };
 
@@ -1560,6 +1810,14 @@ export type ApiParticipant = {
   created_at: string;
   updated_at: string;
   contact?: ApiContact;
+  /** Present but NOT a voice in the transcript — someone who self-tagged as
+   * having attended without speaking.
+   *
+   * The backend decides this and sends it as a boolean; the storage shape
+   * behind it (a reserved speaker_id) is deliberately not something the app
+   * parses. An attendance row is never a speaker: it is not in speaker_names,
+   * no generated document names it as one, and it never resolves an AI task. */
+  attendance_only?: boolean;
 };
 
 /** Returned as a 409 when a contact name matches people we already know
@@ -1775,6 +2033,10 @@ export type ParticipantsResponse = {
   /** The diarization labels this transcript actually contains. */
   speakers: string[];
   speaker_names: Record<string, string>;
+  /** Where the recording is in the pipeline, so an empty speaker list can be
+   * read correctly: still processing (voices may yet appear) versus finished
+   * with none found (they will not). Optional — an older backend omits it. */
+  recording_status?: RecordingStatus | string;
   folder_id: string;
   /** Offered FIRST in the picker — a shortcut, never a restriction. Any global
    * contact can still be chosen. */
@@ -1819,6 +2081,25 @@ export async function setParticipant(
   });
 }
 
+/** Record that someone ATTENDED this meeting without speaking.
+ *
+ * Same route and same table as speaker mapping — the backend stores it under
+ * a reserved key derived from the contact, which is what makes a repeat tap
+ * land on the same row instead of adding the person twice.
+ *
+ * Deliberately NOT a speaker mapping: it creates no transcript segments, does
+ * not claim a speaker label, and cannot cause an AI task to be assigned to
+ * them. Attendance is a statement about the room, not about the audio. */
+export async function tagAttendee(
+  key: string,
+  contactId: string
+): Promise<{ participant?: ApiParticipant; tasks_resolved?: number }> {
+  return request(`/recordings/participants/${encodeURIComponent(key)}`, {
+    method: "PUT",
+    body: { contact_id: contactId, attendance_only: true },
+  });
+}
+
 // -- Cross-meeting tasks ----------------------------------------------------
 export type TaskFilters = {
   status?: TaskStatusV2;
@@ -1855,8 +2136,50 @@ export async function getAllTasks(
   return { tasks: res.tasks ?? [], next_cursor: res.next_cursor ?? "" };
 }
 
+/** What the AUTHENTICATED caller may do with a task.
+ *
+ * Computed server-side and sent with the task, so the app renders the right
+ * controls without re-deriving the rule (and so it cannot get it wrong).
+ * This is presentation only — the backend enforces every one of these
+ * independently, and a client that ignores them gets 403/404, not a write.
+ *
+ * The model: the CREATOR (`owner_user_id` — the authenticated user for a
+ * manual task, the MEETING OWNER for an AI-seeded one) controls the task's
+ * configuration. The ASSIGNEE (`assignee_user_id`, set only from a contact
+ * linked to a real MinuteX account) executes it and may change ONLY status.
+ * Everyone else cannot see it at all. */
+export type TaskPermissions = {
+  is_creator: boolean;
+  is_assignee: boolean;
+  can_view: boolean;
+  can_change_status: boolean;
+  can_edit_details: boolean;
+  can_change_deadline: boolean;
+  can_change_assignee: boolean;
+  can_resolve_assignment: boolean;
+  can_delete: boolean;
+};
+
+/** The safe default for a backend that predates the permission model: assume
+ * the caller is the creator, which is what every task was before assignees
+ * could see anything. Never used to GRANT anything server-side. */
+export const CREATOR_PERMISSIONS: TaskPermissions = {
+  is_creator: true, is_assignee: false, can_view: true,
+  can_change_status: true, can_edit_details: true, can_change_deadline: true,
+  can_change_assignee: true, can_resolve_assignment: true, can_delete: true,
+};
+
 export type TaskDetail = {
   task: ApiTask;
+  permissions?: TaskPermissions;
+  /** Who gave this task to the current user. Sent ONLY to an assignee — the
+   * creator is looking at a task they made and needs no attribution.
+   *
+   * This is the task's creator: only a creator can assign or reassign, and an
+   * AI-seeded task is assigned by the meeting owner, so `owner_user_id` IS the
+   * assigner. Name and photo only, never an email — the assignee has no
+   * relationship with that account beyond this one task. */
+  assigned_by?: { name: string; avatar_view_url?: string };
   contact?: ApiContact;
   folder?: ApiFolder;
   recording?: {
@@ -1867,11 +2190,80 @@ export type TaskDetail = {
     // The meeting's speaker_names, so the detail screen can name the speaker
     // a task came from without a second call to getParticipants.
     speaker_names?: Record<string, string>;
+    /** WHICH MEETING SCREEN this key opens.
+     *
+     * "owner"    the full meeting — audio, transcript, AI, editing.
+     * "assignee" the READ-ONLY notes at /meeting/[key]/shared, and only that.
+     *            The full route still 404s for this caller.
+     *
+     * Sent by the backend so the app switches on one field instead of
+     * re-deriving "am I the creator?" client-side. Absent on older responses,
+     * which the caller must read as "owner" — that was the only case that
+     * ever carried a key before this field existed. */
+    access?: "owner" | "assignee";
   };
 };
 
 export async function getTaskDetail(taskId: string): Promise<TaskDetail> {
   return request<TaskDetail>(`/tasks/${encodeURIComponent(taskId)}`);
+}
+
+// ===========================================================================
+// THE MEETING AN ASSIGNEE MAY READ.
+//
+// A task assignee is not the meeting's owner and cannot open it: every route
+// under /recordings/{key+} gates on ownership and 404s for them. But a task
+// with no context — "prepare the revised quotation by Friday", and nothing
+// about which vendor or what was agreed — is not actionable, so the backend
+// exposes the meeting's NOTES on a separate, read-only route.
+//
+// WHAT THIS IS NOT. It is not the meeting detail response with fields
+// stripped. The backend assembles it through the same builder the public
+// share page uses, and it contains no transcript, no audio URL and no S3
+// key — not hidden, absent. There is deliberately no mutating counterpart to
+// this call anywhere in this file.
+// ===========================================================================
+
+/** One MoM section as the read-only view receives it. The four kinds are the
+ *  MoM schema's, NOT the Overview's two — a shared meeting can carry either,
+ *  so the screen renders both shapes. */
+export type SharedMeetingSection = {
+  kind: "text" | "list" | "fields" | "table" | string;
+  title: string;
+  text?: string;
+  items?: string[];
+  fields?: { label: string; value: string }[];
+  columns?: string[];
+  rows?: string[][];
+};
+
+export type SharedMeeting = {
+  title: string;
+  recorded_at: string;
+  duration: number | null;
+  language: string;
+  /** The AI's own Overview sections — what the owner's Overview tab shows.
+   *  Preferred when non-empty. */
+  overview: OverviewSection[];
+  /** The MoM structure. Populated ONLY when `overview` is empty, so the same
+   *  content can never render twice under two sets of headings. */
+  sections: SharedMeetingSection[];
+  /** Always null on this route. Present in the type because the payload is
+   *  the share assembler's, and pinning them as null documents that the
+   *  absence is the CONTRACT rather than a backend that happened to omit
+   *  them — a future non-null here is a bug, not a feature. */
+  transcript: null;
+  audio_url: null;
+  speaker_blocks: never[];
+  expires_at: string | null;
+};
+
+export async function getSharedMeeting(
+  key: string
+): Promise<{ meeting: SharedMeeting; access: "owner" | "assignee" }> {
+  return request<{ meeting: SharedMeeting; access: "owner" | "assignee" }>(
+    `/recordings/shared-with-me/${encodeURIComponent(key)}`
+  );
 }
 
 export async function patchTaskById(
@@ -1933,4 +2325,255 @@ export async function assignTaskToContact(
     body: { id, assignee_contact_id: contactId },
   });
   return res.task;
+}
+
+// ---------------------------------------------------------------------------
+// Meeting Share — a read-only public link to one meeting.
+//
+// The recipient needs no MinuteX account: the link carries a high-entropy
+// token and the backend renders an HTML page from it. Two consequences shape
+// this client:
+//
+//   * THE URL IS RETURNED EXACTLY ONCE, by createShare. Only sha256(token) is
+//     stored server-side, so listShares deliberately CANNOT return a `url` —
+//     the server has no way to reconstruct one. That is why the UI shows the
+//     link in a "copy it now" state after creation and offers only Revoke for
+//     older links. It is a security property, not a missing feature.
+//
+//   * THE TOGGLES ARE ENFORCED SERVER-SIDE. Sending transcript:false means the
+//     transcript never enters the rendered page at all, so this client never
+//     has to worry about hiding anything.
+//
+// Route shape note: the action segment comes FIRST and the recording key LAST
+// ("/recordings/share/{key+}"), the same constraint every recording-scoped
+// route in this API obeys — a key contains slashes, so it must be the greedy
+// trailing variable.
+// ---------------------------------------------------------------------------
+
+/** What a share link exposes. Mirrors share_schema.TOGGLES on the backend. */
+export type ShareConfig = {
+  summary: boolean;
+  highlights: boolean;
+  decisions: boolean;
+  tasks: boolean;
+  participants: boolean;
+  transcript: boolean;
+  audio: boolean;
+};
+
+/** The V1 default: notes shared, transcript and audio withheld. */
+export const DEFAULT_SHARE_CONFIG: ShareConfig = {
+  summary: true,
+  highlights: true,
+  decisions: true,
+  tasks: true,
+  participants: true,
+  transcript: false,
+  audio: false,
+};
+
+/** One share link as its OWNER sees it. Never carries the token or its hash. */
+export type MeetingShare = {
+  share_id: string;
+  recording_key: string;
+  access_type: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  updated_at: string;
+  view_count: number;
+  last_viewed_at: string | null;
+  active: boolean;
+  summary_enabled: boolean;
+  highlights_enabled: boolean;
+  decisions_enabled: boolean;
+  tasks_enabled: boolean;
+  participants_enabled: boolean;
+  transcript_enabled: boolean;
+  audio_enabled: boolean;
+  /** Present ONLY on the create response — see the section header. */
+  url?: string;
+};
+
+export type CreateShareResult = {
+  share_id: string;
+  url: string;
+  expires_at: string | null;
+  share: MeetingShare;
+};
+
+function sharePath(action: "share" | "shares", key: string): string {
+  return `/recordings/${action}/${encodeURIComponent(key)}`;
+}
+
+/** Turn the backend's *_enabled row into the toggle shape the sheet edits. */
+export function shareConfigOf(share: MeetingShare): ShareConfig {
+  return {
+    summary: share.summary_enabled,
+    highlights: share.highlights_enabled,
+    decisions: share.decisions_enabled,
+    tasks: share.tasks_enabled,
+    participants: share.participants_enabled,
+    transcript: share.transcript_enabled,
+    audio: share.audio_enabled,
+  };
+}
+
+/**
+ * Create a public link for one meeting.
+ *
+ * `expiresInDays` null/undefined means the link never expires. The returned
+ * `url` is the ONLY time the raw token exists on this device — show it, let
+ * the user copy or share it, and do not expect to fetch it again later.
+ */
+export async function createShare(
+  key: string,
+  config: ShareConfig,
+  expiresInDays?: number | null
+): Promise<CreateShareResult> {
+  return request<CreateShareResult>(sharePath("share", key), {
+    method: "POST",
+    body: { ...config, expires_at: expiresInDays ?? null },
+  });
+}
+
+/** Every share link for this meeting, newest first. No URLs — see above. */
+export async function listShares(key: string): Promise<MeetingShare[]> {
+  const res = await request<{ shares?: MeetingShare[] }>(sharePath("shares", key));
+  return res.shares ?? [];
+}
+
+/** Retoggle or re-expire a LIVE link, without changing its URL. Narrowing a
+ * share takes effect immediately on the already-published page. */
+export async function updateShare(
+  shareId: string,
+  config: Partial<ShareConfig>,
+  expiresInDays?: number | null
+): Promise<MeetingShare> {
+  const body: Record<string, unknown> = { ...config };
+  if (expiresInDays !== undefined) body.expires_at = expiresInDays;
+  const res = await request<{ share: MeetingShare }>(
+    `/shares/${encodeURIComponent(shareId)}`,
+    { method: "PATCH", body }
+  );
+  return res.share;
+}
+
+/** Kill a link. The URL stops working immediately and permanently — there is
+ * no un-revoke, because the token only exists with whoever already has it. */
+export async function revokeShare(shareId: string): Promise<void> {
+  await request(`/shares/${encodeURIComponent(shareId)}`, { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------
+// Notifications — the in-app notification centre.
+//
+// The backend derives the recipient from the JWT on EVERY one of these calls;
+// there is no user id in any signature below, and there is deliberately no way
+// to ask for someone else's notifications. See the userApi's NOTIFICATIONS
+// section for the server-side rule.
+//
+// Gmail is not involved. A notification is an in-app record; the Gmail
+// integration remains a separate thing the user triggers by hand. `channels`
+// below is the seam for a later email/WhatsApp delivery channel and is always
+// ["IN_APP"] in this phase.
+// ---------------------------------------------------------------------------
+export type NotificationType =
+  | "MEETING_PROCESSING_COMPLETED"
+  | "MEETING_PROCESSING_FAILED"
+  | "AI_OUTPUT_READY"
+  | "AI_ACTION_REQUIRED"
+  | "TASK_ASSIGNED"
+  | "TASK_REASSIGNED"
+  | "TASK_DUE_TODAY"
+  | "TASK_OVERDUE"
+  | "MEETING_DOCUMENT_READY"
+  | "MEETING_OUTPUT_SHARED";
+
+export type NotificationPriority = "LOW" | "NORMAL" | "HIGH";
+
+/** What a notification points AT. The app opens the entity by this pair —
+ *  never by anything embedded in the notification itself, which is why a
+ *  renamed task still opens correctly from an old notification. */
+export type NotificationEntityType = "task" | "meeting" | "document";
+
+export type AppNotification = {
+  notification_id: string;
+  // Widened with `string` on purpose: a row written by a newer backend must
+  // still render on an older build rather than crashing the list. Unknown
+  // types fall back to neutral styling and a non-actionable row.
+  type: NotificationType | string;
+  title: string;
+  message: string;
+  priority: NotificationPriority | string;
+  entity_type: NotificationEntityType | string;
+  entity_id: string;
+  is_read: boolean;
+  read_at: string;
+  created_at: string;
+  /** Small flat display extras (document_type, meeting_title, due_date …).
+   *  Bounded server-side — never a business object. */
+  metadata: Record<string, string>;
+  /** Delivered-on channels. Always ["IN_APP"] in Phase 1. */
+  channels: string[];
+};
+
+export type NotificationPage = {
+  notifications: AppNotification[];
+  count: number;
+  next_cursor: string;
+  /** Only present on the FIRST page (no cursor) — it is a property of the
+   *  inbox, not of the page, so later pages do not recompute it. */
+  unread_count?: number;
+};
+
+/** One page of notifications, newest first. */
+export async function getNotifications(opts?: {
+  limit?: number;
+  cursor?: string;
+  unreadOnly?: boolean;
+}): Promise<NotificationPage> {
+  const qs = new URLSearchParams();
+  if (opts?.limit) qs.set("limit", String(opts.limit));
+  if (opts?.cursor) qs.set("cursor", opts.cursor);
+  if (opts?.unreadOnly) qs.set("unread", "1");
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  const res = await request<NotificationPage>(`/notifications${suffix}`);
+  return {
+    notifications: res.notifications ?? [],
+    count: res.count ?? 0,
+    next_cursor: res.next_cursor ?? "",
+    unread_count: res.unread_count,
+  };
+}
+
+/** Just the badge number. Separate from the list because it is polled far
+ *  more often than the centre is opened, and must not pay for a page of
+ *  notification bodies to render a count. */
+export async function getUnreadNotificationCount(): Promise<number> {
+  const res = await request<{ unread_count?: number }>(
+    "/notifications/unread-count"
+  );
+  return res.unread_count ?? 0;
+}
+
+/** Mark ONE notification read. Idempotent — marking an already-read one
+ *  succeeds, because the caller's goal is already true. */
+export async function markNotificationRead(
+  notificationId: string
+): Promise<{ notification: AppNotification; unread_count: number }> {
+  return request(
+    `/notifications/${encodeURIComponent(notificationId)}/read`,
+    { method: "POST", body: {} }
+  );
+}
+
+/** Mark every unread notification read. `remaining` is non-zero only for a
+ *  backlog larger than one call's ceiling — the caller repeats until it is 0. */
+export async function markAllNotificationsRead(): Promise<{
+  marked: number;
+  unread_count: number;
+  remaining: number;
+}> {
+  return request("/notifications/read-all", { method: "POST", body: {} });
 }

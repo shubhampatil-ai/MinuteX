@@ -117,7 +117,7 @@ function buildStyles(C: ColorScale) {
 // ===========================================================================
 export function TranscriptView({
   transcript, speakerBlocks, speakerColors, resolveName, onRenameSpeaker,
-  search, onSearchChange,
+  search, onSearchChange, highlightIds, onHighlightLayout,
 }: {
   transcript: string;
   speakerBlocks: SpeakerBlock[];
@@ -126,10 +126,23 @@ export function TranscriptView({
   onRenameSpeaker: (label: string) => void;
   search: string;
   onSearchChange: (v: string) => void;
+  /** Segment ids to call out — an AI task's `ai_evidence_segment_ids`. The
+   *  block model has carried `ids` since it was written precisely so a
+   *  reference like "seg_12" could be resolved without a second data path.
+   *  Optional: every existing caller renders exactly as before. */
+  highlightIds?: string[];
+  /** Fired with the y-offset of the FIRST highlighted block, so the screen can
+   *  scroll to it. Reported rather than scrolled here because this component
+   *  does not own the ScrollView — the screen does. */
+  onHighlightLayout?: (y: number) => void;
 }) {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
   const { seekTo, currentTime, playing } = useAudioSeek();
+
+  // A Set so a block with many segments is still one cheap lookup per block.
+  const wanted = useMemo(
+    () => new Set((highlightIds ?? []).filter(Boolean)), [highlightIds]);
 
   const q = search.trim().toLowerCase();
   const filteredBlocks = q
@@ -171,8 +184,24 @@ export function TranscriptView({
           const name = resolveName(b.speaker);
           const isNamed = name !== `Speaker ${b.speaker}`;
           const active = playing && currentTime >= b.start && currentTime < b.end;
+          // The evidence this screen was opened for. Kept SEPARATE from
+          // `active` (the playback cursor): they mean different things and can
+          // legitimately be true at once, so one must not silently mask the
+          // other.
+          const isEvidence = wanted.size > 0 && b.ids.some((id) => wanted.has(id));
+          const firstEvidence =
+            isEvidence &&
+            filteredBlocks.findIndex((x) => x.ids.some((id) => wanted.has(id))) === i;
           return (
-            <View key={i} style={{ flexDirection: "row", gap: 12, marginTop: 18 }}>
+            <View
+              key={i}
+              style={{ flexDirection: "row", gap: 12, marginTop: 18 }}
+              onLayout={
+                firstEvidence && onHighlightLayout
+                  ? (e) => onHighlightLayout(e.nativeEvent.layout.y)
+                  : undefined
+              }
+            >
               <View style={{ width: 44, flexShrink: 0, alignItems: "flex-end" }}>
                 {seekTo ? (
                   <Pressable onPress={() => seekTo(b.start)} hitSlop={8} accessibilityLabel={`Play from ${fmtTs(b.start)}`}>
@@ -185,8 +214,17 @@ export function TranscriptView({
                 )}
               </View>
               <View style={{
-                flex: 1, backgroundColor: active ? C.primarySoft : "transparent",
-                borderRadius: R.md, padding: active ? 10 : 0,
+                flex: 1,
+                backgroundColor: isEvidence
+                  ? C.accentSoft
+                  : active ? C.primarySoft : "transparent",
+                borderRadius: R.md,
+                padding: isEvidence || active ? 10 : 0,
+                // A left rule rather than a border box: the evidence block
+                // should read as marked, not as a separate card interrupting
+                // the transcript.
+                borderLeftWidth: isEvidence ? 3 : 0,
+                borderLeftColor: isEvidence ? C.accent : "transparent",
               }}>
                 <Pressable
                   onPress={() => onRenameSpeaker(b.speaker)}

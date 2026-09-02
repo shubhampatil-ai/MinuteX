@@ -55,6 +55,27 @@ Routes (HTTP API, payload format v2.0):
   PATCH  /recordings/ai/tasks/{key+}      {id, ...}           -> {task}
   DELETE /recordings/ai/tasks/{key+}      {id}                -> {deleted, id}
 
+  Meeting Share — a read-only public link (see the Meeting Share section).
+  POST   /recordings/share/{key+}   {summary?,highlights?,decisions?,tasks?,
+                                     participants?,transcript?,audio?,
+                                     expires_at?}          (JWT)
+                                  -> 201 {share_id, url, expires_at, share}
+         The `url` is the ONLY time the raw token is ever returned — only its
+         sha256 is stored, so it cannot be re-derived later.
+  GET    /recordings/shares/{key+}                  (JWT)  -> {shares:[...]}
+  PATCH  /shares/{share_id}   {toggles?, expires_at?} (JWT) -> {share}
+  DELETE /shares/{share_id}                          (JWT)  -> {share_id, revoked}
+  GET    /share/{token}     (NO JWT — the token IS the credential) -> text/html
+  GET    /share/{token}/audio  (NO JWT) -> 302 to a fresh short-lived presign
+         The <audio> element points HERE, never at S3, so every seek
+         re-validates the share and re-signs. That is what makes revocation
+         reach playback already under way, and what makes a two-hour meeting
+         seekable — S3 checks a presign at REQUEST time, so one flat window
+         would break the first seek past it.
+         The greedy {key+} sits LAST for the same API Gateway reason the AI
+         routes give above, which is why it is /recordings/share/{key+} and
+         not /recordings/{key}/share.
+
   CRM — Salesforce connect + configuration (see the CRM sections below).
   GET    /crm/salesforce/connect                    (JWT)    -> {authorize_url}
   GET    /crm/salesforce/callback  ?code&state    (NO JWT — Salesforce redirect) -> 302
@@ -67,6 +88,24 @@ Routes (HTTP API, payload format v2.0):
   POST   /crm/salesforce/lookup     {object, lookup_value} (JWT)
                               -> {status: found|not_found|ambiguous, ...}
   POST   /crm/salesforce/sync/{key+} {object}         (JWT)   -> {crm_record}
+
+  Integrations — connect MinuteX to external applications (see the
+  INTEGRATIONS section). Generic over providers; Gmail is the only one that
+  can currently be connected.
+  GET    /integrations                          (JWT) -> {integrations:[...]}
+  GET    /integrations/{provider}               (JWT) -> {integration:{...}}
+  POST   /integrations/{provider}/connect       (JWT) -> {authorize_url}
+  GET    /integrations/{provider}/callback ?code&state  (NO JWT — the
+                                    provider's browser redirect) -> 302
+  DELETE /integrations/{provider}               (JWT) -> {disconnected}
+
+  Gmail communication (JWT, and every one of them ALSO requires a usable
+  Gmail connection — they answer 409 with a `code` otherwise):
+  POST   /integrations/gmail/send   {recipients, subject, body, cc?,
+                                     attachments?}         -> {sent, message_id}
+  GET    /integrations/gmail/recipients/{key+}   -> {recipients, unresolved}
+  POST   /integrations/gmail/send/meeting/{key+} {recipients, ...}
+  POST   /integrations/gmail/send/task/{task_id} {recipients?, ...}
 
   Every /crm route that TALKS to Salesforce (objects, fields, config PUT,
   lookup, sync) answers 409 {"code": "salesforce_reconnect_required"} when the
@@ -182,10 +221,16 @@ from botocore.exceptions import ClientError
 # The shared AI core — the SAME modules transcribeRecording uses. Vendored flat
 # into this function's zip (see scripts/21_deploy_ai_workspace.sh).
 import ai_schema
+import email_message
 import groq_client
+import integrations
 import mom_schema
+import notification_schema
+import pageindex
+import pageindex_store
 import spoken_dates
 import prompts
+import share_schema
 import stt_result
 import transcript_store
 
@@ -196,12 +241,16 @@ DEVICE_KEYS_TABLE = os.environ.get("DEVICE_KEYS_TABLE", "DeviceKeys")
 DEVICES_TABLE = os.environ.get("DEVICES_TABLE", "Devices")
 RECORDINGS_TABLE = os.environ.get("RECORDINGS_TABLE", "Recordings")
 CRM_CONNECTIONS_TABLE = os.environ.get("CRM_CONNECTIONS_TABLE", "CrmConnections")
+INTEGRATIONS_TABLE = os.environ.get("INTEGRATIONS_TABLE", "Integrations")
 CONTACTS_TABLE = os.environ.get("CONTACTS_TABLE", "Contacts")
 FOLDERS_TABLE = os.environ.get("FOLDERS_TABLE", "Folders")
 FOLDER_CONTACTS_TABLE = os.environ.get("FOLDER_CONTACTS_TABLE", "FolderContacts")
 MEETING_PARTICIPANTS_TABLE = os.environ.get("MEETING_PARTICIPANTS_TABLE",
                                             "MeetingParticipants")
 TASKS_TABLE = os.environ.get("TASKS_TABLE", "Tasks")
+NOTIFICATIONS_TABLE = os.environ.get("NOTIFICATIONS_TABLE", "Notifications")
+NOTIFICATION_DEDUPE_TABLE = os.environ.get("NOTIFICATION_DEDUPE_TABLE",
+                                           "NotificationDedupe")
 DEVICE_INDEX = os.environ.get("DEVICE_INDEX", "device-index")
 USER_INDEX = os.environ.get("USER_INDEX", "user-index")
 PAIRED_USER_INDEX = os.environ.get("PAIRED_USER_INDEX", "paired-user-index")
@@ -220,7 +269,18 @@ TASKS_OWNER_INDEX = os.environ.get("TASKS_OWNER_INDEX", "owner-index")
 TASKS_MEETING_INDEX = os.environ.get("TASKS_MEETING_INDEX", "meeting-index")
 TASKS_FOLDER_INDEX = os.environ.get("TASKS_FOLDER_INDEX", "folder-index")
 TASKS_ASSIGNEE_INDEX = os.environ.get("TASKS_ASSIGNEE_INDEX", "assignee-index")
+# Tasks assigned to a MinuteX ACCOUNT (not a contact). The assignee-index
+# above is keyed on assignee_contact_id — an address-book record, which is
+# not an identity and cannot authenticate — so it cannot answer "tasks
+# assigned to me". assignee_user_id is a SPARSE key (see _TASK_SPARSE_KEYS),
+# so unassigned tasks never enter this index.
+TASKS_ASSIGNEE_USER_INDEX = os.environ.get(
+    "TASKS_ASSIGNEE_USER_INDEX", "assignee-user-index")
 TASKS_DEDUPE_INDEX = os.environ.get("TASKS_DEDUPE_INDEX", "dedupe-index")
+NOTIFICATIONS_USER_INDEX = os.environ.get("NOTIFICATIONS_USER_INDEX",
+                                          "user-index")
+NOTIFICATIONS_UNREAD_INDEX = os.environ.get("NOTIFICATIONS_UNREAD_INDEX",
+                                            "user-unread-index")
 JWT_TTL = int(os.environ.get("JWT_TTL", "86400"))  # seconds (default 24h)
 PAIRING_CODE_TTL = int(os.environ.get("PAIRING_CODE_TTL", "300"))  # seconds
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
@@ -240,6 +300,27 @@ SALESFORCE_API_VERSION = os.environ.get("SALESFORCE_API_VERSION", "v62.0")
 # Where the callback redirects the browser once the exchange is done — a deep
 # link back into the app, e.g. "minutex://crm/salesforce/connected".
 SALESFORCE_RETURN_URL = os.environ.get("SALESFORCE_RETURN_URL", "")
+
+# --- Integrations (generic) + the Google OAuth client behind Gmail ---
+# ONE Google OAuth client serves every Google-family integration: Gmail today,
+# Calendar and Tasks later. They differ only by the scopes requested at
+# authorize time, so a second client id would be three sets of credentials to
+# rotate for no isolation gain — Google scopes the grant per user per scope,
+# not per client.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET_ARN = os.environ.get("GOOGLE_CLIENT_SECRET_ARN", "")
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "")
+# Separate from SALESFORCE_KMS_KEY_ID so an integration credential and a CRM
+# credential are not protected by the same key — revoking or rotating one must
+# not reach the other. Falls back to the Salesforce key when unset (see
+# _integration_kms_encrypt) so an un-provisioned stack degrades to "still
+# encrypted", never to plaintext.
+INTEGRATIONS_KMS_KEY_ID = os.environ.get("INTEGRATIONS_KMS_KEY_ID", "")
+# Deep link the OAuth callback redirects back to, e.g.
+# "minutex://integrations/connected". One URL for every provider — the
+# callback appends ?provider= so the app knows which card to refresh.
+INTEGRATION_RETURN_URL = os.environ.get("INTEGRATION_RETURN_URL", "")
+INTEGRATION_STATE_TTL = int(os.environ.get("INTEGRATION_STATE_TTL", "600"))
 
 # Wall-clock ceiling for one on-demand AI generation. Unlike the S3-triggered
 # pipeline (which can spend 300s because nobody is waiting), these routes answer
@@ -391,6 +472,9 @@ _device_keys = _ddb.Table(DEVICE_KEYS_TABLE)
 _devices = _ddb.Table(DEVICES_TABLE)
 _recordings = _ddb.Table(RECORDINGS_TABLE)
 _crm_connections = _ddb.Table(CRM_CONNECTIONS_TABLE)
+_integrations = _ddb.Table(INTEGRATIONS_TABLE)
+_notifications = _ddb.Table(NOTIFICATIONS_TABLE)
+_notification_dedupe = _ddb.Table(NOTIFICATION_DEDUPE_TABLE)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -1967,6 +2051,9 @@ def permanently_delete_recording(event):
 
       * the audio object in S3, at the key that IS the primary key;
       * the transcript object, at transcript_store.s3_key_for(key);
+      * the PageIndex tree, at pageindex_store.s3_key_for(key) — its pointer
+        lives on the row and dies with it, so leaving the object would orphan
+        it exactly as an un-deleted transcript would;
       * the DynamoDB row — and with it EVERY AI artifact, because documents,
         tasks, chat history, highlights, speaker names and crm_records are all
         attributes ON that row rather than separate tables. One delete_item
@@ -2004,7 +2091,8 @@ def permanently_delete_recording(event):
         # (a recording that never got past upload has none) must not stop the
         # audio delete.
         for what, s3_key in (("audio", key),
-                             ("transcript", transcript_store.s3_key_for(key))):
+                             ("transcript", transcript_store.s3_key_for(key)),
+                             ("pageindex", pageindex_store.s3_key_for(key))):
             try:
                 _s3.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
             except Exception as err:  # noqa: BLE001 — see the docstring
@@ -3006,6 +3094,362 @@ def regenerate_highlights(event):
                        "segments_covered": covered, "segments_total": total})
 
 
+# ===========================================================================
+# MEETING RETRIEVAL — grounded context for the AI, from anywhere in a meeting.
+#
+# THE PROBLEM THIS SOLVES. `chat` below used to build its context with
+# prompts.build_context(..., transcript_budget_chars=...), which head-truncates:
+# a transcript longer than one TPM window is cut to its FIRST N characters and
+# the model is told the record is partial. On a 15-minute meeting that never
+# fires. On a two-hour one it means "what did we decide about pricing at the
+# end?" is unanswerable — the model is holding the first thirty-five minutes,
+# and the rest is in S3, unread.
+#
+# So the transcript is indexed into a per-meeting PageIndex tree (see
+# shared/pageindex.py) and the question is used to RETRIEVE the sections that
+# bear on it, wherever in the meeting they fall.
+#
+# WHEN RETRIEVAL RUNS. Only when it has to. If the whole labelled transcript
+# fits the budget it is all sent, exactly as before — retrieval can only lose
+# information in that case, and it would cost an extra Groq round-trip to do
+# it. Retrieval engages precisely in the case the old code got wrong.
+#
+# THE ONE ENTRY POINT. `retrieve_meeting_context` is the only way into this,
+# and it takes the ALREADY-AUTHORIZED item from _owned_recording — it is never
+# handed a bare meeting_id. That ordering (authorize, then retrieve) is what
+# makes it impossible to reach another user's index through this path: there is
+# no code path that resolves an index from a key alone.
+# ===========================================================================
+
+# How many retrieved segments are turned into `sources` on the response. Four
+# is what a chat bubble can show without becoming a citation list; the answer
+# itself is grounded in everything retrieved, not just these.
+MAX_CHAT_SOURCES = 4
+
+# Deadline split for the two-call retrieval path. The navigation call is small
+# (a table of contents and a question) and must not eat the budget the ANSWER
+# needs — a fast retrieval followed by a killed answer is strictly worse than
+# no retrieval at all, because the user waited and got nothing.
+RETRIEVAL_DEADLINE_SECONDS = int(os.environ.get("PAGEINDEX_RETRIEVAL_DEADLINE", "7"))
+
+
+def _speaker_names(item):
+    names = item.get("speaker_names")
+    return names if isinstance(names, dict) else {}
+
+
+def _authoritative_mom(item):
+    """The user-reviewed MoM as Markdown, or "".
+
+    Sent to the model ABOVE the transcript and marked authoritative (see
+    prompts.MOM_CONTEXT_RULES) so a correction the user made in the minutes
+    wins over what the audio literally says.
+
+    Read from the stored STRUCTURE and re-rendered rather than from the
+    mirrored document, because the structure is the source of truth
+    (mom_schema) and the mirror is refreshed from it — going to the structure
+    means the model cannot see a mirror that a failed write left stale.
+    """
+    mom = _stored_mom(item)
+    if not mom:
+        return ""
+    try:
+        return mom_schema.render_markdown(mom) or ""
+    except Exception as err:  # noqa: BLE001
+        print(f"[pageindex] MoM render failed: {err}")
+        return ""
+
+
+def _ensure_index(key, item, fingerprint, deadline=None):
+    """The meeting's PageIndex tree, building it if needed. None if unavailable.
+
+    LAZY GENERATION. An index that is missing (an old meeting, a build that
+    failed, a pipeline that skipped it) is built here, on the first question
+    that needs it. That is what keeps "no index" from being a user-visible
+    error: the feature repairs itself on demand and the user just gets an
+    answer (Part 23).
+
+    SINGLE-FLIGHT. The build is behind pageindex_store.claim(), a conditional
+    write only one caller can win. A caller that loses returns None and falls
+    back for that one request rather than duplicating the work.
+
+    NEVER RAISES. Every failure returns None, and None means "answer the old
+    way" — which still works. An index is an optimisation over a fallback that
+    is already correct, so no failure in here is worth a 500.
+    """
+    stale_pointer = False
+    if pageindex_store.is_fresh(item, fingerprint):
+        tree = pageindex_store.load(_s3, BUCKET_NAME, item)
+        if tree:
+            return tree
+        # Pointer says ready, object is gone or corrupt. Rebuild rather than
+        # trust a record we just failed to honour — and claim with force, or the
+        # claim would be refused for the very freshness we have just disproved
+        # and this meeting could never recover.
+        stale_pointer = True
+
+    owner = item.get("user_id") or ""
+    if not pageindex_store.claim(_recordings, key, fingerprint, owner,
+                                 force=stale_pointer):
+        return None
+
+    try:
+        tree = pageindex_store.build_for(
+            item, item.get("timestamps") or [], item.get("transcript") or "",
+            groq=groq_client, deadline=deadline)
+    except Exception as err:  # noqa: BLE001
+        print(f"[pageindex] build FAILED for {key}: {err}")
+        pageindex_store.mark_failed(_recordings, key, fingerprint, str(err))
+        return None
+
+    if not tree.get("nodes"):
+        # A transcript too short to cut into nodes is not a failure — it is a
+        # meeting that never needed retrieval. Recorded as ready so we do not
+        # re-attempt on every question.
+        pageindex_store.save(_s3, BUCKET_NAME, _recordings, key, tree,
+                             fingerprint, owner)
+        return None
+
+    pageindex_store.save(_s3, BUCKET_NAME, _recordings, key, tree,
+                         fingerprint, owner)
+    return tree
+
+
+def _navigate(tree, question, item, deadline):
+    """Ask the model which sections to read. Returns (node ids, mode).
+
+    On ANY failure — Groq down, a deadline hit, an unparseable reply — this
+    falls back to a SPREAD of nodes across the meeting rather than to nothing.
+    Evenly spaced beats the first N: the first N is the head-truncation
+    behaviour this whole module exists to replace, so degrading into it would
+    be the one fallback that reproduces the bug.
+    """
+    toc = pageindex.table_of_contents(tree, _speaker_names(item))
+    try:
+        reply = groq_client.complete(
+            prompts.RETRIEVAL_SYSTEM,
+            prompts.retrieval_request(question, toc),
+            label="pageindex-retrieval", json_mode=True, temperature=0.0,
+            deadline=deadline,
+        )
+        node_ids = pageindex.parse_node_ids(reply, tree)
+        if node_ids:
+            return node_ids, "llm"
+    except groq_client.GroqError as err:
+        print(f"[pageindex] navigation failed, spreading instead: {err}")
+    except Exception as err:  # noqa: BLE001
+        print(f"[pageindex] navigation error, spreading instead: {err}")
+
+    nodes = tree.get("nodes") or []
+    if not nodes:
+        return [], "none"
+    step = max(1, len(nodes) // 6)
+    return [n["node_id"] for n in nodes[::step]][:6], "spread"
+
+
+def _fit_segments(segments, budget_chars, names):
+    """Retrieved segments trimmed to the context budget. (lines, kept, cut).
+
+    Trimmed from the END so the best-first ordering of the navigator's picks is
+    honoured: the sections it ranked highest survive. Segments are dropped
+    WHOLE — a half segment would be text no `seg_N` can address, which would
+    break the evidence link for the one line most likely to be cited.
+    """
+    kept, used = [], 0
+    for seg in segments:
+        line = pageindex.render_segments([seg], names)
+        if used + len(line) > budget_chars and kept:
+            return pageindex.render_segments(kept, names), kept, True
+        kept.append(seg)
+        used += len(line) + 1
+    return pageindex.render_segments(kept, names), kept, False
+
+
+def retrieve_meeting_context(item, key, question, system_prompt):
+    """Grounded context for ONE meeting question. THE retrieval entry point.
+
+    `item` must be an ALREADY-AUTHORIZED, hydrated recording (what
+    _owned_recording returns). This function does not take a meeting id and
+    cannot resolve one — authorization happens before retrieval, structurally,
+    not by remembering to check.
+
+    Returns (context, sources, metrics). `sources` is the public evidence
+    array — segment ids the app already knows how to deep-link. `metrics` is
+    for the log line, never for the response body.
+
+    THE TWO PATHS, and why the choice is made on size alone:
+      * transcript FITS the budget -> send all of it. Retrieval could only
+        subtract, and the model answering from the complete record is strictly
+        better than answering from a chosen part of it.
+      * transcript does NOT fit -> retrieve. This is the case the old code
+        answered with the first N characters.
+    """
+    started = time.monotonic()
+    names = _speaker_names(item)
+    transcript = item.get("transcript") or ""
+    timestamps = item.get("timestamps") or []
+    highlights = item.get("meeting_highlights")
+    highlights = highlights if isinstance(highlights, dict) else None
+    mom = _authoritative_mom(item)
+
+    # The budget must account for the MoM: it rides in the same window as the
+    # transcript, and on a heavily-edited meeting it is not small.
+    budget = _transcript_budget_chars(system_prompt + mom)
+    labelled = transcript_store.as_labelled_lines(transcript, timestamps)
+
+    metrics = {"retrieval_mode": "full", "retrieved_segments": 0,
+               "nodes_selected": 0, "retrieval_ms": 0}
+
+    if len(labelled) <= budget:
+        # Whole meeting fits. Note this is now the LABELLED transcript, so even
+        # this path can cite segment ids — evidence is not a retrieval-only
+        # feature.
+        context = prompts.build_grounded_context(
+            item, labelled, highlights=highlights, mom_markdown=mom)
+        metrics["retrieved_segments"] = len(timestamps)
+        metrics["retrieval_ms"] = int((time.monotonic() - started) * 1000)
+        return context, [], metrics
+
+    fingerprint = _row_fingerprint(item)
+    tree = _ensure_index(key, item, fingerprint,
+                         deadline=time.monotonic() + RETRIEVAL_DEADLINE_SECONDS)
+
+    if not tree:
+        # NO INDEX AND WE COULD NOT MAKE ONE. Fall back to the old behaviour
+        # rather than failing the question: a head-truncated answer is what the
+        # user got yesterday, and it is not nothing. The MoM still rides along,
+        # so the authoritative-minutes fix holds even on this path.
+        metrics["retrieval_mode"] = "fallback"
+        metrics["retrieval_ms"] = int((time.monotonic() - started) * 1000)
+        context = prompts.build_context(
+            item, highlights=highlights, transcript_budget_chars=budget)
+        if mom:
+            context = ("=== MINUTES OF MEETING (user-reviewed, authoritative) "
+                       "===\n" + mom.strip() + "\n\n" + context)
+        return context, [], metrics
+
+    node_ids, mode = _navigate(tree, question, item,
+                               time.monotonic() + RETRIEVAL_DEADLINE_SECONDS)
+    segments = pageindex.segments_for_nodes(tree, timestamps, node_ids)
+    lines, kept, truncated = _fit_segments(segments, budget - len(mom), names)
+
+    context = prompts.build_grounded_context(
+        item, lines, highlights=highlights, mom_markdown=mom,
+        truncated=truncated)
+
+    metrics.update({
+        "retrieval_mode": f"pageindex:{mode}",
+        "retrieved_segments": len(kept),
+        "nodes_selected": len(node_ids),
+        "retrieval_ms": int((time.monotonic() - started) * 1000),
+        "extract_truncated": truncated,
+    })
+    return context, pageindex.evidence_from_segments(kept, MAX_CHAT_SOURCES), metrics
+
+
+# ---------------------------------------------------------------------------
+# The model cites its evidence on a trailing SOURCES line (see
+# prompts.GROUNDED_CHAT_RULES). It is stripped from the prose before the user
+# sees it and turned into the structured `sources` array instead — the app
+# renders a tappable source row, not a line of raw ids.
+# ---------------------------------------------------------------------------
+_SOURCES_LINE = re.compile(r"\n*^\s*SOURCES:\s*(.*?)\s*$",
+                           re.IGNORECASE | re.MULTILINE)
+
+
+def _log_ai_metrics(route, key, item, metrics, system, message, reply, llm_ms):
+    """One structured line per AI request, for CloudWatch Insights.
+
+    WHY A SINGLE LINE OF JSON. These fields only answer questions when they can
+    be correlated — "what did retrieval cost on the meetings where the answer
+    was wrong?" needs mode, token count and latency from the SAME request. Split
+    across several prints they cannot be joined; as one JSON object an Insights
+    query filters and aggregates them directly.
+
+    TOKEN COUNTS ARE ESTIMATES, and labelled so in the field names via the
+    `est_` prefix. Groq returns real usage on the response, but groq_client.
+    complete() hands back only the message text, and widening that return type
+    would touch every caller in both Lambdas — too much blast radius for
+    telemetry. est_tokens() is the same estimator the budgeting already trusts
+    to decide what fits, so the numbers are consistent with the decisions made
+    from them, which matters more here than absolute accuracy.
+
+    NO TRANSCRIPT CONTENT. Sizes and counts only — never the question, never the
+    answer, never a retrieved line. These logs are retained and broadly
+    readable, and a meeting's contents must not leak into them.
+    """
+    try:
+        payload = {
+            "evt": "ai_request",
+            "route": route,
+            "meeting_id": key,
+            "index_status": pageindex_store.meta(item).get("status") or "none",
+            "transcript_fingerprint": _row_fingerprint(item),
+            "est_context_tokens": groq_client.est_tokens(system),
+            "est_input_tokens": groq_client.est_tokens(system + message),
+            "est_output_tokens": groq_client.est_tokens(reply),
+            "llm_ms": llm_ms,
+            "total_ms": metrics.get("retrieval_ms", 0) + llm_ms,
+        }
+        payload.update(metrics)
+        payload["est_total_tokens"] = (payload["est_input_tokens"]
+                                       + payload["est_output_tokens"])
+        print("[ai_metrics] " + json.dumps(payload, default=str))
+    except Exception as err:  # noqa: BLE001
+        # Telemetry must never be able to fail a request that already succeeded.
+        print(f"[ai_metrics] logging failed: {err}")
+
+
+def _ddb_safe(sources):
+    """Sources with their float timestamps as Decimal, for storage.
+
+    boto3's resource layer raises "Float types are not supported" outright, so
+    writing a source array straight from pageindex.evidence_from_segments (which
+    produces floats, correctly — it also feeds the JSON response, where Decimal
+    is what would break) would 500 the whole chat request at the very last
+    write, AFTER Groq had already been paid for the answer. Converted here at
+    the boundary, the same way _as_duration does for an upload.
+
+    Rounded to 2dp: these are seek positions in seconds, and the app does
+    Number(...) on them for playback — centisecond precision is already more
+    than the player can act on.
+    """
+    out = []
+    for src in sources or []:
+        row = dict(src)
+        for field in ("start_time", "end_time"):
+            try:
+                row[field] = Decimal(str(round(float(src.get(field) or 0), 2)))
+            except (TypeError, ValueError, InvalidOperation):
+                row[field] = Decimal("0")
+        out.append(row)
+    return out
+
+
+def _split_sources(reply, retrieved_sources):
+    """(prose, sources) — the SOURCES line removed and resolved.
+
+    The model's cited ids are matched against what was actually RETRIEVED, so a
+    hallucinated or out-of-context id cannot become a source row that scrolls
+    nowhere. When it cites nothing usable, the retrieved segments stand as the
+    sources anyway: the answer did come from them, and a working "view in
+    transcript" is more useful than a missing one.
+    """
+    match = _SOURCES_LINE.search(reply or "")
+    if not match:
+        return (reply or "").strip(), retrieved_sources
+
+    prose = _SOURCES_LINE.sub("", reply, count=1).strip()
+    raw = match.group(1) or ""
+    if raw.strip().lower() in ("none", "-", ""):
+        return prose, []
+
+    cited = [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
+    by_id = {s["segment_id"]: s for s in retrieved_sources}
+    picked = [by_id[c] for c in cited if c in by_id]
+    return prose, (picked or retrieved_sources)
+
+
 # ---------------------------------------------------------------------------
 # AI Chat — "Ask MinuteX"
 # ---------------------------------------------------------------------------
@@ -3039,17 +3483,25 @@ def _clean_history(raw):
 
 
 def chat(event):
-    """POST /recordings/{key+}/chat {message, history?} -> {reply, chat_history}.
+    """POST /recordings/{key+}/chat {message, history?} -> {reply, chat_history, sources}.
 
     Reuses the shared Groq client with the chat prompt from prompts.py. Context
-    is the stored analysis + highlights + as much transcript as the TPM window
-    allows (prompts.build_context handles the ordering and labels any
-    truncation, so the model knows when its record is partial).
+    now comes from retrieve_meeting_context (see the Meeting Retrieval section
+    above) rather than from prompts.build_context directly: a transcript that
+    fits the budget is still sent whole, and one that does not is RETRIEVED
+    against instead of head-truncated, so a question about the end of a long
+    meeting is answerable.
+
+    `sources` is new and ADDITIVE — the segment ids the answer rests on, in the
+    same shape the transcript deep-link already consumes. An older app build
+    ignores the extra key; a newer one renders tappable sources.
 
     Generated documents are deliberately NOT included in the context: they are
     derived from the same transcript and analysis already present, so sending
     them would spend the TPM budget restating what the model can already see —
     exactly the "do not resend unnecessary data" constraint in spec section 6.
+    The MoM is the ONE exception, because the user can edit it and their
+    correction must outrank the transcript (see _authoritative_mom).
     """
     _, key, item = _owned_recording(event)
     data = _body(event)
@@ -3068,17 +3520,23 @@ def chat(event):
     if not history:
         history = _clean_history(_stored_chat(item))
 
-    highlights = item.get("meeting_highlights")
-    context = prompts.build_context(
-        item,
-        highlights=highlights if isinstance(highlights, dict) else None,
-        transcript_budget_chars=_transcript_budget_chars(prompts.CHAT_SYSTEM),
-    )
+    # The system prompt is assembled BEFORE retrieval because the retrieval
+    # budget is computed against it — the meeting content and the instructions
+    # share one context window, so the rules' own size has to be subtracted
+    # before deciding how much transcript fits.
+    system_rules = prompts.CHAT_SYSTEM + prompts.GROUNDED_CHAT_RULES
+    if _stored_mom(item):
+        system_rules += prompts.MOM_CONTEXT_RULES
+
+    context, retrieved, metrics = retrieve_meeting_context(
+        item, key, message, system_rules)
+
     # The meeting content goes in the SYSTEM turn, not the user turn: it is
     # standing context for the whole conversation, and keeping the user turn to
     # just the question is what lets history stay meaningful across turns.
-    system = prompts.CHAT_SYSTEM + "\n\n" + context
+    system = system_rules + "\n\n" + context
 
+    llm_started = time.monotonic()
     try:
         reply = groq_client.complete(
             system, message, label="chat", json_mode=False, temperature=0.3,
@@ -3087,15 +3545,34 @@ def chat(event):
         )
     except groq_client.GroqError as err:
         _groq_error(err, "a reply")
+    llm_ms = int((time.monotonic() - llm_started) * 1000)
 
     reply = (reply or "").strip()
     if not reply:
         raise ApiError(502, "Unable to generate a reply. Please retry.")
 
+    reply, sources = _split_sources(reply, retrieved)
+    if not reply:
+        # The model answered with nothing but a SOURCES line. Rare, but a blank
+        # bubble is worse than an honest one.
+        raise ApiError(502, "Unable to generate a reply. Please retry.")
+
+    _log_ai_metrics("chat", key, item, metrics, system, message, reply, llm_ms)
+
     now = _now_iso()
+    assistant_turn = {"role": "assistant",
+                      "content": reply[:MAX_DOCUMENT_CHARS], "at": now}
+    # Sources ride ON the stored turn, so reopening the screen restores the
+    # tappable source rows instead of showing an answer whose evidence
+    # evaporated. Written only when there are any, keeping the stored shape
+    # identical to before for the full-transcript path — an older app parsing
+    # this history sees exactly the turns it always did.
+    if sources:
+        assistant_turn["sources"] = _ddb_safe(sources)
+
     turns = _stored_chat(item) + [
         {"role": "user", "content": message, "at": now},
-        {"role": "assistant", "content": reply[:MAX_DOCUMENT_CHARS], "at": now},
+        assistant_turn,
     ]
     # Trim oldest-first so the item can't grow without bound.
     turns = turns[-(MAX_CHAT_TURNS * 2):]
@@ -3104,7 +3581,8 @@ def chat(event):
         UpdateExpression="SET chat_history = :h, updated_at = :now",
         ExpressionAttributeValues={":h": turns, ":now": now},
     )
-    return _resp(200, {"reply": reply, "chat_history": turns})
+    return _resp(200, {"reply": reply, "chat_history": turns,
+                       "sources": sources})
 
 
 def get_chat(event):
@@ -3242,10 +3720,39 @@ def _mom_tasks(user_id, key):
     return rows
 
 
+def _self_tagged_attendee_names(user_id, key):
+    """Names of people recorded as PRESENT but not speaking, for the MoM.
+
+    Read from the participant rows rather than the transcript, because that is
+    the only place this fact exists — a non-speaking attendee leaves no trace
+    in the audio by definition. Best-effort: a Minutes document missing one
+    attendee line beats failing to generate.
+    """
+    try:
+        rows = _participant_rows(key)
+    except ClientError as err:
+        print(f"[mom] participant read failed for {key}: "
+              f"{type(err).__name__}: {err}")
+        return []
+    names = []
+    for row in rows:
+        if not _is_self_speaker(row.get("speaker_id")):
+            continue
+        if row.get("owner_user_id") != user_id:
+            continue
+        c = _contacts.get_item(
+            Key={"contact_id": row.get("contact_id", "")}).get("Item")
+        if c and c.get("owner_user_id") == user_id and c.get("name"):
+            names.append(c["name"])
+    return names
+
+
 def _build_fresh_sections(user_id, key, item):
     names = item.get("speaker_names") or {}
     tasks = [_public_task_v2(r, names) for r in _mom_tasks(user_id, key)]
-    return mom_schema.build_sections(item, tasks=tasks, speaker_names=names)
+    return mom_schema.build_sections(
+        item, tasks=tasks, speaker_names=names,
+        attendees=_self_tagged_attendee_names(user_id, key))
 
 
 def _persist_mom(key, item, mom, regenerated=False):
@@ -3470,6 +3977,9 @@ def delete_mom(event):
 MAX_TASK_TEXT = 300
 MAX_TASK_NOTE_TEXT = 500
 MAX_TASKS = 200
+# Evidence references per task. One or two segments carry a spoken sentence;
+# the cap only stops a runaway model answer from bloating the row.
+MAX_EVIDENCE_SEGMENTS = 8
 TASK_STATUSES = ("Open", "In Progress", "Completed")
 TASK_PRIORITIES = ("Low", "Medium", "High")
 NOTIFY_CHANNELS = ("whatsapp", "email", "sms", "app")
@@ -5132,13 +5642,66 @@ def move_recording_to_folder(event):
 # ---------------------------------------------------------------------------
 # Meeting participants — speaker label -> Contact
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ATTENDANCE WITHOUT SPEECH.
+#
+# MeetingParticipants is keyed (audio_s3_key, speaker_id), which modelled
+# participation as speaker->contact and ONLY that. Someone who attended without
+# speaking — or anyone in a meeting diarization produced no labels for — had no
+# way to record that they were there.
+#
+# A non-speaking attendee is stored in the SAME table under a reserved
+# speaker_id: "self:<contact_id>". No new table, no schema change, no
+# migration.
+#
+# WHY THIS CANNOT COLLIDE WITH A REAL SPEAKER. Diarization labels come from
+# stt_result._speaker_label, which strips a "speaker_" prefix and otherwise
+# passes the provider's id through — in production these are compact ("0",
+# "1", "2", "7"). A colon never appears in one, and "self:" is not a prefix any
+# provider label can produce. Verified against the live table before choosing
+# this representation.
+#
+# TWO RULES MAKE IT ATTENDANCE RATHER THAN SPEECH, and both are enforced by
+# NOT calling something rather than by a flag:
+#
+#   * it is never written into the recording's `speaker_names` map, so
+#     _speaker_labels (which falls back to that map) can never surface it as a
+#     speaker, and no generated document can name it as one;
+#   * it never reaches _resolve_tasks_for_speaker, so tagging yourself as
+#     present cannot make the AI assign you work you never agreed to.
+# ---------------------------------------------------------------------------
+SELF_SPEAKER_PREFIX = "self:"
+
+
+def _self_speaker_id(contact_id):
+    """The reserved key for "this contact attended, but did not speak".
+
+    Derived from the contact id rather than random, which is what makes the
+    write idempotent for free: the same person tagging themselves twice —
+    a double tap, a retry, a second visit — lands on the same primary key and
+    overwrites one row instead of accumulating duplicates.
+    """
+    return f"{SELF_SPEAKER_PREFIX}{str(contact_id or '').strip()}"
+
+
+def _is_self_speaker(speaker_id):
+    return str(speaker_id or "").startswith(SELF_SPEAKER_PREFIX)
+
+
 def _public_participant(row, contact=None):
+    speaker_id = row.get("speaker_id", "")
+    attendance_only = _is_self_speaker(speaker_id)
     out = {
-        "speaker_id": row.get("speaker_id", ""),
+        "speaker_id": speaker_id,
         "contact_id": row.get("contact_id", ""),
         "participant_role": row.get("participant_role", ""),
         "created_at": row.get("created_at", ""),
         "updated_at": row.get("updated_at", ""),
+        # The ONE thing the app needs to know about the distinction: this
+        # person was present but is not a voice in the transcript. Exposed as a
+        # boolean rather than making every client parse the sentinel — the
+        # storage shape stays an implementation detail.
+        "attendance_only": attendance_only,
     }
     if contact is not None:
         out["contact"] = _public_contact(contact)
@@ -5173,7 +5736,14 @@ def list_participants(event):
             if c and c.get("owner_user_id") == user_id:
                 contact = c
         participants.append(_public_participant(row, contact))
-    participants.sort(key=lambda p: _speaker_sort_key(p["speaker_id"]))
+    # Speakers first in speaker order, then attendance-only rows by name.
+    # _speaker_sort_key already puts non-numeric labels after numeric ones, so
+    # the sentinel sorts last without a special case — but the explicit key
+    # keeps that a decision rather than an accident of string ordering.
+    participants.sort(key=lambda p: (
+        1 if p.get("attendance_only") else 0,
+        _speaker_sort_key(p["speaker_id"]),
+    ))
 
     folder_id = str(item.get("folder_id") or "")
     folder_contacts = []
@@ -5187,6 +5757,12 @@ def list_participants(event):
         "participants": participants,
         "speakers": _speaker_labels(item),
         "speaker_names": item.get("speaker_names") or {},
+        # PROCESSING STATE, so the screen can tell "no speakers YET" from "no
+        # speakers, ever". Without it the empty state promised that voices
+        # would appear once transcribing finished — on recordings that had
+        # already finished, which is a promise it could not keep. The row is
+        # already read for the ownership check, so this costs nothing.
+        "recording_status": str(item.get("status") or ""),
         "folder_id": folder_id,
         "folder_contacts": folder_contacts,
     })
@@ -5240,24 +5816,61 @@ def set_participant(event):
     document kept saying "Speaker 0".
 
     `contact_id: null` clears the mapping.
+
+    ATTENDANCE WITHOUT A SPEAKER. Send `attendance_only: true` (with a
+    contact_id and NO speaker_id) to record that someone was present without
+    claiming they spoke. The row is stored under the reserved
+    "self:<contact_id>" key, and the two speaker side effects below — the
+    speaker_names sync and the AI task resolution — are deliberately SKIPPED
+    for it. See the SELF_SPEAKER_PREFIX block for why that is what makes this
+    attendance rather than invented speech.
+
+    Ownership is unchanged and applies to both shapes: _owned_recording means
+    only the meeting's owner can add or remove anyone, on their own meeting.
     """
     user_id, key, item = _owned_recording(event, hydrate=False)
     data = _body(event)
 
+    attendance_only = bool(data.get("attendance_only"))
     speaker_id = str(data.get("speaker_id") or "").strip()[:MAX_SPEAKER_NAME]
-    if not speaker_id:
+    if not speaker_id and not attendance_only:
         raise ApiError(400, "speaker_id required")
-
     raw_contact = data.get("contact_id")
-    if raw_contact is None or str(raw_contact).strip() == "":
+    clearing = raw_contact is None or str(raw_contact).strip() == ""
+    # A caller must not be able to hand-craft the reserved key and have it
+    # treated as a speaker MAPPING — that is the one way the sentinel could be
+    # used to fake a speaker. The prefix is ours to write, never theirs.
+    #
+    # Scoped to writes: CLEARING by the reserved key is how an attendance row
+    # is removed, and the app is handed that key by the API rather than
+    # building one. Rejecting it here would make attendance addable but never
+    # removable.
+    if (speaker_id and _is_self_speaker(speaker_id)
+            and not attendance_only and not clearing):
+        raise ApiError(400, "speaker_id must not start with "
+                            f"{SELF_SPEAKER_PREFIX!r}")
+
+    if clearing:
+        if not speaker_id:
+            raise ApiError(400, "speaker_id required to clear a mapping")
         _meeting_participants.delete_item(
             Key={"audio_s3_key": key, "speaker_id": speaker_id})
-        _sync_speaker_name_from_contact(user_id, key, item, speaker_id, None)
+        # An attendance row was never in speaker_names, so there is nothing
+        # there to unwind — and calling this for one would bump
+        # speaker_mapping_version, marking every generated document stale over
+        # a change that touched no name in them.
+        if not _is_self_speaker(speaker_id):
+            _sync_speaker_name_from_contact(user_id, key, item, speaker_id,
+                                            None)
         _audit("meeting.participant_cleared", user_id, key,
                speaker_id=speaker_id)
         return _resp(200, {"cleared": True, "speaker_id": speaker_id})
 
     contact = _owned_contact(user_id, str(raw_contact).strip())
+    # Attendance is keyed by the CONTACT, not by a speaker slot: that is what
+    # makes a double tap idempotent rather than duplicating a person.
+    if attendance_only:
+        speaker_id = _self_speaker_id(contact["contact_id"])
     now = _now_iso()
     row = {
         "audio_s3_key": key,
@@ -5269,7 +5882,29 @@ def set_participant(event):
         "created_at": now,
         "updated_at": now,
     }
+    # Preserve the original created_at on a re-tag, so "when were they added"
+    # stays true across repeat taps rather than resetting on each one.
+    if attendance_only:
+        prior = _meeting_participants.get_item(
+            Key={"audio_s3_key": key, "speaker_id": speaker_id}).get("Item")
+        if prior and prior.get("created_at"):
+            row["created_at"] = prior["created_at"]
     _meeting_participants.put_item(Item=row)
+
+    # THE TWO SPEAKER SIDE EFFECTS, SKIPPED FOR ATTENDANCE.
+    #
+    # Writing speaker_names would make the sentinel a label _speaker_labels
+    # surfaces and every generated document renders — inventing a speaker.
+    # Resolving tasks would assign the AI's work to someone whose only claim is
+    # "I was in the room". Both are the difference between attendance and
+    # speech, and both are enforced by not running rather than by a flag a
+    # later change could forget to check.
+    if attendance_only:
+        _audit("meeting.attendee_self_tagged", user_id, key,
+               contact_id=contact["contact_id"])
+        return _resp(200, {"participant": _public_participant(row, contact),
+                           "tasks_resolved": 0})
+
     _sync_speaker_name_from_contact(user_id, key, item, speaker_id, contact)
 
     # Mapping a speaker is the event that can resolve AI tasks assigned to that
@@ -5384,12 +6019,20 @@ def _speaker_display_name(label, speaker_names):
 
     Numeric labels read as "Speaker 2"; named ones ("agent") stand alone.
     """
-    raw = str(label or "").strip()
+    # Normalized before the lookup because `speaker_names` is keyed on the
+    # COMPACT id ("0"), while a task row written before speaker normalization
+    # existed can still carry the transcript's "Speaker 0". Without this such a
+    # row renders the literal label forever instead of the person's real name,
+    # even after the user maps that speaker.
+    raw = stt_result.normalize_speaker_id(label)
     if not raw:
         return ""
     named = (speaker_names or {}).get(raw)
     if named:
         return str(named)
+    # The display prefix is RE-ADDED here. Normalization is internal only: what
+    # the user reads is unchanged, so an unmapped speaker still reads
+    # "Speaker 0", exactly as before.
     return f"Speaker {raw}" if raw.isdigit() else raw
 
 
@@ -5430,6 +6073,23 @@ def _speaker_names_for_recording(key, cache=None):
     if cache is not None:
         cache[key] = names
     return names
+
+
+def _task_needs_review(row):
+    """True when a human has to confirm this task's assignee.
+
+    ONE definition, computed from state that already exists rather than stored
+    as a fourth flag that could drift. It is exactly the UNRESOLVED case: an
+    assignee was CLAIMED (a spoken name, or a low-confidence match the gate
+    withheld) but not confirmed. Both AI and legacy-migrated tasks reach it,
+    which is correct — a legacy task carrying a bare name needs the same
+    confirmation as a freshly-gated one.
+
+    NONE is deliberately NOT review-worthy: an unassigned task is a normal
+    outcome, not an open question, and treating it as one would fill the queue
+    with work nobody ever claimed.
+    """
+    return row.get("resolution_status") == RESOLUTION_UNRESOLVED
 
 
 def _public_task_v2(row, speaker_names=None):
@@ -5487,6 +6147,18 @@ def _public_task_v2(row, speaker_names=None):
         "source_type": row.get("source_type", TASK_SOURCE_MANUAL),
         "ai_confidence": row.get("ai_confidence", ""),
         "ai_evidence": row.get("ai_evidence", ""),
+        # WHERE the evidence came from, so the app can offer to jump to that
+        # moment of the meeting. Absent on rows with no reference, and on
+        # manual tasks, which is what lets the UI show AI provenance only
+        # where it genuinely exists.
+        "ai_evidence_segment_ids": list(
+            row.get("ai_evidence_segment_ids") or []),
+        # The ONE flag the UI branches on for "this needs a human". Computed
+        # here rather than stored so it can never disagree with the
+        # resolution_status it is derived from — a task resolved by the user
+        # stops needing review the instant they resolve it, with no second
+        # write to keep in step.
+        "needs_review": _task_needs_review(row),
         "notified_via": row.get("notified_via", []),
         "created_at": row.get("created_at", ""),
         "updated_at": row.get("updated_at", ""),
@@ -5617,6 +6289,13 @@ def _find_task_by_fingerprint(user_id, fingerprint):
 
 
 def _owned_task(user_id, task_id):
+    """The task, if this caller CREATED it. 404 otherwise.
+
+    Deliberately still creator-only: this is the predicate for the actions
+    only a creator may perform (deadline, details, assignee, AI resolution).
+    Routes an assignee may also reach use _visible_task / _task_for_status
+    instead — see the permission model below.
+    """
     tid = str(task_id or "").strip()
     if not tid:
         raise ApiError(400, "task id required")
@@ -5624,6 +6303,132 @@ def _owned_task(user_id, task_id):
     if not row or row.get("owner_user_id") != user_id:
         raise ApiError(404, "task not found")
     return row
+
+
+# ---------------------------------------------------------------------------
+# TASK LIFECYCLE PERMISSIONS
+#
+# Two DIFFERENT people have rights over a task, and conflating them is the bug
+# this section exists to prevent:
+#
+#   CREATOR   `owner_user_id`. The authenticated user for a manual task; the
+#             MEETING OWNER for an AI-seeded one (_seed_ai_tasks is handed the
+#             recording row's user_id, never anything off the event). They
+#             control the task's CONFIGURATION — deadline, details, assignee,
+#             AI assignment resolution.
+#
+#   ASSIGNEE  `assignee_user_id`. Only ever written from a Contact linked to a
+#             real MinuteX account (see _new_task_row), so its presence means
+#             "there is an authenticated person here". They EXECUTE the task
+#             and may change exactly one field: status.
+#
+# `assignee_contact_id` is NOT an authorization input. A contact is a record in
+# someone's address book, not an identity that can authenticate — a task
+# assigned to a contact with no MinuteX account simply has no assignee who can
+# act on it, which is correct rather than a gap to paper over.
+#
+# ERROR CODES. An unrelated caller gets 404 from every route, matching
+# _owned_task / _owned_contact / _owned_recording: a 403 would confirm the id
+# exists. An ASSIGNEE attempting a creator-only action gets 403, because they
+# can already see the task — telling a permitted viewer their own task does
+# not exist would be a lie that is very hard to debug.
+# ---------------------------------------------------------------------------
+
+def _task_creator(row):
+    """The user who controls this task's configuration."""
+    return str((row or {}).get("owner_user_id") or "").strip()
+
+
+def _is_task_creator(user_id, row):
+    return bool(user_id) and _task_creator(row) == user_id
+
+
+def _is_task_assignee(user_id, row):
+    """Whether this caller is the task's assignee AS AN ACCOUNT.
+
+    Reuses _task_assignee_user — the same predicate the notification engine
+    uses to decide there is someone to notify — so "can act on this task" and
+    "can receive mail about this task" can never drift apart.
+    """
+    return bool(user_id) and _task_assignee_user(row) == user_id
+
+
+def _visible_task(user_id, task_id):
+    """The task, if this caller may VIEW it: creator or assignee.
+
+    404 for everyone else, so an unrelated caller cannot use this route to
+    discover that a task id exists.
+    """
+    tid = str(task_id or "").strip()
+    if not tid:
+        raise ApiError(400, "task id required")
+    row = _tasks.get_item(Key={"task_id": tid}).get("Item")
+    if not row or not (_is_task_creator(user_id, row)
+                       or _is_task_assignee(user_id, row)):
+        raise ApiError(404, "task not found")
+    return row
+
+
+def _authorize_task_patch(user_id, row, data):
+    """Reject a patch that touches fields this caller may not change.
+
+    Status is the ONLY field an assignee may modify. Everything else —
+    title, description, due date, priority, assignee, notification record —
+    is the creator's. Checked against the REQUEST BODY rather than against
+    what changed, so a no-op write of a forbidden field is still refused: a
+    client must not be able to probe which fields it can reach.
+
+    Called after the row is loaded and before any update is built, so a denied
+    request writes nothing at all.
+    """
+    if _is_task_creator(user_id, row):
+        return
+    if not _is_task_assignee(user_id, row):
+        # Not creator, not assignee: this row is not theirs to see, let alone
+        # patch. 404 keeps it indistinguishable from a task that never was.
+        raise ApiError(404, "task not found")
+    touched = [f for f in data if f in _TASK_CREATOR_ONLY_FIELDS]
+    if touched:
+        raise ApiError(
+            403,
+            "only the task creator can change "
+            + ", ".join(sorted(touched))
+            + " — the assignee can change status only")
+
+
+def _task_permissions(user_id, row):
+    """What this caller may do with this task, as plain booleans.
+
+    Sent on the task detail response so the app can render the right controls
+    without re-implementing the rule. This is a CONVENIENCE for the UI, never
+    the enforcement point — every mutation route checks for itself, because a
+    client is free to ignore what it is told.
+    """
+    creator = _is_task_creator(user_id, row)
+    assignee = _is_task_assignee(user_id, row)
+    return {
+        "is_creator": creator,
+        "is_assignee": assignee,
+        "can_view": creator or assignee,
+        # The one field an assignee owns.
+        "can_change_status": creator or assignee,
+        # Everything that configures the task belongs to its creator.
+        "can_edit_details": creator,
+        "can_change_deadline": creator,
+        "can_change_assignee": creator,
+        "can_resolve_assignment": creator,
+        "can_delete": creator,
+    }
+
+
+# Every writable field of the patch body EXCEPT status (and `id`, which selects
+# the row rather than changing it). Named explicitly rather than derived as
+# "not status" so a NEW writable field is denied to the assignee by default: a
+# field added here is a decision, a field forgotten is a vulnerability.
+_TASK_CREATOR_ONLY_FIELDS = (
+    "task", "title", "description", "due", "due_date", "priority",
+    "assignee", "assignee_contact_id", "notify_channels", "folder_id",
+)
 
 
 def _write_task(row):
@@ -5647,6 +6452,7 @@ _TASK_SPARSE_KEYS = ("folder_id", "assignee_contact_id", "fingerprint",
 # cursor carrying only the table key is rejected on a GSI query.
 _TASK_INDEX_KEYS = {
     TASKS_OWNER_INDEX: ("owner_user_id", "created_at"),
+    TASKS_ASSIGNEE_USER_INDEX: ("assignee_user_id", "created_at"),
     TASKS_MEETING_INDEX: ("source_recording_id", "created_at"),
     TASKS_FOLDER_INDEX: ("folder_id", "created_at"),
     TASKS_ASSIGNEE_INDEX: ("assignee_contact_id", "created_at"),
@@ -5836,6 +6642,88 @@ def _migrate_embedded_tasks(user_id, key, item):
     return created
 
 
+# ---------------------------------------------------------------------------
+# AI TASK VALIDATION AND CONFIDENCE GATING.
+#
+# THE RULE THIS ENFORCES: MinuteX must never silently assign work to a person
+# it is not sure about. A wrong assignee is worse than no assignee — the real
+# owner never learns the task exists, and the person it landed on has no way to
+# know it was a guess.
+#
+# WHAT IS AND IS NOT A NEW STATE. No new review state was introduced: the Task
+# model already distinguishes RESOLVED / UNRESOLVED / NONE, and UNRESOLVED
+# already means exactly "there is an assignee claim here that a human must
+# confirm". Low-confidence gating therefore DEMOTES a task into the existing
+# UNRESOLVED state rather than inventing a parallel one — which is also why the
+# existing AI_ACTION_REQUIRED notification and the existing
+# resolve-assignee flow light up for it with no extra wiring.
+#
+# CONFIDENCE IS THE MODEL'S CLAIM, GATING IS OURS. `ai_confidence` is stored
+# verbatim as what the model said; the gate below is a separate, deterministic
+# decision about what to DO with that claim. Keeping them apart is deliberate —
+# a stored field that mixed "the model was unsure" with "we downgraded it"
+# could not answer either question later.
+#
+# THE GATE, and why each band behaves as it does:
+#
+#   high    -> trust the resolution as-is. The model says the work and its
+#              owner are both explicit; the speaker chain either found an
+#              account or it did not, and that outcome stands.
+#
+#   medium  -> trust it too. "The work is clear, the owner needs context"
+#              describes ordinary meeting speech, and the resolution chain is
+#              itself evidence-based (a mapped speaker is a fact, not a guess).
+#              Demoting these would bury real assignments under review noise,
+#              which trains people to ignore the review queue.
+#
+#   low     -> NEVER auto-assign. The model is telling us the work or its owner
+#              is genuinely ambiguous. A speaker-derived contact match on an
+#              ambiguous utterance is precisely the case that produces a
+#              confidently-wrong assignee, so the assignment is withheld and
+#              the owner is asked. The task is still CREATED — the work was
+#              discussed and deleting it would lose real information.
+#
+#   ""      -> no claim was made (an older row, or a model answer the enum
+#              refused). Treated like medium: absence of a score is not
+#              evidence of doubt, and demoting every unscored task would put
+#              the entire back catalogue into review.
+#
+# EVIDENCE. A task the model could not quote is not blocked — the work may
+# still be real and the transcript is on the row either way — but it cannot be
+# auto-assigned on a LOW-confidence reading either, which the gate already
+# covers. Evidence is recorded so the user can check the claim; it is not used
+# as a second gate, because a missing quote is a formatting failure, not a
+# statement about who owes the work.
+AI_CONFIDENCE_GATED = (ai_schema.CONFIDENCE_LOW,)
+
+
+def _gate_ai_assignment(raw_confidence, contact, assignee_name):
+    """Decide whether an AI task may keep its resolved assignee.
+
+    Returns (contact, assignee_name, gated) — the values to build the row
+    with, and whether the gate fired. A gated task keeps everything it knows
+    (the speaker id, the spoken name, the evidence) but is NOT handed a
+    Contact, so `_new_task_row` files it as UNRESOLVED and the owner is asked
+    to confirm through the flow that already exists for that state.
+
+    The spoken NAME is preserved rather than dropped: "Rahul" is what the
+    reviewer needs in order to answer the question, and throwing it away would
+    make the review harder than the extraction.
+    """
+    confidence = ai_schema.coerce_confidence(raw_confidence)
+    if confidence not in AI_CONFIDENCE_GATED:
+        return contact, assignee_name, False
+    if contact is None and not assignee_name:
+        # Nothing was claimed, so there is nothing to withhold. This is an
+        # unassigned task, which is a normal outcome and not a review item.
+        return None, "", False
+
+    # Demote. A contact that WAS matched becomes the contact's name, so the
+    # reviewer sees who the system nearly picked and can confirm in one tap.
+    kept_name = assignee_name or (contact or {}).get("name", "")
+    return None, kept_name, True
+
+
 def _seed_ai_tasks(user_id, key, item):
     """Create first-class Tasks from the AI's extracted `ai_tasks`, once.
 
@@ -5864,7 +6752,11 @@ def _seed_ai_tasks(user_id, key, item):
             continue
         c = _contacts.get_item(Key={"contact_id": cid}).get("Item")
         if c and c.get("owner_user_id") == user_id:
-            by_speaker[str(row.get("speaker_id"))] = c
+            # Keyed on the NORMALIZED id. The AI copies the transcript's own
+            # "Speaker 0" label while participant rows hold the compact "0",
+            # and comparing those two directly is what made self-assignment
+            # silently fail. Normalizing BOTH sides is the fix.
+            by_speaker[stt_result.normalize_speaker_id(row.get("speaker_id"))] = c
 
     # The meeting's own day is the only correct anchor for "Friday" or
     # "tomorrow". Resolving against NOW would silently re-point an old
@@ -5882,7 +6774,11 @@ def _seed_ai_tasks(user_id, key, item):
         if not title:
             continue
         assignee_name = str(raw.get("assignee") or "").strip()
-        speaker_id = str(raw.get("assignee_speaker_id") or "").strip()
+        # Normalized at the boundary, so everything downstream — the lookup
+        # below, the stored value, the display map, and the later
+        # _resolve_tasks_for_speaker join — all speak the same dialect.
+        speaker_id = stt_result.normalize_speaker_id(
+            raw.get("assignee_speaker_id"))
         fingerprint = _task_fingerprint(key, title, assignee_name or speaker_id)
         if fingerprint in tombstoned:
             continue  # the user deleted this one; do not resurrect it
@@ -5894,6 +6790,12 @@ def _seed_ai_tasks(user_id, key, item):
         if priority not in TASK_PRIORITIES:
             priority = "Medium"
         spoken_due = raw.get("due_date") or ""
+        # CONFIDENCE GATE, applied after resolution and before the row is
+        # built: a LOW-confidence reading never gets to keep an auto-derived
+        # assignee, however well the speaker chain matched. See
+        # _gate_ai_assignment for why medium and unscored are trusted.
+        gated_contact, gated_name, was_gated = _gate_ai_assignment(
+            raw.get("confidence"), contact, assignee_name)
         row = _new_task_row(
             user_id, title,
             recording_key=key, folder_id=folder_id,
@@ -5902,13 +6804,27 @@ def _seed_ai_tasks(user_id, key, item):
                 spoken_due, anchor),
             priority=priority,
             source_type=TASK_SOURCE_AI,
-            assignee_contact=contact,
-            assignee_name="" if contact else assignee_name,
+            assignee_contact=gated_contact,
+            assignee_name="" if gated_contact else gated_name,
             assignee_speaker_id=speaker_id,
-            ai_confidence=str(raw.get("confidence") or ""),
+            # Stored VERBATIM as the model's own claim — the gate above is a
+            # separate decision and does not rewrite what the model said.
+            ai_confidence=ai_schema.coerce_confidence(raw.get("confidence")),
             ai_evidence=str(raw.get("evidence") or ""),
             fingerprint=fingerprint,
         )
+        # WHERE the evidence sits in the transcript, so the app can offer
+        # "view in transcript" rather than only quoting the line. Already
+        # validated against the real segment list by coerce_analysis, and
+        # written only when present so the attribute stays absent (rather
+        # than an empty list) on rows that have none.
+        segment_ids = [str(i) for i in (raw.get("evidence_segment_ids") or [])
+                       if str(i).strip()][:MAX_EVIDENCE_SEGMENTS]
+        if segment_ids:
+            row["ai_evidence_segment_ids"] = segment_ids
+        if was_gated:
+            print(f"[seed] {key}: low-confidence assignment withheld for "
+                  f"review: {title[:60]!r}")
         try:
             _write_task(row)
         except ClientError as err:
@@ -5918,6 +6834,20 @@ def _seed_ai_tasks(user_id, key, item):
                 raise
             continue
         _mirror_task_to_recording(key, row)
+        # Two DIFFERENT facts, and a task is only ever one of them:
+        #
+        #   * the AI named a speaker we could map to a linked account -> the
+        #     assignee is real, so they are told (TASK_ASSIGNED);
+        #   * the AI named someone we could NOT resolve -> nobody was
+        #     assigned, and the OWNER is asked to confirm rather than the
+        #     system guessing a person (AI_ACTION_REQUIRED, section 13).
+        #
+        # A task the AI left unassigned entirely (RESOLUTION_NONE) raises
+        # neither: there is no ambiguity to review and nobody to notify.
+        if _task_assignee_user(row):
+            _notify_task_assigned(row, actor_user_id=user_id)
+        elif row.get("resolution_status") == RESOLUTION_UNRESOLVED:
+            _notify_ai_action_required(row)
         created += 1
     if created:
         print(f"[seed] {key}: {created} AI task(s) created")
@@ -5935,12 +6865,22 @@ def _resolve_tasks_for_speaker(user_id, key, speaker_id, contact):
     Only tasks whose assignee_speaker_id matches are touched, and only ones
     not already resolved to a contact: a user who hand-assigned a task keeps
     their choice.
+
+    ATTENDANCE ROWS NEVER GET HERE. set_participant already returns before
+    calling this for a self-tag; the guard below makes the rule true of the
+    FUNCTION rather than of one call site, so a future caller cannot let "I
+    was in the room" assign somebody work the AI attributed to a voice.
     """
+    if _is_self_speaker(speaker_id):
+        return 0
     resolved = 0
     for row in _tasks_for_recording(key):
         if row.get("owner_user_id") != user_id:
             continue
-        if str(row.get("assignee_speaker_id") or "") != str(speaker_id):
+        # Both sides normalized: the row may carry a pre-fix "Speaker 0"
+        # written before this normalization existed, and the caller passes the
+        # participant's compact id. Neither is trusted to already match.
+        if stt_result.normalize_speaker_id(row.get("assignee_speaker_id"))                 != stt_result.normalize_speaker_id(speaker_id):
             continue
         if row.get("assignee_contact_id"):
             continue
@@ -5959,6 +6899,13 @@ def _resolve_tasks_for_speaker(user_id, key, speaker_id, contact):
         else:
             removes.append("assignee_user_id")
         _apply_update(_tasks, {"task_id": row["task_id"]}, updates, removes)
+        # Naming a speaker is what finally gives these tasks a real recipient
+        # (section 18's chain). Read back rather than assuming: only a contact
+        # LINKED to a MinuteX account produces an assignee_user_id, and
+        # _notify_task_assigned is what decides whether there is anyone to tell.
+        fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item")
+        if fresh:
+            _notify_task_assigned(fresh, actor_user_id=user_id)
         resolved += 1
     return resolved
 
@@ -5977,6 +6924,8 @@ def list_meeting_tasks(event):
     rows = [r for r in _tasks_for_recording(key)
             if r.get("owner_user_id") == user_id]
     rows.sort(key=lambda r: r.get("created_at", ""))
+    # Same sweep as the Task Tracker, over the rows this route already read.
+    _sweep_task_deadlines(user_id, rows)
     # The recording row is already loaded, so speaker names cost no extra read.
     names = item.get("speaker_names") or {}
     return _resp(200, {"tasks": [_public_task_v2(r, names) for r in rows],
@@ -6038,6 +6987,11 @@ def create_meeting_task(event):
     _write_task(row)
     _mirror_task_to_recording(key, row)
     _audit("task.created", user_id, row["task_id"], recording_key=key)
+    # AFTER the task exists, never before: a notification pointing at a task
+    # that failed to write is a dead tap. `actor_user_id` stops a user who
+    # assigned work to themselves being told about it.
+    _notify_task_assigned(row, actor_user_id=user_id,
+                          meeting_title=_recording_title(item))
     return _resp(201, {"task": _public_task_v2(row,
                                                item.get("speaker_names") or {})})
 
@@ -6059,6 +7013,12 @@ def update_meeting_task(event):
     # from a previous build, which only exists in the Tasks table afterwards.
     _migrate_embedded_tasks(user_id, key, item)
     row = _find_task_for_update(user_id, key, task_id)
+    # Reaching this route already required owning the MEETING, and
+    # _find_task_for_update already required owning the TASK — so the caller
+    # is the creator. The check is kept anyway: it is the one place the field
+    # rules live, and a future change that relaxes either predicate must not
+    # silently open every field to an assignee.
+    _authorize_task_patch(user_id, row, data)
     updates, removes = {}, []
 
     if "task" in data or "title" in data:
@@ -6146,12 +7106,23 @@ def update_meeting_task(event):
     if not updates and not removes:
         raise ApiError(400, "nothing to update")
 
+    # Captured BEFORE the write: after it, the row no longer knows who used to
+    # hold the task, and that is exactly who TASK_REASSIGNED has to reach.
+    previous_assignee = _task_assignee_user(row)
+
     updates["updated_at"] = _now_iso()
     _apply_update(_tasks, {"task_id": row["task_id"]}, updates, removes)
     fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item") or {}
     _mirror_task_to_recording(key, fresh)
     _audit("task.updated", user_id, row["task_id"],
            fields=sorted(set(updates) | set(removes)))
+    # A reassignment is TWO facts for two different people, and only when the
+    # assignee actually changed — an edit to the title or the due date of an
+    # already-assigned task must not re-notify anyone.
+    if _task_assignee_user(fresh) != previous_assignee:
+        _notify_task_reassigned(previous_assignee, fresh, actor_user_id=user_id)
+        _notify_task_assigned(fresh, actor_user_id=user_id,
+                              meeting_title=_recording_title(item))
     return _resp(200, {"task": _public_task_v2(fresh,
                                                item.get("speaker_names") or {})})
 
@@ -6243,6 +7214,11 @@ def list_all_tasks(event):
     if assignee_contact_id:
         _owned_contact(user_id, assignee_contact_id)
 
+    # Set only on the unfiltered path (see below): a second index read whose
+    # rows are merged into the page. None for every explicit filter, each of
+    # which already names the one partition it wants.
+    extra_query = None
+
     if folder_id:
         base = {"IndexName": TASKS_FOLDER_INDEX,
                 "KeyConditionExpression": Key("folder_id").eq(folder_id)}
@@ -6254,47 +7230,127 @@ def list_all_tasks(event):
         base = {"IndexName": TASKS_MEETING_INDEX,
                 "KeyConditionExpression":
                     Key("source_recording_id").eq(recording_key)}
+    elif assigned_to_me:
+        # "Tasks I must execute" — keyed on the ACCOUNT, so it returns work
+        # assigned by OTHER people too. The owner-index cannot answer this:
+        # its partition is the creator, so a task User A created for User B
+        # simply is not in B's partition, and post-filtering would mean a
+        # full table scan.
+        base = {"IndexName": TASKS_ASSIGNEE_USER_INDEX,
+                "KeyConditionExpression":
+                    Key("assignee_user_id").eq(user_id)}
     else:
         base = {"IndexName": TASKS_OWNER_INDEX,
                 "KeyConditionExpression": Key("owner_user_id").eq(user_id)}
+        # The UNFILTERED list must show both directions of a user's work: what
+        # they created AND what was assigned to them. Those live in two
+        # different partitions (creator vs assignee), and a GSI query can only
+        # read one — so the assignee side is read as a SECOND query and merged
+        # below. Without it a task User A created for User B would be missing
+        # from every one of B's views except "My tasks", which is exactly the
+        # gap section 8 calls out.
+        extra_query = {"IndexName": TASKS_ASSIGNEE_USER_INDEX,
+                       "KeyConditionExpression":
+                           Key("assignee_user_id").eq(user_id),
+                       "ScanIndexForward": False}
     base["ScanIndexForward"] = False
 
     cursor = _decode_cursor(qs.get("cursor"))
     if cursor:
         base["ExclusiveStartKey"] = cursor
 
+    def _keep(row):
+        """Every filter that is not expressed as a key condition.
+
+        Shared by both index reads below so the creator side and the assignee
+        side can never apply different rules to the same task.
+        """
+        # EVERY row is re-checked against the caller, including on indexes
+        # not keyed by owner (folder/assignee/meeting): the index is a
+        # lookup path, never an authorization decision.
+        #
+        # The predicate is "may this caller SEE this task" — creator OR
+        # assignee — not "did this caller create it". Checking ownership
+        # alone is what used to hide a task from the very person meant to
+        # do it: User A's task assigned to User B never reached B's list.
+        if not (_is_task_creator(user_id, row)
+                or _is_task_assignee(user_id, row)):
+            return False
+        if status and row.get("status") != status:
+            return False
+        if assigned_to_me and row.get("assignee_user_id") != user_id:
+            return False
+        if overdue_only and not _is_overdue(
+                row.get("due_date"), row.get("status"),
+                row.get("due_date_normalized", "")):
+            return False
+        if due_before:
+            # Compare on the RESOLVED day; a spoken "Friday" is a real
+            # deadline and belongs in a due_before window. Falling back to
+            # the raw value keeps pre-normalization rows behaving as
+            # before rather than dropping out of the filter entirely.
+            due = (str(row.get("due_date_normalized") or "").strip()
+                   or str(row.get("due_date") or ""))
+            if not due or due > due_before:
+                return False
+        return True
+
     out, last_key = [], None
     for _ in range(_SEARCH_MAX_PAGES):
         base["Limit"] = max(limit * 2, 100)
         res = _tasks.query(**base)
-        for row in res.get("Items", []):
-            # EVERY row is re-checked against the caller, including on indexes
-            # not keyed by owner (folder/assignee/meeting): the index is a
-            # lookup path, never an authorization decision.
-            if row.get("owner_user_id") != user_id:
-                continue
-            if status and row.get("status") != status:
-                continue
-            if assigned_to_me and row.get("assignee_user_id") != user_id:
-                continue
-            if overdue_only and not _is_overdue(
-                    row.get("due_date"), row.get("status"),
-                    row.get("due_date_normalized", "")):
-                continue
-            if due_before:
-                # Compare on the RESOLVED day; a spoken "Friday" is a real
-                # deadline and belongs in a due_before window. Falling back to
-                # the raw value keeps pre-normalization rows behaving as
-                # before rather than dropping out of the filter entirely.
-                due = (str(row.get("due_date_normalized") or "").strip()
-                       or str(row.get("due_date") or ""))
-                if not due or due > due_before:
-                    continue
-            out.append(row)
+        out.extend(r for r in res.get("Items", []) if _keep(r))
         last_key = res.get("LastEvaluatedKey")
         if not last_key or len(out) >= limit:
             break
         base["ExclusiveStartKey"] = last_key
+
+    # The assignee half of the unfiltered list, merged in.
+    #
+    # FIRST PAGE ONLY, on purpose. `next_cursor` is an ExclusiveStartKey for
+    # ONE index, so a paginated union of two indexes cannot be resumed
+    # coherently — a cursor into owner-index means nothing to
+    # assignee-user-index. Reading the assignee side only when there is no
+    # incoming cursor keeps the contract honest: the first page is the union
+    # (which is what the dashboard renders), and paging past it continues
+    # through the creator's own tasks exactly as it always has.
+    #
+    # This is a real limit rather than a hidden one — see the comment on
+    # next_cursor below — and it only bites a user with more than one page of
+    # created tasks who ALSO has tasks assigned to them by others.
+    #
+    # Skipped once the creator's own tasks already fill the page: the merge
+    # cannot emit a resumable cursor (see next_cursor below), so merging into
+    # a page that still has more to give would strand the remainder. A user
+    # with a full page of their own tasks reads them normally and finds
+    # assigned work under "My tasks"; the merge exists for the ordinary case
+    # where the first page has room.
+    if extra_query is not None and not cursor and len(out) <= limit:
+        seen = {r.get("task_id") for r in out}
+        extra_query["Limit"] = max(limit * 2, 100)
+        try:
+            extra = _tasks.query(**extra_query)
+        except ClientError as err:
+            # The GSI may not exist yet on an environment that has not run
+            # scripts/44_add_assignee_user_index.sh. Degrading to "creator's
+            # tasks only" is strictly better than 500-ing the whole dashboard,
+            # and it is loud in the logs rather than silent.
+            code = err.response.get("Error", {}).get("Code")
+            if code in ("ValidationException", "ResourceNotFoundException"):
+                print(f"[warn] {TASKS_ASSIGNEE_USER_INDEX} unavailable: {err}")
+                extra = {"Items": []}
+            else:
+                raise
+        for row in extra.get("Items", []):
+            # Deduped by task_id: a task a user created AND is assigned to
+            # appears in both indexes and must be listed once.
+            if row.get("task_id") in seen or not _keep(row):
+                continue
+            seen.add(row.get("task_id"))
+            out.append(row)
+        # Both indexes are sorted newest-first individually; the merged list
+        # has to be re-sorted to keep that order across the two.
+        out.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
 
     # The cursor must resume from the last row we actually RETURNED, not from
     # wherever the index scan happened to stop.
@@ -6308,10 +7364,21 @@ def list_all_tasks(event):
     # Both index key attributes AND the table key go into the cursor, because
     # ExclusiveStartKey on a GSI query needs enough to identify the row in both
     # the index and the base table.
+    #
+    # A MERGED page (the unfiltered union above) cannot emit a row-anchored
+    # cursor at all: its last row may have come from assignee-user-index, and
+    # an ExclusiveStartKey built from that row is meaningless to owner-index —
+    # DynamoDB would reject it, or worse, resume from the wrong place. So the
+    # merged page falls back to the creator index's own LastEvaluatedKey,
+    # which resumes the creator's tasks correctly. Assigned-by-others tasks
+    # are all on page one; "My tasks" (assigned_to_me) pages through them
+    # properly on its own index.
+    merged = (extra_query is not None and not cursor
+              and any(not _is_task_creator(user_id, r) for r in out))
     overflowed = len(out) > limit
     out = out[:limit]
     next_cursor = ""
-    if overflowed and out:
+    if overflowed and out and not merged:
         anchor = out[-1]
         index_name = base.get("IndexName") or ""
         cursor_key = {"task_id": anchor["task_id"]}
@@ -6321,6 +7388,13 @@ def list_all_tasks(event):
         next_cursor = _encode_cursor(cursor_key)
     elif last_key:
         next_cursor = _encode_cursor(last_key)
+    # Deadlines are noticed HERE because nothing in MinuteX fires at the
+    # moment a task falls due (see the sweep's own header). It costs no extra
+    # reads — these rows are already loaded and already ownership-checked —
+    # and the day-scoped dedupe key makes it exactly-once per day however
+    # often the tracker is opened.
+    _sweep_task_deadlines(user_id, out)
+
     # One recording read per DISTINCT meeting on this page, not per task —
     # a page of 50 tasks from 3 meetings costs 3 reads (see
     # _speaker_names_for_recording on why the cache is per-request).
@@ -6338,17 +7412,55 @@ def get_task(event):
 
     The task detail screen's one call: the task plus the entities it points at
     (section 13's who / where / why), each ownership-checked in its own right.
+
+    VISIBLE to the creator AND the assignee — the assignee cannot act on work
+    they cannot open. Everyone else gets 404. The related entities below are
+    still resolved against the CALLER, so an assignee sees the task without
+    inheriting any read access to the creator's contacts or folders.
     """
     user_id = _require_auth(event)
     task_id = (event.get("pathParameters") or {}).get("task_id", "")
-    row = _owned_task(user_id, task_id)
+    row = _visible_task(user_id, task_id)
     out = {}
+    # What this caller may DO with the task, decided server-side and sent to
+    # the client so the UI never has to re-derive the rule (and cannot get it
+    # wrong). The backend stays the enforcement point regardless.
+    out["permissions"] = _task_permissions(user_id, row)
+
+    # THE RELATED ENTITIES, AND WHY THE ASSIGNEE SEES A NARROWER SET.
+    #
+    # These records belong to the CREATOR — the contact is a row in their
+    # address book, the folder is their workspace, the meeting is theirs. An
+    # assignee owns none of them, so an ownership-gated read returns nothing
+    # and the task arrives context-free. That is what made the detail screen
+    # tell an assignee "Nobody is assigned to this task": the assignee WAS
+    # set on the row, but the `contact` the UI renders it from was withheld.
+    #
+    # The fix is not to hand the assignee the creator's records. It is to
+    # answer the two questions they legitimately have — "who is this for?"
+    # and "where did it come from?" — from the TASK ROW itself, which already
+    # carries the assignee's display fields, plus a deliberately minimal
+    # projection of the meeting. Nothing here exposes the creator's other
+    # contacts, their folder contents, or the transcript.
+    creator = _is_task_creator(user_id, row)
 
     cid = row.get("assignee_contact_id")
     if cid:
         c = _contacts.get_item(Key={"contact_id": cid}).get("Item")
         if c and c.get("owner_user_id") == user_id:
             out["contact"] = _public_contact(c)
+        elif _is_task_assignee(user_id, row):
+            # The assignee, seeing THEMSELVES. Built from the task row rather
+            # than the creator's contact record: it is the same person, and
+            # this way no address-book row crosses a tenant boundary. The id
+            # is deliberately omitted — it addresses a contact they cannot
+            # open, and offering it would only produce a 404 on tap.
+            out["contact"] = {
+                "id": "",
+                "name": row.get("assignee_name", ""),
+                "email": row.get("assignee_email", ""),
+                "phone": row.get("assignee_phone", ""),
+            }
     fid = row.get("folder_id")
     if fid:
         f = _folders.get_item(Key={"folder_id": fid}).get("Item")
@@ -6362,26 +7474,136 @@ def get_task(event):
     key = row.get("source_recording_id")
     if key:
         rec = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
-        if rec and (rec.get("user_id") == user_id
-                    or rec.get("device_id") in _owned_devices(user_id)):
+        owns_recording = bool(rec) and (
+            rec.get("user_id") == user_id
+            or rec.get("device_id") in _owned_devices(user_id))
+        if owns_recording:
             got = rec.get("speaker_names")
             speaker_names = got if isinstance(got, dict) else {}
             out["recording"] = {"audio_s3_key": key,
                                 "title": rec.get("title", ""),
                                 "recorded_at": rec.get("recorded_at", ""),
                                 "folder_id": str(rec.get("folder_id") or ""),
-                                "speaker_names": speaker_names}
+                                "speaker_names": speaker_names,
+                                # The full meeting screen. Stated rather than
+                                # implied by the absence of the assignee
+                                # marker, so the app switches on one field.
+                                "access": "owner"}
+        elif rec and not creator and not _is_trashed(rec):
+            # WHERE THIS CAME FROM, for the assignee. A task that arrives with
+            # no provenance reads as if it appeared from nowhere; the meeting
+            # title and date are what make it accountable work rather than an
+            # anonymous instruction.
+            #
+            # THE KEY IS SENT, and it addresses a real route for them: the
+            # read-only notes view at /recordings/shared-with-me/{key+} (see
+            # the Assignee Meeting Access section). It is NOT a route into the
+            # owner's meeting screen — that one still gates on _owned_recording
+            # and 404s for this caller, which is why `access` below tells the
+            # app which of the two screens the key is good for.
+            #
+            # STILL NO FOLDER AND NO speaker_names. The folder is the owner's
+            # workspace and addresses a screen the assignee cannot open, and
+            # an empty speaker_names is what makes _public_task_v2 fall back to
+            # the stored assignee string instead of resolving a speaker label
+            # out of the creator's meeting.
+            out["recording"] = {"audio_s3_key": key,
+                                "title": rec.get("title", ""),
+                                "recorded_at": rec.get("recorded_at", ""),
+                                "folder_id": "",
+                                "speaker_names": {},
+                                # Read-only notes, not the full meeting. The
+                                # server enforces this either way; the field
+                                # exists so the app routes to the right screen
+                                # instead of guessing from who is calling.
+                                "access": "assignee"}
+    # WHO GAVE ME THIS WORK. Shown to the assignee, and to them only — the
+    # creator is looking at a task they made and does not need to be told.
+    #
+    # The CREATOR is the assigner. MinuteX does not store an `assigned_by`
+    # separate from `owner_user_id`, and for these tasks the two are the same
+    # person by construction: only the creator can assign or reassign (that is
+    # the permission model), and an AI-seeded task is assigned by the meeting
+    # owner who recorded it. Inventing a second field would be a schema change
+    # to record what owner_user_id already means.
+    #
+    # NAME AND PHOTO ONLY. Not the email — the assignee has no relationship
+    # with the creator's account beyond this task, and an address is contact
+    # detail, not provenance.
+    if not creator:
+        u = _users.get_item(
+            Key={"user_id": _task_creator(row)}).get("Item") or {}
+        if u:
+            out["assigned_by"] = {
+                "name": u.get("name", ""),
+                "avatar_view_url": _avatar_view_url(u.get("avatar_url", "")),
+            }
     out["task"] = _public_task_v2(row, speaker_names)
     return _resp(200, {**out})
+
+
+def _update_task_status_as_assignee(user_id, row, data):
+    """Apply a STATUS-ONLY patch on behalf of the task's assignee.
+
+    Deliberately narrow: it writes `status`, the completion timestamp that
+    belongs to it, and `updated_at`. Nothing else is touched, so every piece
+    of AI provenance on the row — confidence, evidence, evidence segment ids,
+    speaker id, resolution status, deadline provenance, folder — survives an
+    assignee moving the task along, which section 16 requires.
+
+    Status validation goes through _clean_task_status, the SAME helper the
+    creator's path uses, so the two callers can never accept different values.
+    """
+    if "status" not in data:
+        # Nothing this caller is allowed to change was actually sent.
+        raise ApiError(400, "status required")
+    status = _clean_task_status(data["status"])
+    updates = {"status": status, "updated_at": _now_iso()}
+    if status == TASK_STATUS_COMPLETED:
+        # Preserve an existing completion time, exactly as the creator's path
+        # does — re-completing must not move when the work was finished.
+        if not row.get("completed_at"):
+            updates["completed_at"] = _now_iso()
+    else:
+        updates["completed_at"] = ""
+
+    _apply_update(_tasks, {"task_id": row["task_id"]}, updates, [])
+    fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item") or {}
+    # Keep the legacy embedded map in step, the same dual-write every other
+    # task mutation performs.
+    if fresh.get("source_recording_id"):
+        _mirror_task_to_recording(fresh["source_recording_id"], fresh)
+    _audit("task.status_changed_by_assignee", user_id, row["task_id"],
+           status=status)
+    return _resp(200, {"task": _public_task_v2(
+        fresh, _speaker_names_for_recording(fresh.get("source_recording_id")))})
 
 
 def update_task_v2(event):
     """PATCH /tasks/{task_id} — the same mutation as the meeting-scoped route,
     reached by task id alone so the Task Tracker doesn't need to know which
-    meeting a task came from."""
+    meeting a task came from.
+
+    TWO CALLERS, TWO PATHS. The creator goes through the meeting-scoped
+    implementation exactly as before, so edit/reassign/deadline logic stays in
+    one place. The ASSIGNEE cannot: that route begins with _owned_recording,
+    and an assignee does not own the creator's meeting — it would 404 before
+    reaching any task check. So a status-only patch by the assignee is applied
+    here directly, against the same validation helpers, and every other field
+    is refused by _authorize_task_patch before a single write is built.
+    """
     user_id = _require_auth(event)
     task_id = (event.get("pathParameters") or {}).get("task_id", "")
-    row = _owned_task(user_id, task_id)
+    row = _visible_task(user_id, task_id)
+    data = _body(event)
+    # Refuses a forbidden field for BOTH callers, and 404s anyone who is
+    # neither — before any mutation is assembled.
+    _authorize_task_patch(user_id, row, data)
+
+    if not _is_task_creator(user_id, row):
+        # Assignee: status and nothing else (already guaranteed above).
+        return _update_task_status_as_assignee(user_id, row, data)
+
     # Delegate to the meeting-scoped implementation by handing it the shape it
     # expects — one code path for task mutation, not two that can drift.
     forged = dict(event)
@@ -6407,6 +7629,12 @@ def resolve_task_assignee(event):
     for an unresolved task is the ONLY way an unresolved assignee becomes a
     resolved one by name — nothing in this system upgrades a name to an
     identity on its own.
+
+    CREATOR ONLY. Resolving an assignment decides WHO the work belongs to,
+    which is task configuration, not execution — and letting the current
+    assignee reassign would let them hand their work to someone else. The
+    _owned_task predicate below is exactly that check: an assignee gets 404
+    here, since this route never tells a non-creator a task exists.
     """
     user_id = _require_auth(event)
     task_id = (event.get("pathParameters") or {}).get("task_id", "")
@@ -6428,18 +7656,28 @@ def resolve_task_assignee(event):
         updates["assignee_user_id"] = linked
     else:
         removes.append("assignee_user_id")
+    previous_assignee = _task_assignee_user(row)
     _apply_update(_tasks, {"task_id": row["task_id"]}, updates, removes)
     fresh = _tasks.get_item(Key={"task_id": row["task_id"]}).get("Item") or {}
     if fresh.get("source_recording_id"):
         _mirror_task_to_recording(fresh["source_recording_id"], fresh)
     _audit("task.assignee_resolved", user_id, row["task_id"],
            contact_id=contact["contact_id"])
+    # Resolving "which Rahul?" to a contact with a MinuteX account is the
+    # moment the task first has a real recipient — so it is a genuine
+    # assignment, and the person it moved away from (if any) is told too.
+    if _task_assignee_user(fresh) != previous_assignee:
+        _notify_task_reassigned(previous_assignee, fresh, actor_user_id=user_id)
+        _notify_task_assigned(fresh, actor_user_id=user_id)
     return _resp(200, {"task": _public_task_v2(
         fresh, _speaker_names_for_recording(fresh.get("source_recording_id")))})
 
 
 def suggest_task_assignees(event):
     """GET /tasks/{task_id}/assignee-candidates -> {status, candidates}
+
+    CREATOR ONLY (via _owned_task): these are candidate people from the
+    creator's own address book, and only the creator can act on the answer.
 
     Who an unresolved task's NAME might refer to, ranked by the folder it is
     in. Returns candidates for the user to choose from — it never picks. The
@@ -9748,6 +10986,2535 @@ def ai_suggestions(event):
     ]})
 
 
+# ===========================================================================
+# MEETING SHARE — a read-only public link to one meeting.
+#
+# The product goal is the one every meeting-notes tool has: send someone a URL
+# and they read the notes on their phone, with no account, no app and no
+# login. That requirement is what makes this the THIRD unauthenticated route
+# in this file (after /crm/salesforce/callback and the ElevenLabs STT
+# webhook), and it is worth being explicit about what replaces the JWT.
+#
+# THE TOKEN IS THE CREDENTIAL. Possession of a 256-bit URL-safe token IS the
+# authorization — there is no identity behind it to check. Everything else
+# follows from that:
+#
+#   * Only sha256(token) is stored. A dump of the Shares table yields no
+#     working links, and the raw token exists exactly once, in the create
+#     response. This is why there is no "resend link" route: the server
+#     genuinely cannot reconstruct one. Revoke and re-share instead.
+#   * The token is NEVER logged. share_schema.redact_token() produces the
+#     hash prefix for the one place a log line is useful.
+#   * The public route reads the SHARES table first and the recording second,
+#     so an unknown token costs one indexed lookup and never touches the
+#     recording row.
+#   * The public payload is ASSEMBLED (share_schema.public_payload), never a
+#     stripped-down recording row — see that module's docstring for why the
+#     direction matters.
+#
+# WHAT THIS DOES NOT CHANGE. Every authenticated route keeps the exact
+# ownership rule it had: _owned_recording / get_recording are untouched, and a
+# share confers no authenticated access to anything. Sharing is purely
+# additive — a recording with no shares behaves precisely as before.
+#
+# STORAGE. One table, Shares, PK share_id, with a token-index GSI on
+# token_hash because the public route arrives holding only the token, and a
+# recording-index GSI so the owner's list is a query rather than a scan.
+# ===========================================================================
+SHARES_TABLE = os.environ.get("SHARES_TABLE", "Shares")
+SHARES_TOKEN_INDEX = os.environ.get("SHARES_TOKEN_INDEX", "token-index")
+SHARES_RECORDING_INDEX = os.environ.get("SHARES_RECORDING_INDEX",
+                                        "recording-index")
+# Where the public page lives. An env var rather than a constant so the link
+# can move to a custom domain later without touching this code — the route
+# path (/share/{token}) stays identical either way.
+SHARE_BASE_URL = os.environ.get("SHARE_BASE_URL", "")
+# A ceiling on live links per recording. Not a licensing limit — it stops a
+# runaway client (or a user tapping Create repeatedly) from filling the table
+# with links nobody can enumerate afterwards.
+MAX_SHARES_PER_RECORDING = int(os.environ.get("MAX_SHARES_PER_RECORDING", "20"))
+MAX_SHARE_TTL_DAYS = int(os.environ.get("MAX_SHARE_TTL_DAYS", "365"))
+
+_shares = _ddb.Table(SHARES_TABLE)
+
+
+def _share_base_url(event):
+    """The origin the public link should use.
+
+    Prefers SHARE_BASE_URL; falls back to the API Gateway host the request
+    arrived on, so a fresh deploy produces working links before anyone sets
+    the variable. The Host header is only ever used to BUILD a link shown to
+    the authenticated owner — never to make an authorization decision — so a
+    spoofed Host cannot grant access to anything.
+    """
+    if SHARE_BASE_URL:
+        return SHARE_BASE_URL.rstrip("/")
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    host = headers.get("host") or ""
+    stage = ((event.get("requestContext") or {}).get("stage") or "")
+    if not host:
+        return ""
+    base = f"https://{host}"
+    # HTTP API's implicit "$default" stage is not part of the URL; a named
+    # stage is.
+    if stage and stage != "$default":
+        base = f"{base}/{stage}"
+    return base
+
+
+def _html_resp(status, body):
+    """An HTML response, with the cache posture a private page needs.
+
+    _resp() answers JSON for every other route in this file; the share page is
+    the one place that must return text/html, so it gets its own builder
+    rather than a mode flag on _resp.
+
+    Cache-Control is `no-store` on purpose. A shared meeting can be revoked,
+    and a page a CDN or a phone browser kept would outlive the revocation — so
+    the one thing this response must never be is durably cached. It also keeps
+    meeting content out of shared/proxy caches on whatever network the
+    recipient happens to be using.
+    """
+    return {
+        "statusCode": status,
+        "headers": {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store, no-cache, must-revalidate, private",
+            "Pragma": "no-cache",
+            "X-Robots-Tag": "noindex, nofollow, noarchive",
+            # Deny-by-default, then the four things this page genuinely
+            # needs. Each entry is here for a stated reason; anything not
+            # listed is blocked, which is the point.
+            #
+            #   style-src   'unsafe-inline' for the inline <style> block, plus
+            #               fonts.googleapis.com for the app's own two
+            #               families (theme.tsx FONT) — the shared page is
+            #               typographically the SAME product, not a lookalike.
+            #   font-src    fonts.gstatic.com, where that stylesheet's @font-face
+            #               rules actually fetch the files from.
+            #   script-src  'unsafe-inline' for the ~14-line tab switcher. It
+            #               is the only script on the page and it touches
+            #               nothing but a class name and `hidden`. A nonce
+            #               would be stricter, but with no other script source
+            #               permitted there is nothing for an injected tag to
+            #               do — and every interpolation is html-escaped.
+            #   media-src   https:, so the <audio> element can follow the
+            #               gateway's 302 to the presigned S3 URL.
+            "Content-Security-Policy": (
+                "default-src 'none'; "
+                "style-src 'unsafe-inline' https://fonts.googleapis.com; "
+                "font-src https://fonts.gstatic.com; "
+                "script-src 'unsafe-inline'; "
+                "img-src 'self' data:; media-src https:; "
+                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+        "body": body,
+    }
+
+
+def _share_by_id(share_id, user_id):
+    """One share the caller owns, or 404.
+
+    Same 404-not-403 rule the recording routes use: a share_id belonging to
+    another user is reported as missing, so the endpoint cannot confirm that
+    an id exists.
+    """
+    if not share_id:
+        raise ApiError(400, "share id required")
+    item = _shares.get_item(Key={"share_id": share_id}).get("Item")
+    if not item or item.get("owner_id") != user_id:
+        raise ApiError(404, "share not found")
+    return item
+
+
+def _shares_for_recording(key):
+    res = _shares.query(
+        IndexName=SHARES_RECORDING_INDEX,
+        KeyConditionExpression=Key("recording_key").eq(key),
+    )
+    return res.get("Items", [])
+
+
+def _parse_expires_at(raw):
+    """The requested expiry -> a stored ISO string, or "" for never.
+
+    Accepts an ISO timestamp or a number of days, because the app's picker
+    offers durations while an API caller more naturally sends an instant.
+    """
+    if raw is None or raw == "":
+        return ""
+    if isinstance(raw, bool):
+        raise ApiError(400, "expires_at must be a timestamp, a number of "
+                            "days, or null")
+    if isinstance(raw, (int, float, Decimal)):
+        days = float(raw)
+        if days <= 0:
+            raise ApiError(400, "expiry must be greater than zero days")
+        if days > MAX_SHARE_TTL_DAYS:
+            raise ApiError(400, f"expiry cannot exceed {MAX_SHARE_TTL_DAYS} days")
+        at = datetime.now(timezone.utc) + timedelta(days=days)
+        return at.isoformat().replace("+00:00", "Z")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return ""
+        try:
+            at = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            raise ApiError(400, "expires_at must be an ISO-8601 timestamp")
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if at <= now:
+            raise ApiError(400, "expires_at must be in the future")
+        if at > now + timedelta(days=MAX_SHARE_TTL_DAYS):
+            raise ApiError(400, f"expiry cannot exceed {MAX_SHARE_TTL_DAYS} days")
+        return at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    raise ApiError(400, "expires_at must be a timestamp, a number of days, or null")
+
+
+def _shared_mom(user_id, key, item):
+    """The MoM structure the public page renders from.
+
+    Prefers the STORED structure, so the shared page shows exactly what the
+    owner edited in the MoM editor. A recording that has never had a MoM
+    generated falls back to building the sections on the fly — a read-only
+    build, never persisted, because a viewer opening a link must not cause a
+    write to the owner's meeting.
+    """
+    stored = _stored_mom(item)
+    if stored is not None:
+        return mom_schema.coerce_mom(stored)
+    mom = mom_schema.empty_mom()
+    try:
+        mom["sections"] = _build_fresh_sections(user_id, key, item)
+    except Exception as e:  # noqa: BLE001
+        # A share that renders the header and nothing else beats a 500. The
+        # recording key is safe to log; the token never appears here.
+        print(f"[share] section build failed for {key}: {type(e).__name__}: {e}")
+        mom["sections"] = []
+    return mom
+
+
+# ===========================================================================
+# ASSIGNEE MEETING ACCESS — read-only notes for the person doing the work.
+#
+# THE PROBLEM. A task extracted from a meeting arrives in the assignee's list
+# with a title, a deadline and nothing else. get_task already sends the
+# meeting's TITLE and DATE as provenance, but a title is not context:
+# "Prepare the quotation by Friday" does not say which vendor, what was
+# agreed, or what the number is supposed to cover. The assignee had to go and
+# ask the person who recorded the meeting, which is exactly the coordination
+# this product exists to remove.
+#
+# THE GRANT IS DERIVED, NOT STORED. There is no grants table and no share row
+# behind this. Access is recomputed on every request from one question: does
+# this caller currently assignee-own a task whose source_recording_id is this
+# key? Three consequences, all of them the reason for the design:
+#
+#   * REASSIGNMENT REVOKES INSTANTLY. Moving the task to someone else rewrites
+#     assignee_user_id, so the next request from the old assignee finds no
+#     task and 404s. A stored grant would have to be swept, and the day the
+#     sweep is forgotten is the day a former assignee still reads the meeting.
+#   * DELETING THE TASK REVOKES TOO, for the same reason and for free.
+#   * NOTHING TO REVOKE BY HAND, so no owner-facing revoke UI has to exist
+#     for the feature to be safe.
+#
+# WHAT COMES OUT. share_schema.public_payload() — the SAME assembler the
+# public share page uses, deliberately, rather than a second payload builder
+# for this route. That module's contract is that it can only emit the keys it
+# explicitly writes, so no future attribute on the recording row
+# (owner_user_id, device_id, the raw S3 key, CRM records, chat history,
+# folder membership) can reach an assignee by being forgotten here. A
+# parallel builder would be a deny-list by another name and would drift from
+# the share page within one release.
+#
+# NOTES ONLY. The synthetic config below pins transcript_enabled and
+# audio_enabled to FALSE — they are not toggles, and no request field can
+# turn them on. This route is therefore strictly narrower than a public share
+# link the owner could create anyway, and it never mints a presigned URL:
+# the audio gateway (/share/{token}/audio) has no counterpart here, because
+# there is no token and no audio in the payload to point at.
+#
+# 404, NEVER 403, matching _owned_recording and _owned_task: a caller with no
+# task in this meeting must not learn that the meeting exists.
+# ===========================================================================
+
+def _assignee_share_config():
+    """The synthetic share config an assignee's meeting view renders under.
+
+    Not stored and never user-supplied: the FIXED visibility of this route.
+    Built through coerce_config so it is validated by the same code path as a
+    real share and picks up any future toggle at its default, rather than
+    being a hand-rolled dict that silently lacks the new key.
+
+    transcript/audio are pinned OFF *after* coercion, so a change to the
+    module defaults can widen a public share without widening this.
+    """
+    config = share_schema.coerce_config({})
+    config["transcript_enabled"] = False
+    config["audio_enabled"] = False
+    return config
+
+
+def _assignee_tasks_in_recording(user_id, key):
+    """This caller's tasks sourced from this meeting. [] when there are none.
+
+    Queried on assignee-user-index — the ACCOUNT, not assignee_contact_id: a
+    contact is an address-book row, not an identity that can authenticate,
+    the same distinction the whole task permission model rests on.
+
+    The index is keyed by assignee alone, so every row is still re-checked
+    against BOTH the caller and the recording key. An index is a lookup path,
+    never an authorization decision.
+    """
+    if not user_id or not key:
+        return []
+    try:
+        res = _tasks.query(
+            IndexName=TASKS_ASSIGNEE_USER_INDEX,
+            KeyConditionExpression=Key("assignee_user_id").eq(user_id),
+        )
+    except ClientError as err:
+        print(f"[assignee-view] task lookup failed for {key}: "
+              f"{type(err).__name__}: {err}")
+        return []
+    return [row for row in res.get("Items", [])
+            if str(row.get("source_recording_id") or "") == key
+            and _is_task_assignee(user_id, row)]
+
+
+def _assignee_readable_recording(event):
+    """(user_id, key, item) when the caller may READ this meeting's notes.
+
+    The assignee counterpart to _owned_recording, deliberately shaped like it
+    so the two read the same at every call site. 404 for a caller with no
+    task here, for a meeting that does not exist, and for one in the Trash —
+    a trashed meeting stops being readable through a task exactly as it stops
+    being readable through a share link.
+
+    The OWNER is allowed through too: they can already open the meeting
+    properly, and rejecting them would make the route lie about a recording
+    the caller demonstrably owns.
+    """
+    user_id = _require_auth(event)
+    key = _url_unquote((event.get("pathParameters") or {}).get("key", ""))
+    if not key:
+        raise ApiError(400, "recording key required")
+
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item or _is_trashed(item):
+        raise ApiError(404, "recording not found")
+
+    owns = item.get("user_id") == user_id or \
+        item.get("device_id") in _owned_devices(user_id)
+    if not owns and not _assignee_tasks_in_recording(user_id, key):
+        raise ApiError(404, "recording not found")
+    return user_id, key, item
+
+
+def get_assignee_meeting(event):
+    """GET /recordings/shared-with-me/{key+} -> {meeting, access}
+
+    The read-only meeting an ASSIGNEE opens from their task. Notes only: no
+    transcript, no audio, no presigned URL — and no route here can write.
+
+    The MoM is resolved against the recording's OWNER, not the caller. The
+    stored structure and its fresh-build fallback both belong to the owner's
+    meeting, and building them as the assignee would produce an empty
+    document. That is a read of the owner's content on the assignee's behalf,
+    which is the point of the route; what it can EMIT is still bounded by
+    public_payload and the pinned-off toggles above.
+    """
+    user_id, key, item = _assignee_readable_recording(event)
+
+    # Hydrated because the MoM fallback builds its sections from the
+    # transcript. The transcript still cannot LEAVE: transcript_enabled is
+    # False, so public_payload never copies it into the response.
+    item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+    owner_id = str(item.get("user_id") or "")
+    config = _assignee_share_config()
+    mom = _shared_mom(owner_id, key, item)
+
+    # audio_url is not merely omitted from the response — it is never
+    # GENERATED. A presign is a bearer credential, and minting one the payload
+    # then drops would still put it in this Lambda's memory and in any future
+    # log line. Hence audio_url=None here, on top of audio_enabled being False.
+    meeting = share_schema.public_payload(item, mom, config, audio_url=None)
+    return _resp(200, {
+        "meeting": meeting,
+        # Lets the app pick the right screen without re-deriving the rule.
+        # Enforcement stays here regardless of what any client does.
+        "access": "owner" if owner_id == user_id else "assignee",
+    })
+
+
+def create_share(event):
+    """POST /recordings/share/{key+} -> {share_id, url, expires_at, share}
+
+    The ONLY place a raw token exists. It is returned once and then forgotten:
+    only its hash is written, so this response is the user's single
+    opportunity to capture the link.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    body = _body(event)
+
+    active = [s for s in _shares_for_recording(key) if share_schema.is_active(s)]
+    if len(active) >= MAX_SHARES_PER_RECORDING:
+        raise ApiError(409, "this meeting already has the maximum number of "
+                            "active share links; revoke one first")
+
+    config = share_schema.coerce_config(body)
+    expires_at = _parse_expires_at(
+        body.get("expires_at", body.get("expires_in_days")))
+
+    token = share_schema.new_token()
+    now = _now_iso()
+    share = {
+        "share_id": f"shr_{uuid.uuid4().hex}",
+        "recording_key": key,
+        "owner_id": user_id,
+        "token_hash": share_schema.hash_token(token),
+        "access_type": share_schema.ACCESS_PUBLIC,
+        "expires_at": expires_at,
+        "revoked_at": "",
+        "created_at": now,
+        "updated_at": now,
+        "view_count": 0,
+        "last_viewed_at": "",
+        # A denormalised copy so the owner's list screen reads without a
+        # second lookup. Nothing reads it for authorization.
+        "recording_title": (item.get("title") or "").strip()[:200],
+    }
+    share.update(config)
+
+    _shares.put_item(Item=share,
+                     ConditionExpression="attribute_not_exists(share_id)")
+
+    # AFTER the share exists. The owner is both actor and recipient here, and
+    # that is deliberate rather than an oversight of the never-notify-the-actor
+    # rule: a share link is a durable thing that stays live until revoked, and
+    # the notification is the record of "this meeting is exposed by a link" —
+    # which is worth being able to find later, unlike a transient action. It is
+    # the one event site that passes no actor_user_id, for that reason.
+    _notify_meeting_shared(user_id, key, item, share["share_id"])
+
+    base = _share_base_url(event)
+    return _resp(201, {
+        "share_id": share["share_id"],
+        "url": share_schema.public_share_url(base, token),
+        "expires_at": expires_at or None,
+        "share": share_schema.owner_view(share, base_url=base, token=token),
+    })
+
+
+def list_shares(event):
+    """GET /recordings/shares/{key+} -> {shares:[...]}
+
+    No `url` on any row: the raw tokens are unrecoverable by design (only
+    their hashes were stored), so the app shows a revoke control for old links
+    and a Create button for a new one.
+    """
+    _, key, _item = _owned_recording(event, hydrate=False)
+    rows = _shares_for_recording(key)
+    rows.sort(key=lambda s: s.get("created_at", ""), reverse=True)
+    return _resp(200, {"shares": [share_schema.owner_view(s) for s in rows]})
+
+
+def update_share(event):
+    """PATCH /shares/{share_id} -> {share}
+
+    Toggles and expiry only. The token never changes: rotating it would break
+    a link the owner has already sent while leaving the old one revoked
+    anyway, so "change who can see what" and "issue a new link" stay separate
+    operations.
+    """
+    user_id = _require_auth(event)
+    share_id = (event.get("pathParameters") or {}).get("share_id", "")
+    share = _share_by_id(share_id, user_id)
+    body = _body(event)
+
+    updates = share_schema.coerce_config(body, base=share)
+    now = _now_iso()
+    values = {":now": now}
+    names = {}
+    sets = ["updated_at = :now"]
+
+    for i, (name, _default, _roles) in enumerate(share_schema.TOGGLES):
+        sets.append(f"#n{i} = :t{i}")
+        names[f"#n{i}"] = name
+        values[f":t{i}"] = updates[name]
+
+    if "expires_at" in body or "expires_in_days" in body:
+        sets.append("expires_at = :exp")
+        values[":exp"] = _parse_expires_at(
+            body.get("expires_at", body.get("expires_in_days")))
+
+    # Un-revoking is deliberately not offered: a revoked link's token is gone
+    # from the owner's reach anyway, so "restore" would resurrect a URL only a
+    # recipient still holds. The condition re-checks ownership at write time.
+    _shares.update_item(
+        Key={"share_id": share_id},
+        UpdateExpression="SET " + ", ".join(sets),
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues={**values, ":owner": user_id},
+        ConditionExpression="owner_id = :owner",
+    )
+
+    fresh = _shares.get_item(Key={"share_id": share_id}).get("Item") or share
+    return _resp(200, {"share": share_schema.owner_view(fresh)})
+
+
+def revoke_share(event):
+    """DELETE /shares/{share_id} -> {share_id, revoked}
+
+    A soft revoke: the row stays, stamped with revoked_at. Keeping it is what
+    makes the kill auditable — "this link existed and was killed at 14:02" is
+    worth more than the reclaimed row, and the public route treats a revoked
+    share exactly like a nonexistent one.
+    """
+    user_id = _require_auth(event)
+    share_id = (event.get("pathParameters") or {}).get("share_id", "")
+    share = _share_by_id(share_id, user_id)
+
+    if share.get("revoked_at"):
+        return _resp(200, {"share_id": share_id, "revoked": True,
+                           "revoked_at": share["revoked_at"]})
+
+    now = _now_iso()
+    _shares.update_item(
+        Key={"share_id": share_id},
+        UpdateExpression="SET revoked_at = :now, updated_at = :now",
+        ExpressionAttributeValues={":now": now, ":owner": user_id},
+        ConditionExpression="owner_id = :owner",
+    )
+    return _resp(200, {"share_id": share_id, "revoked": True, "revoked_at": now})
+
+
+def _share_by_token(token):
+    """The share row for a raw token, or None. Reads the hash, never the token."""
+    res = _shares.query(
+        IndexName=SHARES_TOKEN_INDEX,
+        KeyConditionExpression=Key("token_hash").eq(
+            share_schema.hash_token(token)),
+    )
+    rows = res.get("Items", [])
+    return rows[0] if rows else None
+
+
+def _count_share_view(share):
+    """Best-effort view counter. Never fails the page.
+
+    A share link's whole value is that it opens; a throttled counter update
+    must not be the reason a recipient sees an error.
+    """
+    try:
+        _shares.update_item(
+            Key={"share_id": share.get("share_id")},
+            UpdateExpression="SET view_count = if_not_exists(view_count, :z) "
+                             "+ :one, last_viewed_at = :now",
+            ExpressionAttributeValues={":z": 0, ":one": 1, ":now": _now_iso()},
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[share] view count failed for "
+              f"{share.get('share_id')}: {type(e).__name__}: {e}")
+
+
+# The wording every dead link gets, whatever killed it. One tuple so the
+# revoked and unknown paths cannot drift apart and start distinguishing
+# themselves — see _resolve_public_share.
+_SHARE_GONE = ("This link isn't available",
+               "It may have been revoked by its owner, or the address may be "
+               "incomplete. Ask the sender for a new link.")
+
+
+class ShareGone(Exception):
+    """A public share request that must not be served.
+
+    Carries the HTTP status and the page to render. Raised rather than
+    returned so the validation sequence reads top-to-bottom in one place and
+    BOTH public routes (the page and the audio gateway) are forced through
+    exactly the same checks — an audio gateway that silently skipped the
+    revocation test is precisely the bug this shape prevents.
+    """
+
+    def __init__(self, status, headline, detail):
+        super().__init__(headline)
+        self.status = status
+        self.headline = headline
+        self.detail = detail
+
+    def response(self):
+        return _html_resp(self.status, share_schema.render_error_page(
+            self.status, self.headline, self.detail))
+
+
+def _resolve_public_share(event):
+    """(token, share, item) for a public request, or raise ShareGone.
+
+    THE one gate in front of every unauthenticated read. The checks run
+    cheapest and most-likely-to-reject first, so a flood of bad URLs costs a
+    regex and at most one indexed lookup:
+
+      1. SHAPE      the token must look like a token at all (no DB read).
+      2. LOOKUP     token-index on sha256(token). Unknown -> 404.
+      3. REVOKED    revoked_at set -> 404, the SAME page as unknown.
+      4. EXPIRED    expires_at passed -> 410, and says so: an expiry is a
+                    fact the owner chose to communicate, unlike a revocation.
+      5. RECORDING  resolved from the SHARE, never from the URL.
+      6. TRASHED    a meeting in the Trash stops being shared with it.
+
+    Failures 2 and 3 render the same page on purpose, so a dead link cannot be
+    used to learn whether a share ever existed.
+    """
+    token = _url_unquote((event.get("pathParameters") or {}).get("token", ""))
+
+    if not share_schema.token_looks_valid(token):
+        raise ShareGone(404, *_SHARE_GONE)
+
+    try:
+        share = _share_by_token(token)
+    except ClientError as e:
+        print(f"[share] lookup failed for {share_schema.redact_token(token)}: "
+              f"{type(e).__name__}: {e}")
+        raise ShareGone(503, "Something went wrong",
+                        "This page couldn't be loaded right now. "
+                        "Please try again.")
+
+    if not share or share_schema.is_revoked(share):
+        raise ShareGone(404, *_SHARE_GONE)
+
+    if share_schema.is_expired(share):
+        raise ShareGone(410, "This link has expired",
+                        "The owner set this share link to expire. "
+                        "Ask them for a new one.")
+
+    key = share.get("recording_key") or ""
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") \
+        if key else None
+    if not item or _is_trashed(item):
+        raise ShareGone(404, *_SHARE_GONE)
+
+    return token, share, item
+
+
+def public_share_audio(event):
+    """GET /share/{token}/audio -> 302 to a fresh presign. NO JWT.
+
+    THE AUDIO GATEWAY. The page never points <audio> at S3 directly; it points
+    here, and this re-validates the share and re-signs on EVERY request. Three
+    things follow, and each is a reason this route exists:
+
+      * REVOCATION REACHES PLAYBACK. An HTML5 player re-requests on every seek
+        and on many pause/resumes. Because each of those passes through
+        _resolve_public_share again, revoking a share (or turning its audio
+        toggle off) stops audio that is already under way, instead of leaving
+        a signed URL working in someone's tab until it lapses.
+
+      * NO S3 URL IN THE PAGE SOURCE. What ships in the HTML is this route,
+        which is useless without a live share behind it. The presign exists
+        only inside a 302 the browser follows.
+
+      * LONG RECORDINGS WORK. S3 checks a presign's expiry at REQUEST time, so
+        a ranged read that starts inside the window completes, but the NEXT
+        one — every seek — is checked afresh. Re-signing per request means the
+        window only ever has to be one read wide, and a two-hour meeting still
+        seeks correctly at minute 118.
+
+    RANGE / 206 is preserved because the browser replays its original request,
+    Range header and all, against the Location it is given. S3 answers the 206
+    directly; this Lambda never proxies a byte of audio, which also keeps it
+    clear of API Gateway's 29s timeout and 10MB response cap.
+    """
+    try:
+        _token, share, item = _resolve_public_share(event)
+    except ShareGone as gone:
+        return gone.response()
+
+    # Checked HERE, not only when rendering the page: a viewer holding an
+    # already-loaded page must not keep streaming after the owner turns audio
+    # off. This is the check that makes that true.
+    if not share.get("audio_enabled"):
+        return ShareGone(404, *_SHARE_GONE).response()
+
+    key = share.get("recording_key") or ""
+    if not (BUCKET_NAME and key):
+        return ShareGone(404, *_SHARE_GONE).response()
+
+    try:
+        url = _s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET_NAME, "Key": key},
+            # Flat and short: this URL only has to outlive ONE ranged read,
+            # because the next seek comes back through this route.
+            ExpiresIn=share_schema.SHARE_AUDIO_URL_EXPIRY,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[share] presign failed for {key}: {type(e).__name__}: {e}")
+        return ShareGone(503, "Something went wrong",
+                         "The recording couldn't be loaded right now. "
+                         "Please try again.").response()
+
+    # 302, not 301: a permanent redirect is exactly the thing a browser is
+    # entitled to cache, and caching it would pin one expiring presign in
+    # front of every later seek.
+    return {
+        "statusCode": 302,
+        "headers": {
+            "Location": url,
+            "Cache-Control": "no-store, no-cache, must-revalidate, private",
+            "Referrer-Policy": "no-referrer",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
+        "body": "",
+    }
+
+
+def public_share(event):
+    """GET /share/{token} -> a mobile-friendly HTML page. NO JWT.
+
+    THE THIRD UNAUTHENTICATED ROUTE IN THIS FILE (public_share_audio above is
+    the fourth). Validation lives in _resolve_public_share; what remains here
+    is assembling the payload from the enabled toggles only.
+    """
+    try:
+        token, share, item = _resolve_public_share(event)
+    except ShareGone as gone:
+        return gone.response()
+
+    key = share.get("recording_key") or ""
+
+    # The transcript lives in S3 for newer rows, so it is only fetched when the
+    # share actually publishes it — a notes-only share costs no S3 GET.
+    if share.get("transcript_enabled"):
+        try:
+            item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+        except Exception as e:  # noqa: BLE001
+            print(f"[share] transcript hydrate failed for {key}: "
+                  f"{type(e).__name__}: {e}")
+
+    # The page points at the GATEWAY, never at S3. The permanent object URL is
+    # never exposed and no presign appears in the HTML at all — the gateway
+    # mints one per request, behind a fresh validation. See public_share_audio.
+    #
+    # FALLBACK: if the gateway address cannot be resolved (no SHARE_BASE_URL
+    # and no Host header), fall back to a direct presign sized to the
+    # RECORDING rather than to a flat 15 minutes — a fixed window breaks
+    # seeking on any meeting longer than it. Still only when audio is shared.
+    audio_url = None
+    if share.get("audio_enabled") and BUCKET_NAME and key:
+        base = _share_base_url(event)
+        if base:
+            audio_url = f"{base}/share/{token}/audio"
+        else:
+            try:
+                audio_url = _s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": BUCKET_NAME, "Key": key},
+                    ExpiresIn=share_schema.audio_url_expiry(item.get("duration")),
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[share] presign failed for {key}: "
+                      f"{type(e).__name__}: {e}")
+                audio_url = None
+
+    mom = _shared_mom(share.get("owner_id") or "", key, item)
+    payload = share_schema.public_payload(item, mom, share, audio_url=audio_url)
+    _count_share_view(share)
+    return _html_resp(200, share_schema.render_page(payload))
+
+
+# ---------------------------------------------------------------------------
+# INTEGRATIONS — the generic "connect MinuteX to an external application"
+# layer, with Gmail as the first (and currently only) working provider.
+#
+# WHY A SECOND OAUTH SECTION EXISTS ALONGSIDE THE SALESFORCE ONE ABOVE. The
+# Salesforce code is the right pattern and this section reuses every part of
+# it that is genuinely generic — the signed/expiring `state` (_sign_oauth_state
+# / _verify_oauth_state), PKCE, KMS envelope-encryption of the refresh token,
+# the "never 401 for a dead third-party credential" rule. What it does NOT do
+# is widen the Salesforce handlers to take a provider argument, because those
+# handlers are wound through Salesforce-specific concerns (instance_url, org
+# describe, field mapping, SOQL) that no other provider has. Generalising them
+# would mean a growing pile of `if provider == "salesforce"` inside code that
+# currently reads straight through.
+#
+# So the split is by SHAPE, not by vendor:
+#   * shared/integrations.py owns the connection model + status vocabulary
+#   * IntegrationProvider below owns the OAuth mechanics every provider shares
+#   * GmailProvider owns only what is Gmail-specific
+# Adding WhatsApp later is a subclass plus a PROVIDERS entry. Salesforce can be
+# migrated onto this table when someone wants it to be, and until then it is
+# listed in the catalog as managed elsewhere so the Integrations screen is
+# still a complete picture.
+#
+# THE FLOW (identical in shape to the Salesforce one, three parties):
+#   1. POST /integrations/{provider}/connect  (JWT) -> {authorize_url}
+#   2. the app opens it; the user approves on Google's own page
+#   3. Google redirects to GET /integrations/{provider}/callback?code&state
+#      — UNAUTHENTICATED, because a browser redirect carries no JWT; `state`
+#      is the credential there, exactly as in the Salesforce callback
+#   4. the callback exchanges the code, encrypts the refresh token, writes
+#      one Integrations row with status CONNECTED
+#   5. GET /integrations and DELETE /integrations/{provider} let the app read
+#      status and disconnect — tokens never appear in any response
+# ---------------------------------------------------------------------------
+
+# Google's OAuth endpoints. Constants rather than env vars: unlike the
+# Salesforce login host (which legitimately differs for a sandbox org), these
+# are the same for every Google account in the world.
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+
+# SCOPES — the minimum for Phase 1, and this list is the security boundary.
+#
+# gmail.send is a SEND-ONLY scope: it grants permission to send mail as the
+# user and NOTHING else. It cannot read the inbox, cannot search, cannot list
+# threads, cannot even read the message it just sent. That is exactly the
+# capability MinuteX needs and exactly the one it should hold — the moment a
+# read scope is added, every meeting-notes product becomes a mailbox-scraping
+# product in the user's eyes and in Google's verification review.
+#
+# userinfo.email exists only so the Manage screen can show WHICH account is
+# connected. Without it the app could say "Gmail: Connected" but not whose
+# Gmail, which is the difference between a trustworthy integration and a
+# spooky one.
+#
+# Explicitly NOT requested: gmail.readonly, gmail.modify, gmail.compose,
+# gmail.metadata, or any Calendar/Tasks/Contacts scope. Phase 1 does not need
+# them, and Gmail inbox reading is named in the scope boundary as out of scope.
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
+
+# The provider whose connection is REQUIRED for the mail routes below.
+INTEGRATION_GMAIL = integrations.PROVIDER_GMAIL
+
+# HTTP status + code for "MinuteX is fine, but the INTEGRATION behind this
+# route is not usable". Same reasoning as SF_RECONNECT_STATUS above, and the
+# reasoning is worth restating because it is the single most load-bearing
+# decision in this file's error handling: 401 on this API means the MinuteX
+# JWT is dead, and lib/api.ts reacts by clearing the session and bouncing the
+# user to /login. A dead Gmail refresh token must never do that — the user's
+# MinuteX session is perfectly valid and the fix is "reconnect Gmail", not
+# "sign in again".
+#
+# 409 Conflict is the honest code: authenticated, well-formed, but in conflict
+# with the current state of the resource. The app branches on `code`.
+INTEGRATION_STATUS_CODE = 409
+INTEGRATION_REAUTH_CODE = "integration_reauth_required"
+INTEGRATION_NOT_CONNECTED_CODE = "integration_not_connected"
+
+
+class IntegrationNotConnected(ApiError):
+    """The user has not connected this provider (or has disconnected it).
+
+    409 rather than 400 for the same reason as below: the app needs ONE branch
+    for "this integration cannot serve the request", distinguished by `code`.
+    """
+
+    def __init__(self, provider: str, message: str = ""):
+        meta = integrations.PROVIDERS_BY_ID.get(provider, {})
+        name = meta.get("name", provider)
+        super().__init__(INTEGRATION_STATUS_CODE,
+                         message or f"Connect {name} to use this feature.")
+        self.code = INTEGRATION_NOT_CONNECTED_CODE
+        self.provider = provider
+
+
+class IntegrationReauthRequired(ApiError):
+    """The stored credential is dead — the user must reconnect.
+
+    Raising this also FLIPS THE STORED STATUS to REAUTH_REQUIRED (see
+    _mark_integration_status), which is what makes the backend the source of
+    truth the requirement asks for: the next GET /integrations reports the
+    honest state without needing another failed send to discover it.
+    """
+
+    def __init__(self, provider: str, message: str = ""):
+        meta = integrations.PROVIDERS_BY_ID.get(provider, {})
+        name = meta.get("name", provider)
+        super().__init__(INTEGRATION_STATUS_CODE,
+                         message or f"Your {name} connection expired. "
+                                    f"Reconnect {name} to continue.")
+        self.code = INTEGRATION_REAUTH_CODE
+        self.provider = provider
+
+
+def _google_client_secret():
+    """The OAuth client secret from Secrets Manager — same lazy per-container
+    cache as _jwt_secret()/_salesforce_client_secret(). No env-var fallback:
+    a client secret must never land as a plaintext Lambda env var, and there
+    is no legacy deployment here to stay compatible with."""
+    global _google_secret_cache
+    if _google_secret_cache is not None:
+        return _google_secret_cache
+    if not GOOGLE_CLIENT_SECRET_ARN:
+        raise ApiError(500, "Gmail integration is not configured")
+    sm = boto3.client("secretsmanager", region_name=REGION)
+    _google_secret_cache = sm.get_secret_value(
+        SecretId=GOOGLE_CLIENT_SECRET_ARN)["SecretString"]
+    return _google_secret_cache
+
+
+_google_secret_cache = None
+
+
+def _integration_kms_encrypt(plaintext: str) -> str:
+    """Envelope-encrypt a refresh token for storage.
+
+    Uses INTEGRATIONS_KMS_KEY_ID, falling back to the Salesforce key when it
+    is unset so a deployment that has not yet run the new provisioning script
+    still works rather than storing plaintext. Storing plaintext is never an
+    acceptable degradation, so if NEITHER key exists this raises.
+    """
+    key_id = INTEGRATIONS_KMS_KEY_ID or SALESFORCE_KMS_KEY_ID
+    if not key_id:
+        raise ApiError(500, "integration credential storage is not configured")
+    resp = _kms.encrypt(KeyId=key_id, Plaintext=plaintext.encode("utf-8"))
+    return _b64u_encode(resp["CiphertextBlob"])
+
+
+def _integration_kms_decrypt(ciphertext_b64: str) -> str:
+    # KeyId is omitted deliberately: a symmetric ciphertext blob carries the
+    # key it was encrypted under, so decrypt works even if the configured key
+    # changed after the row was written. Passing a mismatched KeyId would
+    # fail an otherwise recoverable decrypt.
+    resp = _kms.decrypt(CiphertextBlob=_b64u_decode(ciphertext_b64))
+    return resp["Plaintext"].decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Storage — the Integrations table, keyed exactly like CrmConnections.
+# ---------------------------------------------------------------------------
+def _get_integration(user_id: str, provider: str):
+    return _integrations.get_item(
+        Key={"user_id": user_id, "provider": provider}).get("Item")
+
+
+def _all_integrations(user_id: str) -> dict:
+    """Every connection row this user has, keyed by provider.
+
+    One Query on the partition key, not N GetItems: the catalog needs all of
+    them and the row count per user is bounded by the provider list.
+    """
+    try:
+        res = _integrations.query(
+            KeyConditionExpression=Key("user_id").eq(user_id))
+    except Exception as e:  # noqa: BLE001
+        # A brand-new deployment may not have the table yet. The Integrations
+        # screen showing everything as not-connected is a far better failure
+        # than a 500 that hides the Coming Soon cards too.
+        print(f"[integrations] list failed for {user_id}: {type(e).__name__}: {e}")
+        return {}
+    return {row.get("provider"): row for row in res.get("Items", [])
+            if row.get("provider")}
+
+
+def _mark_integration_status(user_id: str, provider: str, status: str,
+                             message: str = "") -> None:
+    """Persist a status transition (CONNECTED -> REAUTH_REQUIRED / ERROR).
+
+    Best-effort by design: this is called from a failure path that is already
+    reporting a useful error to the user, and failing THAT over a bookkeeping
+    write would be strictly worse. The next call re-discovers the same state.
+    """
+    try:
+        _integrations.update_item(
+            Key={"user_id": user_id, "provider": provider},
+            UpdateExpression=("SET #s = :s, status_message = :m, "
+                              "updated_at = :now"),
+            # Only touch a row that EXISTS. A disconnect that raced with this
+            # must not be resurrected as a REAUTH_REQUIRED row — that would
+            # show the user a "Reconnect" card for something they just removed.
+            ConditionExpression="attribute_exists(user_id)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": status, ":m": message[:300],
+                                       ":now": _now_iso()},
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[integrations] status write failed ({provider}={status}): "
+              f"{type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Provider abstraction.
+#
+# The base class owns the OAuth-2 authorization-code flow as Google, Slack,
+# HubSpot, Microsoft and most others implement it — which is why a future
+# provider overrides configuration (URLs, scopes) rather than logic. It
+# deliberately does NOT declare send_message(): a calendar provider has no
+# such operation, and an abstract method that half the subclasses raise
+# NotImplementedError from is a worse contract than no method at all. Each
+# provider declares the capabilities it actually has.
+# ---------------------------------------------------------------------------
+class IntegrationProvider:
+    """Base: connect / disconnect / status / refresh_credentials."""
+
+    provider = ""
+    auth_url = ""
+    token_url = ""
+    revoke_url = ""
+    scopes = ()
+
+    # ---- configuration -------------------------------------------------
+    def client_id(self) -> str:
+        raise NotImplementedError
+
+    def client_secret(self) -> str:
+        raise NotImplementedError
+
+    def redirect_uri(self) -> str:
+        raise NotImplementedError
+
+    def is_configured(self) -> bool:
+        return bool(self.client_id() and self.redirect_uri())
+
+    # ---- HTTP ----------------------------------------------------------
+    def _post_form(self, url: str, form: dict, what: str) -> dict:
+        """POST x-www-form-urlencoded, return parsed JSON.
+
+        Mirrors SalesforceClient._post_form — stdlib urllib, no dependencies,
+        matching this file's convention. The provider's own error body is
+        logged and never returned: an OAuth error body can echo parameters.
+        """
+        body = urllib.parse.urlencode(form).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            print(f"[{self.provider}] {what} failed: {e.code} {detail[:300]}")
+            # invalid_grant is THE signal that a refresh token is dead (user
+            # revoked access in their Google account, or it went unused for
+            # six months). It is the one OAuth error with a specific user
+            # action attached, so it must not be flattened into "try again".
+            if "invalid_grant" in detail:
+                raise IntegrationReauthRequired(self.provider)
+            raise ApiError(502, f"Could not complete the {what}. Try again.")
+        except urllib.error.URLError as e:
+            print(f"[{self.provider}] {what} network error: {e}")
+            raise ApiError(502, "Could not reach the provider. "
+                                "Check your connection and try again.")
+
+    # ---- flow ----------------------------------------------------------
+    def authorize_url(self, state: str, verifier: str) -> str:
+        """The provider's consent URL for this attempt.
+
+        access_type=offline + prompt=consent is what makes Google return a
+        REFRESH token. Google issues one only on the first consent for a given
+        client/user pair, and returns nothing on subsequent authorizations —
+        so a user who disconnects and reconnects would come back with no
+        refresh token at all, i.e. a connection that works for one hour and
+        then dies. prompt=consent forces the consent screen every time and
+        with it a fresh refresh token. The cost is one extra tap on reconnect;
+        the alternative is a connection that silently rots.
+        """
+        return self.auth_url + "?" + urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id": self.client_id(),
+            "redirect_uri": self.redirect_uri(),
+            "scope": " ".join(self.scopes),
+            "state": state,
+            "access_type": "offline",
+            "prompt": "consent",
+            "include_granted_scopes": "true",
+            # Only the CHALLENGE goes over the wire — the verifier rides
+            # inside the signed state. See the PKCE note in the CRM section.
+            "code_challenge": _pkce_challenge(verifier),
+            "code_challenge_method": PKCE_METHOD,
+        })
+
+    def exchange_code(self, code: str, verifier: str) -> dict:
+        return self._post_form(self.token_url, {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": self.client_id(),
+            "client_secret": self.client_secret(),
+            "redirect_uri": self.redirect_uri(),
+            "code_verifier": verifier,
+        }, "connection")
+
+    def refresh_credentials(self, refresh_token: str) -> dict:
+        """refresh_token -> a fresh short-lived access token.
+
+        Access tokens are NOT stored, for the same reason the Salesforce path
+        does not store them: they expire in an hour, and persisting them would
+        mean a second secret to encrypt, rotate and leak for no gain. Each
+        request pays one cheap refresh.
+        """
+        return self._post_form(self.token_url, {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": self.client_id(),
+            "client_secret": self.client_secret(),
+        }, "token refresh")
+
+    def revoke(self, refresh_token: str) -> None:
+        """Best-effort revoke on disconnect.
+
+        Never blocks the local disconnect: the user asked MinuteX to stop
+        using their account, and that must happen whether or not Google is
+        reachable. They can also revoke from their Google account page.
+        """
+        if not self.revoke_url:
+            return
+        try:
+            self._post_form(self.revoke_url, {"token": refresh_token}, "revoke")
+        except ApiError as e:
+            print(f"[{self.provider}] revoke failed (non-fatal): {e.message}")
+
+    def account_info(self, access_token: str) -> dict:
+        """{account_identifier, account_name} for the Manage screen. Optional —
+        a provider with no identity endpoint returns {}."""
+        return {}
+
+
+class GmailProvider(IntegrationProvider):
+    """Gmail: OAuth + send. No read capability, by design (see GMAIL_SCOPES)."""
+
+    provider = integrations.PROVIDER_GMAIL
+    auth_url = GOOGLE_AUTH_URL
+    token_url = GOOGLE_TOKEN_URL
+    revoke_url = GOOGLE_REVOKE_URL
+    scopes = tuple(GMAIL_SCOPES)
+
+    def client_id(self) -> str:
+        return GOOGLE_CLIENT_ID
+
+    def client_secret(self) -> str:
+        return _google_client_secret()
+
+    def redirect_uri(self) -> str:
+        return GOOGLE_REDIRECT_URI
+
+    def account_info(self, access_token: str) -> dict:
+        """Which Google account this is — the userinfo.email scope's purpose."""
+        req = urllib.request.Request(
+            GOOGLE_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as e:
+            # Cosmetic: the connection itself succeeded. Better to show
+            # "Connected" with no address than to fail the whole connect.
+            print(f"[gmail] userinfo failed (non-fatal): {e}")
+            return {}
+        return {"account_identifier": str(data.get("email") or ""),
+                "account_name": str(data.get("name") or "")}
+
+    def send_message(self, access_token: str, raw_message: str) -> dict:
+        """POST one base64url-encoded RFC 2822 message to Gmail.
+
+        Error mapping is where the user-facing quality of this feature lives.
+        Gmail answers with codes ("invalid_grant", "rateLimitExceeded",
+        "Invalid to header") that mean nothing to a user, so each is turned
+        into a sentence describing what happened and what to do. The raw body
+        goes to CloudWatch, never to the client.
+        """
+        body = json.dumps({"raw": raw_message}).encode("utf-8")
+        req = urllib.request.Request(
+            GMAIL_SEND_URL, data=body, method="POST",
+            headers={"Authorization": f"Bearer {access_token}",
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                raw = r.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            print(f"[gmail] send failed: {e.code} {detail[:400]}")
+            if e.code == 401:
+                # The ACCESS token was rejected. _gmail_call refreshes and
+                # retries once before this can reach the user.
+                raise GmailAuthExpired(detail[:200])
+            if e.code == 403:
+                if "rateLimit" in detail or "userRateLimit" in detail:
+                    raise ApiError(429, "Gmail is rate-limiting this account. "
+                                        "Wait a moment and try again.")
+                if "quotaExceeded" in detail or "Daily" in detail:
+                    raise ApiError(429, "This Gmail account has reached its "
+                                        "daily sending limit. Try again "
+                                        "tomorrow.")
+                # A 403 that is not a quota means the grant no longer carries
+                # the send scope — reconnecting is genuinely the fix.
+                raise IntegrationReauthRequired(
+                    self.provider,
+                    "MinuteX no longer has permission to send from this "
+                    "Gmail account. Reconnect Gmail to continue.")
+            if e.code == 429:
+                raise ApiError(429, "Gmail is rate-limiting this account. "
+                                    "Wait a moment and try again.")
+            if e.code == 400:
+                # Almost always a malformed recipient that survived validation
+                # (an address Gmail rejects but our regex accepts).
+                raise ApiError(400, "Gmail rejected the message — check the "
+                                    "recipient addresses and try again.")
+            raise ApiError(502, "Gmail could not send the message. Try again.")
+        except urllib.error.URLError as e:
+            print(f"[gmail] send network error: {e}")
+            raise ApiError(502, "Could not reach Gmail. Check your connection "
+                                "and try again.")
+
+
+class GmailAuthExpired(Exception):
+    """The ACCESS token was rejected (401) — internal, never surfaced.
+
+    Same distinction SalesforceAuthExpired draws: this one means "mint a new
+    access token and retry", which _gmail_call does transparently. A dead
+    REFRESH token is IntegrationReauthRequired, which the user does see.
+    """
+
+
+_gmail_provider = GmailProvider()
+
+PROVIDER_IMPLS = {
+    integrations.PROVIDER_GMAIL: _gmail_provider,
+}
+
+
+def _provider_impl(provider: str):
+    """The implementation for `provider`, or a 404.
+
+    404 rather than 400 for an unknown provider: the path segment names a
+    resource, and one MinuteX does not have simply does not exist.
+    """
+    impl = PROVIDER_IMPLS.get(provider)
+    if impl is None:
+        raise ApiError(404, "unknown integration")
+    return impl
+
+
+def _path_provider(event) -> str:
+    """The {provider} path parameter, normalised and checked against the
+    registry BEFORE it is used to key anything."""
+    provider = str((event.get("pathParameters") or {}).get("provider") or
+                   "").strip().lower()
+    if provider not in integrations.PROVIDERS_BY_ID:
+        raise ApiError(404, "unknown integration")
+    return provider
+
+
+# ---------------------------------------------------------------------------
+# The credential lifecycle — one place, exactly like _sf_call.
+# ---------------------------------------------------------------------------
+def _integration_call(user_id: str, provider: str, fn):
+    """Run `fn(access_token)` against the user's connected account.
+
+    Owns the whole access-token lifecycle so no route handler repeats it:
+    verify the connection is USABLE, decrypt the refresh token, mint an access
+    token, call, and on a 401 mint once more and retry.
+
+    THE OWNERSHIP CHECK IS HERE, not in the handlers. Every outbound operation
+    passes through this function and it reads the connection row keyed by the
+    user_id from the JWT — so there is no code path on which user A's request
+    can reach user B's credential, because no handler ever names a user.
+    """
+    row = _get_integration(user_id, provider)
+    if not row or not row.get("refresh_token_enc"):
+        raise IntegrationNotConnected(provider)
+    if row.get("status") == integrations.STATUS_REAUTH_REQUIRED:
+        raise IntegrationReauthRequired(provider)
+    if not integrations.is_usable(row):
+        raise IntegrationNotConnected(
+            provider, row.get("status_message") or "")
+
+    impl = _provider_impl(provider)
+    refresh_token = _integration_kms_decrypt(row["refresh_token_enc"])
+
+    try:
+        tokens = impl.refresh_credentials(refresh_token)
+    except IntegrationReauthRequired:
+        # The refresh token itself is dead. Record it so the NEXT status read
+        # is honest without needing another failed send to discover it — this
+        # is what makes the backend the source of truth.
+        _mark_integration_status(
+            user_id, provider, integrations.STATUS_REAUTH_REQUIRED,
+            "The connection was revoked or expired.")
+        raise
+
+    access_token = tokens.get("access_token")
+    if not access_token:
+        _mark_integration_status(
+            user_id, provider, integrations.STATUS_REAUTH_REQUIRED,
+            "The connection could not be renewed.")
+        raise IntegrationReauthRequired(provider)
+
+    # Google does not rotate refresh tokens the way Salesforce can, so there
+    # is no rotation write here. If a provider that DOES rotate is added, this
+    # is the one place that needs the conditional-write dance
+    # _persist_rotated_refresh_token performs.
+    try:
+        return fn(access_token)
+    except GmailAuthExpired:
+        print(f"[{provider}] access token rejected; refreshing once and retrying")
+        tokens = impl.refresh_credentials(refresh_token)
+        access_token = tokens.get("access_token")
+        if not access_token:
+            _mark_integration_status(
+                user_id, provider, integrations.STATUS_REAUTH_REQUIRED,
+                "The connection could not be renewed.")
+            raise IntegrationReauthRequired(provider)
+        try:
+            return fn(access_token)
+        except GmailAuthExpired:
+            _mark_integration_status(
+                user_id, provider, integrations.STATUS_REAUTH_REQUIRED,
+                "The connection kept being rejected.")
+            raise IntegrationReauthRequired(provider)
+
+
+def _require_integration(user_id: str, provider: str) -> dict:
+    """The connection row, or the right 409. The server-side half of the
+    "Gmail-dependent features are unavailable without Gmail" rule — hiding the
+    button in the app is presentation; THIS is enforcement."""
+    row = _get_integration(user_id, provider)
+    if not row or not row.get("refresh_token_enc"):
+        raise IntegrationNotConnected(provider)
+    if row.get("status") == integrations.STATUS_REAUTH_REQUIRED:
+        raise IntegrationReauthRequired(provider)
+    if not integrations.is_usable(row):
+        raise IntegrationNotConnected(provider, row.get("status_message") or "")
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Routes — status
+# ---------------------------------------------------------------------------
+def _integration_rows(user_id: str) -> dict:
+    """Every provider's connection row for this user, from EVERY source.
+
+    Two tables feed one catalog. Integrations holds the providers this system
+    manages; CrmConnections holds Salesforce, which predates it and is
+    connected through /crm/salesforce/*. Merging here — rather than teaching
+    the catalog about two tables, or reporting Salesforce as "not connected"
+    because its row lives elsewhere — is what lets the Integrations screen be
+    one honest list.
+
+    The Salesforce read is best-effort: an unconfigured CrmConnections table
+    must degrade that ONE card to "not connected", never take down the whole
+    Integrations screen (which is also how Coming Soon cards reach the user).
+    """
+    rows = _all_integrations(user_id)
+    try:
+        crm = _get_salesforce_connection(user_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[integrations] salesforce read failed for {user_id}: "
+              f"{type(e).__name__}: {e}")
+        crm = None
+    sf = integrations.salesforce_row(crm)
+    if sf:
+        rows[integrations.PROVIDER_SALESFORCE] = sf
+    return rows
+
+
+def list_integrations(event):
+    """GET /integrations (JWT) -> {integrations:[...]}.
+
+    The FULL catalog, not just what is connected: the Integrations screen
+    renders Coming Soon cards from this too, so a new provider appears in
+    every already-installed client the day it is added to PROVIDERS.
+    """
+    user_id = _require_auth(event)
+    return _resp(200, {
+        "integrations": integrations.catalog(_integration_rows(user_id))})
+
+
+def get_integration(event):
+    """GET /integrations/{provider} (JWT) -> {integration:{...}}."""
+    user_id = _require_auth(event)
+    provider = _path_provider(event)
+    # Reads through the same merge as the catalog, so a single-provider fetch
+    # can never disagree with the list it came from.
+    return _resp(200, {"integration": integrations.public_status(
+        provider, _integration_rows(user_id).get(provider))})
+
+
+def integration_connect(event):
+    """POST /integrations/{provider}/connect (JWT) -> {authorize_url}.
+
+    Mints a fresh PKCE verifier per attempt and carries it inside the signed
+    state, exactly as salesforce_connect does — see the PKCE note in the CRM
+    section for why the verifier is server-side rather than on the device.
+
+    The state additionally carries the PROVIDER, so a state minted for one
+    integration cannot be replayed against another's callback. Without it, the
+    signature would still verify (same secret, same user) and the code would
+    be exchanged against the wrong provider's token endpoint.
+    """
+    user_id = _require_auth(event)
+    provider = _path_provider(event)
+    if provider not in integrations.CONNECTABLE:
+        raise ApiError(400, "That integration isn't available yet.")
+    impl = _provider_impl(provider)
+    if not impl.is_configured():
+        raise ApiError(500, "This integration is not configured on the server.")
+
+    verifier = _new_pkce_verifier()
+    state = _sign_integration_state(user_id, provider, verifier)
+    _audit("integration.connect_started", user_id, provider)
+    return _resp(200, {"authorize_url": impl.authorize_url(state, verifier)})
+
+
+def _sign_integration_state(user_id: str, provider: str, verifier: str) -> str:
+    """HMAC-signed, expiring state — CSRF guard, PKCE carrier AND provider
+    binding. Same construction and same secret as _sign_oauth_state; the extra
+    `pv` claim is what stops a cross-provider replay."""
+    payload = {"sub": user_id, "pv": provider, "cv": verifier,
+               "exp": int(time.time()) + INTEGRATION_STATE_TTL}
+    seg = _b64u_encode(json.dumps(payload, separators=(",", ":")).encode())
+    sig = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
+    return seg + "." + _b64u_encode(sig)
+
+
+def _verify_integration_state(state: str, provider: str) -> tuple:
+    """(user_id, verifier) from a state minted for THIS provider, or ApiError."""
+    try:
+        seg, sig_b64 = state.split(".")
+        expected = hmac.new(_jwt_secret().encode(), seg.encode(),
+                            hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, _b64u_decode(sig_b64)):
+            raise ValueError("bad signature")
+        payload = json.loads(_b64u_decode(seg))
+    except (ValueError, TypeError, KeyError):
+        raise ApiError(400, "invalid or tampered state")
+    if not isinstance(payload, dict) or payload.get("exp", 0) < int(time.time()):
+        raise ApiError(410, "connect session expired — try again")
+    user_id = payload.get("sub")
+    verifier = str(payload.get("cv") or "")
+    if not user_id or not verifier:
+        raise ApiError(400, "invalid state")
+    if payload.get("pv") != provider:
+        # A state signed for a different integration. Same user, same secret,
+        # valid signature — and still wrong.
+        raise ApiError(400, "state does not match this integration")
+    return user_id, verifier
+
+
+def integration_callback(event):
+    """GET /integrations/{provider}/callback?code&state (NO JWT — the
+    provider's browser redirect calls this).
+
+    `state` is the credential here, exactly as in salesforce_callback: a
+    browser redirect cannot carry a bearer token. Ends in a 302 to the app's
+    deep link with an ok/error param, because the browser tab — not this
+    Lambda — is the only thing that can hand control back to the app.
+    """
+    provider = _path_provider(event)
+    qs = event.get("queryStringParameters") or {}
+
+    def _redirect(ok: bool, reason: str = "") -> dict:
+        params = {"provider": provider}
+        params.update({"connected": "1"} if ok
+                      else {"connected": "0", "reason": reason})
+        target = INTEGRATION_RETURN_URL or SALESFORCE_RETURN_URL or "/"
+        return {"statusCode": 302,
+                "headers": {"Location": f"{target}?{urllib.parse.urlencode(params)}"},
+                "body": ""}
+
+    error = qs.get("error")
+    if error:
+        # access_denied is the user pressing Cancel/Deny — a normal choice,
+        # distinguished from a real failure so the app can stay quiet about it.
+        print(f"[{provider}] callback error param: {error}")
+        return _redirect(False, "denied" if error == "access_denied" else "failed")
+
+    code = qs.get("code")
+    state = qs.get("state")
+    if not code or not state:
+        return _redirect(False, "missing_params")
+
+    try:
+        user_id, verifier = _verify_integration_state(state, provider)
+    except ApiError as e:
+        print(f"[{provider}] callback state rejected: {e.message}")
+        return _redirect(False, "expired")
+
+    impl = _provider_impl(provider)
+    try:
+        tokens = impl.exchange_code(code, verifier)
+    except ApiError as e:
+        # e.message is our own wording — never the code, the verifier or a token.
+        print(f"[{provider}] callback exchange failed: {e.message}")
+        return _redirect(False, "exchange_failed")
+
+    refresh_token = tokens.get("refresh_token")
+    access_token = tokens.get("access_token")
+    if not access_token:
+        print(f"[{provider}] token response carried no access token")
+        return _redirect(False, "exchange_failed")
+    if not refresh_token:
+        # Google omits the refresh token when the user has already granted
+        # consent and prompt=consent was not honoured. Without one the
+        # connection would work for an hour and then die, so refuse now and
+        # tell the app to retry rather than storing a connection that rots.
+        print(f"[{provider}] token response carried no refresh token")
+        return _redirect(False, "no_refresh_token")
+
+    info = {}
+    try:
+        info = impl.account_info(access_token)
+    except Exception as e:  # noqa: BLE001 - identity is cosmetic, never fatal
+        print(f"[{provider}] account info failed (non-fatal): {e}")
+
+    granted = str(tokens.get("scope") or "").split()
+    now = _now_iso()
+    existing = _get_integration(user_id, provider)
+    _integrations.put_item(Item={
+        "user_id": user_id,
+        "provider": provider,
+        "status": integrations.STATUS_CONNECTED,
+        "status_message": "",
+        "refresh_token_enc": _integration_kms_encrypt(refresh_token),
+        "account_identifier": info.get("account_identifier", ""),
+        "account_name": info.get("account_name", ""),
+        "scopes": granted or list(impl.scopes),
+        # Preserved across a reconnect so the Manage screen can show when the
+        # user FIRST connected, not when they last re-approved.
+        "connected_at": (existing or {}).get("connected_at") or now,
+        "updated_at": now,
+    })
+    _audit("integration.connected", user_id, provider,
+           scopes=len(granted or impl.scopes))
+    return _redirect(True)
+
+
+def integration_disconnect(event):
+    """DELETE /integrations/{provider} (JWT) -> {disconnected}.
+
+    Revokes the grant with the provider (best-effort) and DELETES the row.
+
+    Deleting rather than flagging is deliberate: the requirement is that the
+    stored credential is removed, and a row flagged "disconnected" that still
+    holds ciphertext is a credential we said we deleted and did not. Absence
+    of a row IS integrations.STATUS_NOT_CONNECTED, so nothing is lost.
+
+    Nothing else is touched. Meetings, contacts, tasks, MoMs and documents are
+    MinuteX data and have no dependency on the connection — disconnecting Gmail
+    removes the ability to send mail, not anything the user created.
+    """
+    user_id = _require_auth(event)
+    provider = _path_provider(event)
+
+    # A provider whose connection this system does not own must not be
+    # disconnected through here. Without this guard the delete below would run
+    # against the Integrations table for a Salesforce row that lives in
+    # CrmConnections — reporting success while leaving the real credential in
+    # place, which is the worst possible outcome for a "disconnect".
+    meta = integrations.PROVIDERS_BY_ID.get(provider) or {}
+    if meta.get("managed_elsewhere"):
+        raise ApiError(400, f"Disconnect {meta.get('name', provider)} from its "
+                            f"own settings screen.")
+
+    row = _get_integration(user_id, provider)
+    if row and row.get("refresh_token_enc"):
+        try:
+            impl = _provider_impl(provider)
+            impl.revoke(_integration_kms_decrypt(row["refresh_token_enc"]))
+        except Exception as e:  # noqa: BLE001 - never blocks the disconnect
+            print(f"[{provider}] revoke on disconnect failed (non-fatal): "
+                  f"{type(e).__name__}: {e}")
+
+    _integrations.delete_item(Key={"user_id": user_id, "provider": provider})
+    _audit("integration.disconnected", user_id, provider)
+    return _resp(200, {"disconnected": True,
+                       "integration": integrations.public_status(provider)})
+
+
+# ---------------------------------------------------------------------------
+# Gmail — communication.
+#
+# WHERE THE LAYERING SITS. Meeting/task/MoM code does not know Gmail exists;
+# it hands a message to the communication layer, which asks the integration
+# layer for a provider. Concretely:
+#
+#     POST /integrations/gmail/send        a message the caller composed
+#     POST /integrations/gmail/send/meeting/{key+}   a MEETING message
+#     POST /integrations/gmail/send/task/{task_id}   a TASK message
+#
+# The last two exist so recipient resolution and ownership live on the server.
+# The alternative — the app posting a list of raw addresses to the generic
+# route — would mean the backend could not verify that a recipient is really a
+# participant of a meeting the caller owns, and "send to whoever the client
+# says" is how a mail relay gets abused.
+#
+# ATTACHMENTS COME FROM THE CLIENT. The PDF and DOCX renderers live in the app
+# (lib/mom-pdf.ts, lib/mom-docx.ts) and are what the user previews before
+# sending. Re-implementing them server-side would mean two renderers that
+# drift, and the recipient would receive a document that differs from the
+# preview. So the app sends the bytes it rendered, base64, and the backend
+# validates them as untrusted input (see shared/email_message.py).
+# ---------------------------------------------------------------------------
+def _gmail_call(user_id: str, fn):
+    return _integration_call(user_id, INTEGRATION_GMAIL, fn)
+
+
+def _send_via_gmail(user_id: str, row: dict, to, subject: str, body: str,
+                    cc=None, attachments=None) -> dict:
+    """Build the message and send it. One place, so every caller — generic,
+    meeting, task — produces identically shaped mail and identical errors."""
+    sender = row.get("account_identifier") or ""
+    if not sender:
+        # The address is only cosmetic on the status screen, but as a From
+        # header it matters. Gmail rewrites From to the authenticated account
+        # anyway, so an empty one is safe — it just loses the display name.
+        print(f"[gmail] no stored account identifier for {user_id}")
+    sender_name = row.get("account_name") or ""
+
+    try:
+        raw = email_message.build_message(
+            sender=sender, sender_name=sender_name, to=to, subject=subject,
+            body=body, cc=cc, attachments=attachments)
+    except email_message.EmailError as e:
+        # Always user-facing wording by construction — see EmailError.
+        raise ApiError(400, str(e))
+
+    result = _gmail_call(user_id, lambda tok:
+                         _gmail_provider.send_message(tok, raw))
+    return {"message_id": str(result.get("id") or ""),
+            "thread_id": str(result.get("threadId") or "")}
+
+
+def _recipient_payload(data) -> list:
+    """The `recipients` field of a send request, sanity-bounded.
+
+    Accepts [{contact_id?, email?, name?}]. Plain strings are accepted too,
+    so a caller with only an address does not have to wrap it.
+    """
+    raw = data.get("recipients")
+    if not isinstance(raw, list):
+        raise ApiError(400, "recipients must be a list")
+    if len(raw) > email_message.MAX_RECIPIENTS:
+        raise ApiError(400, f"Send to at most {email_message.MAX_RECIPIENTS} "
+                            f"people at a time.")
+    out = []
+    for entry in raw:
+        if isinstance(entry, str):
+            out.append({"email": entry})
+        elif isinstance(entry, dict):
+            out.append(entry)
+    return out
+
+
+def _resolve_contact_recipients(user_id: str, requested) -> tuple:
+    """Turn requested recipients into (resolved, unresolved), resolving any
+    contact_id through the OWNER'S contacts.
+
+    A contact_id that is not this user's resolves to nothing and lands in
+    `unresolved` rather than raising — the caller reports "no email address
+    for this person", which is also the honest answer for a contact that does
+    not exist as far as this user is concerned. Same reasoning as the 404-not-
+    403 rule elsewhere: the API must not confirm that some other user's
+    contact id is real.
+    """
+    hydrated = []
+    for entry in requested:
+        contact_id = str(entry.get("contact_id") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        email = str(entry.get("email") or "").strip()
+        if contact_id:
+            row = _contacts.get_item(Key={"contact_id": contact_id}).get("Item")
+            if row and row.get("owner_user_id") == user_id:
+                # The stored contact is authoritative for the address — a
+                # client-supplied email alongside a contact_id would otherwise
+                # be a way to send to an arbitrary address while looking like
+                # a legitimate contact send.
+                email = str(row.get("email") or "")
+                name = name or str(row.get("name") or "")
+            else:
+                email = ""
+                name = name or "This contact"
+        hydrated.append({"name": name, "email": email, "contact_id": contact_id})
+    return email_message.resolve_recipients(hydrated)
+
+
+def _require_resolved(resolved, unresolved):
+    """Refuse the send when anyone could not be resolved.
+
+    The product rule is explicit: do NOT silently attempt to send. A partial
+    send looks identical to a complete one from the app's point of view, and
+    the person left out never learns they were.
+    """
+    if unresolved:
+        raise ApiError(422, email_message.describe_unresolved(unresolved))
+    if not resolved:
+        raise ApiError(400, "Choose at least one recipient.")
+
+
+def gmail_send(event):
+    """POST /integrations/gmail/send (JWT) -> {sent, message_id}.
+
+    The generic path: the caller supplies recipients, subject, body and any
+    attachments. Used for follow-up communication that is not tied to one
+    meeting or task.
+    """
+    user_id = _require_auth(event)
+    row = _require_integration(user_id, INTEGRATION_GMAIL)
+    data = _body(event)
+
+    resolved, unresolved = _resolve_contact_recipients(
+        user_id, _recipient_payload(data))
+    _require_resolved(resolved, unresolved)
+
+    sent = _send_via_gmail(
+        user_id, row,
+        to=[email_message.format_recipient(r["name"], r["email"])
+            for r in resolved],
+        subject=data.get("subject"),
+        body=data.get("body"),
+        cc=[a for a in (email_message.normalize_email(c)
+                        for c in (data.get("cc") or [])) if a],
+        attachments=data.get("attachments"),
+    )
+    # Recipient COUNT, never addresses — see _audit's rule on personal data.
+    _audit("gmail.sent", user_id, "generic", recipients=len(resolved),
+           attachments=len(data.get("attachments") or []))
+    return _resp(200, {"sent": True, **sent, "recipient_count": len(resolved)})
+
+
+def gmail_meeting_recipients(event):
+    """GET /integrations/gmail/recipients/{key+} (JWT)
+    -> {recipients:[...], unresolved:[...]}
+
+    The participant list for the Share sheet, already resolved to addresses.
+    Returned BEFORE the user picks, so the sheet can show "Email address
+    unavailable for Rahul" next to the person it applies to rather than
+    failing at Send time.
+
+    Requires Gmail: this is a Gmail-dependent surface, and the requirement is
+    that the backend enforces that too, not only the UI.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    _require_integration(user_id, INTEGRATION_GMAIL)
+
+    rows = _participant_rows(key)
+    recipients, unresolved = [], []
+    seen = set()
+    for row in rows:
+        contact_id = str(row.get("contact_id") or "")
+        if not contact_id:
+            continue
+        contact = _contacts.get_item(Key={"contact_id": contact_id}).get("Item")
+        if not contact or contact.get("owner_user_id") != user_id:
+            continue
+        name = str(contact.get("name") or "")
+        email = email_message.normalize_email(contact.get("email"))
+        entry = {"contact_id": contact_id, "name": name, "email": email,
+                 "speaker_id": str(row.get("speaker_id") or "")}
+        if not email:
+            unresolved.append(entry)
+            continue
+        if email in seen:
+            continue
+        seen.add(email)
+        recipients.append(entry)
+
+    return _resp(200, {"recipients": recipients, "unresolved": unresolved,
+                       "meeting_title": str(item.get("title") or "")})
+
+
+def gmail_send_meeting(event):
+    """POST /integrations/gmail/send/meeting/{key+} (JWT) -> {sent, message_id}.
+
+    MoM / summary / highlights / action-item sharing for ONE meeting the caller
+    owns. The recording key comes LAST for the same API Gateway reason every
+    other {key+} route gives: a greedy variable is only legal in final position.
+
+    Ownership is checked by _owned_recording before anything else, so a caller
+    cannot mail themselves someone else's meeting by guessing a key.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    row = _require_integration(user_id, INTEGRATION_GMAIL)
+    data = _body(event)
+
+    resolved, unresolved = _resolve_contact_recipients(
+        user_id, _recipient_payload(data))
+    _require_resolved(resolved, unresolved)
+
+    title = str(item.get("title") or "Meeting")
+    subject = str(data.get("subject") or "").strip() or f"Minutes of Meeting — {title}"
+    body = str(data.get("body") or "").strip() or _default_meeting_body(title)
+
+    sent = _send_via_gmail(
+        user_id, row,
+        to=[email_message.format_recipient(r["name"], r["email"])
+            for r in resolved],
+        subject=subject, body=body,
+        cc=[a for a in (email_message.normalize_email(c)
+                        for c in (data.get("cc") or [])) if a],
+        attachments=data.get("attachments"),
+    )
+    _audit("gmail.sent_meeting", user_id, key, recipients=len(resolved),
+           attachments=len(data.get("attachments") or []))
+    return _resp(200, {"sent": True, **sent, "recipient_count": len(resolved)})
+
+
+def _default_meeting_body(title: str) -> str:
+    """The fallback body when the user did not write one.
+
+    Deliberately plain and deliberately CONTENT-FREE beyond the title: the
+    user chooses what to share by choosing attachments and by editing this
+    text. Auto-composing a summary into the body would send meeting content
+    the user did not explicitly select, which the requirement rules out.
+    """
+    return (f"Hi,\n\nPlease find the Minutes of Meeting from {title}.\n\n"
+            f"Regards,\nMinuteX")
+
+
+def gmail_send_task(event):
+    """POST /integrations/gmail/send/task/{task_id} (JWT) -> {sent, message_id}.
+
+    Task communication — explicitly triggered from the task screen, never
+    automatic. This is NOT a notification engine: nothing here schedules,
+    batches or reacts to a task changing. One user action, one email.
+
+    When no recipients are supplied, the task's ASSIGNEE is used — which is
+    the whole point of sending a task by mail, and saves the app resolving it.
+    """
+    user_id = _require_auth(event)
+    row = _require_integration(user_id, INTEGRATION_GMAIL)
+    task_id = str((event.get("pathParameters") or {}).get("task_id") or "").strip()
+    task = _owned_task(user_id, task_id)
+    data = _body(event)
+
+    requested = _recipient_payload(data) if isinstance(data.get("recipients"),
+                                                       list) else []
+    if not requested:
+        assignee_contact = str(task.get("assignee_contact_id") or "")
+        if not assignee_contact:
+            raise ApiError(422, "This task has no assignee to email. "
+                                "Choose a recipient.")
+        requested = [{"contact_id": assignee_contact}]
+
+    resolved, unresolved = _resolve_contact_recipients(user_id, requested)
+    _require_resolved(resolved, unresolved)
+
+    title = str(task.get("title") or "Task")
+    subject = str(data.get("subject") or "").strip() or f"Action item — {title}"
+    body = str(data.get("body") or "").strip() or _default_task_body(task, resolved)
+
+    sent = _send_via_gmail(
+        user_id, row,
+        to=[email_message.format_recipient(r["name"], r["email"])
+            for r in resolved],
+        subject=subject, body=body,
+        attachments=data.get("attachments"),
+    )
+    _audit("gmail.sent_task", user_id, task_id, recipients=len(resolved))
+    return _resp(200, {"sent": True, **sent, "recipient_count": len(resolved)})
+
+
+def _default_task_body(task: dict, resolved) -> str:
+    """The fallback task email.
+
+    Only fields the task ACTUALLY has are included — an empty "Due:" line
+    invites the reader to infer a deadline that was never set, and inventing
+    one is exactly the fabrication the project rules forbid.
+    """
+    greeting = ""
+    if len(resolved) == 1 and resolved[0].get("name"):
+        greeting = f"Hi {resolved[0]['name'].split()[0]},\n\n"
+
+    lines = [f"Task:\n{task.get('title') or 'Untitled task'}"]
+    notes = str(task.get("description") or "").strip()
+    if notes:
+        lines.append(f"Details:\n{notes}")
+    due = str(task.get("due_date") or "").strip()
+    if due:
+        lines.append(f"Due:\n{due}")
+    priority = str(task.get("priority") or "").strip()
+    if priority:
+        lines.append(f"Priority:\n{priority}")
+
+    return greeting + "\n\n".join(lines) + "\n\nRegards,\nMinuteX"
+
+
+# ---------------------------------------------------------------------------
+# NOTIFICATIONS — the in-app notification engine (Phase 1).
+#
+# WHAT THIS IS. One place that turns a MinuteX BUSINESS EVENT into a
+# notification for one user. Every event site in this file calls
+# `_notify(...)` and nothing else: no route writes the Notifications table
+# directly, and no UI component decides what a notification says.
+#
+#     business action succeeds
+#            |
+#            v
+#     _notify(user_id, TYPE, entity_id, subject=...)
+#            |
+#            +-- notification_schema.build()   copy + priority + entity kind
+#            +-- dedupe claim (conditional)    "this fact, once"
+#            +-- Notifications row             the stored record
+#            |
+#            v
+#     GET /notifications  ->  in-app notification centre
+#
+# THE ORDERING RULE, AND WHY IT IS ABSOLUTE. A notification is only ever
+# raised AFTER the business write it describes has succeeded. "A task was
+# assigned to you" that links to a task which was never created is worse than
+# no notification: the user taps it, gets a 404, and learns not to trust the
+# bell. So every call site here sits after its _write_task / _apply_update /
+# _upsert, never before and never in the same try block.
+#
+# THE FAILURE RULE, AND WHY IT IS THE OPPOSITE. A notification failing must
+# NEVER fail the business action. The task was genuinely created; answering
+# 500 because the bell could not be updated would turn a cosmetic problem into
+# a data-entry one, and the client's retry would then create a second task.
+# So `_notify` swallows and logs. This is the same best-effort reasoning
+# _mirror_task_to_recording already documents.
+#
+# NEVER NOTIFY THE ACTOR. Every event site passes the RECIPIENT, and _notify
+# drops the write when the recipient is the person who caused the event. A
+# user who assigns a task to themselves already knows; telling them is the
+# noise the requirement rules out. This is enforced HERE rather than at each
+# call site, so a new event site cannot forget it.
+#
+# GMAIL IS NOT INVOLVED. This engine has no email path, imports nothing from
+# the Gmail section, and is not reachable from it. Gmail remains what it was:
+# a communication integration the user triggers by hand. When EMAIL becomes a
+# delivery channel it will be a consumer of the rows written here, reading the
+# `channels` seam — not a second place notifications are decided.
+# ---------------------------------------------------------------------------
+
+# How long a dedupe claim is kept before DynamoDB's TTL reaps it.
+#
+# 90 days, which is comfortably longer than any fact this system dedupes stays
+# interesting: a "due today" claim matters for one day, a "processing
+# completed" claim for as long as someone might reprocess that meeting. The
+# cost of it being too LONG is a few bytes; the cost of it being too SHORT is
+# a duplicate notification, so it is deliberately generous.
+NOTIFICATION_DEDUPE_TTL_DAYS = int(
+    os.environ.get("NOTIFICATION_DEDUPE_TTL_DAYS", "90"))
+
+# Page sizes for GET /notifications. Same convention as the tasks list.
+NOTIFICATIONS_PAGE_DEFAULT = 20
+NOTIFICATIONS_PAGE_MAX = 50
+
+# Ceiling for one mark-all-read call. A user with a huge unread backlog is
+# served across several calls rather than one request that risks the gateway's
+# 30s timeout half-way through — the response says whether more remain, so the
+# client can finish the job. Chosen well under what 29s allows.
+NOTIFICATIONS_MARK_ALL_MAX = 500
+
+
+def _notification_row(user_id, built, entity_id, dedupe):
+    """Assemble one Notifications item from a built notification.
+
+    The SHAPE lives in notification_schema.make_row so this Lambda and
+    transcribeRecording write identical rows — only the id and the clock are
+    supplied here.
+    """
+    return notification_schema.make_row(
+        user_id, built, entity_id, dedupe,
+        notification_id=uuid.uuid4().hex[:20], now=_now_iso())
+
+
+def _claim_notification(dedupe):
+    """Win the right to write this notification, or return False.
+
+    The uniqueness mechanism. DynamoDB can only enforce a condition against an
+    item's OWN key, so the claim is an item whose KEY IS the dedupe key —
+    written with attribute_not_exists, which exactly one caller can win.
+    Whoever wins writes the notification; everyone else drops the event.
+
+    This is what makes the whole engine idempotent under retries, reprocessing,
+    concurrent readers and the deadline sweep running on every list call. It is
+    the same conditional-claim shape _folder_name_claim uses for folder names.
+
+    Fails OPEN on an unexpected error: if the claim table is unreachable, a
+    possible duplicate notification is a better outcome than silently losing a
+    real one, and the caller's log records it.
+    """
+    if not dedupe:
+        return True
+    expires = int(time.time()) + NOTIFICATION_DEDUPE_TTL_DAYS * 86400
+    try:
+        _notification_dedupe.put_item(
+            Item={"dedupe_key": dedupe, "created_at": _now_iso(),
+                  "expires_at": expires},
+            ConditionExpression="attribute_not_exists(dedupe_key)",
+        )
+        return True
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                == "ConditionalCheckFailedException":
+            return False
+        print(f"[notify] dedupe claim errored for {dedupe}: {err}")
+        return True
+    except Exception as err:  # noqa: BLE001
+        # Broad on purpose, and it is what makes "fails open" true rather than
+        # aspirational: an unreachable claim table raises something other than
+        # ClientError, and letting that escape would reach _notify's outer
+        # handler and drop the notification — turning a duplicate-prevention
+        # mechanism into a notification-LOSS mechanism. A possible duplicate is
+        # the strictly better failure.
+        print(f"[notify] dedupe claim failed for {dedupe}: "
+              f"{type(err).__name__}: {err}")
+        return True
+
+
+def _notify(user_id, notification_type, entity_id, *, subject="",
+            metadata=None, title="", message="", dedupe_day="",
+            actor_user_id=""):
+    """Raise ONE notification for ONE user. The only way notifications are made.
+
+    Returns the created row, or None when nothing was written — which is a
+    normal outcome, not a failure: no recipient, the recipient is the actor, or
+    the fact was already notified.
+
+    `dedupe_day` makes the identity per-day instead of once-ever (the deadline
+    types). `actor_user_id` is who CAUSED the event, and is never notified.
+
+    Never raises. See the failure rule in this section's header: the business
+    action has already succeeded by the time this runs, and it must not be
+    undone by a notification problem.
+    """
+    try:
+        recipient = str(user_id or "").strip()
+        if not recipient:
+            # Not an error: an unassigned task, or one assigned to a contact
+            # with no MinuteX account, has nobody to notify. Silence is the
+            # correct behaviour — there is no user to tell.
+            return None
+        if actor_user_id and recipient == str(actor_user_id).strip():
+            return None
+
+        built = notification_schema.build(
+            notification_type, subject=subject, metadata=metadata,
+            title=title, message=message)
+        dedupe = notification_schema.dedupe_key(
+            recipient, notification_type, entity_id, dedupe_day)
+        if not _claim_notification(dedupe):
+            return None
+
+        row = _notification_row(recipient, built, entity_id, dedupe)
+        _notifications.put_item(Item=row)
+        _audit("notification.created", recipient, row["notification_id"],
+               type=notification_type, entity=built["entity_type"])
+        return row
+    except Exception as err:  # noqa: BLE001
+        # Deliberately broad. Every caller is a business action that has
+        # already committed, and there is no notification failure worth
+        # failing it for.
+        print(f"[notify] FAILED type={notification_type} "
+              f"user={user_id}: {type(err).__name__}: {err}")
+        return None
+
+
+def _recording_title(item):
+    """The meeting label a notification shows, or an honest placeholder.
+
+    Never invents one: an untitled recording is a real state (AI titling can
+    fail), and "Untitled meeting" says so rather than guessing from the
+    transcript — which would be exactly the fabrication the project rules
+    forbid.
+    """
+    return (str((item or {}).get("title") or "").strip()
+            or notification_schema.UNTITLED_MEETING)
+
+
+def _task_title(row):
+    return (str((row or {}).get("title") or "").strip()
+            or notification_schema.UNTITLED_TASK)
+
+
+def _task_assignee_user(row):
+    """The MinuteX USER a task is assigned to, or "".
+
+    This is the whole basis of task notifications, and it is deliberately NOT
+    the assignee's name or email. A task can name "Rahul Sharma" without Rahul
+    having a MinuteX account — that is an UNRESOLVED assignee, and there is no
+    inbox to notify. `assignee_user_id` is only ever written from a Contact
+    that is LINKED to a real account (see _new_task_row), so its presence is
+    exactly the condition "there is a person here who can receive this".
+    """
+    return str((row or {}).get("assignee_user_id") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Event sites — the notifications each MinuteX event raises.
+#
+# Each helper is named for the BUSINESS event, not for the notification, so a
+# call site reads as "this happened" rather than "send this". They are grouped
+# here rather than inlined so the complete set of things MinuteX notifies
+# about can be read in one place — which is what stops the noise the
+# requirement warns against creeping in one route at a time.
+# ---------------------------------------------------------------------------
+def _notify_task_assigned(task_row, *, actor_user_id="", meeting_title=""):
+    """A task now has an assignee who holds a MinuteX account."""
+    recipient = _task_assignee_user(task_row)
+    if not recipient:
+        return None
+    meta = {}
+    if task_row.get("source_recording_id"):
+        meta["recording_key"] = task_row["source_recording_id"]
+    if meeting_title:
+        meta["meeting_title"] = meeting_title
+    return _notify(recipient, notification_schema.TYPE_TASK_ASSIGNED,
+                   task_row.get("task_id"), subject=_task_title(task_row),
+                   metadata=meta, actor_user_id=actor_user_id)
+
+
+def _notify_task_reassigned(previous_user_id, task_row, *, actor_user_id=""):
+    """A task moved AWAY from someone who held a MinuteX account.
+
+    Only the departing assignee gets this; the arriving one gets
+    TASK_ASSIGNED from _notify_task_assigned. Nobody else is told — the
+    requirement is explicit that unrelated users are not notified, and the
+    task's owner is almost always the actor anyway.
+    """
+    previous = str(previous_user_id or "").strip()
+    if not previous:
+        return None
+    if previous == _task_assignee_user(task_row):
+        return None  # not actually a reassignment
+    return _notify(previous, notification_schema.TYPE_TASK_REASSIGNED,
+                   task_row.get("task_id"), subject=_task_title(task_row),
+                   actor_user_id=actor_user_id)
+
+
+def _notify_ai_action_required(task_row):
+    """An AI-extracted task names an assignee the system could not resolve.
+
+    This is the "AI must not silently assign uncertain work" rule made
+    visible. The AI heard a name; MinuteX could not match it to a contact, so
+    rather than guessing a person (or dropping the assignment quietly) it asks
+    the OWNER to confirm. The owner is the recipient because they are the only
+    one who can resolve it — the intended assignee has no account to notify,
+    which is precisely why it is unresolved.
+    """
+    owner = str(task_row.get("owner_user_id") or "").strip()
+    if not owner:
+        return None
+    meta = {"resolution_status": str(task_row.get("resolution_status") or "")}
+    if task_row.get("source_recording_id"):
+        meta["recording_key"] = task_row["source_recording_id"]
+    name = str(task_row.get("assignee_name_legacy") or "").strip()
+    if name:
+        meta["assignee_name"] = name
+    return _notify(owner, notification_schema.TYPE_AI_ACTION_REQUIRED,
+                   task_row.get("task_id"), subject=_task_title(task_row),
+                   metadata=meta)
+
+
+def _notify_document_ready(user_id, key, item, doc_type, label=""):
+    """A meeting-generated document finished generating.
+
+    ONE path for every document type (summary, MoM, custom, Quick AI) — the
+    requirement rules out per-type notification logic, and the generic
+    Documents model already makes that unnecessary. The document TYPE travels
+    in metadata so the app can scroll to it; the notification itself points at
+    the MEETING, because that is where documents are read.
+
+    Deduped on the meeting AND the document type, so regenerating a document
+    the user already has does not re-notify, while a DIFFERENT document from
+    the same meeting still does.
+    """
+    title = _recording_title(item)
+    shown = str(label or "").strip() or str(doc_type or "").strip()
+    return _notify(
+        user_id, notification_schema.TYPE_MEETING_DOCUMENT_READY, key,
+        message=f"{title} — {shown}" if shown else title,
+        metadata={"document_type": str(doc_type or ""), "meeting_title": title},
+        dedupe_day=str(doc_type or ""),
+    )
+
+
+def _notify_meeting_shared(user_id, key, item, share_id=""):
+    """A read-only public link was created for a meeting's outputs."""
+    return _notify(user_id, notification_schema.TYPE_MEETING_OUTPUT_SHARED,
+                   key, subject=_recording_title(item),
+                   metadata={"share_id": str(share_id or "")},
+                   # Per share, not per meeting: creating a second link is a
+                   # second real event worth its own row.
+                   dedupe_day=str(share_id or ""))
+
+
+# ---------------------------------------------------------------------------
+# Deadline notifications — TASK_DUE_TODAY / TASK_OVERDUE.
+#
+# WHY THESE ARE SWEPT RATHER THAN SCHEDULED. A deadline is not an event
+# anything in MinuteX causes: no request happens at the moment a task becomes
+# overdue. The two honest ways to notice are a scheduled job (EventBridge) or
+# a sweep when the user's tasks are read. This implements the SWEEP, because:
+#
+#   * it needs no new infrastructure, which the project rules ask us to avoid
+#     adding without justification;
+#   * it is exactly-once per day REGARDLESS of how often it runs, because the
+#     dedupe key carries the day — so "every app open" costs nothing;
+#   * a user who never opens MinuteX gets no in-app notification, which is
+#     correct: an in-app notification only exists to be seen in the app. When
+#     EMAIL becomes a channel, THAT is when a scheduled job earns its place,
+#     and it will call this same function.
+#
+# The sweep is bounded (it only ever looks at tasks already read for another
+# purpose) and it never blocks the response — a failure inside _notify is
+# swallowed, so the task list is served either way.
+# ---------------------------------------------------------------------------
+def _sweep_task_deadlines(user_id, rows, now=None):
+    """Raise due-today / overdue notifications for the caller's OWN tasks.
+
+    `rows` are tasks that have ALREADY been read and ownership-checked by the
+    caller, so this adds no reads of its own.
+
+    Only tasks assigned to THIS user are considered — `assignee_user_id`, the
+    same condition every other task notification uses. A task the user owns
+    but assigned to someone else is that person's deadline to be reminded of,
+    not theirs.
+
+    Returns the number of notifications raised (used by tests; callers ignore
+    it — the sweep is a side effect of reading, never something a response
+    reports).
+    """
+    moment = now or datetime.now(timezone.utc)
+    today = notification_schema.today_iso(moment)
+    raised = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("owner_user_id") != user_id:
+            continue
+        if _task_assignee_user(row) != user_id:
+            continue
+        if row.get("status") in TASK_TERMINAL_STATUSES:
+            continue
+
+        due = (str(row.get("due_date_normalized") or "").strip()
+               or str(row.get("due_date") or "").strip())
+        if not due:
+            continue
+
+        if _is_overdue(row.get("due_date"), row.get("status"),
+                       row.get("due_date_normalized", "")):
+            ntype = notification_schema.TYPE_TASK_OVERDUE
+        elif due[:10] == today:
+            # Due today and not yet past — a bare date is compared on the day
+            # itself, which is why _is_overdue is asked first: a task due
+            # today only becomes overdue at the end of the day, and until then
+            # "due today" is the true statement.
+            ntype = notification_schema.TYPE_TASK_DUE_TODAY
+        else:
+            continue
+
+        # The day is part of the identity, so this is at most one per task per
+        # day per type — on every app open, from every device, forever.
+        if _notify(user_id, ntype, row.get("task_id"),
+                   subject=_task_title(row), dedupe_day=today,
+                   metadata={"due_date": str(row.get("due_date") or "")}):
+            raised += 1
+    return raised
+
+
+# ---------------------------------------------------------------------------
+# Notification API — the read side.
+#
+# SECURITY. Every route derives the user from the JWT (_require_auth) and
+# never from the request. Reads are keyed by that user_id on the user-index;
+# writes go through _owned_notification, which re-checks the row's user_id
+# after the GetItem. A notification_id is therefore not a capability: holding
+# someone else's id gets a 404, the same answer an id that does not exist
+# gets, so the API does not confirm the row's existence either.
+# ---------------------------------------------------------------------------
+def _owned_notification(user_id, notification_id):
+    """One notification belonging to this user, or 404.
+
+    404 rather than 403 ON PURPOSE, matching _owned_task / _owned_contact /
+    _owned_folder: telling a caller "this exists but is not yours" leaks that
+    the id is real. Same answer for both cases, no oracle.
+    """
+    nid = str(notification_id or "").strip()
+    if not nid:
+        raise ApiError(400, "notification id required")
+    row = _notifications.get_item(Key={"notification_id": nid}).get("Item")
+    if not row or row.get("user_id") != user_id:
+        raise ApiError(404, "notification not found")
+    return row
+
+
+def list_notifications(event):
+    """GET /notifications?limit=&cursor=&unread=  -> {notifications, count,
+                                                     next_cursor, unread_count}
+
+    Newest first, paginated — the app never loads a user's whole history.
+    `unread=1` narrows to unread rows, served from the sparse unread index so
+    it stays cheap no matter how much read history has accumulated.
+
+    The unread COUNT rides along on the first page (no cursor) so the centre
+    can render its badge without a second round trip on open. Later pages omit
+    it: it is a property of the inbox, not of the page, and recomputing it per
+    page would be a read the client already has the answer to.
+    """
+    user_id = _require_auth(event)
+    qs = event.get("queryStringParameters") or {}
+    limit = _clean_limit(qs.get("limit"), NOTIFICATIONS_PAGE_DEFAULT,
+                         NOTIFICATIONS_PAGE_MAX)
+    unread_only = str(qs.get("unread") or "").strip().lower() in ("1", "true")
+
+    if unread_only:
+        query = {"IndexName": NOTIFICATIONS_UNREAD_INDEX,
+                 "KeyConditionExpression": Key("user_id").eq(user_id)}
+    else:
+        query = {"IndexName": NOTIFICATIONS_USER_INDEX,
+                 "KeyConditionExpression": Key("user_id").eq(user_id)}
+    query["ScanIndexForward"] = False
+    query["Limit"] = limit
+
+    cursor = _decode_cursor(qs.get("cursor"))
+    if cursor:
+        query["ExclusiveStartKey"] = cursor
+
+    res = _notifications.query(**query)
+    # Re-checked against the caller even though the index is keyed by user_id:
+    # an index is a lookup path, never an authorization decision. Same rule
+    # list_all_tasks states.
+    rows = [r for r in res.get("Items", []) if r.get("user_id") == user_id]
+
+    body = {
+        "notifications": [notification_schema.public_notification(r)
+                          for r in rows],
+        "count": len(rows),
+        "next_cursor": _encode_cursor(res.get("LastEvaluatedKey")),
+    }
+    if not cursor:
+        body["unread_count"] = _unread_count(user_id)
+    return _resp(200, body)
+
+
+def _unread_count(user_id):
+    """How many unread notifications this user has.
+
+    Counted over the SPARSE unread index, so the work is proportional to the
+    unread rows — not to the user's whole notification history. A user with
+    three unread and four years of read notifications pays for three.
+
+    Uses Select=COUNT so DynamoDB never ships the items themselves.
+    """
+    total, start_key = 0, None
+    # Paged because COUNT is still subject to the 1 MB scan limit per call.
+    # Bounded by the same page ceiling the filtered task list uses, so a
+    # pathological backlog cannot make the badge query unbounded.
+    for _ in range(_SEARCH_MAX_PAGES):
+        query = {"IndexName": NOTIFICATIONS_UNREAD_INDEX,
+                 "KeyConditionExpression": Key("user_id").eq(user_id),
+                 "Select": "COUNT"}
+        if start_key:
+            query["ExclusiveStartKey"] = start_key
+        res = _notifications.query(**query)
+        total += int(res.get("Count") or 0)
+        start_key = res.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    return total
+
+
+def get_unread_count(event):
+    """GET /notifications/unread-count -> {unread_count}
+
+    Separate from the list on purpose (section 24): the badge is polled far
+    more often than the centre is opened, and it must not pay for a page of
+    notification bodies to render a number.
+    """
+    user_id = _require_auth(event)
+    return _resp(200, {"unread_count": _unread_count(user_id)})
+
+
+def _mark_read(row):
+    """Flip one row to read, and drop it out of the unread index.
+
+    REMOVING `unread_marker` is what takes the row out of the sparse index —
+    that is the mechanism, not a cleanup. Writing is_read=true alone would
+    leave the badge counting it forever.
+
+    Conditional on the row still being unread so a double-tap (or two devices)
+    cannot overwrite the original read_at with a later one.
+    """
+    now = _now_iso()
+    try:
+        _notifications.update_item(
+            Key={"notification_id": row["notification_id"]},
+            UpdateExpression="SET is_read = :t, read_at = :now "
+                             "REMOVE unread_marker",
+            ConditionExpression="attribute_exists(unread_marker)",
+            ExpressionAttributeValues={":t": True, ":now": now},
+        )
+        return True
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                == "ConditionalCheckFailedException":
+            return False   # already read — the desired end state either way
+        raise
+
+
+def mark_notification_read(event):
+    """POST /notifications/{notification_id}/read -> {notification}
+
+    Idempotent: marking an already-read notification succeeds and returns it
+    unchanged, because the client's goal ("this is read") is already true. An
+    error there would make a double-tap look like a failure.
+    """
+    user_id = _require_auth(event)
+    nid = (event.get("pathParameters") or {}).get("notification_id")
+    row = _owned_notification(user_id, nid)
+
+    if _mark_read(row):
+        row = dict(row)
+        row["is_read"] = True
+        row["read_at"] = _now_iso()
+        row.pop("unread_marker", None)
+        _audit("notification.read", user_id, row["notification_id"])
+
+    return _resp(200, {
+        "notification": notification_schema.public_notification(row),
+        "unread_count": _unread_count(user_id),
+    })
+
+
+def mark_all_notifications_read(event):
+    """POST /notifications/read-all -> {marked, unread_count, remaining}
+
+    Sweeps the sparse unread index, which is exactly the set that needs
+    changing — a scan over all notifications filtering on is_read would get
+    slower every week the user keeps the app.
+
+    Bounded per call (NOTIFICATIONS_MARK_ALL_MAX). `remaining` tells the
+    client whether to call again, so a very large backlog is finished across
+    calls instead of risking the gateway timeout mid-sweep. In practice one
+    call clears any realistic inbox.
+    """
+    user_id = _require_auth(event)
+    marked, start_key, hit_ceiling = 0, None, False
+
+    while True:
+        query = {"IndexName": NOTIFICATIONS_UNREAD_INDEX,
+                 "KeyConditionExpression": Key("user_id").eq(user_id)}
+        if start_key:
+            query["ExclusiveStartKey"] = start_key
+        res = _notifications.query(**query)
+
+        for row in res.get("Items", []):
+            # The index is keyed by user_id, but ownership is re-checked
+            # before a WRITE for the same reason it is before a read.
+            if row.get("user_id") != user_id:
+                continue
+            if marked >= NOTIFICATIONS_MARK_ALL_MAX:
+                hit_ceiling = True
+                break
+            if _mark_read(row):
+                marked += 1
+
+        start_key = res.get("LastEvaluatedKey")
+        if hit_ceiling or not start_key:
+            break
+
+    remaining = _unread_count(user_id)
+    _audit("notification.read_all", user_id, "-", marked=marked)
+    return _resp(200, {"marked": marked, "unread_count": remaining,
+                       "remaining": remaining})
+
+
+# ---------------------------------------------------------------------------
+# EAGER TASK SEEDING — the pipeline's entry point into the task layer.
+#
+# WHY THIS EXISTS. Task seeding used to happen only LAZILY: `_seed_ai_tasks`
+# ran when somebody opened a task list. That made the Tasks table a function of
+# who had browsed where, which is wrong in a specific and damaging way —
+# a meeting could finish processing, extract five real action items, and none
+# of them existed anywhere the product could see:
+#
+#   * GET /tasks (the Task Tracker) showed nothing from that meeting;
+#   * the assignee never got TASK_ASSIGNED, because nothing had been created
+#     to notify them about;
+#   * AI_ACTION_REQUIRED never reached the owner, so an ambiguous assignment
+#     sat unreviewed indefinitely.
+#
+# All three resolved themselves the moment someone opened the meeting, which is
+# exactly what made it easy to miss: the bug is invisible to anyone testing by
+# opening the meeting they just recorded.
+#
+# WHY IT IS AN INVOKE RATHER THAN A COPY. The seeder is not a small function.
+# It reaches Tasks, Contacts, MeetingParticipants, Recordings and the two
+# notification tables, and it carries the fingerprint/tombstone rules, the
+# assignee-resolution chain and the meeting-anchored date normalisation. That
+# logic must exist exactly once. transcribeRecording therefore does NOT
+# reimplement any of it — it asks THIS Lambda to run the seeder it already
+# owns, over the row it has just finished writing.
+#
+# This is the same cross-Lambda shape the pipeline already uses in the other
+# direction (userApi hands the STT analysis to transcribeRecording as a typed
+# async invoke — see the stt.completed section), so it introduces no new
+# infrastructure and no new failure mode, only a second traveller on a proven
+# road.
+#
+# IDEMPOTENCY IS WHAT MAKES THIS SAFE. Nothing here is a new guarantee: the
+# seeder was ALREADY idempotent, because the lazy path could run on every
+# single read. Eager seeding just adds one more caller to a function built to
+# be called repeatedly. The lazy call stays exactly where it was, as the safety
+# net for anything this invoke misses (a legacy row, a failed invoke, a
+# recording that predates this feature).
+INTERNAL_SEED_TASKS_EVENT = "tasks.seed"
+
+
+def handle_seed_tasks_event(event):
+    """Seed one meeting's AI tasks, invoked by the pipeline. NOT an HTTP route.
+
+    There is deliberately no JWT here and no _require_auth: the caller is our
+    own transcribeRecording Lambda, authenticated by IAM at the invoke
+    boundary, and it has no user session to present. The tenant is taken from
+    the RECORDING ROW's stamped `user_id` — the same value _owned_recording
+    checks a JWT against — so this path cannot seed tasks for anyone other than
+    the recording's real owner, and it cannot be reached from the internet at
+    all (API Gateway only ever sends events carrying a routeKey).
+
+    Returns a small dict rather than an HTTP response: the invoke is async and
+    nobody reads the body, but it is what the logs and the tests assert on.
+    """
+    key = str((event or {}).get("audio_s3_key") or "").strip()
+    if not key:
+        print("[seed] no audio_s3_key on the seed event")
+        return {"seeded": 0, "error": "audio_s3_key required"}
+
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item:
+        # The row should exist — the pipeline has just written it — so this is
+        # worth a log line rather than a silent return.
+        print(f"[seed] recording not found: {key}")
+        return {"seeded": 0, "error": "recording not found"}
+
+    # THE TENANT, taken from the row and never from the event. An event that
+    # named its own user_id would be a way to write tasks into someone else's
+    # account, so the field is not read even if present.
+    user_id = str(item.get("user_id") or "").strip()
+    if not user_id:
+        # A legacy recording whose ownership is only resolvable through the
+        # UserDevices join. Seeding needs a definite owner to stamp on the
+        # rows, so this one waits for the lazy path, where the JWT supplies it.
+        print(f"[seed] {key} has no stamped owner — leaving it to the "
+              f"lazy path")
+        return {"seeded": 0, "skipped": "no owner"}
+
+    # The SAME two calls list_meeting_tasks makes, in the same order, for the
+    # same reasons — migration first so a legacy embedded task is not seeded a
+    # second time under a new id. Both are idempotent; that is precisely why
+    # this can also run lazily afterwards without creating anything twice.
+    migrated = _migrate_embedded_tasks(user_id, key, item)
+    seeded = _seed_ai_tasks(user_id, key, item)
+
+    _audit("tasks.seeded", user_id, key, seeded=seeded, migrated=migrated)
+    return {"seeded": seeded, "migrated": migrated, "key": key}
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -9883,6 +13650,48 @@ _ROUTES = {
     # unauthenticated route in this file (after /crm/salesforce/callback):
     # ElevenLabs has no MinuteX JWT, so identity is proven by an HMAC signature
     # over the raw body instead. See the section above for all five checks.
+    # --- Meeting Share. The first four are owner-only (JWT); /share/{token}
+    # is the ONLY unauthenticated way to read a meeting, and it authorizes on
+    # the token alone. See the Meeting Share section above.
+    ("POST", "/recordings/share/{key+}"): create_share,
+    ("GET", "/recordings/shares/{key+}"): list_shares,
+    # A task ASSIGNEE reading the meeting their work came from. JWT-
+    # authenticated like the owner routes, but authorized on the task
+    # assignment rather than on ownership, and read-only by construction —
+    # see the Assignee Meeting Access section above.
+    ("GET", "/recordings/shared-with-me/{key+}"): get_assignee_meeting,
+    ("PATCH", "/shares/{share_id}"): update_share,
+    ("DELETE", "/shares/{share_id}"): revoke_share,
+    ("GET", "/share/{token}"): public_share,
+    ("GET", "/share/{token}/audio"): public_share_audio,
+    # --- Integrations. Generic connect/status/disconnect for ANY provider;
+    # only the ones flagged available in shared/integrations.py can actually
+    # start a flow. /callback is the THIRD unauthenticated route in this file
+    # (after the Salesforce callback and the ElevenLabs webhook), for the same
+    # reason: a provider's browser redirect carries no JWT, so the signed
+    # `state` is the credential there.
+    ("GET", "/integrations"): list_integrations,
+    ("GET", "/integrations/{provider}"): get_integration,
+    ("POST", "/integrations/{provider}/connect"): integration_connect,
+    ("GET", "/integrations/{provider}/callback"): integration_callback,
+    ("DELETE", "/integrations/{provider}"): integration_disconnect,
+    # Gmail communication. Every one of these 409s with
+    # "integration_not_connected" / "integration_reauth_required" when Gmail
+    # is not usable — hiding the button in the app is presentation, these are
+    # the enforcement. The {key+} routes put the action first and the greedy
+    # key last, for the same API Gateway reason as the AI routes.
+    ("POST", "/integrations/gmail/send"): gmail_send,
+    ("GET", "/integrations/gmail/recipients/{key+}"): gmail_meeting_recipients,
+    ("POST", "/integrations/gmail/send/meeting/{key+}"): gmail_send_meeting,
+    ("POST", "/integrations/gmail/send/task/{task_id}"): gmail_send_task,
+    # --- Notifications. The in-app notification centre (Phase 1). Every one
+    # of these is JWT-only and scoped to the caller: there is no route that
+    # takes a user_id, and no route that reads another user's rows. See the
+    # NOTIFICATIONS section for the engine that writes them.
+    ("GET", "/notifications"): list_notifications,
+    ("GET", "/notifications/unread-count"): get_unread_count,
+    ("POST", "/notifications/{notification_id}/read"): mark_notification_read,
+    ("POST", "/notifications/read-all"): mark_all_notifications_read,
     ("POST", "/webhooks/elevenlabs/stt"): stt_webhook,
     # Recover a job whose webhook never arrived, by asking ElevenLabs directly.
     # JWT-authenticated and owner-scoped — this one is for the user/operator,
@@ -9892,6 +13701,14 @@ _ROUTES = {
 
 
 def lambda_handler(event, context):
+    # An INTERNAL invoke from the pipeline, not an HTTP request. Checked first
+    # because it carries no routeKey and would otherwise fall straight through
+    # to the 404 below. Only our own Lambdas can reach this — API Gateway
+    # always sets a routeKey, so no request from the internet can take this
+    # branch.
+    if (event or {}).get("type") == INTERNAL_SEED_TASKS_EVENT:
+        return handle_seed_tasks_event(event)
+
     # HTTP API v2.0: method + matched route template live under requestContext.
     rc = (event.get("requestContext") or {}).get("http") or {}
     method = rc.get("method", "")

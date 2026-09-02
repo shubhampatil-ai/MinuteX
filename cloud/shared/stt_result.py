@@ -33,6 +33,7 @@ Decimal (not float) for start/end: DynamoDB cannot serialize a Python float,
 and these segments used to be written straight onto the item.
 """
 import json  # noqa: F401  (kept for parity with the callers' expectations)
+import re
 from decimal import Decimal
 
 
@@ -125,3 +126,67 @@ def parse(result):
     language = (result.get("language_code")
                 if isinstance(result, dict) else None) or "unknown"
     return transcript, timestamps, language
+
+
+# ---------------------------------------------------------------------------
+# Speaker-id normalization for ASSIGNEE RESOLUTION.
+#
+# THE BUG THIS FIXES. The transcript handed to the model is rendered
+# "Speaker 0: ..." (see build_transcript below), and prompts.py tells the model
+# to copy that label EXACTLY into `assignee_speaker_id`. But every other part of
+# the system keys speakers on the COMPACT label `_speaker_label` produces —
+# participant rows, the `speaker_names` display map, timestamp segments — which
+# for that same speaker is "0".
+#
+# So the join that turns "I'll do it" into a real assignee compared
+# "Speaker 0" against "0" and never matched. Self-assignment — the most common
+# and most confidently-extracted kind of task there is — silently produced an
+# unassigned task, no TASK_ASSIGNED notification, and a task that displayed the
+# literal text "Speaker 0" instead of the mapped person's name. Three symptoms,
+# one format mismatch.
+#
+# WHY NORMALIZE INSTEAD OF CHANGING THE PROMPT. The prompt is right: the model
+# should copy what it can see, and what it can see is "Speaker 0". Asking it to
+# emit a bare "0" would be asking it to transform a label it was shown, which is
+# exactly the kind of instruction models follow inconsistently. Normalizing on
+# OUR side is deterministic and also repairs the rows already written.
+#
+# WHAT THIS IS NOT. It is INTERNAL only — a comparison key, never a display
+# value. Nothing here touches transcript labels, `speaker_names`, participant
+# display names or anything the user reads; "Speaker 0" keeps rendering as
+# "Speaker 0" (see the userApi's _speaker_display_name, which re-adds the
+# prefix for numeric labels).
+#
+# DELIBERATELY CONSERVATIVE. Only the two forms this system actually produces
+# are recognised — a "Speaker N"/"speaker_N" prefix, and a bare label. Anything
+# else is returned trimmed but otherwise untouched, because a speaker id can
+# legitimately be a word ("agent", "customer" — see _speaker_label above), and
+# stripping characters out of those would invent a match that is not there.
+# A wrong match here assigns work to the wrong person, so "no match" is always
+# the safer failure.
+_SPEAKER_PREFIX_RE = re.compile(r"^speaker[\s_-]*", re.IGNORECASE)
+
+
+def normalize_speaker_id(value):
+    """A speaker label reduced to the compact form the system keys on.
+
+        "Speaker 0" / "speaker 0" / "SPEAKER 0" / " speaker 0 "
+        "speaker_0" / "Speaker-0" / "0"                 -> "0"
+        "agent" / "customer"                            -> unchanged
+        "" / None                                       -> ""
+
+    Idempotent: normalizing an already-normalized value returns it unchanged,
+    which is what lets this be applied at every comparison site without
+    tracking whether a particular value has been through it before.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    stripped = _SPEAKER_PREFIX_RE.sub("", text).strip()
+    # Only accept the prefix-strip when it leaves a plain speaker NUMBER.
+    # "Speaker 0" -> "0" (a real match), but a name that merely begins with
+    # those letters keeps its own identity rather than being truncated into
+    # something that could collide with a different speaker.
+    if stripped.isdigit():
+        return stripped
+    return text

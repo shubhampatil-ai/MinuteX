@@ -8,18 +8,22 @@
 // Completed), and the task's own activity timeline.
 import { useMemo, useState } from "react";
 import {
-  Alert, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
+  Alert, Modal, Pressable, ScrollView,
   StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import * as DocumentPicker from "expo-document-picker";
 import { FONT, R, S, useTheme, ColorScale } from "../../../../../../lib/theme";
-import { Button, StatusPill } from "../../../../../../lib/ui";
+import { Button, KeyboardAwareSheet, StatusPill } from "../../../../../../lib/ui";
 import { Icon } from "../../../../../../lib/icons";
 import { useMeeting } from "../../../../../../lib/meeting-context";
 import { DueDatePicker, isPlottableDue } from "../../../../../../lib/due-date-picker";
 import { initialsOf, nextId, type Task, type TaskStatus } from "../../../../../../lib/task-model";
 import { Pop, PressSpring } from "../../../../../../lib/motion";
+import {
+  GmailTaskButton, GmailTaskSheet,
+} from "../../../../../../lib/gmail-task-share";
+import { useGmail } from "../../../../../../lib/integrations";
 
 const STATUS_STEPS: TaskStatus[] = ["Open", "In Progress", "Completed"];
 const PRIORITY_COLOR: Record<Task["priority"], (C: ColorScale) => string> = {
@@ -105,6 +109,10 @@ export default function TaskDetailScreen() {
   const [priorityPickerOpen, setPriorityPickerOpen] = useState(false);
   const [editingField, setEditingField] = useState<"title" | "description" | null>(null);
   const [dueOpen, setDueOpen] = useState(false);
+  const [gmailTaskOpen, setGmailTaskOpen] = useState(false);
+  // The ONE Gmail check this screen makes — the shared context, so
+  // disconnecting Gmail in Settings removes this action here immediately.
+  const gmail = useGmail();
   const [editDraft, setEditDraft] = useState("");
 
   if (!task) {
@@ -281,6 +289,47 @@ export default function TaskDetailScreen() {
           style={{ marginTop: S.xl }}
         />
 
+        {/* Notify Assignee — multi-channel deep-link handoff (WhatsApp / Email
+            / SMS / in-app acknowledgement).
+
+            An EXPLICIT action, not a forced step. Assign To used to redirect
+            here the moment someone was picked, which conflated two independent
+            decisions — who owns the task, and whether to message them about it
+            — and left every reassignment feeling half-finished. Most
+            reassignments are bookkeeping, so notifying is offered here and
+            chosen, never imposed. Assigned tasks only: the channels are the
+            assignee's contact details, so there is nothing to send without
+            one. */}
+        {task.assignee ? (
+          <Button
+            label="Notify Assignee"
+            variant="secondary"
+            onPress={() => router.push({
+              pathname: "/recording/[key]/task/[taskId]/notify",
+              params: { key, taskId },
+            })}
+            style={{ marginTop: S.md }}
+          />
+        ) : null}
+
+        {/* Email the task to its assignee, through the user's own Gmail.
+            Explicitly triggered communication — distinct from Notify Assignee,
+            which is a multi-channel deep-link handoff and the seed of the
+            notification feature that comes later.
+
+            GmailTaskButton owns the visibility rule: with Gmail unconnected it
+            becomes a prompt routing to Settings, never an action that fails.
+            Offered only for an ASSIGNED task, because the assignee is who the
+            backend resolves the recipient from. */}
+        {task.assignee ? (
+          <GmailTaskButton
+            usable={gmail.usable}
+            needsReauth={gmail.needsReauth}
+            onPress={() => setGmailTaskOpen(true)}
+            style={{ marginTop: S.md }}
+          />
+        ) : null}
+
         {/* ---- Status stepper ---- */}
         <Text style={[st.descLabel, { marginTop: S.xxl }]}>Status</Text>
         <PressSpring onPress={() => setStatusPickerOpen(true)} style={st.stepperTrack} accessibilityLabel="Change status">
@@ -398,7 +447,7 @@ export default function TaskDetailScreen() {
       </ScrollView>
 
       <Modal visible={statusPickerOpen} transparent animationType="fade" onRequestClose={() => setStatusPickerOpen(false)}>
-        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+        <KeyboardAwareSheet>
           <Pressable style={st.sheetBackdrop} onPress={() => setStatusPickerOpen(false)}>
             <Pressable style={st.sheet} onPress={() => {}}>
               <Text style={{ fontFamily: FONT.extrabold, fontSize: 19, color: C.text }}>Change status</Text>
@@ -417,7 +466,7 @@ export default function TaskDetailScreen() {
               ))}
             </Pressable>
           </Pressable>
-        </KeyboardAvoidingView>
+        </KeyboardAwareSheet>
       </Modal>
 
       <Modal visible={priorityPickerOpen} transparent animationType="fade" onRequestClose={() => setPriorityPickerOpen(false)}>
@@ -452,7 +501,7 @@ export default function TaskDetailScreen() {
       />
 
       <Modal visible={editingField !== null} transparent animationType="fade" onRequestClose={() => setEditingField(null)}>
-        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
+        <KeyboardAwareSheet>
           <Pressable style={st.sheetBackdrop} onPress={() => setEditingField(null)}>
             <Pressable style={st.sheet} onPress={() => {}}>
               <Text style={st.sheetTitle}>
@@ -474,8 +523,19 @@ export default function TaskDetailScreen() {
               </View>
             </Pressable>
           </Pressable>
-        </KeyboardAvoidingView>
+        </KeyboardAwareSheet>
       </Modal>
+
+      {/* Gmail send. A sibling of the edit modal, not nested inside it — a
+          Modal within a Modal can render behind its parent on Android. */}
+      <GmailTaskSheet
+        visible={gmailTaskOpen}
+        onClose={() => setGmailTaskOpen(false)}
+        taskId={taskId}
+        taskTitle={task.task}
+        assigneeName={task.assignee?.name}
+        onSent={() => Alert.alert("Sent", "The task was emailed.")}
+      />
     </View>
   );
 }

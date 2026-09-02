@@ -29,7 +29,7 @@ import {
 } from "./ui";
 import {
   ApiContact, ApiError, ambiguousCandidates, createContact, getContacts,
-  isAmbiguousContact,
+  getMe, isAmbiguousContact,
 } from "./api";
 import {
   ContactPickResult, requestContactsPermissionDetailed, searchPhoneContacts,
@@ -73,11 +73,22 @@ export type ContactPickerProps = {
   title?: string;
   /** Shown as a "remove" affordance when the caller already has a selection. */
   onClear?: () => void;
+  /**
+   * Offer a "That's me" shortcut that picks the SIGNED-IN user.
+   *
+   * Opt-in, because it only makes sense where the answer could genuinely be
+   * the user themselves — tagging a speaker in your own meeting, mostly.
+   * Without it a user had to hand-type a contact for themselves and get their
+   * own email exactly right, or the account link (and every notification that
+   * depends on it) silently never happened.
+   */
+  allowSelf?: boolean;
 };
 
 export function ContactPicker({
   visible, onClose, onPick, meetingContacts = [], folderContacts = [],
   folderName = "", folderId = "", title = "Select Contact", onClear,
+  allowSelf = false,
 }: ContactPickerProps) {
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C, T), [C, T]);
@@ -100,6 +111,26 @@ export function ContactPicker({
   const [createError, setCreateError] = useState("");
   // Populated when the backend answers "which one did you mean?".
   const [candidates, setCandidates] = useState<ApiContact[]>([]);
+
+  // THE SIGNED-IN USER, for the "That's me" shortcut. Loaded only when the
+  // caller asked for it and only while the sheet is open — most pickers never
+  // offer it, and it must not cost a request on every mount.
+  const [me, setMe] = useState<{ name: string; email: string } | null>(null);
+  const [selfBusy, setSelfBusy] = useState(false);
+  useEffect(() => {
+    if (!allowSelf || !visible || me) return;
+    let alive = true;
+    getMe()
+      .then((u) => {
+        // An account with no email cannot be linked to a contact (see
+        // _resolve_minutex_user server-side), so the shortcut would produce an
+        // UNRESOLVED contact that can never be notified. Better to not offer
+        // it than to offer a broken version of it.
+        if (alive && u.email) setMe({ name: u.name || "Me", email: u.email });
+      })
+      .catch(() => { /* the shortcut simply does not appear */ });
+    return () => { alive = false; };
+  }, [allowSelf, visible, me]);
 
   // Phone-contact import. Deliberately ONE PERSON AT A TIME: the user's
   // address book is theirs, and nothing leaves the device until they pick a
@@ -314,6 +345,48 @@ export function ContactPicker({
     },
     [newName, newEmail, newPhone, folderId, onPick, onClose]
   );
+
+  /** Pick the signed-in user, creating their self-contact once if needed.
+   *
+   * A contact is still the unit of assignment everywhere in MinuteX, so "me"
+   * has to BE one — there is no separate self-participant concept, and
+   * inventing one would mean every screen that reads a contact learning about
+   * a second shape. Instead this reuses the ordinary create path.
+   *
+   * Reuse rather than duplicate: createContact answers 200 {existing:true}
+   * when a strong identifier (the email) already matches, so tapping this
+   * twice, or after having typed yourself in by hand once, converges on the
+   * SAME contact rather than growing a pile of self-rows.
+   *
+   * The email is what makes it work — the backend links a contact to an
+   * account by looking it up in the Users table (_resolve_minutex_user), so
+   * taking it from the authenticated profile means the link cannot be broken
+   * by a typo the way hand-entry could.
+   */
+  const pickSelf = useCallback(async () => {
+    if (!me) return;
+    setSelfBusy(true);
+    setCreateError("");
+    try {
+      const { contact } = await createContact({
+        name: me.name,
+        email: me.email,
+        folder_id: folderId || undefined,
+        // Same-name collisions must not stop the user identifying THEMSELVES:
+        // the email is an exact identifier, so an "is this a different
+        // person?" prompt would be noise here.
+        force: true,
+      });
+      onPick(contact);
+      onClose();
+    } catch (e) {
+      setCreateError(
+        e instanceof ApiError ? e.message : "Could not add you as a contact."
+      );
+    } finally {
+      setSelfBusy(false);
+    }
+  }, [me, folderId, onPick, onClose]);
 
   // Ask for permission and load the device list. Kept out of the render path
   // so the address book is only read after a deliberate tap.
@@ -675,6 +748,21 @@ export function ContactPicker({
                   />
                 )}
                 <View style={st.actions}>
+                  {/* THAT'S ME. First, because when the answer is the user
+                      themselves it is the answer — and because without it the
+                      only route was typing your own name and email into
+                      "Create New Contact" and getting the address exactly
+                      right, since that email is what links the contact to
+                      your account. Shown only when the caller opted in AND
+                      the account has an email to link with. */}
+                  {allowSelf && !!me && (
+                    <Button
+                      label={`That’s me (${me.name})`}
+                      variant="secondary"
+                      onPress={pickSelf}
+                      loading={selfBusy}
+                    />
+                  )}
                   {!!onClear && (
                     <Button
                       label="Clear selection"

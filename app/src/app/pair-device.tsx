@@ -17,7 +17,7 @@
 // point a scanner's result at it and nothing else has to change.
 import React, { useMemo, useState } from "react";
 import {
-  KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View,
+  KeyboardAvoidingView, ScrollView, StyleSheet, Text, View,
 } from "react-native";
 import { useRouter } from "expo-router";
 import { S, FONT, TABULAR, useTheme, ColorScale } from "../../lib/theme";
@@ -136,7 +136,10 @@ export default function PairDeviceScreen() {
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: C.bg }}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      // "padding" on BOTH platforms: on Android 15+ edge-to-edge means the OS
+      // no longer resizes the window, and RN's KeyboardAvoidingView ignores the
+      // keyboard entirely when behavior is undefined. See lib/ui.tsx.
+      behavior="padding"
     >
       <ScrollView
         contentContainerStyle={st.scroll}

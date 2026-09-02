@@ -4,7 +4,7 @@
 // After a successful claim its recordings show up on the files list.
 import React, { useMemo, useState } from "react";
 import {
-  KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View,
+  KeyboardAvoidingView, Pressable, ScrollView, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { Icon } from "../../lib/icons";
@@ -66,7 +66,10 @@ export default function ClaimScreen() {
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: C.bg }}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      // "padding" on BOTH platforms: on Android 15+ edge-to-edge means the OS
+      // no longer resizes the window, and RN's KeyboardAvoidingView ignores the
+      // keyboard entirely when behavior is undefined. See lib/ui.tsx.
+      behavior="padding"
     >
       <ScrollView contentContainerStyle={st.scroll} keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}>

@@ -9,19 +9,34 @@
 // nothing about a missing KeyboardAvoidingView looks wrong in a diff — it only
 // looks wrong on a handset, which is exactly where we cannot run CI.
 //
-// The rule that actually mattered, learned the hard way: ANDROID NEEDS THE
-// OPPOSITE BEHAVIOR IN A MODAL THAN ON A SCREEN. A screen is resized by the OS
-// (MainActivity is adjustResize), so KeyboardAvoidingView must add nothing. A
-// Modal is a SEPARATE WINDOW that never gets resized, so it must shrink itself
-// with behavior="height". Applying the screen rule to a sheet — which is what a
-// first pass at this did — leaves the sheet's input under the keyboard, and a
-// bottom-anchored sheet is the worst case rather than an edge case.
+// THE RULE CHANGED ONCE ALREADY — read this before "simplifying" anything here.
+//
+// Round 1 (Android 14 and earlier): a screen was resized by the OS
+// (adjustResize), so KeyboardAvoidingView had to add nothing —
+// behavior={undefined} — while a Modal, its own window and never resized, had to
+// shrink itself with behavior="height". This suite asserted exactly that.
+//
+// Round 2 (Android 15+, which is what Expo SDK 57 targets): edge-to-edge is
+// ENFORCED and THE OS NO LONGER RESIZES THE WINDOW. RN 0.86's
+// KeyboardAvoidingView.render() switches on `behavior` with no default branch,
+// so behavior={undefined} renders a plain View that ignores the keyboard
+// completely. The moment the window stopped shrinking, "undefined" stopped
+// meaning "the OS handles it" and started meaning "nothing handles it".
+//
+// The Assistant chat composer was covered by the keyboard on Android 15 while
+// every test here passed — because the suite was asserting the broken value.
+// That is the failure this header exists to prevent repeating.
+//
+// Current rule: "padding" on BOTH platforms for a screen; "height" inside a
+// Modal (unchanged — a modal was never resized by the OS on any version, which
+// is why sheets kept working when screens broke).
 //
 // So this test reads the SOURCE of every screen and asserts:
 //
-//   1. app.json keeps softwareKeyboardLayoutMode = "resize" (belt-and-braces:
-//      Expo's template also writes adjustResize onto MainActivity, verified by
-//      decoding the built APK's manifest).
+//   1. app.json keeps softwareKeyboardLayoutMode = "resize". NOTE: on Android
+//      15+ this is largely vestigial — the OS ignores the resize request under
+//      enforced edge-to-edge. Kept because it still applies below API 35 and
+//      does no harm; it is NOT what makes the current fixes work.
 //   2. Every file that renders a text input is either wrapped in keyboard
 //      avoidance itself, or delegates its inputs to a shared component that is.
 //   3. Every ScrollView that contains an input sets
@@ -96,6 +111,21 @@ const DELEGATES = new Map([
   // rename Modal in KeyboardAwareSheet, which is the input that genuinely
   // needed covering.
   ["lib/transcript-view.tsx", "top-anchored search over the transcript list"],
+  // Handles the keyboard ITSELF, without KeyboardAvoidingView, on purpose.
+  //
+  // It is the app's one presentation: "modal" screen, so under
+  // react-native-screens it renders in its own native container and
+  // KeyboardAvoidingView's onLayout frame is container-relative while the
+  // keyboard's screenY is window-relative. The two coordinate spaces disagree,
+  // its computed inset collapses to ~0, and the composer stays under the
+  // keyboard — silently, on a real Android 15 handset, with every check here
+  // green. So it tracks endCoordinates.height and lifts the composer directly.
+  //
+  // Verified by ASSERTION below rather than trust: see "the Assistant screen
+  // tracks the keyboard itself". Without that, this file passes the
+  // HAS_AVOIDANCE regex purely on the word KeyboardAvoidingView appearing in
+  // its explanatory comments, which is not a fix.
+  ["src/app/recording/[key]/assistant.tsx", "tracks endCoordinates.height itself; see assertion below"],
 ]);
 
 describe("android keyboard layout mode", () => {
@@ -188,20 +218,190 @@ describe("the shared wrappers use the right platform behavior", () => {
     );
   });
 
-  it("leaves Android behavior undefined for full SCREENS", () => {
-    // The opposite of the rule above, and both must hold. A normal screen IS
-    // resized by the OS (MainActivity is adjustResize), so adding a behavior
-    // double-counts the inset and leaves a keyboard-sized gap.
+  it('uses "padding" on Android for full SCREENS too', () => {
+    // THIS ASSERTION USED TO DEMAND THE OPPOSITE, and the reversal is the point.
+    //
+    // It previously required behavior={undefined} on Android, on the theory
+    // that MainActivity's adjustResize already resized the window so any
+    // behavior would double-count the inset. That was true until it wasn't:
+    // Expo SDK 57 targets Android 15+, where edge-to-edge is ENFORCED and the
+    // OS no longer resizes the window for the keyboard.
+    //
+    // RN 0.86's KeyboardAvoidingView.render() switches on `behavior` with no
+    // default branch, so undefined renders a plain View with NO keyboard
+    // handling at all. Once the window stopped shrinking, "undefined" went from
+    // "the OS handles it" to "nothing handles it" — the Assistant chat composer
+    // sat under the keyboard on Android 15 with every test still green, because
+    // the suite was asserting the broken value.
+    //
+    // "padding" applies paddingBottom from the keyboardDidShow event and needs
+    // no window resize, so it is correct with or without edge-to-edge.
     const screen = ui.slice(
       ui.indexOf("export function KeyboardAware("),
       ui.indexOf("export function KeyboardAwareSheet")
     );
-    assert.match(screen, /Platform\.OS === "ios" \? "padding" : undefined/);
+    assert.match(
+      screen, /behavior="padding"/,
+      'KeyboardAware must use behavior="padding" on both platforms. ' +
+      "behavior={undefined} is inert on Android 15+ (edge-to-edge enforced, no " +
+      "window resize), which silently removes keyboard avoidance from every " +
+      "screen that uses this wrapper."
+    );
+    assert.doesNotMatch(
+      screen, /: undefined/,
+      "Android must not get behavior={undefined} — see above."
+    );
+  });
+
+  it("no screen-level wrapper still uses the inert Android value", () => {
+    // The wrapper above is shared, but four screens hand-rolled the same
+    // KeyboardAvoidingView and all four had the same inert value. Catch any new
+    // one rather than trusting everybody to use the wrapper.
+    const offenders = [];
+    for (const f of files) {
+      const src = read(f);
+      if (/"ios" \? "padding" : undefined/.test(src)) offenders.push(rel(f));
+    }
+    assert.deepEqual(
+      offenders, [],
+      'behavior={Platform.OS === "ios" ? "padding" : undefined} is inert on ' +
+      "Android 15+ — RN renders a plain View and the OS no longer resizes the " +
+      'window. Use behavior="padding" (screens) or <KeyboardAware>:\n  ' +
+      offenders.join("\n  ")
+    );
   });
 
   it("exports both wrappers and the scroll props", () => {
     for (const name of ["KeyboardAware", "KeyboardAwareSheet", "scrollFormProps"]) {
       assert.match(ui, new RegExp(`export (?:function|const) ${name}\\b`), name);
     }
+  });
+});
+
+// A Modal containing an input must use MODAL behavior, not screen behavior.
+//
+// This is the check the original suite was missing, and it is exactly how the
+// bug came back. The file-level assertions above are satisfied by ANY
+// KeyboardAvoidingView anywhere in the file — so a screen that correctly wrapped
+// itself in <KeyboardAware> passed while its bottom sheet, hundreds of lines
+// further down, had no avoidance at all (salesforce-config's field picker,
+// mom-editor's rename sheet) or had the SCREEN rule copied into it
+// (mom-editor's add-section/row/columns sheets, meeting-crm-records, the task
+// detail status picker). Both leave the sheet's input under the keyboard on
+// Android, and a bottom-anchored sheet is the worst case, not an edge case.
+//
+// The rule: inside <Modal>, either use <KeyboardAwareSheet> or spell out
+// behavior with "height" on Android. `undefined` is a screen-only answer.
+describe("modals with inputs use modal keyboard behavior", () => {
+  const offenders = [];
+
+  // Comments discuss <Modal> in prose (the wrappers document exactly this
+  // rule), and a commented-out block is not shipped markup. Blanking comments
+  // to equal-length whitespace keeps every later index/line number honest.
+  const blankComments = (src) =>
+    src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, (c) => c.replace(/[^\n]/g, " "));
+
+  for (const f of files) {
+    const src = blankComments(read(f));
+    // ui.tsx defines the wrappers themselves and renders no modal of its own.
+    if (rel(f) === "lib/ui.tsx") continue;
+
+    for (const m of src.matchAll(/<Modal\b/g)) {
+      // Walk from this <Modal to its matching close, counting nesting so a
+      // sheet inside a sheet is attributed to the inner one.
+      let depth = 0, end = src.length;
+      const tag = /<Modal\b|<\/Modal>/g;
+      tag.lastIndex = m.index;
+      for (let t; (t = tag.exec(src)); ) {
+        if (t[0] === "<Modal") depth++;
+        else if (--depth === 0) { end = t.index; break; }
+      }
+      const body = src.slice(m.index, end);
+
+      // Only a modal that actually contains an input can hide one. A modal that
+      // delegates to a child component (e.g. <MomEditorScreen />) is skipped
+      // here and checked where that component is defined.
+      if (!RENDERS_INPUT.test(body)) continue;
+
+      // The shared wrapper already encodes the right rule.
+      if (/<KeyboardAwareSheet\b/.test(body)) continue;
+
+      // Otherwise it must spell out "height" for Android.
+      const kav = body.match(/<KeyboardAvoidingView[\s\S]{0,240}?>/);
+      if (kav && /"ios" \? "padding" : "height"/.test(kav[0])) continue;
+
+      const line = src.slice(0, m.index).split("\n").length;
+      offenders.push(
+        `${rel(f)}:${line} — ` +
+        (kav ? "screen behavior (undefined) inside a Modal" : "no keyboard avoidance")
+      );
+    }
+  }
+
+  it("has no modal input using screen behavior", () => {
+    assert.deepEqual(
+      offenders, [],
+      "A <Modal> containing a text input is its own window on Android and is " +
+      "never resized by the OS, so it must shrink itself. Wrap it in " +
+      "<KeyboardAwareSheet> from lib/ui.tsx:\n  " + offenders.join("\n  ")
+    );
+  });
+});
+
+// The Assistant screen tracks the keyboard itself — verify it really does.
+//
+// This screen is exempted from the wrapper check in DELEGATES, and an exemption
+// without an assertion is just a hole: the file would satisfy the HAS_AVOIDANCE
+// regex on the word "KeyboardAvoidingView" appearing in its comments alone, so
+// deleting the actual fix would not fail anything.
+//
+// The mechanism it must keep: read endCoordinates.height from a keyboard show
+// event, and apply it to the composer. Asserting on the mechanism rather than
+// exact source lets the code be refactored, while still failing loudly if the
+// keyboard handling is removed.
+describe("the Assistant screen tracks the keyboard itself", () => {
+  const f = "src/app/recording/[key]/assistant.tsx";
+  const src = read(join(ROOT, f));
+
+  it("listens for a keyboard show event", () => {
+    assert.match(
+      src, /Keyboard\.addListener/,
+      `${f} must subscribe to keyboard events — it is exempt from the shared ` +
+      "wrapper check precisely because it handles the keyboard itself."
+    );
+    // keyboardWillShow is iOS-only; Android must use keyboardDidShow or the
+    // listener silently never fires and the composer is never lifted.
+    assert.match(
+      src, /keyboardDidShow/,
+      `${f} must listen for "keyboardDidShow" — "keyboardWillShow" does not ` +
+      "fire on Android, which is the platform this fix exists for."
+    );
+  });
+
+  it("reads the keyboard height from the event", () => {
+    assert.match(
+      src, /endCoordinates[?.]*\.height/,
+      `${f} must take its offset from endCoordinates.height. Deriving it from ` +
+      "onLayout is what failed here: this screen is presentation: \"modal\", " +
+      "so its frame and the keyboard's screenY are in different coordinate " +
+      "spaces and the computed inset collapses to ~0."
+    );
+  });
+
+  it("resets to zero when the keyboard hides", () => {
+    // Without this the composer stays lifted after dismissal, leaving a
+    // keyboard-sized gap above it.
+    assert.match(
+      src, /keyboardDidHide|keyboardWillHide/,
+      `${f} must handle the hide event and reset the offset to 0.`
+    );
+  });
+
+  it("applies the offset to the composer", () => {
+    assert.match(
+      src, /composerWrap,\s*\{\s*(?:margin|padding)Bottom:/,
+      `${f} must apply the tracked height to composerWrap as margin/padding ` +
+      "Bottom. Tracking the height without applying it lifts nothing."
+    );
   });
 });

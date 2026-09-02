@@ -298,3 +298,78 @@ def strip_for_write(fields):
     """
     return {k: v for k, v in fields.items()
             if k not in ("transcript", "timestamps")}
+
+
+# ---------------------------------------------------------------------------
+# The transcript AS THE MODEL SEES IT.
+#
+# WHY THIS EXISTS. Segment ids have been derivable since with_segment_ids()
+# was written, and the task schema has always had a place to put them — but the
+# model was handed the PLAIN prose transcript ("Speaker 0: ...") built by
+# stt_result.build_diarized_text, which contains no ids at all. So the prompt
+# asked for evidence_segment_ids, the model had nothing to copy, and every real
+# extraction came back with []. The plumbing on both sides was complete and the
+# middle was missing.
+#
+# WHY THE IDS CAN BE DERIVED RATHER THAN STORED. stt_result builds the prose
+# lines and the timestamps array from the SAME word stream with the SAME
+# speaker-turn grouping (build_diarized_text and build_timestamps are the same
+# loop), so line N is always segment N. Verified against 10 real production
+# transcripts: line count == segment count and the texts match, on every one.
+# That is what makes `seg_{index}` stable across rendering, extraction, storage
+# and later viewing without persisting a second copy of anything.
+#
+# WHAT THE MODEL IS GIVEN, and nothing more:
+#
+#     [seg_0] Speaker 0: Right, where are we on the proposal?
+#     [seg_1] Speaker 1: I'll send it tomorrow.
+#
+# No start/end times (the model has no use for them and they cost tokens on
+# every line of a 1500-segment meeting), no database ids, no internal keys.
+# The id and the speaker label are exactly what an evidence reference needs.
+#
+# FORMAT. The id is a PREFIX on the existing line rather than a separate line,
+# because it keeps the transcript's shape — one turn per line — which is what
+# the rest of the prompt's rules are written against. Reformatting it into
+# blocks would have meant re-tuning wording that is already proven.
+def as_labelled_lines(transcript, timestamps):
+    """The transcript with `[seg_N]` on each line, for the model to quote.
+
+    Falls back to the plain transcript whenever the two sides do not line up —
+    a legacy row with no timestamps, an offloaded transcript that failed to
+    hydrate, or a count mismatch from some future STT change. A mismatched
+    label is far worse than no label: it would point evidence at the wrong
+    moment of the meeting while looking perfectly valid, and the validator
+    downstream cannot catch that because the id would genuinely exist.
+
+    Degrading here costs only the evidence REFERENCES; the quote, the tasks and
+    the whole analysis are unaffected.
+    """
+    text = str(transcript or "")
+    if not isinstance(timestamps, list) or not timestamps:
+        return text
+
+    lines = text.split("\n")
+    # The prose joins turns with a blank line ("\n\n"), so drop the blanks
+    # before pairing. Positions are what carry the identity.
+    content = [i for i, ln in enumerate(lines) if ln.strip()]
+    if len(content) != len(timestamps):
+        return text
+
+    out = list(lines)
+    for position, line_index in enumerate(content):
+        out[line_index] = f"[{segment_id(position)}] {lines[line_index]}"
+    return "\n".join(out)
+
+
+def valid_segment_ids(timestamps):
+    """The set of ids that actually exist for this meeting.
+
+    The one place the "which ids are real?" question is answered, so the
+    prompt's input and the validator's allow-list can never disagree about what
+    a valid reference is.
+    """
+    if not isinstance(timestamps, list):
+        return set()
+    return {seg["id"] for seg in with_segment_ids(timestamps)
+            if isinstance(seg, dict) and seg.get("id")}

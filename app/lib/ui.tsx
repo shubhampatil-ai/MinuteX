@@ -344,18 +344,32 @@ export function TextField(props: TextInputProps & { style?: ViewStyle }) {
 // things to agree and hand-repeating them across twenty screens is how they
 // drift apart:
 //
-//   1. android.softwareKeyboardLayoutMode should be "resize" (app.json) so a
-//      normal screen is resized by the OS. NOTE: Expo's template also writes
-//      adjustResize onto MainActivity itself, so this is belt-and-braces rather
-//      than the thing that was broken — verified by decoding the built APK's
-//      manifest, which showed adjustResize even when app.json said "pan".
+//   1. android.softwareKeyboardLayoutMode is "resize" (app.json). This USED to
+//      be load-bearing; on Android 15+ it largely is not — see (3).
 //   2. iOS needs an explicit behavior; "padding" is right for a full screen and
 //      is what login/claim/pair-device already use.
-//   3. Android needs behavior UNDEFINED on a normal SCREEN (the OS already
-//      resized the window; adding a behavior double-counts the inset), but
-//      "height" inside a MODAL, which is its own window and is never resized.
-//      Getting this backwards leaves every sheet's input under the keyboard —
-//      see KeyboardAwareSheet.
+//   3. Android ALSO needs "padding" on a screen. This reverses what this file
+//      said for a long time (and what Expo's keyboard guide still says), so the
+//      reason matters:
+//
+//      Expo SDK 57 targets Android 15+, where edge-to-edge is ENFORCED and the
+//      system NO LONGER RESIZES the window when the keyboard opens — it expects
+//      the app to consume IME insets itself. adjustResize is not a reliable
+//      shrink any more.
+//
+//      RN 0.86's KeyboardAvoidingView.render() switches on `behavior` with NO
+//      default branch, so behavior={undefined} renders a plain View that
+//      ignores the keyboard entirely. Under the old resize it did not matter —
+//      the window shrank underneath it. On Android 15 nothing shrinks, so
+//      "undefined" means genuinely no keyboard avoidance.
+//
+//      "padding" applies paddingBottom from the keyboardDidShow event, which
+//      needs no window resize, so it works whether or not the OS resizes.
+//
+//      A MODAL still uses "height" (see KeyboardAwareSheet) — a modal is its
+//      own window, was never resized by the OS on any version, and "height"
+//      shrinks its own frame. That is why the sheets kept working on Android 15
+//      while screens using "undefined" quietly broke.
 //
 // `KeyboardAware` wraps a whole screen. `KeyboardAwareSheet` wraps a
 // bottom-anchored Modal, which is the worse case: a sheet pinned to the bottom
@@ -368,7 +382,7 @@ export function KeyboardAware({
   return (
     <KeyboardAvoidingView
       style={[{ flex: 1, backgroundColor: C.bg }, style]}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      behavior="padding"
     >
       {children}
     </KeyboardAvoidingView>

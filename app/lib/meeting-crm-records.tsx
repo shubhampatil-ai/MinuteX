@@ -27,11 +27,11 @@
 // because notes written onto the wrong record are worse than no notes.
 import { useMemo, useState } from "react";
 import {
-  ActivityIndicator, KeyboardAvoidingView, Modal, Platform, Pressable,
+  ActivityIndicator, Modal, Pressable,
   StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { FONT, R, S, useTheme, ColorScale } from "./theme";
-import { Button, Card, SectionRule, StatusPill } from "./ui";
+import { Button, Card, KeyboardAwareSheet, SectionRule, StatusPill } from "./ui";
 import { Icon, type IconName } from "./icons";
 import type { CrmCandidate, CrmMapping, CrmRecordValue, CrmSyncStatus } from "./api";
 
@@ -367,10 +367,7 @@ function CrmRecordRow({
         animationType="slide"
         onRequestClose={() => setSheetOpen(false)}
       >
-        <KeyboardAvoidingView
-          behavior={Platform.OS === "ios" ? "padding" : undefined}
-          style={{ flex: 1 }}
-        >
+        <KeyboardAwareSheet>
           <Pressable style={st.backdrop} onPress={() => setSheetOpen(false)}>
             <Pressable style={st.sheet} onPress={() => {}}>
               <Text style={st.sheetTitle}>{fieldLabel}</Text>
@@ -417,7 +414,7 @@ function CrmRecordRow({
               ) : null}
             </Pressable>
           </Pressable>
-        </KeyboardAvoidingView>
+        </KeyboardAwareSheet>
       </Modal>
     </>
   );

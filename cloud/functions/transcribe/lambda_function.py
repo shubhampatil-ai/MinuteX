@@ -73,6 +73,7 @@ come from env only, never hardcoded.
 """
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -82,11 +83,14 @@ from decimal import Decimal
 
 import boto3
 from botocore.config import Config as _BotoConfig
+from botocore.exceptions import ClientError
 
 # The shared AI core — one Groq client, one set of prompts, one coercion layer
 # for the whole backend. Vendored into this zip alongside lambda_function.py.
 import ai_schema
 import groq_client
+import notification_schema
+import pageindex_store
 import prompts
 import stt_result
 import transcript_store
@@ -565,7 +569,7 @@ def _note_partial_overview(overview, covered, total):
     return {**overview, "sections": [first] + list(sections[1:])}
 
 
-def analyze_meeting(transcript, valid_ids=None):
+def analyze_meeting(transcript, valid_ids=None, roster_source=None):
     """THE analysis: title, the dynamic overview, tasks, participants and the
     structured meeting_highlights — in ONE Groq call.
 
@@ -617,7 +621,15 @@ def analyze_meeting(transcript, valid_ids=None):
     # result); coercion then leaves the model's list alone rather than dropping
     # every participant. Tasks are never roster-filtered — an assignee may be a
     # non-attendee, a team or an external party.
-    roster = ai_schema.speaker_roster(transcript)
+    # The roster is read from the PLAIN transcript when one is supplied,
+    # because the labelled form the model receives prefixes each line with
+    # "[seg_N] " and speaker_roster's regex is anchored at line start — it
+    # would find nothing and silently empty the participants list. Reading the
+    # roster from the unlabelled text keeps that regex strict (it is a
+    # structural guarantee about build_diarized_text's output, not a loose
+    # match) instead of widening it to tolerate a prefix.
+    roster = ai_schema.speaker_roster(
+        roster_source if roster_source is not None else transcript)
     print(f"[groq] analyze: {len(roster)} speaker(s) in the transcript: "
           f"{roster}")
 
@@ -812,6 +824,9 @@ def handle_s3_event(event):
                 print(f"[elevenlabs] SYNC fallback FAILED for {key}: {sync_err}")
                 _upsert(key, {"status": "failed",
                               "error": str(sync_err)[:1000]})
+                _notify_processing_outcome(
+                    key, _notify_recipient(key), "failed",
+                    _notify_meeting_title(key))
                 raise
             outcome = analyze_and_persist(bucket, key, transcript, timestamps,
                                           language)
@@ -820,6 +835,12 @@ def handle_s3_event(event):
         except Exception as err:  # noqa: BLE001
             print(f"[elevenlabs] START FAILED for {key}: {err}")
             _upsert(key, {"status": "failed", "error": str(err)[:1000]})
+            # Deduped per meeting, so the S3/Lambda retries this `raise`
+            # triggers do not each add a notification — the user is told once
+            # that this recording could not be processed.
+            _notify_processing_outcome(
+                key, _notify_recipient(key), "failed",
+                _notify_meeting_title(key))
             raise  # abort -> S3/Lambda retry semantics apply
 
         # Persist the id BEFORE returning. This write is what makes the async
@@ -946,13 +967,20 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # reference that validates at write time but resolves to nothing at read
     # time is the one failure the validation exists to prevent.
     _upsert(key, {"status": "generating_ai"})
-    valid_ids = {seg["id"] for seg in transcript_store.with_segment_ids(timestamps)
-                 if isinstance(seg, dict) and seg.get("id")}
+    # The allow-list of real segment ids, and the transcript rendered WITH those
+    # ids on each line. Both come from transcript_store so the input the model
+    # reads and the validator's allow-list can never disagree about what a valid
+    # reference is. Before this, the model was handed the plain prose transcript
+    # — it had no ids to copy, so every extraction returned
+    # evidence_segment_ids: [] however clearly the prompt asked for them.
+    valid_ids = transcript_store.valid_segment_ids(timestamps)
+    labelled = transcript_store.as_labelled_lines(transcript, timestamps)
 
     analysis = ai_schema.empty_unified()
     status = "complete"
     try:
-        analysis = analyze_meeting(transcript, valid_ids)
+        analysis = analyze_meeting(labelled, valid_ids,
+                                   roster_source=transcript)
         if ai_schema.overview_empty(analysis.get("overview")):
             # analyze_meeting() can return NORMALLY with an empty overview (e.g.
             # map_reduce's reduce step came back blank without Groq itself
@@ -1102,8 +1130,86 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # finished is stt_completed_request_id, written by the webhook's idempotency
     # claim — the reconciler compares the two rather than testing for absence.
     _upsert(key, fields, remove=RETIRED_ANALYSIS_ATTRS)
+
+    # Step 3c: index the transcript for retrieval. AFTER the terminal write, and
+    # deliberately unable to affect it — see _build_pageindex.
+    _build_pageindex(key, bucket, user_id, transcript, timestamps,
+                     fields.get("transcript_fingerprint") or "")
+
+    # SEED THE TASKS BEFORE ANNOUNCING THE MEETING. Both orderings work, but
+    # this one is better for the user: the completion notification is what
+    # sends them to the meeting, so seeding first makes it far more likely the
+    # tasks are already there when they arrive. It costs nothing — the invoke
+    # is async and returns immediately.
+    #
+    # AFTER the terminal write, never before, for the same reason the
+    # notification is: the seeder reads `ai_tasks` off the row, so the row must
+    # already carry the analysis this run produced.
+    _seed_tasks_for(key, status)
+
+    # AFTER the terminal status is persisted, never before: the notification
+    # says the meeting is ready, so the row the user lands on must already say
+    # so too. `fields` holds the title this write decided, so no read-back is
+    # needed here.
+    # `user_id` here is the one parsed from the key, which is empty for a
+    # legacy row — _notify_recipient falls back to the row's own stamped owner
+    # so those recordings still reach their user.
+    _notify_processing_outcome(
+        key, user_id or _notify_recipient(key), status,
+        _notify_meeting_title(key, str(fields.get("title") or "").strip()))
     print(f"[done] {key} status={status} source={source} (device={device_id})")
     return {"key": key, "status": status}
+
+
+# ---------------------------------------------------------------------------
+# PAGEINDEX — building the retrieval index for the transcript we just wrote.
+#
+# WHY IT RUNS HERE. The index is a pure function of the transcript, so the one
+# moment it can be built without re-reading anything is the moment the
+# transcript is produced. Building it now means the first person to ask the
+# meeting a question gets an answer immediately instead of waiting for a lazy
+# build (userApi's _ensure_index still covers old meetings and any failure
+# here — this is the fast path, not the only path).
+#
+# WHY IT CANNOT BREAK THE PIPELINE. Everything in this function is inside one
+# try/except that swallows, and it is called AFTER the terminal _upsert. That
+# ordering is the whole point: this Lambda's history is of expensive paid work
+# (ElevenLabs, Groq) being thrown away because a LATER write failed and S3
+# retried the entire invocation — the exact failure transcript_store.py was
+# written to end. An index is an optimisation over a fallback that already
+# works, so it gets no power to strand a recording at a non-terminal status or
+# to trigger a re-run of the analysis.
+#
+# It is also NOT retried here. A failure is recorded (mark_failed) and the next
+# question rebuilds it lazily, which is a better retry than burning this
+# invocation's remaining time on a second attempt at something nobody may need.
+# ---------------------------------------------------------------------------
+def _build_pageindex(key, bucket, user_id, transcript, timestamps, fingerprint):
+    """Index the transcript for retrieval. Never raises, never blocks."""
+    if not timestamps or not bucket:
+        return
+    try:
+        started = time.monotonic()
+        tree = pageindex_store.build_for(
+            {}, timestamps, transcript,
+            # Groq is passed so the optional LLM-summary path CAN run here —
+            # this is the right place for it if it is ever enabled, since it is
+            # the one caller not behind an API Gateway timeout. It stays off
+            # unless PAGEINDEX_LLM_SUMMARY says otherwise.
+            groq=groq_client)
+        if not tree.get("nodes"):
+            return
+        pageindex_store.save(_s3, bucket, _table, key, tree, fingerprint,
+                             user_id or "")
+        print(f"[pageindex] built {key}: {len(tree['nodes'])} nodes from "
+              f"{tree.get('segment_count')} segments in "
+              f"{int((time.monotonic() - started) * 1000)}ms")
+    except Exception as err:  # noqa: BLE001
+        print(f"[pageindex] build FAILED for {key} (meeting is unaffected): {err}")
+        try:
+            pageindex_store.mark_failed(_table, key, fingerprint, str(err))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1111,6 +1217,251 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
 # creating it if absent, never touching fields it wasn't given (unlike
 # put_item, which replaces the whole item).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# EAGER TASK SEEDING — handing the finished analysis to the task layer.
+#
+# The AI's extracted tasks land on the recording row as `ai_tasks`. Turning
+# those into real, id-bearing, assignable Task rows is userApi's job and its
+# logic lives there (fingerprint dedupe, tombstones, the speaker -> contact ->
+# account resolution chain, meeting-anchored date normalisation, and the two
+# notifications). None of that is reimplemented here — this asks userApi to run
+# the seeder it already owns.
+#
+# WHY THIS RUNS AT ALL. Seeding used to happen only when a user opened a task
+# list, so a processed meeting nobody opened had no tasks anywhere: absent from
+# the Task Tracker, and — because the notifications are raised BY the seeder —
+# no TASK_ASSIGNED for the assignee and no AI_ACTION_REQUIRED for the owner.
+# The work was extracted and then sat invisible until somebody happened to
+# look. Seeding here is what makes "the meeting finished" and "its tasks exist"
+# the same moment.
+#
+# WHY IT IS ASYNC AND NON-BLOCKING. The invoke is "Event" (fire-and-forget) and
+# every failure is swallowed, exactly like _notify above it. That is a
+# deliberate product decision, not laziness, and it rests on the lazy path
+# still being there:
+#
+#   * the transcript and the analysis are already persisted by the time this
+#     runs — they are the expensive, irreplaceable part, and nothing here may
+#     put them at risk;
+#   * raising would fail the invocation, and S3/Lambda would then RETRY THE
+#     WHOLE PIPELINE, re-paying ElevenLabs and Groq for a recording that was
+#     already processed correctly;
+#   * a seed that never happens is not lost work. `_seed_ai_tasks` still runs
+#     on the next task-list read, and being idempotent it produces the same
+#     rows it would have produced here. The cost of a failure is a delay, not
+#     a missing task.
+#
+# So the guarantee is "seeded at completion, or at first read" — never "seeded
+# twice", and never "completion blocked on seeding".
+USERAPI_LAMBDA_NAME = os.environ.get("USERAPI_LAMBDA_NAME", "userApi")
+
+# Must match INTERNAL_SEED_TASKS_EVENT in functions/userapi. A typo here is a
+# silent no-op (userApi would 404 the event), which is why the seeding tests
+# assert on the payload shape rather than only on the outcome.
+SEED_TASKS_EVENT = "tasks.seed"
+
+_lambda_client = boto3.client("lambda", region_name=REGION)
+
+
+def _seed_tasks_for(key, status):
+    """Ask userApi to seed this meeting's AI tasks. Best-effort, never raises.
+
+    Only for a run that produced a usable analysis. A "failed" row has no
+    `ai_tasks` to seed, and asking anyway would spend an invoke to do nothing;
+    "transcribed" (the AI step degraded) is likewise skipped because the
+    analysis that would have carried the tasks is exactly what did not survive.
+    The lazy path covers both if a later reprocess fills them in.
+    """
+    if status != "complete":
+        return False
+
+    payload = {"type": SEED_TASKS_EVENT, "audio_s3_key": key}
+    try:
+        _lambda_client.invoke(
+            FunctionName=USERAPI_LAMBDA_NAME,
+            InvocationType="Event",   # async — nothing here waits for tasks
+            Payload=json.dumps(payload).encode("utf-8"),
+        )
+        print(f"[seed] requested task seeding for {key}")
+        return True
+    except Exception as err:  # noqa: BLE001
+        # Logged, never raised. See the section header: the lazy path is the
+        # retry, and failing the invocation would re-run the whole paid
+        # pipeline for a recording that already succeeded.
+        print(f"[seed] invoke FAILED for {key} — the meeting is still "
+              f"complete and its tasks will be seeded on first read: "
+              f"{type(err).__name__}: {err}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# NOTIFICATIONS — the two events this pipeline raises.
+#
+# This Lambda is where a meeting's processing actually FINISHES, successfully
+# or not, so it is where those two facts are known first. Everything else the
+# notification engine does lives in userApi; this is deliberately the smallest
+# possible write path rather than a second engine:
+#
+#   * the VOCABULARY (types, copy, priority, dedupe rule, row shape) comes
+#     from shared/notification_schema.py — the same module userApi builds
+#     from, so the two cannot drift;
+#   * the two tables are the same two tables;
+#   * the claim-then-write sequence is the same sequence.
+#
+# WHAT IT DOES NOT DO. It does not notify per AI step. The pipeline has many
+# internal stages (transcription queued, transcript delivered, analysis
+# mapped, documents mirrored) and none of them is a user-facing fact. Exactly
+# one notification is raised per terminal outcome, at the point the row's
+# final status is persisted — which is also what makes the requirement's
+# "never notify before the state is persisted" rule structural here rather
+# than a thing to remember.
+# ---------------------------------------------------------------------------
+NOTIFICATIONS_TABLE = os.environ.get("NOTIFICATIONS_TABLE", "Notifications")
+NOTIFICATION_DEDUPE_TABLE = os.environ.get("NOTIFICATION_DEDUPE_TABLE",
+                                           "NotificationDedupe")
+NOTIFICATION_DEDUPE_TTL_DAYS = int(
+    os.environ.get("NOTIFICATION_DEDUPE_TTL_DAYS", "90"))
+
+
+def _notify(user_id, notification_type, entity_id, *, subject="",
+            metadata=None, dedupe_day=""):
+    """Raise ONE notification. Best-effort, never raises.
+
+    Mirrors userApi's `_notify` and shares its two rules:
+
+      * it runs AFTER the status write it describes, so a notification never
+        points at a state the database does not have;
+      * it can never fail the pipeline. The transcription and the analysis
+        have already been paid for and persisted by the time this runs —
+        letting a notification error throw would fail the invocation, and S3
+        would then retry the WHOLE pipeline, re-paying for both.
+    """
+    try:
+        recipient = str(user_id or "").strip()
+        if not recipient:
+            # A legacy recording with no user_id stamped on the key. There is
+            # nobody to notify — not a failure, just an older row.
+            return None
+
+        built = notification_schema.build(notification_type, subject=subject,
+                                          metadata=metadata)
+        dedupe = notification_schema.dedupe_key(
+            recipient, notification_type, entity_id, dedupe_day)
+
+        # The claim IS the idempotency: a reprocess, an S3 retry or a
+        # duplicate webhook delivery all recompute the same key and lose the
+        # conditional write, so one completed meeting produces one
+        # notification however many times this code runs for it.
+        try:
+            _ddb.Table(NOTIFICATION_DEDUPE_TABLE).put_item(
+                Item={"dedupe_key": dedupe,
+                      "created_at": datetime.now(timezone.utc).isoformat()
+                                    .replace("+00:00", "Z"),
+                      "expires_at": int(time.time())
+                                    + NOTIFICATION_DEDUPE_TTL_DAYS * 86400},
+                ConditionExpression="attribute_not_exists(dedupe_key)",
+            )
+        except ClientError as err:
+            if err.response.get("Error", {}).get("Code") \
+                    == "ConditionalCheckFailedException":
+                return None
+            # Fails OPEN, like userApi: a possible duplicate beats losing a
+            # real notification, and the log records that it happened.
+            print(f"[notify] dedupe claim errored for {dedupe}: {err}")
+        except Exception as err:  # noqa: BLE001
+            # Same reasoning, for the errors that are not ClientError: an
+            # unreachable claim table must not cost the notification.
+            print(f"[notify] dedupe claim failed for {dedupe}: "
+                  f"{type(err).__name__}: {err}")
+
+        row = notification_schema.make_row(
+            recipient, built, entity_id, dedupe,
+            notification_id=uuid.uuid4().hex[:20],
+            now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+        _ddb.Table(NOTIFICATIONS_TABLE).put_item(Item=row)
+        print(f"[notify] {notification_type} user={recipient} "
+              f"id={row['notification_id']}")
+        return row
+    except Exception as err:  # noqa: BLE001
+        print(f"[notify] FAILED type={notification_type} "
+              f"user={user_id}: {type(err).__name__}: {err}")
+        return None
+
+
+def _notify_processing_outcome(key, user_id, status, title):
+    """The one notification a finished meeting raises.
+
+    THREE terminal statuses, TWO user-facing outcomes:
+
+      complete     the whole pipeline worked            -> COMPLETED
+      transcribed  the transcript is there, the AI      -> COMPLETED
+                   analysis degraded (see the fallback
+                   in analyze_and_persist)
+      failed       there is no usable transcript        -> FAILED
+
+    "transcribed" counts as SUCCESS on purpose. The user has a real,
+    readable meeting — the transcript is the source of truth, and the
+    workspace can regenerate the AI output on demand. Telling them it failed
+    would be false, and would send them to reprocess something that worked.
+
+    AI_OUTPUT_READY is raised only for a FULL success, and only in addition:
+    it is the "your summary and highlights are ready" fact, which is
+    genuinely not true for a degraded row. Both are deduped per meeting, so a
+    reprocess of an already-notified meeting stays silent.
+    """
+    if status == "failed":
+        _notify(user_id, notification_schema.TYPE_MEETING_PROCESSING_FAILED,
+                key, subject=title)
+        return
+
+    _notify(user_id, notification_schema.TYPE_MEETING_PROCESSING_COMPLETED,
+            key, subject=title)
+    if status == "complete":
+        _notify(user_id, notification_schema.TYPE_AI_OUTPUT_READY,
+                key, subject=title)
+
+
+def _notify_recipient(key):
+    """The user to notify about this recording, or "".
+
+    The key carries the owner for every recording uploaded since user
+    ownership existed, so that is the first source. LEGACY keys
+    ({deviceId}/{meetingId}_{ts}.wav) carry none — for those the row itself
+    may still have a user_id, stamped by an unpair (see the userApi's
+    _stamp_user_on_legacy_recordings). Falling back to the row is what lets a
+    legacy recording still notify its owner; when neither has one, there is
+    genuinely nobody to tell and "" is the honest answer.
+    """
+    user_id = parse_key(key)[0]
+    if user_id:
+        return user_id
+    try:
+        row = _table.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+        return str(row.get("user_id") or "").strip()
+    except Exception as err:  # noqa: BLE001
+        print(f"[notify] could not read owner for {key}: {err}")
+        return ""
+
+
+def _notify_meeting_title(key, fallback=""):
+    """The title to show, read back from the row that was just written.
+
+    Read back rather than passed in, because the title is decided by
+    _resolve_title_fields during the same write and the caller does not
+    otherwise hold the winner. Falls back to the honest placeholder rather
+    than inventing a name for an untitled meeting.
+    """
+    if fallback:
+        return fallback
+    try:
+        row = _table.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+        return (str(row.get("title") or "").strip()
+                or notification_schema.UNTITLED_MEETING)
+    except Exception as err:  # noqa: BLE001
+        print(f"[notify] could not read title for {key}: {err}")
+        return notification_schema.UNTITLED_MEETING
+
+
 def _upsert(key, fields, remove=()):
     """SET `fields` on the row, and REMOVE the attributes named in `remove`.
 

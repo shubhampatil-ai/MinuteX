@@ -47,6 +47,17 @@ type MeetingCtxValue = {
   renameMeeting: (title: string) => Promise<void>;
   renameSpeaker: (rawLabel: string, name: string) => Promise<void>;
   /**
+   * Re-read the meeting after a speaker was mapped to a Contact ELSEWHERE.
+   *
+   * The Participants screen writes through the participants API rather than
+   * renameSpeaker, so the recording row's `speaker_names` changes server-side
+   * with nothing telling this provider. Everything that renders a speaker name
+   * — the transcript, the overview summary, generated documents — reads that
+   * map through `rec`, so without this they keep showing the OLD name (or
+   * "Speaker 0") until the provider remounts.
+   */
+  syncSpeakerNames: () => Promise<void>;
+  /**
    * Add a task the AI did not extract.
    *
    * The AI is deliberately conservative — prompts.SUMMARY_SYSTEM forbids
@@ -451,6 +462,32 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
     }
   }, [rec, meetingKey, refreshDocumentStatus, refreshTaskAssignees]);
 
+  /** Pull the meeting back down after a speaker mapping changed elsewhere.
+   *
+   * The same three steps renameSpeaker performs, for the same reasons — the
+   * only difference is that the write already happened on another screen, so
+   * there is nothing to send, only to re-read. Kept as its own function rather
+   * than exporting `reload` because reload() also re-fetches tasks and resets
+   * loading state, which would flash a spinner over a screen the user is
+   * still looking at.
+   */
+  const syncSpeakerNames = useCallback(async () => {
+    if (!meetingKey) return;
+    try {
+      const data = await getRecording(meetingKey);
+      setRec(data);
+      // Documents bake their prose in, so they do not follow the map — ask
+      // the backend which ones it now considers stale.
+      refreshDocumentStatus();
+      // Tasks resolve their assignee from the map that just changed.
+      refreshTaskAssignees();
+    } catch {
+      // Best-effort: the mapping itself already succeeded, and the next
+      // reload picks the name up. Failing loudly here would surface an error
+      // for a write that worked.
+    }
+  }, [meetingKey, refreshDocumentStatus, refreshTaskAssignees]);
+
   // UPSERT by type, not a blind prepend. Regenerating a document, or saving
   // the structured MoM (which rewrites its mirrored minutes_of_meeting on
   // every save — see lib/mom-editor.tsx), calls this repeatedly with the same
@@ -664,6 +701,7 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
   const value = useMemo<MeetingCtxValue>(() => ({
     key: meetingKey, rec, loading, error, reload: load,
     documents, addDocument, setDocuments, renameMeeting, renameSpeaker,
+    syncSpeakerNames,
     setCrmRecord, chooseCrmCandidate, confirmCrmRecord, syncCrmRecordNow,
     crmMappings, crmAmbiguity,
     documentsNeedingUpdate, updateAllDocuments,
@@ -673,6 +711,7 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
     activity, logActivity,
   }), [
     meetingKey, rec, loading, error, load, documents, addDocument, renameMeeting, renameSpeaker,
+    syncSpeakerNames,
     setCrmRecord, chooseCrmCandidate, confirmCrmRecord, syncCrmRecordNow,
     crmMappings, crmAmbiguity,
     documentsNeedingUpdate, updateAllDocuments,

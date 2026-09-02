@@ -6050,6 +6050,10 @@ class TestPermanentDelete(TrashTestCase):
         self.item["deleted_at"] = "2026-08-18T10:00:00Z"
 
     def test_permanent_delete_removes_audio_and_transcript_from_s3(self):
+        """Every S3 object the row points at goes with it. The PageIndex tree
+        joined this set when retrieval landed: its pointer lives on the row and
+        dies with the row, so leaving the object behind would orphan it exactly
+        as an un-deleted transcript would."""
         status, body = self._permanent()
         self.assertEqual(status, 200)
         self.assertTrue(body["deleted"])
@@ -6057,6 +6061,7 @@ class TestPermanentDelete(TrashTestCase):
         self.assertEqual(deleted_keys, {
             RECORDING["audio_s3_key"],
             api.transcript_store.s3_key_for(RECORDING["audio_s3_key"]),
+            api.pageindex_store.s3_key_for(RECORDING["audio_s3_key"]),
         })
 
     def test_permanent_delete_removes_the_dynamodb_item(self):
@@ -6092,7 +6097,7 @@ class TestPermanentDelete(TrashTestCase):
     def test_permanent_delete_is_safe_to_retry(self):
         """S3 DELETE is idempotent and delete_item on an absent key is a no-op,
         so a second call after a partial failure completes cleanly."""
-        self.s3.delete_object.side_effect = [RuntimeError("s3 down"), None]
+        self.s3.delete_object.side_effect = [RuntimeError("s3 down"), None, None]
         status, _ = self._permanent()
         self.assertEqual(status, 200)
 
@@ -6102,7 +6107,8 @@ class TestPermanentDelete(TrashTestCase):
         status, body = self._permanent()
         self.assertEqual(status, 200)
         self.assertTrue(body["deleted"])
-        self.assertEqual(self.s3.delete_object.call_count, 2)
+        # audio + transcript + pageindex
+        self.assertEqual(self.s3.delete_object.call_count, 3)
         self.table.delete_item.assert_called_once()
 
     def test_s3_failure_does_not_block_the_row_delete(self):

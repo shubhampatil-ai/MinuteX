@@ -90,6 +90,7 @@ from botocore.exceptions import ClientError
 import ai_schema
 import groq_client
 import notification_schema
+import pageindex_store
 import prompts
 import stt_result
 import transcript_store
@@ -1130,6 +1131,11 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # claim — the reconciler compares the two rather than testing for absence.
     _upsert(key, fields, remove=RETIRED_ANALYSIS_ATTRS)
 
+    # Step 3c: index the transcript for retrieval. AFTER the terminal write, and
+    # deliberately unable to affect it — see _build_pageindex.
+    _build_pageindex(key, bucket, user_id, transcript, timestamps,
+                     fields.get("transcript_fingerprint") or "")
+
     # SEED THE TASKS BEFORE ANNOUNCING THE MEETING. Both orderings work, but
     # this one is better for the user: the completion notification is what
     # sends them to the meeting, so seeding first makes it far more likely the
@@ -1153,6 +1159,57 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
         _notify_meeting_title(key, str(fields.get("title") or "").strip()))
     print(f"[done] {key} status={status} source={source} (device={device_id})")
     return {"key": key, "status": status}
+
+
+# ---------------------------------------------------------------------------
+# PAGEINDEX — building the retrieval index for the transcript we just wrote.
+#
+# WHY IT RUNS HERE. The index is a pure function of the transcript, so the one
+# moment it can be built without re-reading anything is the moment the
+# transcript is produced. Building it now means the first person to ask the
+# meeting a question gets an answer immediately instead of waiting for a lazy
+# build (userApi's _ensure_index still covers old meetings and any failure
+# here — this is the fast path, not the only path).
+#
+# WHY IT CANNOT BREAK THE PIPELINE. Everything in this function is inside one
+# try/except that swallows, and it is called AFTER the terminal _upsert. That
+# ordering is the whole point: this Lambda's history is of expensive paid work
+# (ElevenLabs, Groq) being thrown away because a LATER write failed and S3
+# retried the entire invocation — the exact failure transcript_store.py was
+# written to end. An index is an optimisation over a fallback that already
+# works, so it gets no power to strand a recording at a non-terminal status or
+# to trigger a re-run of the analysis.
+#
+# It is also NOT retried here. A failure is recorded (mark_failed) and the next
+# question rebuilds it lazily, which is a better retry than burning this
+# invocation's remaining time on a second attempt at something nobody may need.
+# ---------------------------------------------------------------------------
+def _build_pageindex(key, bucket, user_id, transcript, timestamps, fingerprint):
+    """Index the transcript for retrieval. Never raises, never blocks."""
+    if not timestamps or not bucket:
+        return
+    try:
+        started = time.monotonic()
+        tree = pageindex_store.build_for(
+            {}, timestamps, transcript,
+            # Groq is passed so the optional LLM-summary path CAN run here —
+            # this is the right place for it if it is ever enabled, since it is
+            # the one caller not behind an API Gateway timeout. It stays off
+            # unless PAGEINDEX_LLM_SUMMARY says otherwise.
+            groq=groq_client)
+        if not tree.get("nodes"):
+            return
+        pageindex_store.save(_s3, bucket, _table, key, tree, fingerprint,
+                             user_id or "")
+        print(f"[pageindex] built {key}: {len(tree['nodes'])} nodes from "
+              f"{tree.get('segment_count')} segments in "
+              f"{int((time.monotonic() - started) * 1000)}ms")
+    except Exception as err:  # noqa: BLE001
+        print(f"[pageindex] build FAILED for {key} (meeting is unaffected): {err}")
+        try:
+            pageindex_store.mark_failed(_table, key, fingerprint, str(err))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------

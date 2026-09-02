@@ -594,27 +594,55 @@ def _build_details(item, meta):
                     fields=fields)
 
 
-def _build_attendees(item, speaker_names):
-    """The Attendees table, from the STRUCTURAL speaker roster.
+# What the Role/Contribution column says for someone who was present but did
+# not speak. A plain, checkable statement rather than an empty cell: a blank
+# there is indistinguishable from a speaker whose summary the model left out,
+# and a reader could not tell attendance from missing data.
+ATTENDED_ONLY = "Attended"
+
+
+def _build_attendees(item, speaker_names, attendees=None):
+    """The Attendees table: the speaker roster, plus anyone who self-tagged.
 
     Reads `participants`, which ai_schema has already filtered to actual
     speakers in the transcript (see its _roster_filtered) — so a name merely
     MENTIONED in the meeting can never appear here as an attendee. That
     filtering is the whole reason this section can be trusted, and is why the
     builder does not fall back to scanning tasks for owner names.
+
+    `attendees` carries people who recorded that they were PRESENT without
+    speaking (the self-tag: see SELF_SPEAKER_PREFIX in the API). They are
+    listed with a fixed "Attended" contribution and never a summary, because
+    the meeting contains no speech of theirs to summarise — writing one would
+    be exactly the invented attribution the roster filtering exists to
+    prevent. They are appended AFTER the speakers, so the table still reads in
+    speaker order.
+
+    A self-tagged person who ALSO spoke is not duplicated: the speaker row is
+    the truer record, and it wins.
     """
     participants = item.get("participants")
-    if not isinstance(participants, list) or not participants:
+    have_speakers = isinstance(participants, list) and participants
+    attendees = [a for a in (attendees or []) if str(a or "").strip()]
+    if not have_speakers and not attendees:
         return None
     columns = _columns(ROLE_ATTENDEES, ["Sr. No", "Name", "Role / Contribution"])
     values = []
-    for p in participants:
+    seen = set()
+    for p in (participants if have_speakers else []):
         if not isinstance(p, dict):
             continue
         name = speaker_display_name(p.get("speaker"), speaker_names)
         if not name:
             continue
+        seen.add(name.strip().casefold())
         values.append([str(len(values) + 1), name, _s(p.get("summary"))])
+    for name in attendees:
+        name = str(name).strip()
+        if name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        values.append([str(len(values) + 1), name, ATTENDED_ONLY])
     if not values:
         return None
     return _section(ROLE_ATTENDEES, KIND_TABLE, "Attendees",
@@ -840,7 +868,8 @@ def _build_followups(item):
     return _section(ROLE_FOLLOWUPS, KIND_LIST, "Follow-ups", items=items)
 
 
-def build_sections(item, tasks=None, speaker_names=None, meta=None):
+def build_sections(item, tasks=None, speaker_names=None, meta=None,
+                   attendees=None):
     """The default MoM sections for one recording, in catalogue order.
 
     Every builder returns None for "nothing to say", and those are dropped —
@@ -863,7 +892,7 @@ def build_sections(item, tasks=None, speaker_names=None, meta=None):
 
     built = [
         _build_details(item, meta),
-        _build_attendees(item, speaker_names),
+        _build_attendees(item, speaker_names, attendees),
         *prose,
         _build_points(item, speaker_names),
         _build_decisions(item),

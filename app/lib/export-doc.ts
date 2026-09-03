@@ -235,8 +235,43 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+// The Markdown punctuation a backslash may legitimately escape. Anything NOT
+// in this set keeps its backslash, which is what stops a Windows path
+// (C:\Users), a regex (\d+) or an escape sequence inside a code answer from
+// being silently corrupted.
+const MD_ESCAPE = /\\([\\`*_{}[\]()#+\-.!|>~])/g;
+
+/**
+ * `\*bold\*` -> `*bold*`.
+ *
+ * WHY THIS EXISTS. Models trained to emit Markdown into environments that
+ * require escaping sometimes escape it here too. All three of our renderers —
+ * this one, lib/document-renderer.tsx and lib/docx-export.ts — are small
+ * hand-written passes over the same subset, and NONE of them knew about
+ * backslash escapes: they match on the bare asterisk, so `\*text\*` produced
+ * fragments that failed the emphasis test and the BACKSLASHES REACHED THE
+ * USER, on screen and in exports alike.
+ *
+ * Unescaping is always right here regardless of what the model meant. If it
+ * meant emphasis, the backslash was breaking it. If it meant a literal
+ * asterisk, this subset has no escape syntax to express that anyway, and a
+ * bare `*` is still closer to the intent than `\*`.
+ *
+ * Lives HERE, in the module the other two already import from, so the three
+ * renderings cannot drift apart — the same reason the subset itself is shared.
+ * The backend applies the same rule at its own boundary
+ * (cloud/shared/ai_sanitize.py) so stored chat history is clean too.
+ */
+export function unescapeMarkdown(s: string): string {
+  return (s || "").replace(MD_ESCAPE, "$1");
+}
+
 function inlineMarkdown(s: string): string {
-  return escapeHtml(s)
+  // unescapeMarkdown FIRST, before the emphasis passes: an escaped `\*bold\*`
+  // otherwise leaves its backslashes in the exported PDF exactly as it used to
+  // leave them on screen. Same defect, same subset, one shared helper — see
+  // lib/document-renderer.tsx for why unescaping is always correct here.
+  return escapeHtml(unescapeMarkdown(s))
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|\W)\*(?!\s)(.+?)(?<!\s)\*(?=\W|$)/g, "$1<em>$2</em>")
     .replace(/`(.+?)`/g, "<code>$1</code>");

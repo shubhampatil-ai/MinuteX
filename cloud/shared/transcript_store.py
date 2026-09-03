@@ -80,6 +80,8 @@ import json
 import os
 from decimal import Decimal
 
+import stt_result
+
 # Where the transcript object sits, relative to the audio key. Deriving it from
 # the audio key (rather than storing a uuid) means the object is findable from
 # the key alone during debugging, and a re-transcribe overwrites in place
@@ -332,7 +334,36 @@ def strip_for_write(fields):
 # because it keeps the transcript's shape — one turn per line — which is what
 # the rest of the prompt's rules are written against. Reformatting it into
 # blocks would have meant re-tuning wording that is already proven.
-def as_labelled_lines(transcript, timestamps):
+def _named_line(line, seg, names):
+    """One prose line with its speaker label swapped for the user's name.
+
+    Returns the line unchanged when there is no name to apply, so this is a
+    no-op on every caller that does not pass a mapping.
+
+    THE SWAP IS CONDITIONAL ON THE PREFIX MATCHING. The compact label comes
+    from `seg["speaker"]` — authoritative, the same value pageindex renders
+    from — and the prose prefix stt_result.build_diarized_text wrote for that
+    same turn is exactly "Speaker {label}: ". Rebuilding that prefix and
+    requiring the line to start with it means a line whose shape we do not
+    recognise is left ALONE rather than guessed at: a wrong swap would
+    attribute one person's words to another, which is worse than showing the
+    model "Speaker 0".
+    """
+    if not isinstance(seg, dict):
+        return line
+    label = stt_result.normalize_speaker_id(seg.get("speaker"))
+    if not label:
+        return line
+    named = names.get(label)
+    if not named:
+        return line
+    prefix = f"Speaker {label}: "
+    if not line.startswith(prefix):
+        return line
+    return f"{named}: {line[len(prefix):]}"
+
+
+def as_labelled_lines(transcript, timestamps, speaker_names=None):
     """The transcript with `[seg_N]` on each line, for the model to quote.
 
     Falls back to the plain transcript whenever the two sides do not line up —
@@ -344,10 +375,28 @@ def as_labelled_lines(transcript, timestamps):
 
     Degrading here costs only the evidence REFERENCES; the quote, the tasks and
     the whole analysis are unaffected.
+
+    `speaker_names` is the recording's `{label: name}` map. When given, each
+    line's "Speaker N:" is replaced by the user's name IN THE RENDERED TEXT —
+    never in storage, which stays the raw diarized record.
+
+    WHY THE NAME GOES IN THE LINE rather than only in the roster the analysis
+    context already emits. Without this, a renamed meeting handed the model
+    "Speaker 0: ..." plus one far-away line saying "Speaker 0 is Ravi", and
+    "what did Ravi say?" became a two-hop lookup the model had to perform
+    across the whole transcript. It got that wrong often enough to look like
+    the rename had not saved — worst on long and non-English meetings, where
+    the roster sits furthest from the evidence it explains.
+    pageindex.render_segments already resolved the name inline on the
+    retrieval path, so SHORT meetings (which fit, and therefore skip
+    retrieval) answered name questions WORSE than long ones. This closes that
+    gap: both paths now render one format.
     """
     text = str(transcript or "")
     if not isinstance(timestamps, list) or not timestamps:
         return text
+
+    names = speaker_names if isinstance(speaker_names, dict) else {}
 
     lines = text.split("\n")
     # The prose joins turns with a blank line ("\n\n"), so drop the blanks
@@ -358,7 +407,10 @@ def as_labelled_lines(transcript, timestamps):
 
     out = list(lines)
     for position, line_index in enumerate(content):
-        out[line_index] = f"[{segment_id(position)}] {lines[line_index]}"
+        line = lines[line_index]
+        if names:
+            line = _named_line(line, timestamps[position], names)
+        out[line_index] = f"[{segment_id(position)}] {line}"
     return "\n".join(out)
 
 

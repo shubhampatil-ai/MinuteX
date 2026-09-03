@@ -10,7 +10,7 @@
 // document agree with each other.
 import { zipSync, strToU8 } from "fflate";
 import { shareFileBytes } from "./file-share";
-import { exportFilename } from "./export-doc";
+import { exportFilename, unescapeMarkdown } from "./export-doc";
 import type { ExportResult } from "./export-doc";
 
 function escapeXml(s: string): string {
@@ -25,7 +25,12 @@ function escapeXml(s: string): string {
 // Bold/italic runs within a line. Each run is its own <w:r>, since
 // WordprocessingML has no inline tag mixing — formatting is per-run.
 function inlineRuns(text: string): string {
-  const parts = text.split(/(\*\*[^*]+\*\*|\*[^*\n]+\*)/g).filter(Boolean);
+  // unescapeMarkdown BEFORE the split: the split matches bare asterisks, so an
+  // escaped `\*bold\*` would otherwise carry its backslashes into the .docx —
+  // the same defect the on-screen renderer had. See export-doc.ts for why
+  // unescaping is unconditionally correct across this shared subset.
+  const parts = unescapeMarkdown(text)
+    .split(/(\*\*[^*]+\*\*|\*[^*\n]+\*)/g).filter(Boolean);
   return parts.map((p) => {
     if (/^\*\*[^*]+\*\*$/.test(p)) {
       return `<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">${escapeXml(p.slice(2, -2))}</w:t></w:r>`;
@@ -55,11 +60,15 @@ const tableCells = (l: string) => l.replace(/^\||\|$/g, "").split("|").map((c) =
 
 function tableXml(header: string[], rows: string[][]): string {
   const cellWidth = Math.floor(9350 / Math.max(header.length, 1));
-  const cellXml = (text: string, bold: boolean) =>
-    `<w:tc><w:tcPr><w:tcW w:w="${cellWidth}" w:type="dxa"/></w:tcPr>` +
-    `<w:p>${bold
-      ? `<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r>`
-      : `<w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r>`}</w:p></w:tc>`;
+  // Cells render directly rather than through inlineRuns(), so they unescape
+  // here — otherwise a `\*` inside a table survives into the .docx.
+  const cellXml = (raw: string, bold: boolean) => {
+    const text = unescapeMarkdown(raw);
+    return `<w:tc><w:tcPr><w:tcW w:w="${cellWidth}" w:type="dxa"/></w:tcPr>` +
+      `<w:p>${bold
+        ? `<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r>`
+        : `<w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r>`}</w:p></w:tc>`;
+  };
   const rowXml = (cells: string[], bold: boolean) =>
     `<w:tr>${cells.map((c) => cellXml(c, bold)).join("")}</w:tr>`;
   return `<w:tbl>` +

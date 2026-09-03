@@ -23,9 +23,7 @@ import {
   S, R, ELEV, CAPS, FONT, useTheme, ColorScale,
 } from "./theme";
 import { Card, Skeleton } from "./ui";
-import {
-  ApiTask, TaskStatusV2, assigneeLabel, needsAssigneeResolution,
-} from "./api";
+import { ApiTask, TaskStatusV2, assigneeLabel } from "./api";
 import { avatarColorFor, initialsOf } from "./task-model";
 import {
   Deadline, MeetingInsight, TaskCounts, WeeklyProgress, describeInsight,
@@ -221,23 +219,46 @@ function buildHeaderStyles(C: ColorScale) {
 // MinuteXAIActionCard (§4)
 //
 // The dark card is the one high-contrast surface on the screen — it reads as a
-// core capability rather than a banner. The chips are real controls, but there
-// is NO task-agent backend: no endpoint accepts "prioritize my tasks". So a
-// tap applies the honest local equivalent (a filter / a scroll) and the card
-// says what it did. It never fabricates an AI reply or calls an endpoint that
-// does not exist.
+// core capability rather than a banner, and it is now the real entry point to
+// the assistant.
+//
+// WHAT CHANGED AND WHY. These chips used to apply a local filter and print a
+// sentence about what they had done, because at the time there was no
+// task-agent endpoint to call and a chip that faked an AI answer would have
+// been worse than one that admitted its limits. There IS one now
+// (POST /ai/chat, answered by the backend's task tools), so the honest
+// implementation is no longer a local filter — it is the real call. Each chip
+// carries the QUESTION it asks, and tapping it opens the assistant on the
+// answer.
+//
+// The chip labels are the questions themselves rather than commands
+// ("What's overdue?" not "Show overdue"), because that is literally what gets
+// sent: the label a user taps and the message the model receives are the same
+// string, so the card cannot promise something different from what it asks.
 // ---------------------------------------------------------------------------
-export type AIPromptKey = "prioritize" | "overdue" | "week";
 
-export const AI_PROMPTS: { key: AIPromptKey; label: string }[] = [
-  { key: "prioritize", label: "Prioritize my tasks" },
+/** The dashboard's starter questions. Sent VERBATIM as the assistant's first
+ *  message, which is why each is phrased as a question a user would type.
+ *
+ *  These mirror the backend's own AI_SUGGESTIONS catalogue. Kept here as well
+ *  because this card renders before any network call has completed, and a
+ *  card with no chips would be a worse first impression than three that are
+ *  one round-trip stale. The assistant screen itself then loads the live
+ *  catalogue from /ai/suggestions. */
+export const AI_PROMPTS: { key: string; label: string }[] = [
+  { key: "attention", label: "What needs my attention?" },
   { key: "overdue", label: "What's overdue?" },
-  { key: "week", label: "Summarize my week" },
+  { key: "week", label: "What should I work on this week?" },
 ];
 
 export const MinuteXAIActionCard = memo(function MinuteXAIActionCard({
-  onPrompt, note,
-}: { onPrompt: (key: AIPromptKey) => void; note?: string }) {
+  onAsk, onOpen,
+}: {
+  /** Ask one question — opens the assistant on the answer. */
+  onAsk: (question: string) => void;
+  /** Open the assistant with no question, for a user who wants to type. */
+  onOpen: () => void;
+}) {
   const { C } = useTheme();
   const st = useMemo(() => buildAIStyles(C), [C]);
   return (
@@ -249,12 +270,22 @@ export const MinuteXAIActionCard = memo(function MinuteXAIActionCard({
         <Icon name="sparkles" size={12} tintColor="#A9BEFF" />
         <Text style={st.brand}>MinuteX AI</Text>
       </View>
-      <Text style={st.headline}>What do you want to get done?</Text>
+      {/* The headline is the affordance for a free-form question, so it is
+          the tap target for "open the assistant and let me type". */}
+      <Pressable
+        onPress={onOpen}
+        accessibilityRole="button"
+        accessibilityLabel="Ask MinuteX AI about your tasks"
+        style={({ pressed }) => [st.headlineRow, pressed && { opacity: 0.7 }]}
+      >
+        <Text style={st.headline}>What do you want to get done?</Text>
+        <Icon name="arrow.right" size={13} tintColor="#A9BEFF" />
+      </Pressable>
       <View style={st.chipRow}>
         {AI_PROMPTS.map((p) => (
           <Pressable
             key={p.key}
-            onPress={() => onPrompt(p.key)}
+            onPress={() => onAsk(p.label)}
             accessibilityRole="button"
             accessibilityLabel={p.label}
             style={({ pressed }) => [st.chip, pressed && { opacity: 0.65 }]}
@@ -263,7 +294,6 @@ export const MinuteXAIActionCard = memo(function MinuteXAIActionCard({
           </Pressable>
         ))}
       </View>
-      {note ? <Text style={st.note}>{note}</Text> : null}
     </View>
   );
 });
@@ -298,12 +328,19 @@ function buildAIStyles(C: ColorScale) {
       letterSpacing: 1.2,
       color: "#A9BEFF",
     },
+    headlineRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: S.sm,
+      marginTop: 10,
+    },
     headline: {
+      flex: 1,
       fontFamily: FONT.bold,
       fontSize: 17,
       lineHeight: 24,
       color: "#FFFFFF",
-      marginTop: 10,
       letterSpacing: -0.2,
     },
     chipRow: {
@@ -321,12 +358,283 @@ function buildAIStyles(C: ColorScale) {
       paddingVertical: 7,
     },
     chipTxt: { fontFamily: FONT.semibold, fontSize: 12, color: "#E8EBF7" },
-    note: {
-      fontFamily: FONT.regular,
-      fontSize: 11.5,
-      lineHeight: 17,
-      color: "#9AA2C0",
-      marginTop: S.md,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// TaskIntelSections (§3, §9) — the AI's recommendations, grouped.
+//
+// THE ONE RULE THIS COMPONENT EXISTS TO ENFORCE: a recommendation is never
+// rendered as task state.
+//
+// An intelligence row carries (task_id, kind, reason, recommendation) and
+// deliberately nothing else — no status, no deadline, no assignee. So every
+// value a card displays about the task comes from `tasksById`, i.e. from what
+// GET /tasks returned. The AI supplies the GROUPING and the SENTENCE; the
+// database supplies the facts. A row whose task is not in the map is dropped
+// rather than rendered from the AI's own words, because there would be no
+// authoritative title to show and no row to open.
+//
+// Every section is also explicitly labelled as a suggestion. That is not
+// decoration: "Overdue" as a health-card number is a fact computed from dates,
+// while "Overdue risk" here is a judgement, and a user must be able to tell
+// which one they are looking at.
+//
+// LOADED ON DEMAND. The button is the whole entry point — this costs a Groq
+// call, so it is never fetched on mount. Until it is pressed the section is a
+// single row of affordance, not an empty state pretending to be a feature.
+// ---------------------------------------------------------------------------
+export type IntelState = "idle" | "loading" | "ready" | "error";
+
+/** The sections, in the order a person asks the questions. `kind` matches the
+ *  backend's TASK_INTEL_KINDS exactly; an unknown kind renders nowhere, which
+ *  is the correct outcome for a value this app does not understand. */
+const INTEL_SECTIONS: {
+  kind: string; title: string; icon: string; tone: "warn" | "danger" | "primary";
+}[] = [
+  { kind: "priority", title: "Recommended first", icon: "bolt.fill", tone: "primary" },
+  { kind: "needs_attention", title: "Needs attention", icon: "bell.badge", tone: "warn" },
+  { kind: "overdue_risk", title: "Overdue risk", icon: "exclamationmark.triangle.fill", tone: "danger" },
+  { kind: "stale", title: "Not moving", icon: "hourglass", tone: "warn" },
+  { kind: "duplicate", title: "Possible duplicates", icon: "doc.on.doc", tone: "primary" },
+];
+
+export type TaskIntelSectionsProps = {
+  rows: { task_id: string; kind: string; reason: string; recommendation: string;
+          related_task_id?: string }[];
+  summary: string;
+  state: IntelState;
+  /** Why the analysis failed, when it did. Shown verbatim: a missing endpoint
+   *  and a busy model need different actions from whoever reads this. */
+  error?: string;
+  partial: boolean;
+  /** The authoritative tasks. A row without an entry here is not rendered. */
+  tasksById: Map<string, ApiTask>;
+  onAnalyze: () => void;
+  onOpenTask: (task: ApiTask) => void;
+};
+
+export const TaskIntelSections = memo(function TaskIntelSections({
+  rows, summary, state, error, partial, tasksById, onAnalyze, onOpenTask,
+}: TaskIntelSectionsProps) {
+  const { C } = useTheme();
+  const st = useMemo(() => buildIntelStyles(C), [C]);
+
+  // Grouped, and only over rows whose task we actually hold.
+  const grouped = useMemo(
+    () =>
+      INTEL_SECTIONS.map((sec) => ({
+        ...sec,
+        items: rows
+          .filter((r) => r.kind === sec.kind && tasksById.has(r.task_id))
+          .map((r) => ({ row: r, task: tasksById.get(r.task_id) as ApiTask })),
+      })).filter((sec) => sec.items.length > 0),
+    [rows, tasksById]
+  );
+
+  const toneColor = (tone: "warn" | "danger" | "primary") =>
+    tone === "danger" ? C.danger : tone === "warn" ? C.warn : C.primary;
+
+  if (state === "idle") {
+    return (
+      <Pressable
+        onPress={onAnalyze}
+        accessibilityRole="button"
+        accessibilityLabel="Analyze my tasks with AI"
+        style={({ pressed }) => [st.cta, pressed && { opacity: 0.7 }]}
+      >
+        <Icon name="sparkles" size={14} tintColor={C.primary} />
+        <View style={{ flex: 1 }}>
+          <Text style={st.ctaTitle}>Analyze my tasks</Text>
+          <Text style={st.ctaSub}>
+            See what to do first, what is at risk, and what looks duplicated.
+          </Text>
+        </View>
+        <Icon name="arrow.right" size={13} tintColor={C.textFaint} />
+      </Pressable>
+    );
+  }
+
+  if (state === "loading") {
+    return (
+      <View style={st.wrap}>
+        <Text style={st.aiLabel}>AI suggestions</Text>
+        <Skeleton style={{ width: "100%", height: 62, borderRadius: R.md }} />
+        <View style={{ height: S.sm }} />
+        <Skeleton style={{ width: "100%", height: 62, borderRadius: R.md }} />
+      </View>
+    );
+  }
+
+  if (state === "error") {
+    return (
+      <Pressable
+        onPress={onAnalyze}
+        accessibilityRole="button"
+        accessibilityLabel="Retry the AI analysis"
+        style={({ pressed }) => [st.cta, pressed && { opacity: 0.7 }]}
+      >
+        <Icon name="exclamationmark.triangle.fill" size={14} tintColor={C.warn} />
+        <View style={{ flex: 1 }}>
+          <Text style={st.ctaTitle}>Could not analyze your tasks</Text>
+          <Text style={st.ctaSub}>
+            {error || "Your task list is unaffected."} Tap to try again.
+          </Text>
+        </View>
+      </Pressable>
+    );
+  }
+
+  // Ready, but the model found nothing worth flagging. Said plainly rather
+  // than rendered as an empty section list — "nothing needs attention" is a
+  // real answer, and padding it with headings would imply otherwise.
+  if (!grouped.length) {
+    return (
+      <View style={st.wrap}>
+        <Text style={st.aiLabel}>AI suggestions</Text>
+        <View style={st.emptyBox}>
+          <Icon name="checkmark.circle.fill" size={15} tintColor={C.success} />
+          <Text style={st.emptyTxt}>
+            {summary || "Nothing stands out as needing attention right now."}
+          </Text>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={st.wrap}>
+      <View style={st.headRow}>
+        <Text style={st.aiLabel}>AI suggestions</Text>
+        <Pressable onPress={onAnalyze} hitSlop={8} accessibilityRole="button"
+                   accessibilityLabel="Refresh the AI analysis">
+          <Icon name="arrow.clockwise" size={13} tintColor={C.textFaint} />
+        </Pressable>
+      </View>
+
+      {summary ? <Text style={st.summary}>{summary}</Text> : null}
+
+      {grouped.map((sec) => (
+        <View key={sec.kind} style={st.section}>
+          <View style={st.sectionHead}>
+            <Icon name={sec.icon as never} size={12} tintColor={toneColor(sec.tone)} />
+            <Text style={[st.sectionTitle, { color: toneColor(sec.tone) }]}>
+              {sec.title}
+            </Text>
+          </View>
+          {sec.items.map(({ row, task }) => (
+            <Pressable
+              key={`${row.kind}:${row.task_id}`}
+              onPress={() => onOpenTask(task)}
+              accessibilityRole="button"
+              accessibilityLabel={`Open ${task.task || task.title}`}
+              style={({ pressed }) => [st.item, pressed && { opacity: 0.7 }]}
+            >
+              {/* The TITLE comes from the task row, never from the AI. */}
+              <Text style={st.itemTitle} numberOfLines={2}>
+                {task.task || task.title}
+              </Text>
+              {row.reason ? (
+                <Text style={st.itemReason} numberOfLines={3}>{row.reason}</Text>
+              ) : null}
+              {row.recommendation ? (
+                <View style={st.recRow}>
+                  <Icon name="sparkles" size={10} tintColor={C.primary} />
+                  <Text style={st.recTxt} numberOfLines={3}>
+                    {row.recommendation}
+                  </Text>
+                </View>
+              ) : null}
+              {/* A duplicate claim names the other task by ITS real title —
+                  the backend already checked the id is a task from the same
+                  request, so this can never point at nothing. */}
+              {row.related_task_id && tasksById.has(row.related_task_id) ? (
+                <Text style={st.dupTxt} numberOfLines={2}>
+                  Looks like: {tasksById.get(row.related_task_id)?.task}
+                </Text>
+              ) : null}
+            </Pressable>
+          ))}
+        </View>
+      ))}
+
+      {/* Same honesty as the health cards' partial note: an analysis of the
+          first N open tasks must not read as an analysis of all of them. */}
+      {partial ? (
+        <Text style={st.partial}>
+          Based on your most urgent open tasks, not all of them.
+        </Text>
+      ) : null}
+    </View>
+  );
+});
+
+function buildIntelStyles(C: ColorScale) {
+  return StyleSheet.create({
+    wrap: { marginTop: S.lg },
+    headRow: {
+      flexDirection: "row", alignItems: "center",
+      justifyContent: "space-between", marginBottom: 8,
+    },
+    aiLabel: {
+      ...CAPS, fontFamily: FONT.bold, fontSize: 9.5, letterSpacing: 1.1,
+      color: C.textFaint,
+    },
+    summary: {
+      fontFamily: FONT.regular, fontSize: 12.5, lineHeight: 18,
+      color: C.textDim, marginBottom: S.md,
+    },
+    cta: {
+      flexDirection: "row", alignItems: "center", gap: S.sm,
+      backgroundColor: C.surface, borderWidth: 1, borderColor: C.border,
+      borderRadius: R.card, padding: 13, marginTop: S.lg,
+      shadowColor: C.shadow, ...ELEV.sm,
+    },
+    ctaTitle: { fontFamily: FONT.semibold, fontSize: 13.5, color: C.text },
+    ctaSub: {
+      fontFamily: FONT.regular, fontSize: 11.5, lineHeight: 16,
+      color: C.textDim, marginTop: 2,
+    },
+    emptyBox: {
+      flexDirection: "row", alignItems: "center", gap: S.sm,
+      backgroundColor: C.successSoft, borderRadius: R.md, padding: 12,
+    },
+    emptyTxt: {
+      flex: 1, fontFamily: FONT.medium, fontSize: 12.5, lineHeight: 18,
+      color: C.text,
+    },
+    section: { marginBottom: S.md },
+    sectionHead: {
+      flexDirection: "row", alignItems: "center", gap: 5, marginBottom: 7,
+    },
+    sectionTitle: {
+      ...CAPS, fontFamily: FONT.bold, fontSize: 9.5, letterSpacing: 0.9,
+    },
+    item: {
+      backgroundColor: C.surface, borderWidth: 1, borderColor: C.border,
+      borderRadius: R.md, padding: 12, marginBottom: 7,
+    },
+    itemTitle: {
+      fontFamily: FONT.semibold, fontSize: 13.5, lineHeight: 19, color: C.text,
+    },
+    itemReason: {
+      fontFamily: FONT.regular, fontSize: 12, lineHeight: 17,
+      color: C.textDim, marginTop: 5,
+    },
+    recRow: {
+      flexDirection: "row", alignItems: "flex-start", gap: 5, marginTop: 7,
+    },
+    recTxt: {
+      flex: 1, fontFamily: FONT.medium, fontSize: 12, lineHeight: 17,
+      color: C.primary,
+    },
+    dupTxt: {
+      fontFamily: FONT.regular, fontSize: 11.5, lineHeight: 16,
+      color: C.textFaint, marginTop: 6, fontStyle: "italic",
+    },
+    partial: {
+      fontFamily: FONT.regular, fontSize: 11, lineHeight: 16,
+      color: C.textFaint, marginTop: 2,
     },
   });
 }

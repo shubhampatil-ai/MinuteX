@@ -129,6 +129,11 @@ class AIBase(unittest.TestCase):
             mock.patch.object(api, "_meeting_participants", self.t["participants"]),
             mock.patch.object(api, "_tasks", self.t["tasks"]),
             mock.patch.object(api, "_users", self.t["users"]),
+            # Persistent workspace conversations. Wired for every AI suite
+            # because /ai/chat now writes a session on every successful turn —
+            # a suite without this table would exercise the persistence
+            # FAILURE path on every chat test and prove nothing about it.
+            mock.patch.object(api, "_chat_sessions", self.t["chat_sessions"]),
             mock.patch.object(api, "_require_auth", return_value=USER),
             mock.patch.object(api, "_owned_devices", return_value=[]),
         ]
@@ -356,9 +361,41 @@ class TestOverdueUpcoming(AIBase):
                      status=api.TASK_STATUS_COMPLETED, assignee_user_id=USER)
         self.assertEqual(api.tool_get_overdue_tasks(self.ctx())["count"], 0)
 
-    def test_overdue_excludes_other_peoples_work(self):
+    def test_overdue_includes_work_the_caller_delegated(self):
+        """CHANGED DELIBERATELY — this test used to assert count == 0.
+
+        It encoded the bug the consistency pass was opened for. A task the
+        caller CREATED and delegated appears under the dashboard's own
+        Overdue filter (list_all_tasks applies no assignee narrowing unless
+        assigned_to_me is passed), so an assistant that omitted it answered a
+        narrower question than the one the user was looking at: "what's
+        overdue?" returned nothing beside a dashboard showing a late task.
+
+        The narrowing did not disappear, it became opt-in — see the next
+        test. See tests/test_ai_consistency.py for the full invariant.
+        """
         self.mk_task("Rahul is late", due=days_out(-3),
                      assignee_contact_id="c-rahul", assignee_name="Rahul")
+        out = api.tool_get_overdue_tasks(self.ctx())
+        self.assertEqual([t["title"] for t in out["tasks"]], ["Rahul is late"])
+
+    def test_overdue_can_be_narrowed_to_the_callers_own_commitments(self):
+        """The original intent of the test above, now reachable explicitly:
+        "what am I personally late on" excludes delegated work."""
+        self.mk_task("Rahul is late", due=days_out(-3),
+                     assignee_contact_id="c-rahul", assignee_name="Rahul")
+        self.mk_task("I am late", due=days_out(-2), assignee_user_id=USER)
+        out = api.tool_get_overdue_tasks(self.ctx(),
+                                         include_assigned_to_others=False)
+        self.assertEqual([t["title"] for t in out["tasks"]], ["I am late"])
+
+    def test_overdue_never_includes_another_tenants_task(self):
+        """The widening above is within what the caller can SEE. A task
+        neither created by nor assigned to them stays invisible."""
+        row = api._new_task_row(OTHER, "Bob is late", recording_key=OTHER_KEY,
+                                due=days_out(-3))
+        row["assignee_user_id"] = OTHER
+        api._write_task(row)
         self.assertEqual(api.tool_get_overdue_tasks(self.ctx())["count"], 0)
 
     def test_upcoming_window_default_seven_days(self):

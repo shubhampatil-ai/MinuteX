@@ -107,14 +107,45 @@ class GroqError(RuntimeError):
 
     `status` is the HTTP status when there was one (0 for transport errors) and
     `retryable` says whether trying again could plausibly succeed — a 429 or a
-    5xx can, a 400/401 never will. Callers use this to decide between "show
-    Retry" and "show the real problem".
+    5xx can, a 400/401 as a rule cannot. Callers use this to decide between
+    "show Retry" and "show the real problem".
+
+    The rule's one real exception is a json_validate_failed 400, which reports
+    a failed GENERATION rather than a malformed request — see
+    _is_transient_generation_failure below. It stays retryable=False here,
+    because the transport loop must not blind-retry every 400, and is
+    recognized by the one caller that knows its payload is worth resending.
     """
 
     def __init__(self, message, status=0, retryable=False):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+
+
+# Groq answers 400 with code "json_validate_failed" when the model, in
+# json_object mode, produced output that is not valid JSON — classically a raw
+# line break inside a string value, and sometimes (as seen on a 5-speaker
+# Marathi transcript in production) an EMPTY generation, where
+# `failed_generation` comes back as "".
+#
+# It is a 400, so it is not retryable as a REQUEST — resending a genuinely
+# malformed request is pointless and the transport loop is right to refuse.
+# But the request here was fine; the sampled tokens were not, and the same
+# payload sent again gets a fresh sample. Measured at roughly 1 first attempt
+# in 6 on the prose-bearing analysis prompt (see
+# test_the_summary_field_states_its_json_string_format), which is far too
+# often to answer by abandoning the single-pass path.
+_GENERATION_FAILURE_MARKERS = ("json_validate_failed", "failed_generation")
+
+
+def _is_transient_generation_failure(err):
+    """True for a 400 that reports a failed generation rather than a bad
+    request — the one 400 worth sending again unchanged."""
+    if getattr(err, "status", 0) != 400:
+        return False
+    text = str(err).lower()
+    return any(m in text for m in _GENERATION_FAILURE_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +421,11 @@ def analyze(text, map_prompt, reduce_prompt, merge, coerce,
     gkey = key or api_key()
     budget_chars = single_pass_budget_chars(map_prompt)
 
-    if len(text or "") <= budget_chars:
+    fits = len(text or "") <= budget_chars
+    reason = (f"{len(text or '')} chars > {budget_chars} single-pass budget"
+              if not fits else "")
+
+    if fits:
         deadline = time.monotonic() + deadline_seconds
         for attempt in range(2):
             try:
@@ -402,8 +437,24 @@ def analyze(text, map_prompt, reduce_prompt, merge, coerce,
                 # already tight for other reasons) — map_reduce's chunk-level
                 # retry gives one more real chance rather than failing the
                 # whole analysis outright.
-                print(f"[groq] {label}: single-pass failed ({err}), "
-                      f"falling back to map_reduce")
+                #
+                # EXCEPT for a json_validate_failed 400, which is STOCHASTIC:
+                # the model emitted a raw line break inside a JSON string (or
+                # nothing at all) on this attempt and very likely will not on
+                # the next. _chat_once cannot retry it, because a 400 is
+                # normally a permanently malformed request — but here the
+                # request is well-formed and only the generation failed, so
+                # the retry decision belongs to this loop, which knows the
+                # payload is worth sending again unchanged. Falling through to
+                # map_reduce instead would take the ONE path this function
+                # exists to avoid (a reduce over partial JSONs, whose measured
+                # failure mode is an empty overview) in response to a fault a
+                # plain resend usually clears.
+                if _is_transient_generation_failure(err) and attempt == 0:
+                    print(f"[groq] {label}: single-pass generation failed "
+                          f"({err}) — resending once before falling back")
+                    continue
+                reason = f"single-pass failed ({err})"
                 break
             if is_usable is None or is_usable(result):
                 return result, 1, 1
@@ -411,11 +462,15 @@ def analyze(text, map_prompt, reduce_prompt, merge, coerce,
                 print(f"[groq] {label}: single-pass result failed the "
                       f"usability check, retrying once before falling back")
                 continue
-            print(f"[groq] {label}: retry also failed the usability check, "
-                  f"falling back to map_reduce")
+            reason = "retry also failed the usability check"
 
-    print(f"[groq] {label}: {len(text or '')} chars > "
-          f"{budget_chars} single-pass budget — falling back to map_reduce")
+    # ONE fall-through for three distinct reasons (overflow, a failed call, a
+    # failed usability check). It used to report the overflow arithmetic
+    # unconditionally, so a 18k-char transcript that failed for either of the
+    # other two reasons logged "18712 chars > 352789 single-pass budget" — a
+    # comparison that is plainly false and sent a production investigation
+    # after a budget bug that did not exist. Say which reason actually fired.
+    print(f"[groq] {label}: falling back to map_reduce ({reason})")
     return map_reduce(text, map_prompt, reduce_prompt, merge, coerce,
                       deadline_seconds, label=label, key=gkey)
 

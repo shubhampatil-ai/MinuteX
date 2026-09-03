@@ -920,6 +920,69 @@ def _restore_segment_timing(timestamps):
     return restored
 
 
+# ---------------------------------------------------------------------------
+# DURATION BACKFILL.
+#
+# THE BUG THIS FIXES. `duration` is stamped at presign time from a value the
+# CLIENT supplies, and the upload screen has none to send: a picked file's
+# length is never probed, so app/src/app/upload.tsx omits the field entirely
+# (unlike record-phone.tsx, whose recorder object knows how long it ran).
+# _as_duration in userApi returns None for an absent value, so every UPLOAD row
+# lands with no `duration` attribute at all. Downstream that is not a cosmetic
+# gap: the meetings list renders a blank m:ss stamp, "captured this week" adds
+# 0 for the row (a 97-minute import contributed nothing to the total), and a
+# share link's audio URL expiry falls back instead of scaling to the audio.
+#
+# WHY HERE. This Lambda never downloads the audio — flow A hands ElevenLabs a
+# presigned URL and returns, so there is no decode step to read a container
+# header from and adding one would mean paying to fetch every file twice. But
+# the webhook already gives us real per-word timing, and the last segment's
+# `end` is the last spoken word's offset in seconds. It is already a Decimal
+# (stt_result._round), which is exactly what DynamoDB needs, so the value costs
+# one max() over a list we are already holding.
+#
+# WHAT IT MEASURES. Speech extent, not file length: trailing silence after the
+# final word is excluded, so this can read slightly SHORT of the true duration.
+# That is why it is a fallback and never an overwrite — a client-supplied value
+# measures the real recording and is the better number whenever it exists.
+# ---------------------------------------------------------------------------
+def _duration_from_timestamps(timestamps):
+    """Last spoken word's offset in seconds, as a Decimal, or None.
+
+    None (rather than 0) when there is nothing to measure, so the caller can
+    tell "no duration available" apart from a genuine zero and skip the write
+    instead of stamping a 0 that would look authoritative to every reader.
+    """
+    end = None
+    for seg in timestamps or []:
+        try:
+            value = Decimal(str((seg or {}).get("end")))
+        except (TypeError, ValueError, ArithmeticError):
+            continue
+        if value > 0 and (end is None or value > end):
+            end = value
+    return end
+
+
+def _duration_fields(existing, timestamps):
+    """{"duration": Decimal} when the row has none and we can derive one.
+
+    An existing value ALWAYS wins, including across reprocessing: it came from
+    the device or the phone recorder and measures the file itself, whereas this
+    one measures speech. Returns {} when the row already has a duration or the
+    transcript yields nothing — so `fields` simply never mentions the attribute
+    and the SET clause cannot blank what presign stamped.
+    """
+    try:
+        current = Decimal(str(existing.get("duration")))
+    except (TypeError, ValueError, ArithmeticError):
+        current = None
+    if current is not None and current > 0:
+        return {}
+    derived = _duration_from_timestamps(timestamps)
+    return {"duration": derived} if derived is not None else {}
+
+
 def handle_stt_completed(event):
     bucket = (event or {}).get("bucket") or ""
     key = (event or {}).get("audio_s3_key") or ""
@@ -1082,6 +1145,11 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     if user_id:
         fields["user_id"] = user_id
     fields.update(_resolve_title_fields(existing, analysis["title"]))
+    # duration ONLY when the row hasn't got one — see _duration_fields. An
+    # UPLOAD has none (the upload screen never probes the picked file), and
+    # without this the row stays duration-less forever: a blank m:ss in the
+    # list and a 0 contribution to "captured this week".
+    fields.update(_duration_fields(existing, timestamps))
 
     # meeting_highlights is written ONLY when it actually contains
     # something. An all-empty result is indistinguishable from "never

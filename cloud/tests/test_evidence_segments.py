@@ -130,6 +130,131 @@ class LabelledTranscriptTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# RENAMED SPEAKERS — the name goes in the LINE, not only in a roster.
+#
+# THE BUG THIS PINS. After a user renamed speakers, AI Chat could not reliably
+# say what a named person said. The mapping was saved and was even sent to the
+# model — as one line inside the analysis digest ("Speaker 0 is Ravi") — but
+# the transcript underneath still read "Speaker 0: ...". Answering "what did
+# Ravi say?" therefore required a two-hop lookup (Ravi -> Speaker 0 -> scan
+# every line) across a whole meeting, from a roster line sitting far above the
+# evidence. It failed often enough to look like the rename had not saved, and
+# worst on long Hindi/Marathi meetings where the distance is greatest.
+#
+# The asymmetry that hid it: pageindex.render_segments ALREADY resolved names
+# inline, so the retrieval path (long meetings) was correct while the
+# full-transcript path (short meetings, which fit and skip retrieval) was not
+# — the inverse of what anyone would look for.
+#
+# Storage is untouched: the raw transcript keeps its "Speaker N:" prefixes and
+# only the AI-visible rendering resolves them.
+# ---------------------------------------------------------------------------
+class RenamedSpeakerRenderingTests(unittest.TestCase):
+    NAMES = {"0": "Ravi", "1": "Priya"}
+
+    def lines(self, out):
+        return [ln for ln in out.split("\n") if ln.strip()]
+
+    def test_renamed_numeric_speakers_appear_in_the_line(self):
+        out = ts.as_labelled_lines(TRANSCRIPT, TIMESTAMPS, self.NAMES)
+        self.assertIn("[seg_0] Ravi: Right, where are we on the proposal?", out)
+        self.assertIn("[seg_1] Priya: I'll send it tomorrow.", out)
+        # The whole point: the label the model had to resolve is GONE for the
+        # speakers that were named.
+        self.assertNotIn("[seg_0] Speaker 0:", out)
+        self.assertNotIn("[seg_1] Speaker 1:", out)
+
+    def test_an_unnamed_speaker_keeps_its_label(self):
+        """A partial rename is the normal case — the user names the two people
+        they care about. Speaker 2 must stay "Speaker 2", never None/blank."""
+        out = ts.as_labelled_lines(TRANSCRIPT, TIMESTAMPS, {"0": "Ravi"})
+        self.assertIn("[seg_1] Speaker 1: I'll send it tomorrow.", out)
+        self.assertIn("[seg_3] Speaker 2: Sure, I'll have it ready.", out)
+        self.assertNotIn("None:", out)
+        self.assertNotIn("Unknown:", out)
+
+    def test_word_style_speaker_labels_resolve(self):
+        """Diarization ids are not always numeric — stt_result._speaker_label
+        passes "agent"/"customer" straight through. A numeric-only fix would
+        silently do nothing for those meetings."""
+        transcript = ("Speaker agent: How can I help?\n\n"
+                      "Speaker customer: I need a quote.")
+        stamps = [{"speaker": "agent", "text": "How can I help?"},
+                  {"speaker": "customer", "text": "I need a quote."}]
+        out = ts.as_labelled_lines(transcript, stamps,
+                                   {"agent": "Ravi", "customer": "Priya"})
+        self.assertIn("[seg_0] Ravi: How can I help?", out)
+        self.assertIn("[seg_1] Priya: I need a quote.", out)
+
+    def test_no_names_renders_exactly_as_before(self):
+        """Backwards compatibility for every caller that does not pass a map —
+        the transcribe Lambda analyses before any rename can exist."""
+        base = ts.as_labelled_lines(TRANSCRIPT, TIMESTAMPS)
+        self.assertEqual(ts.as_labelled_lines(TRANSCRIPT, TIMESTAMPS, None),
+                         base)
+        self.assertEqual(ts.as_labelled_lines(TRANSCRIPT, TIMESTAMPS, {}),
+                         base)
+        self.assertIn("[seg_0] Speaker 0: ", base)
+
+    def test_segment_ids_are_untouched_by_renaming(self):
+        """Renaming is a presentation change. If it renumbered anything, every
+        stored evidence reference on the meeting would break at once."""
+        plain = self.lines(ts.as_labelled_lines(TRANSCRIPT, TIMESTAMPS))
+        named = self.lines(ts.as_labelled_lines(TRANSCRIPT, TIMESTAMPS,
+                                                self.NAMES))
+        self.assertEqual(len(plain), len(named))
+        for i, line in enumerate(named):
+            self.assertTrue(line.startswith(f"[seg_{i}] "), line)
+        self.assertEqual(ts.valid_segment_ids(TIMESTAMPS),
+                         {f"seg_{i}" for i in range(len(TIMESTAMPS))})
+
+    def test_the_reported_scenario(self):
+        """THE regression test — the exact case the user hit. After this, the
+        evidence for "what did Ravi say about pricing?" is a line that says
+        "Ravi", so no mapping step stands between the question and the answer.
+        """
+        transcript = ("Speaker 0: We should increase the pricing to 8000.\n\n"
+                      "Speaker 1: I agree.\n\n"
+                      "Speaker 0: I'll send the proposal tomorrow.")
+        stamps = [
+            {"speaker": "0", "text": "We should increase the pricing to 8000.",
+             "start": 0, "end": 4},
+            {"speaker": "1", "text": "I agree.", "start": 4, "end": 6},
+            {"speaker": "0", "text": "I'll send the proposal tomorrow.",
+             "start": 6, "end": 9},
+        ]
+        out = ts.as_labelled_lines(transcript, stamps, self.NAMES)
+        self.assertEqual(self.lines(out), [
+            "[seg_0] Ravi: We should increase the pricing to 8000.",
+            "[seg_1] Priya: I agree.",
+            "[seg_2] Ravi: I'll send the proposal tomorrow.",
+        ])
+        # And storage is untouched — the raw record still says "Speaker 0".
+        self.assertIn("Speaker 0: We should increase the pricing", transcript)
+
+    def test_a_count_mismatch_still_refuses_to_label_or_rename(self):
+        """The safety fallback must not be weakened by the rename path: with no
+        trustworthy position join there is no trustworthy speaker either."""
+        self.assertEqual(
+            ts.as_labelled_lines(TRANSCRIPT, TIMESTAMPS[:2], self.NAMES),
+            TRANSCRIPT)
+        self.assertEqual(
+            ts.as_labelled_lines(TRANSCRIPT, [], self.NAMES), TRANSCRIPT)
+
+    def test_it_matches_what_pageindex_renders(self):
+        """PARITY. render_segments' docstring claims both paths give the model
+        one format; before this fix that was false precisely on speaker names,
+        which is why long meetings answered name questions better than short
+        ones. Pin the two renderers together so they cannot drift again."""
+        import pageindex
+        segs = [dict(s, id=ts.segment_id(i))
+                for i, s in enumerate(TIMESTAMPS)]
+        via_pageindex = pageindex.render_segments(segs, self.NAMES)
+        via_full = ts.as_labelled_lines(TRANSCRIPT, TIMESTAMPS, self.NAMES)
+        self.assertEqual(self.lines(via_full), self.lines(via_pageindex))
+
+
+# ---------------------------------------------------------------------------
 # VALIDATION — the model is never trusted.
 # ---------------------------------------------------------------------------
 class EvidenceValidationTests(unittest.TestCase):

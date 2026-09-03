@@ -2180,6 +2180,180 @@ class TestSinglePassAnalysis(unittest.TestCase):
                 deadline_seconds=120, label="summarize", key="k")
         self.assertEqual(got["overview"]["sections"][0]["content"], "Recovered.")
 
+    # -- json_validate_failed: a 400 that is worth resending -----------------
+    #
+    # Observed in production on a 16.6k-char / 5-speaker Marathi transcript:
+    # Groq answered 400 json_validate_failed with an EMPTY failed_generation,
+    # and analyze() abandoned the single-pass path for map_reduce on the first
+    # try. That is backwards - the failure is a bad SAMPLE, not a bad request,
+    # and map_reduce's own measured failure mode (an empty overview out of the
+    # reduce) is worse than the thing being worked around.
+
+    def _json_validate_failed(self):
+        """The error _chat_once actually raises for this Groq response."""
+        body = ("{'error': {'message': 'Failed to validate JSON. Please "
+                "adjust your prompt. See failed_generation for more "
+                "details.', 'type': 'invalid_request_error', 'code': "
+                "'json_validate_failed', 'failed_generation': ''}}")
+        return groq_client.GroqError("Groq 400 on analyze: " + body,
+                                     status=400, retryable=False)
+
+    def _ok(self, content="Recovered."):
+        return {"title": "T", "tasks": [], "participants": [],
+                "overview": {"sections": [
+                    {"title": "Pricing", "content": content}]}}
+
+    def test_json_validate_failed_resends_the_single_pass_call(self):
+        """The whole point: a stochastic generation failure gets the SAME
+        payload sent again, and never reaches map_reduce when the resend
+        works. `text` is long enough that a fall-through would have to chunk,
+        so a passing assertion here cannot be an accident of a short input."""
+        text = "Speaker 0: " + ("word " * 3000)
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            seen.append(prompt)
+            if len(seen) == 1:              # first single-pass attempt only
+                raise self._json_validate_failed()
+            return self._ok()
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "GROQ_CONTEXT_TOKENS", 131_072), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json):
+            got, covered, total = groq_client.analyze(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k")
+        # Two calls, both single-pass - the reduce prompt never ran.
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen, [prompts.SUMMARY_SYSTEM] * 2)
+        self.assertNotIn(prompts.SUMMARY_REDUCE_SYSTEM, seen)
+        self.assertEqual((covered, total), (1, 1))
+        self.assertEqual(got["overview"]["sections"][0]["content"],
+                         "Recovered.")
+
+    def test_json_validate_failed_twice_still_falls_back(self):
+        """The resend is ONE extra chance, not a loop. A transcript whose
+        every single-pass attempt fails must still reach map_reduce rather
+        than raise - the long-meeting safety net is unchanged."""
+        text = "Speaker 0: " + ("word " * 3000)
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            single_pass = content == text
+            seen.append((prompt, single_pass))
+            if single_pass:                 # BOTH single-pass attempts fail
+                raise self._json_validate_failed()
+            return self._ok("via map_reduce")
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "GROQ_CONTEXT_TOKENS", 131_072), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            got, covered, total = groq_client.analyze(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k")
+        # Two single-pass attempts, no more - the resend is not a loop.
+        self.assertEqual(sum(1 for _, sp in seen if sp), 2)
+        self.assertEqual([sp for _, sp in seen[:2]], [True, True])
+        self.assertGreater(len(seen), 2)      # it did go on to map_reduce
+        self.assertTrue(got["overview"]["sections"])
+
+    def test_a_non_generation_400_is_not_resent(self):
+        """Only a failed GENERATION earns the resend. A genuinely malformed
+        request (a bad model name, a bad key) must fall through on the first
+        failure - resending it is a wasted call and a wasted second of a
+        29-second budget."""
+        text = "Speaker 0: " + ("word " * 3000)
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            # Only the SINGLE-PASS attempt fails: it is the one that gets the
+            # whole transcript. A chunk of it must succeed, or map_reduce dies
+            # of "all N chunks failed" and the assertion never runs.
+            single_pass = content == text
+            seen.append((prompt, single_pass))
+            if single_pass:
+                raise groq_client.GroqError(
+                    "Groq 400 on analyze: model `nope` does not exist",
+                    status=400, retryable=False)
+            return self._ok("via map_reduce")
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "GROQ_CONTEXT_TOKENS", 131_072), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            groq_client.analyze(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k")
+        # Exactly ONE single-pass attempt before the fallback took over.
+        self.assertEqual(sum(1 for _, sp in seen if sp), 1)
+
+    def test_the_fallback_log_states_the_reason_that_actually_fired(self):
+        """A 400 on an 18k-char transcript used to log "18712 chars > 352789
+        single-pass budget" - a false comparison, because the overflow message
+        sat on the fall-through path shared by all three fallback reasons. It
+        sent a production investigation after a budget bug that did not exist,
+        so the log must name the reason that really fired."""
+        text = "Speaker 0: " + ("word " * 3000)
+
+        def _complete_json(prompt, content, **kw):
+            # As above: fail only the single pass, so the fallback completes
+            # and the fall-through log line is actually reached.
+            if content == text:
+                raise self._json_validate_failed()
+            return self._ok("x")
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "GROQ_CONTEXT_TOKENS", 131_072), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"), \
+             mock.patch("builtins.print") as printed:
+            groq_client.analyze(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k")
+        lines = [str(c.args[0]) for c in printed.call_args_list if c.args]
+        fallback = [ln for ln in lines if "falling back to map_reduce" in ln]
+        self.assertTrue(fallback)
+        # It must NOT claim the transcript overflowed the budget: it did not.
+        for ln in fallback:
+            self.assertNotIn("single-pass budget", ln, ln)
+        self.assertTrue(any("json_validate_failed" in ln for ln in fallback),
+                        "the real cause is missing from %r" % (fallback,))
+
+    def test_the_overflow_log_still_reports_the_budget_arithmetic(self):
+        """The inverse of the above - a transcript that GENUINELY overflows
+        must keep logging the numbers, which are what makes a real budget
+        problem diagnosable."""
+        text = "line\n" * 100_000
+
+        def _complete_json(prompt, content, **kw):
+            return self._ok("x")
+
+        with mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"), \
+             mock.patch("builtins.print") as printed:
+            groq_client.analyze(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k")
+        lines = [str(c.args[0]) for c in printed.call_args_list if c.args]
+        self.assertTrue(any("single-pass budget" in ln and "chars >" in ln
+                            for ln in lines), lines[:5])
+
 
 # ===========================================================================
 # _upsert's REMOVE clause — how a row written under the OLD analysis schema

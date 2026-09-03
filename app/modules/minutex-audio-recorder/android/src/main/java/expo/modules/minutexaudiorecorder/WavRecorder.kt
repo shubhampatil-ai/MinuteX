@@ -57,6 +57,47 @@ data class RecorderConfig(
    * a WAV-vs-AAC comparison meaningless. Falls back to MIC if unavailable.
    */
   val audioSource: Int = MediaRecorder.AudioSource.VOICE_RECOGNITION,
+  /**
+   * How many consecutive milliseconds of PURE DIGITAL SILENCE mark the
+   * microphone as taken. Zero or negative disables the detector entirely.
+   *
+   * WHY THIS EXISTS
+   * When the telephony stack takes the microphone, AudioRecord.read() does not
+   * fail and does not return an error code — it keeps returning full buffers of
+   * zeros. `n > 0`, so the capture loop happily writes them, ERROR_DEAD_OBJECT
+   * never arrives, and the engine reports a healthy recording while the file
+   * fills with nothing. That is the failure this detects, at the only layer
+   * that can see the actual frames.
+   *
+   * WHY IT CANNOT FIRE ON A QUIET ROOM
+   * The test is `peak == 0` — every sample in the buffer exactly 0x0000 — not
+   * "quieter than some threshold". A real microphone always carries a noise
+   * floor: preamp thermal noise and ADC dither mean even an anechoic room in
+   * front of a muted talker produces samples in the ±1..±30 range, and a single
+   * nonzero sample anywhere in the buffer resets the run. Exact zero across
+   * every frame for [zeroRunMillis] is not something an active analogue input
+   * produces; it means the OS has substituted a silent stream. See
+   * [zeroToleranceSamples] for the one deliberate exception.
+   *
+   * 2500ms is chosen to sit clear of the two legitimate zero-runs that do
+   * occur: the first buffers after start() on some ROMs (a warm-up gap of a few
+   * hundred ms) and the moment around a device/route switch. It is also well
+   * under the JS-side 6s detector it replaces as primary, so a call is caught
+   * about twice as fast as before.
+   */
+  val zeroRunMillis: Int = 2500,
+  /**
+   * Peak sample value still treated as digital silence, in 16-bit steps.
+   *
+   * Defaults to 0 — strict exact-zero, the safest possible test. It exists as a
+   * config knob for one real hardware case: a few OEM ROMs feed a *decayed* or
+   * DC-offset-corrected stream rather than true zeros when the mic is stolen,
+   * landing at a constant ±1. Raising this to 1 covers those without meaningful
+   * risk (a peak of 1 is -90 dBFS, some 30 dB below the quietest genuine room
+   * tone). Anything above ~4 starts to overlap real signal and should not be
+   * used.
+   */
+  val zeroToleranceSamples: Int = 0,
 )
 
 /** A finalized segment on disk. */
@@ -94,6 +135,23 @@ class WavRecorder(
    */
   @Volatile private var peakLevel: Float = 0f
 
+  /**
+   * Bytes of consecutive digital silence seen so far, and whether that run has
+   * crossed [RecorderConfig.zeroRunMillis].
+   *
+   * Counted in BYTES rather than milliseconds because bytes are what read()
+   * actually returns; converting once at the threshold comparison keeps the
+   * hot path to an integer add. Reset by any buffer containing real signal, so
+   * the run always describes the immediate present.
+   *
+   * `micUnavailable` is latched (never cleared while recording) on purpose: the
+   * controller's job is to tear this recorder down and build another, and a
+   * flag that flickered back to false on one stray nonzero sample would let a
+   * dead recorder look recovered while still bound to the stolen input.
+   */
+  @Volatile private var zeroRunBytes: Long = 0L
+  @Volatile private var micUnavailable: Boolean = false
+
   private var record: AudioRecord? = null
   private var out: BufferedOutputStream? = null
   private var thread: Thread? = null
@@ -101,11 +159,37 @@ class WavRecorder(
 
   val format = WavFormat(config.sampleRate, config.channels, config.bitsPerSample)
 
+  /**
+   * [RecorderConfig.zeroRunMillis] expressed in PCM bytes, so the capture loop
+   * compares two integers instead of doing a division per buffer. Computed once
+   * from the real byte rate, which already accounts for sample rate, channel
+   * count and bit depth — so the threshold stays 2.5 seconds of audio whatever
+   * the format is configured to.
+   *
+   * 0 when the detector is disabled, which the loop treats as "never check".
+   */
+  private val zeroLimitBytes: Long =
+    if (config.zeroRunMillis > 0) {
+      (format.byteRate.toLong() * config.zeroRunMillis) / 1000L
+    } else {
+      0L
+    }
+
   fun currentState(): CaptureState = state
   fun bytesWritten(): Long = pcmBytes
   fun level(): Float = peakLevel
   fun error(): String? = lastError
   fun durationSeconds(): Double = format.durationOf(pcmBytes)
+
+  /**
+   * Whether a sustained run of digital silence says the mic has been taken.
+   *
+   * Reported rather than acted on: this class does not stop, error or roll a
+   * segment on its own. The controller owns interruption policy (pause label,
+   * auto-resume intent, segment rebuild) and a dead recorder that stopped
+   * itself would race that state machine. See [RecorderConfig.zeroRunMillis].
+   */
+  fun isMicUnavailable(): Boolean = micUnavailable
 
   /**
    * Open the mic and begin writing. Throws [RecorderException] with a specific
@@ -210,6 +294,11 @@ class WavRecorder(
       pcmBytes = 0L
       peakLevel = 0f
       lastError = null
+      // A fresh recorder starts with a clean slate: this instance has its own
+      // mic and its own file, so nothing observed before it can be evidence
+      // about it.
+      zeroRunBytes = 0L
+      micUnavailable = false
       state = CaptureState.RECORDING
 
       val t = Thread({ captureLoop() }, "minutex-wav-capture")
@@ -251,6 +340,17 @@ class WavRecorder(
       if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
         throw RecorderException("the microphone did not restart", micUnavailable = true)
       }
+      // Clear the run before the loop wakes up. A pause is a legitimate gap in
+      // audio, not evidence about the mic, and the frames either side of it are
+      // unrelated — carrying the count across would let a long user pause trip
+      // the detector on the first buffer after resuming.
+      //
+      // The latch is cleared too: this is the same AudioRecord, so if the mic is
+      // genuinely still stolen the very next buffers re-trip it within
+      // zeroRunMillis. Leaving it latched would instead make a resumed
+      // recording permanently look dead.
+      zeroRunBytes = 0L
+      micUnavailable = false
       state = CaptureState.RECORDING
     }
   }
@@ -354,7 +454,27 @@ class WavRecorder(
         try {
           out?.write(buffer, 0, n)
           pcmBytes += n
-          peakLevel = peakOf(buffer, n)
+
+          val peakSample = peakSampleOf(buffer, n)
+          peakLevel = peakSample / 32768f
+
+          // Zero-run tracking. The frames are already in hand and scanned, so
+          // this costs one comparison and one add — cheap enough to do on every
+          // buffer, which is what makes detection fast rather than polled.
+          //
+          // Deliberately keeps WRITING the silent frames. The audio timeline
+          // must stay continuous: dropping them here would silently shorten the
+          // recording relative to wall clock and desynchronise anything aligned
+          // against it. The controller decides what to do about the silence; the
+          // engine only reports it.
+          if (zeroLimitBytes > 0 && peakSample <= config.zeroToleranceSamples) {
+            zeroRunBytes += n
+            if (!micUnavailable && zeroRunBytes >= zeroLimitBytes) {
+              micUnavailable = true
+            }
+          } else {
+            zeroRunBytes = 0L
+          }
         } catch (e: Exception) {
           // Disk full, or the file went away. Stop rather than spin writing
           // into a stream that cannot accept bytes — and keep what landed.
@@ -404,17 +524,40 @@ class WavRecorder(
 
   /** Peak magnitude of a 16-bit LE buffer, normalised to 0..1. */
   private fun peakOf(buffer: ByteArray, length: Int): Float {
+    return peakSampleOf(buffer, length) / 32768f
+  }
+
+  /**
+   * Peak ABSOLUTE 16-bit sample value (0..32768) of a little-endian buffer.
+   *
+   * Kept separate from [peakOf] because zero-run detection compares against an
+   * exact integer count of quantisation steps. Going through a normalised float
+   * first would reintroduce rounding at precisely the magnitudes that matter —
+   * a peak of 1 becomes 0.0000305f — and the whole point of the detector is to
+   * distinguish "exactly zero" from "very nearly zero".
+   *
+   * The mask-and-truncate form (`toShort().toInt()`) is equivalent to the
+   * previous `lo or (hi.toInt() shl 8)`: Byte.toInt() sign-extends, and for a
+   * negative high byte those extended bits land exactly where two's complement
+   * wants them, so both reproduce -32768..32767 faithfully. This form is used
+   * only because it states the 16-bit PCM contract explicitly rather than
+   * relying on that coincidence.
+   */
+  private fun peakSampleOf(buffer: ByteArray, length: Int): Int {
     var peak = 0
     var i = 0
     // Step 2 bytes per sample; ignore a trailing odd byte (never happens with
     // frame-aligned reads, but a truncated read must not index past `length`).
     while (i + 1 < length) {
-      val sample = (buffer[i].toInt() and 0xFF) or (buffer[i + 1].toInt() shl 8)
+      val lo = buffer[i].toInt() and 0xFF
+      val hi = buffer[i + 1].toInt() and 0xFF
+      val sample = ((hi shl 8) or lo).toShort().toInt()
+      // -32768 has no positive counterpart in Short; abs() it in Int space.
       val abs = if (sample < 0) -sample else sample
       if (abs > peak) peak = abs
       i += 2
     }
-    return (peak / 32768f).coerceIn(0f, 1f)
+    return peak
   }
 
   private companion object {

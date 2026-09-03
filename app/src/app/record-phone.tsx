@@ -17,7 +17,7 @@
 // network and keeps it safe when there isn't. The user lands back on Files,
 // where the upload banner tracks progress.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "../../lib/icons";
@@ -268,60 +268,103 @@ export default function RecordPhoneScreen() {
   const chrome = statusChrome(rec.state);
 
   /**
-   * Offer to silence the ringer, ONCE, ever.
+   * Offer to silence the ringer, ONCE, ever — and RESOLVE before recording.
    *
    * Do Not Disturb access cannot be requested from a runtime dialog — it only
    * exists as a system Settings screen — so the honest flow is to explain why
    * it helps and hand the user a button that takes them there.
    *
+   * WHY THIS AWAITS
+   * This used to be fired off after start(), which meant the recorder was
+   * already capturing while the dialog sat on screen, and tapping "Open
+   * Settings" backgrounded the app — recording the walk through Settings and
+   * whatever was said during it. The user asked to make a decision about
+   * silence and was recorded while making it. Resolving first means nothing is
+   * captured until the choice is made.
+   *
+   * The promise settles on dismissal, not on the outcome of the Settings trip:
+   * we deliberately do NOT wait for the user to come back and grant access.
+   * Blocking a meeting recording on a system settings screen would be worse
+   * than a ringtone in the file. If they do grant it, it applies to the next
+   * recording.
+   *
    * Asked once and never again: a recorder that nags before every meeting is
-   * worse than one that occasionally records a ringtone. The recording is
-   * started either way — this never blocks or delays it.
+   * worse than one that occasionally records a ringtone.
    */
-  const maybeOfferSilence = useCallback(async () => {
+  const maybeOfferSilence = useCallback(async (): Promise<void> => {
+    if (Platform.OS !== "android") return;       // DND access is Android-only
     if (canSilenceRinger()) return;              // already granted
     const asked = await store.getItemAsync(SILENCE_ASK_KEY);
     if (asked) return;                            // asked before; respect that
+    // Written BEFORE showing the alert so a crash or a force-quit at the dialog
+    // cannot turn "ask once" into "ask every launch".
     await store.setItemAsync(SILENCE_ASK_KEY, "1");
-    Alert.alert(
-      "Silence your ringer while recording?",
-      "If a call comes in, the ringtone and vibration get picked up by the " +
-      "microphone. MinuteX can mute the ringer while you record and put it " +
-      "back afterwards.\n\nThis needs Do Not Disturb access, which "
-      + "Android only lets you grant from Settings.",
-      [
-        { text: "Not now", style: "cancel" },
-        {
-          text: "Open Settings",
-          onPress: () => {
-            void openSilenceRingerSettings().then((opened) => {
-              if (!opened) {
-                Alert.alert(
-                  "Could not open Settings",
-                  "Look for “Do Not Disturb access” in your phone's " +
-                  "notification settings and enable it for MinuteX."
-                );
-              }
-            });
+
+    return new Promise<void>((resolve) => {
+      // Guarantees resolve() runs exactly once however the alert is dismissed —
+      // a second call from an OEM that fires both onPress and onDismiss would
+      // otherwise be a silently swallowed no-op, and a path that never resolved
+      // would hang the record button forever.
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+
+      Alert.alert(
+        "Silence your ringer while recording?",
+        "If a call comes in, the ringtone and vibration get picked up by the " +
+        "microphone. MinuteX can mute the ringer while you record and put it " +
+        "back afterwards.\n\nThis needs Do Not Disturb access, which " +
+        "Android only lets you grant from Settings. Recording starts as soon " +
+        "as you choose.",
+        [
+          { text: "Not now", style: "cancel", onPress: done },
+          {
+            text: "Open Settings",
+            onPress: () => {
+              void openSilenceRingerSettings().then((opened) => {
+                if (!opened) {
+                  Alert.alert(
+                    "Could not open Settings",
+                    "Look for “Do Not Disturb access” in your phone's " +
+                    "notification settings and enable it for MinuteX."
+                  );
+                }
+              });
+              // Resolve immediately rather than waiting for the Settings round
+              // trip: the user tapped Record, and the recording should be
+              // running when they return.
+              done();
+            },
           },
-        },
-      ]
-    );
+        ],
+        { onDismiss: done }        // Android back button / tap-outside
+      );
+    });
   }, []);
 
   const begin = async () => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
     try {
+      // Resolve the ringer question BEFORE any audio is captured, so the user
+      // is never recorded while deciding whether to be recorded, and so a trip
+      // to Settings cannot happen mid-recording. Never fatal: any failure here
+      // must not stop the user from recording a meeting.
+      try {
+        await maybeOfferSilence();
+      } catch {
+        // Storage unavailable, or an alert that could not be presented.
+      }
+
       const res = await start();
       if (!res.ok && res.needsPermission && !res.needsSettings) {
         // The dialog was shown and declined. requestPermission already ran
         // inside start(); nothing more to do here but let the error render.
         await requestPermission();
       }
-      // Only once the recording is actually running: prompting before it starts
-      // would put a dialog between the user's tap and the thing they asked for.
-      if (res.ok) void maybeOfferSilence();
     } finally {
       inFlightRef.current = false;
     }

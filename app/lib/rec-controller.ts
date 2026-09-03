@@ -46,7 +46,10 @@ import { recLog, getSessionLog } from "./rec-log";
 import {
   hasAudioFocusDetection,
   getCallPhase,
-  silenceRinger,
+  // silenceRinger is intentionally NOT imported: the recording path no longer
+  // mutes the ringer, because doing so hid MODE_RINGTONE from getCallPhase().
+  // See the note at the end of start(). restoreRinger stays — it repairs a
+  // phone left silenced by an older build.
   restoreRinger,
   isInCall,
   onFocusChange,
@@ -687,7 +690,25 @@ async function enterInterruption(
   // resume path rebuild from scratch — the bytes already flushed are still on
   // disk either way.
   try {
-    recorder?.pause();
+    // Both engines must actually stop draining, not just be relabelled.
+    //
+    // For WAV this is essential rather than tidy: the native capture loop is
+    // still calling read() on a mic the call now owns, so every buffer it
+    // writes is digital zero appended to the segment file. Left running for a
+    // ten-minute call that is ten minutes of silence baked into the audio, and
+    // the pause is invisible in the final timeline. pause() parks the loop and
+    // stops the AudioRecord while keeping the file open, so the bytes already
+    // captured stay exactly as they are and rollSegment() can take over on
+    // resume.
+    // WavEngineRecorder.pause() is async (it crosses to native), the AAC
+    // recorder's is not; awaiting inside this already-async function keeps a
+    // native rejection inside the catch below rather than escaping as an
+    // unhandled rejection.
+    if (wavRecorder) {
+      await wavRecorder.pause();
+    } else {
+      recorder?.pause();
+    }
     recLog("recording.paused", { by: "encoder", reason: labelled }, session.id);
   } catch (e: any) {
     recLog("recording.error", {
@@ -705,10 +726,12 @@ async function enterInterruption(
  * dBFS scale expo-audio reports, which is what keeps SILENCE_DB_FLOOR — and
  * therefore mic-theft detection — working identically for both.
  */
-function engineStatus(): Pick<
-  RecorderState,
-  "isRecording" | "metering" | "mediaServicesDidReset" | "durationMillis"
-> | null {
+function engineStatus():
+  | (Pick<
+      RecorderState,
+      "isRecording" | "metering" | "mediaServicesDidReset" | "durationMillis"
+    > & { micUnavailable?: boolean })
+  | null {
   try {
     if (wavRecorder) {
       const st = wavRecorder.getStatus();
@@ -717,8 +740,12 @@ function engineStatus(): Pick<
         metering: st.metering,
         mediaServicesDidReset: st.mediaServicesDidReset,
         durationMillis: st.durationMillis,
-      } as RecorderState;
+        // WAV only: the native capture loop's verdict on the frames themselves.
+        micUnavailable: st.micUnavailable === true,
+      } as RecorderState & { micUnavailable?: boolean };
     }
+    // AAC leaves micUnavailable undefined — expo-audio cannot see the frames,
+    // so the metering-based detector below stays its only interruption signal.
     return recorder ? recorder.getStatus() : null;
   } catch {
     return null;
@@ -774,6 +801,37 @@ function reconcile(): void {
       }
     } else {
       stallCount = 0;
+
+      // The native capture layer's verdict, when the engine can give one.
+      //
+      // This is now the PRIMARY interruption signal on Android: the WAV engine
+      // inspects the actual PCM frames, so unlike focus events it cannot be
+      // missed by an OEM that doesn't deliver them, and unlike AudioManager.mode
+      // it does not depend on the ringer being audible. It is also strictly
+      // more reliable than the metering check below — same evidence, but
+      // evaluated on every buffer in native code rather than sampled twice a
+      // second across the bridge.
+      //
+      // Deliberately checked BEFORE the ring-aware hold. The hold exists to
+      // avoid pausing on a ring that was never answered, but this flag only
+      // latches after ~2.5s of true digital zero, and a ringing-but-unanswered
+      // phone does not zero the capture stream on the ROMs where the hold
+      // matters. Treating a latched flag as "still just ringing" would recreate
+      // exactly the bug being fixed: an answered call that never pauses.
+      if (status?.micUnavailable) {
+        silenceCount = 0;
+        recLog("mic.interrupted", {
+          reason: "native_digital_silence",
+          seconds: Math.round(segmentSeconds(s)),
+          callPhase: getCallPhase(),
+          note: "capture layer reported sustained zero samples — mic taken",
+        }, s.id);
+        void enterInterruption(
+          "microphone_unavailable",
+          "native capture reported sustained digital silence"
+        );
+        return;
+      }
 
       // The mic-stolen case the status flags cannot show us. A sustained run of
       // hardware-zero metering means the encoder is writing silence — the
@@ -1475,19 +1533,25 @@ export async function start(): Promise<StartResult> {
     pollInput();
     startTicker();
 
-    // Silence the ringer so an incoming call's ringtone or vibration is not
-    // captured. Fire-and-forget on purpose: this is a nicety, and the recording
-    // must not wait on it or fail because of it. A refusal (no Do Not Disturb
-    // access) is logged and ignored — ring-aware pausing already stops an
-    // unanswered call from truncating the audio, so the recording is still
-    // correct, just potentially noisier.
-    void silenceRinger().then((ok) => {
-      recLog("ringer.silenced", {
-        ok,
-        note: ok ? "ringer muted for this recording"
-                 : "no Do Not Disturb access — ringer left as-is",
-      }, session?.id);
-    });
+    // NOTE: the ringer is deliberately NOT silenced here any more.
+    //
+    // Silencing it was counterproductive. Forcing RINGER_MODE_SILENT means the
+    // platform has no ringtone to play, so on most builds telephony never
+    // enters MODE_RINGTONE — and MODE_RINGTONE is exactly what getCallPhase()
+    // reads to tell "ringing" from "answered". The feature intended to make
+    // recordings cleaner was blinding the detection that keeps them complete,
+    // which is the wrong trade: a ringtone in the audio is a blemish, a call
+    // that never pauses the recorder loses the meeting.
+    //
+    // Call detection reliability now takes priority over automatically muting
+    // the ringtone. silenceRinger()/restoreRinger() remain implemented and
+    // exported (see lib/audio-focus.ts) so the behaviour can be reintroduced
+    // as an explicit opt-in later, but nothing in the recording path depends
+    // on it, and no recording is silenced without the user asking.
+    //
+    // restoreRinger() is still called on every stop path (see stopTicker) — it
+    // is a no-op when nothing was silenced, and keeping it guarantees a phone
+    // silenced by an older build of this app is put back.
 
     return { ok: true, sessionId: session.id };
   } catch (e: any) {

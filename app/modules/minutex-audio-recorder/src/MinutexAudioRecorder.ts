@@ -52,6 +52,21 @@ export type WavRecorderStatus = {
   sizeBytes: number;
   /** Peak level 0..1 of the last buffer. Feeds the silence detector. */
   level: number;
+  /**
+   * The capture layer has seen enough consecutive digital silence to conclude
+   * the microphone was taken (a call, or another app grabbing it exclusively).
+   *
+   * This is the authoritative interruption signal for the WAV engine. Android's
+   * AudioRecord.read() does not fail when the telephony stack takes the mic —
+   * it returns full buffers of zeros indefinitely — so neither `state` nor
+   * `isRecording` nor `error` can reveal it. Only the frames can.
+   *
+   * Latched: once true it stays true for the life of the recorder object, so
+   * the controller must roll to a new segment rather than wait for it to clear.
+   * Absent on builds predating this field, hence optional — treat undefined as
+   * false and fall back to the JS-side level check.
+   */
+  micUnavailable?: boolean;
   segmentCount: number;
   sampleRate: number;
   channels: number;

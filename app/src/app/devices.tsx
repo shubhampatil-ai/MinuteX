@@ -4,9 +4,9 @@
 // shadowed Card holding its portrait beside the one number that matters
 // (battery, set in a bold extrabold numeral), then a spec list inside the
 // same card. Claimed devices below are their own cards, not a ruled list.
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
-import { useRouter } from "expo-router";
+import { useCallback, useMemo, useState } from "react";
+import { ActivityIndicator, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useFocusEffect, useRouter } from "expo-router";
 import { Icon } from "../../lib/icons";
 import { S, R, ELEV, CAPS, FONT, TABULAR, useTheme, ColorScale } from "../../lib/theme";
 import {
@@ -62,6 +62,11 @@ export default function DevicesScreen() {
   const [claimed, setClaimed] = useState<DeviceInfo[]>([]);
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  // Until the first response lands, this screen knows nothing — and "nothing"
+  // is not the same as "no devices". Without this the empty state rendered on
+  // every mount while the request was still in flight, so a user with a paired
+  // device saw "Nothing linked" flash before their device appeared.
+  const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     setError("");
@@ -72,10 +77,15 @@ export default function DevicesScreen() {
       setError(e instanceof ApiError ? e.message : "Could not load devices.");
     } finally {
       setRefreshing(false);
+      setLoading(false);
     }
   }, [router]);
 
-  useEffect(() => { load(); }, [load]);
+  // useFocusEffect, not useEffect: renaming or removing a device happens on
+  // /device/[id] and returns here with router.back(), which does NOT remount
+  // this screen. With a mount-only effect the list still showed the old name,
+  // or a device that had just been removed.
+  useFocusEffect(useCallback(() => { load(); }, [load]));
 
   const onRefresh = () => { setRefreshing(true); refreshStatus(); load(); };
 
@@ -86,9 +96,6 @@ export default function DevicesScreen() {
   // else on the screen competes with it.
   const battColor = batt <= 20 ? C.danger : C.success;
   const synced = (status?.pendingUploads ?? 0) === 0;
-  // Rough runtime estimate from the design's "About 9 hours of listening
-  // left" line, scaled off a ~12h full-charge budget.
-  const hoursLeft = Math.round((batt / 100) * 12);
 
   return (
     <ScrollView
@@ -125,9 +132,17 @@ export default function DevicesScreen() {
                       width: `${Math.max(2, Math.min(100, batt))}%`, backgroundColor: battColor,
                     }]} />
                   </View>
-                  <Text style={st.battNote}>
-                    {hoursLeft > 0 ? `About ${hoursLeft} hours of listening left` : "Charge it soon"}
-                  </Text>
+                  {/* The percentage is real telemetry from the device. A
+                      "hours of listening left" line was shown here too,
+                      derived from a hardcoded 12-hour full-charge budget —
+                      the firmware reports no runtime estimate and no such
+                      budget was ever measured, so the figure was invented and
+                      would have been read as a device reading. Only the low
+                      battery nudge remains, which follows from the percentage
+                      alone. */}
+                  {batt <= 20 ? (
+                    <Text style={st.battNote}>Charge it soon</Text>
+                  ) : null}
                 </>
               ) : (
                 <>
@@ -181,7 +196,12 @@ export default function DevicesScreen() {
 
       {/* Claimed devices (account-linked, from backend) */}
       <SectionRule>Linked to your account</SectionRule>
-      {claimed.length === 0 ? (
+      {loading ? (
+        // Nothing is asserted until the first response lands — "Nothing
+        // linked" is a claim about the account, and making it while the
+        // request is still in flight is simply wrong.
+        <ActivityIndicator color={C.textDim} style={{ marginVertical: S.xl }} />
+      ) : claimed.length === 0 ? (
         <EmptyState
           title="Nothing linked"
           subtitle="Link a device to your account so its recordings land on your desk."

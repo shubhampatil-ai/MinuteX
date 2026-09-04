@@ -6054,6 +6054,48 @@ class TestSoftDelete(TrashTestCase):
 
 
 # --- 4-5: listings ---------------------------------------------------------
+class TestListingPagination(TrashTestCase):
+    """A user's list must not stop at DynamoDB's 1 MB page boundary.
+
+    Query returns at most 1 MB and hands back a LastEvaluatedKey rather than
+    an error. Both listing routes used to issue a single query and ignore it,
+    so a heavy account simply stopped seeing its OLDEST recordings — with no
+    error anywhere, because a truncated page looks exactly like a complete
+    one. Both Recordings GSIs project ALL, so each row carries its whole AI
+    payload and that ceiling arrives far sooner than the row count suggests.
+    """
+
+    def _paged(self, first, second):
+        """One truncated page, then the rest."""
+        self.table.query.side_effect = [
+            {"Items": first, "LastEvaluatedKey": {"audio_s3_key": "page-1"}},
+            {"Items": second},
+        ]
+
+    def test_desk_listing_follows_the_page_boundary(self):
+        older = dict(self.item,
+                     audio_s3_key="recordings/u-1/mobile/mobile-old_1.m4a",
+                     created_at="2026-08-01T10:00:00Z")
+        self._paged([self.item], [older])
+        status, body = self._list_desk()
+        self.assertEqual(status, 200)
+        keys = [r["audio_s3_key"] for r in body["recordings"]]
+        self.assertIn(older["audio_s3_key"], keys)
+        self.assertEqual(len(keys), 2)
+
+    def test_trash_listing_follows_the_page_boundary(self):
+        # A row the user cannot SEE in Trash is a row they cannot restore.
+        a = dict(self.item, recording_status="trashed",
+                 deleted_at="2026-08-18T10:00:00Z")
+        b = dict(self.item, audio_s3_key="recordings/u-1/mobile/mobile-old_1.m4a",
+                 recording_status="trashed", deleted_at="2026-08-01T10:00:00Z")
+        self._paged([a], [b])
+        status, body = self._list_trash()
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["recordings"]), 2)
+        self.assertEqual(body["count"], 2)
+
+
 class TestTrashListing(TrashTestCase):
 
     def test_trashed_recording_disappears_from_the_desk(self):

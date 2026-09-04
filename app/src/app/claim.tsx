@@ -102,7 +102,14 @@ export default function ClaimScreen() {
         {error ? <ErrorText>{error}</ErrorText> : null}
         {ok ? <SuccessText>✓ Linked {ok}. Taking you to your files…</SuccessText> : null}
 
-        <Button label="Link device" onPress={submit} loading={busy} style={{ marginTop: S.xl }} />
+        {/* Disabled on success too, not just while in flight: `busy` clears in
+            the `finally` above, but navigation is deferred 900ms so the
+            confirmation is readable. That left the button live for those
+            900ms, and a second press re-submitted an already-claimed key —
+            which comes back as an error over the top of a success message.
+            Same guard pair-device.tsx uses. */}
+        <Button label="Link device" onPress={submit} loading={busy}
+          disabled={busy || !!ok} style={{ marginTop: S.xl }} />
 
         <Pressable onPress={() => router.replace("/")} disabled={busy} style={{ marginTop: S.lg }}>
           <Text style={st.link}>Skip — go to my files</Text>

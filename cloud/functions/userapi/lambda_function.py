@@ -1439,6 +1439,38 @@ def request_upload(event):
     if folder_id:
         _owned_folder(user_id, folder_id)   # 404 if it isn't the caller's
 
+    # RE-PRESIGN of an upload already under way, when the client sends back the
+    # key it was given. A presigned PUT is only valid for UPLOAD_URL_EXPIRY, so
+    # a big file on a slow connection (or one resumed after the app was killed)
+    # outlives its URL and must ask for another. Minting a fresh identity there
+    # is what the client's "one session = one key" durability design is built
+    # to avoid: the second key becomes a SECOND timeline row, and the first is
+    # left at "uploading" forever — a phantom duplicate the user cannot clear
+    # except by trashing it, because reprocess refuses that status.
+    #
+    # Only the caller's OWN still-uploading row can be re-presigned. An
+    # unknown key, someone else's, or one that already reached "uploaded" or
+    # beyond falls through to a new identity, so this can never overwrite a
+    # finished recording or let a key be guessed onto another user's row.
+    prior_key = str(data.get("key") or "").strip()
+    if prior_key:
+        prior = _recordings.get_item(Key={"audio_s3_key": prior_key}).get("Item")
+        if (prior
+                and prior.get("user_id") == user_id
+                and prior.get("status") == STATUS_UPLOADING):
+            return _resp(200, {
+                "upload_url": _s3.generate_presigned_url(
+                    "put_object",
+                    Params={"Bucket": BUCKET_NAME, "Key": prior_key},
+                    ExpiresIn=UPLOAD_URL_EXPIRY,
+                ),
+                "key": prior_key,
+                "recording_id": prior.get("recording_id", ""),
+                "expires_in": UPLOAD_URL_EXPIRY,
+                "content_type": UPLOAD_FORMATS[fmt],
+                "folder_id": prior.get("folder_id", ""),
+            })
+
     # recording_id keeps the device convention "{meeting_id}_{timestamp}" so
     # the pipeline's one key parser works unchanged. e.g. mobile-3fa8c2_1754.
     prefix = "mobile" if source == SOURCE_MOBILE else "upload"
@@ -1565,6 +1597,33 @@ def complete_upload(event):
     return _resp(200, {"key": key, "status": current.get("status", "")})
 
 
+def _query_all(table, **kwargs):
+    """Every item matching a Query, following LastEvaluatedKey to the end.
+
+    DynamoDB caps a Query response at 1 MB and then stops, handing back a
+    LastEvaluatedKey instead of an error. A caller that ignores it silently
+    sees a PREFIX of the matches and cannot tell — which for a list endpoint
+    means a user's oldest rows quietly disappear from their own timeline. That
+    ceiling is reached far sooner than the row count suggests here, because
+    both Recordings GSIs project ALL: every item carries its full AI payload
+    (documents, mom, chat_history) even when the caller only wants a handful
+    of summary fields.
+
+    Use for the whole-collection reads (a user's recordings, their trash).
+    Cursor-paginated endpoints like /tasks page deliberately instead — this
+    walks the entire partition, and that is only correct when the caller
+    genuinely needs all of it.
+    """
+    items = []
+    while True:
+        res = table.query(**kwargs)
+        items.extend(res.get("Items", []))
+        last = res.get("LastEvaluatedKey")
+        if not last:
+            return items
+        kwargs["ExclusiveStartKey"] = last
+
+
 def list_recordings(event):
     """Recordings the user OWNS: user-index rows (new uploads carry user_id)
     unioned with legacy device-index rows for owned devices, deduped."""
@@ -1606,26 +1665,30 @@ def list_recordings(event):
     # user-index: user_id HASH, created_at RANGE. Newest first. This is the
     # primary (user-owned) path; it also covers recordings stamped to the
     # user by a past unpair, whose device is no longer in `devices`.
-    res = _recordings.query(
-        IndexName=USER_INDEX,
-        KeyConditionExpression=Key("user_id").eq(user_id),
-        ScanIndexForward=False,
-    )
-    items = res.get("Items", [])
-    if want:
-        items = [it for it in items if it.get("device_id") == want]
+    #
+    # PAGINATED, not a single query: DynamoDB caps a Query response at 1 MB,
+    # and BOTH indexes project ALL — so each item carries its full AI payload
+    # (documents, mom, chat_history, crm_records), not just the LIST_FIELDS
+    # this route returns. Without the LastEvaluatedKey loop a heavy account
+    # silently loses its OLDEST recordings off the end of the first page, with
+    # no error anywhere: the response still looks like a complete list. Matches
+    # the loop _recordings_in_folder already runs over this same index.
+    items = []
+    for row in _query_all(_recordings, IndexName=USER_INDEX,
+                          KeyConditionExpression=Key("user_id").eq(user_id),
+                          ScanIndexForward=False):
+        if want and row.get("device_id") != want:
+            continue
+        items.append(row)
     _collect(items)
 
     for dev in devices:
         # device-index: device_id HASH, created_at RANGE. Newest first.
         # Legacy rows (uploaded before user ownership) have no user_id and
         # are only reachable this way.
-        res = _recordings.query(
-            IndexName=DEVICE_INDEX,
-            KeyConditionExpression=Key("device_id").eq(dev),
-            ScanIndexForward=False,
-        )
-        _collect(res.get("Items", []))
+        _collect(_query_all(_recordings, IndexName=DEVICE_INDEX,
+                            KeyConditionExpression=Key("device_id").eq(dev),
+                            ScanIndexForward=False))
     # Merge across sources, newest first by created_at.
     out.sort(key=lambda r: r.get("created_at", ""), reverse=True)
     return _resp(200, {"recordings": out, "count": len(out)})
@@ -2025,20 +2088,17 @@ def list_trash(event):
             row["deleted_at"] = item.get("deleted_at", "")
             out.append(row)
 
-    res = _recordings.query(
-        IndexName=USER_INDEX,
-        KeyConditionExpression=Key("user_id").eq(user_id),
-        ScanIndexForward=False,
-    )
-    _collect(res.get("Items", []))
+    # Paginated for the same reason list_recordings is: a 1 MB Query page of
+    # ALL-projected rows would silently drop the oldest trashed recordings,
+    # and a user who cannot see a row in Trash cannot restore it.
+    _collect(_query_all(_recordings, IndexName=USER_INDEX,
+                        KeyConditionExpression=Key("user_id").eq(user_id),
+                        ScanIndexForward=False))
 
     for dev in devices:
-        res = _recordings.query(
-            IndexName=DEVICE_INDEX,
-            KeyConditionExpression=Key("device_id").eq(dev),
-            ScanIndexForward=False,
-        )
-        _collect(res.get("Items", []))
+        _collect(_query_all(_recordings, IndexName=DEVICE_INDEX,
+                            KeyConditionExpression=Key("device_id").eq(dev),
+                            ScanIndexForward=False))
 
     out.sort(key=lambda r: (r.get("deleted_at", ""), r.get("created_at", "")),
              reverse=True)
@@ -2522,7 +2582,17 @@ def _generate_document(item, doc_type, system_prompt, label):
     except groq_client.GroqError as err:
         _groq_error(err, label)
 
-    content = (content or "").strip()
+    # Same user-output boundary chat and the overview already pass through.
+    # Documents are the most Markdown-heavy surface in the app (headings,
+    # bullets, bold — see _MARKDOWN_RULES), and they were the one prose
+    # surface skipping this: a model that escapes its own syntax sent
+    # "\*Important\*" straight to the renderer, which shows the backslashes.
+    # Applied BEFORE the length cap so the cap measures what is actually
+    # stored, not text that is about to get shorter.
+    content = ai_sanitize.sanitize_ai_user_output(
+        content or "", label=f"document:{doc_type}")
+
+    content = content.strip()
     if not content:
         raise ApiError(502, f"Unable to generate {label}. Please retry.")
     if len(content) > MAX_DOCUMENT_CHARS:
@@ -2623,6 +2693,10 @@ def generate_custom_document(event):
         ).strip().strip('"')
     except groq_client.GroqError as err:
         print(f"[ai] custom document title failed, using fallback: {err}")
+    # The title is model-written and shown as the document's name in the list,
+    # so it crosses the same user-output boundary the body does.
+    label = ai_sanitize.sanitize_ai_user_output(
+        label, label="custom-doc-title").strip()
     if not label:
         label = prompt[:60] + ("…" if len(prompt) > 60 else "")
 

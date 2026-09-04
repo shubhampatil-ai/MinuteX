@@ -1087,6 +1087,14 @@ export async function requestUpload(params: {
   // cannot leave it unfiled. A folder the caller does not own fails the whole
   // request (404) rather than yielding an unfiled recording.
   folder_id?: string;
+  // RE-PRESIGN an upload already under way. A presigned PUT expires, so a
+  // large file on a slow link outlives its URL and needs a new one — and
+  // asking for a fresh identity there would create a SECOND timeline row and
+  // strand the first at "uploading" forever. Send the key this session was
+  // already given and the backend re-signs THAT key instead of minting one.
+  // Honoured only for the caller's own row that is still "uploading"; a stale
+  // or foreign key is ignored and a new recording is issued.
+  key?: string;
 }): Promise<UploadTicket> {
   return request<UploadTicket>("/recordings/upload-request", {
     method: "POST",
@@ -1224,7 +1232,25 @@ export function isNotReady(e: unknown): boolean {
 export async function getMeetingHighlights(
   key: string,
   regenerate = false
-): Promise<{ meeting_highlights: MeetingHighlights; cached: boolean }> {
+): Promise<{
+  meeting_highlights: MeetingHighlights;
+  cached: boolean;
+  /** How much of the meeting the model actually saw. A long transcript is
+   * truncated to fit API Gateway's 29s window, so these two can differ —
+   * `segments_covered < segments_total` means the highlights describe the
+   * START of a longer meeting, not all of it.
+   *
+   * The backend has always computed and returned these (and its tests pin
+   * both the complete and truncated cases), but they were omitted from this
+   * return type, so the honesty signal was dropped at the client boundary and
+   * no screen could read it. Typed here so a caller CAN surface it; nothing
+   * renders it yet — see the audit's open items.
+   *
+   * Optional because a cached response predating this may omit them; treat a
+   * missing value as "coverage unknown", never as "fully covered". */
+  segments_covered?: number;
+  segments_total?: number;
+}> {
   return request(aiPath("highlights", key), {
     method: "POST",
     body: { regenerate },

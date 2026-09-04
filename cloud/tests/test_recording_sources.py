@@ -172,6 +172,53 @@ def unit_tests():
           and body.get("content_type") == "audio/flac")
     check("upload-request accepts flac (broad format set)", ok, body.get("key", ""))
 
+    # --- 2c. re-presign reuses the key instead of making a second row --------
+    #
+    # A presigned PUT expires, so a large file on a slow link asks for another
+    # URL mid-upload. Minting a fresh identity there produced a SECOND timeline
+    # row and stranded the first at "uploading" forever (reprocess refuses that
+    # status), so the user saw a phantom duplicate they could only trash.
+    fake = FakeRecordings()
+    userapi._recordings = fake
+    first = resp_body(userapi.request_upload(make_event(token, {
+        "source": "MOBILE", "format": "m4a", "folder_id": ""})))
+    fake.items[first["key"]] = {"audio_s3_key": first["key"],
+                                "user_id": user_id,
+                                "recording_id": first["recording_id"],
+                                "status": userapi.STATUS_UPLOADING}
+    before = len(fake.updates)
+    again = resp_body(userapi.request_upload(make_event(token, {
+        "source": "MOBILE", "format": "m4a", "key": first["key"]})))
+    ok = (again.get("key") == first["key"]
+          and again.get("recording_id") == first["recording_id"]
+          and again.get("upload_url", "").startswith("https://")
+          and len(fake.updates) == before)   # no second stub row written
+    check("re-presign returns the SAME key and writes no second row", ok,
+          f"{first['key']} -> {again.get('key')}")
+
+    # A key that already finished uploading is NOT re-signable: the pipeline
+    # owns the row from there, and re-signing would let a late PUT overwrite
+    # a transcribed recording's audio.
+    done_key = first["key"] + ".done"
+    fake.items[done_key] = {"audio_s3_key": done_key, "user_id": user_id,
+                            "status": userapi.STATUS_UPLOADED}
+    body = resp_body(userapi.request_upload(make_event(token, {
+        "source": "MOBILE", "format": "m4a", "key": done_key})))
+    check("re-presign of an already-uploaded key issues a NEW recording",
+          body.get("key") != done_key, body.get("key", ""))
+
+    # Someone else's still-uploading key must never be re-signed — that would
+    # hand the caller a write URL onto another user's recording.
+    other_key = f"recordings/other-user/mobile/mobile-abc_1.m4a"
+    fake.items[other_key] = {"audio_s3_key": other_key,
+                             "user_id": "other-user",
+                             "status": userapi.STATUS_UPLOADING}
+    body = resp_body(userapi.request_upload(make_event(token, {
+        "source": "MOBILE", "format": "m4a", "key": other_key})))
+    check("re-presign of another user's key issues a NEW recording",
+          body.get("key") != other_key and user_id in body.get("key", ""),
+          body.get("key", ""))
+
     # --- 3-6. validation -----------------------------------------------------
     expect_api_error(userapi.request_upload,
                      make_event(token, {"source": "DEVICE"}), 400,

@@ -12,6 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert, Animated, Easing, Pressable, RefreshControl, SectionList, StyleSheet,
   Text, View,
+  type LayoutChangeEvent, type NativeScrollEvent, type NativeSyntheticEvent,
 } from "react-native";
 import { useFocusEffect, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -179,16 +180,81 @@ function Stat({
   );
 }
 
-// The Workspace row — Tasks / Folders / Contacts, directly on MinuteX.
+type WorkspaceTile = {
+  key: string; label: string; icon: IconName; path: string; badge?: string;
+};
+
+// The four workspace destinations, in one place. Both the full row and the
+// collapsed strip in the sticky bar render from this, so the two can never
+// drift apart on destinations, icons, or the open-task badge.
+function workspaceTiles(openTasks: number | null): WorkspaceTile[] {
+  return [
+    {
+      key: "tasks", label: "Tasks", icon: "checklist", path: "/tasks",
+      // Capped at 99+: the badge is a glanceable "how much", and a real
+      // account already carries 61 open tasks, so three digits would either
+      // overflow the circle or shrink the type past legibility.
+      badge: openTasks != null && openTasks > 0
+        ? (openTasks > 99 ? "99+" : String(openTasks))
+        : undefined,
+    },
+    { key: "calendar", label: "Calendar", icon: "calendar", path: "/calendar" },
+    { key: "folders", label: "Folders", icon: "folder", path: "/folders" },
+    { key: "contacts", label: "People", icon: "person.2.fill", path: "/contacts" },
+  ];
+}
+
+// The collapsed workspace strip — four icons that live in the sticky control
+// bar once the full row has scrolled away. Icon-only, sized to sit beside the
+// search field without out-shouting it; the labels are gone but the badge
+// stays, because "4 open tasks" is the reason to tap.
+function WorkspaceStrip({
+  st, C, openTasks, onPress,
+}: {
+  st: ReturnType<typeof buildStyles>;
+  C: ColorScale;
+  openTasks: number | null;
+  onPress: (path: string) => void;
+}) {
+  return (
+    <View style={st.wsStrip}>
+      {workspaceTiles(openTasks).map((t) => (
+        <Pressable
+          key={t.key}
+          onPress={() => onPress(t.path)}
+          hitSlop={4}
+          style={({ pressed }) => [st.wsStripBtn, pressed && { opacity: 0.6 }]}
+          accessibilityRole="button"
+          accessibilityLabel={t.badge ? `${t.label}, ${t.badge} open` : t.label}
+        >
+          <View style={st.wsIconWrap}>
+            <Icon name={t.icon} tintColor={C.textDim} size={18} />
+            {t.badge ? (
+              <View style={st.wsStripBadge}>
+                <Text style={st.wsStripBadgeTxt}>{t.badge}</Text>
+              </View>
+            ) : null}
+          </View>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+
+// The Workspace row — Tasks / Calendar / Folders / People, directly on
+// MinuteX.
 //
-// These three were briefly buried under You › Organize, which was wrong: they
-// are places you WORK, not preferences you set once. Tasks especially — "what
-// do I owe" is a daily question, and it does not belong behind two taps in a
+// These were briefly buried under You › Organize, which was wrong: they are
+// places you WORK, not preferences you set once. Tasks especially — "what do
+// I owe" is a daily question, and it does not belong behind two taps in a
 // settings list.
 //
 // Tasks leads and carries a live count, so the row reports state rather than
 // just offering navigation. The count is omitted (not shown as 0) when it
 // could not be fetched, because a wrong 0 reads as "nothing to do".
+//
+// This full row scrolls away with the masthead; WorkspaceStrip above keeps
+// the same four destinations reachable from the sticky bar once it has gone.
 function WorkspaceRow({
   st, C, openTasks, onPress,
 }: {
@@ -197,22 +263,7 @@ function WorkspaceRow({
   openTasks: number | null;
   onPress: (path: string) => void;
 }) {
-  const tiles: {
-    key: string; label: string; icon: IconName; path: string; badge?: string;
-  }[] = [
-      {
-        key: "tasks", label: "Tasks", icon: "checklist", path: "/tasks",
-        // Capped at 99+: the badge is a glanceable "how much", and a real
-        // account already carries 61 open tasks, so three digits would either
-        // overflow the circle or shrink the type past legibility.
-        badge: openTasks != null && openTasks > 0
-          ? (openTasks > 99 ? "99+" : String(openTasks))
-          : undefined,
-      },
-      { key: "calendar", label: "Calendar", icon: "calendar", path: "/calendar" },
-      { key: "folders", label: "Folders", icon: "folder", path: "/folders" },
-      { key: "contacts", label: "People", icon: "person.2.fill", path: "/contacts" },
-    ];
+  const tiles = workspaceTiles(openTasks);
   return (
     <View style={st.wsRow}>
       {tiles.map((t, i) => (
@@ -304,7 +355,42 @@ function DevicePill({
 
 function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
   return StyleSheet.create({
-    container: { flex: 1, backgroundColor: C.bg, paddingHorizontal: 20 },
+    // No horizontal padding here any more. The list is full-bleed so the
+    // sticky control layer can span edge to edge and paint an opaque band
+    // across the whole width; the 20px gutter now sits on each block inside
+    // (dashboard, controls, section heads, cards) via `gutter`.
+    container: { flex: 1, backgroundColor: C.bg },
+    gutter: { paddingHorizontal: 20 },
+    // The pinned bar: search, plus the workspace icons once they collapse.
+    // Sits above the list as a sibling, so it never scrolls. Opaque and
+    // hairline-separated, because cards scroll beneath its lower edge.
+    bar: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: S.sm,
+      paddingHorizontal: 20, paddingTop: S.sm, paddingBottom: S.md,
+      backgroundColor: C.bg,
+      borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.border,
+    },
+    hidden: { display: "none" as const },
+    // The collapsed workspace strip. Icon-only and tucked against the search
+    // field: it must be reachable at a glance without competing with it.
+    wsStrip: { flexDirection: "row" as const, alignItems: "center" as const, gap: 2 },
+    wsStripBtn: { paddingHorizontal: 6, paddingVertical: 6 },
+    // Smaller than the full row's badge (17px) to suit an 18px icon, and
+    // bordered in the page background so it reads as sitting ON the icon
+    // rather than colliding with the neighbouring one.
+    wsStripBadge: {
+      position: "absolute" as const, top: -5, right: -8,
+      minWidth: 14, height: 14, borderRadius: 7, paddingHorizontal: 3,
+      backgroundColor: C.primary, alignItems: "center" as const,
+      justifyContent: "center" as const,
+      borderWidth: 1.5, borderColor: C.bg,
+    },
+    wsStripBadgeTxt: {
+      ...TABULAR, fontFamily: FONT.bold, fontSize: 8.5,
+      color: C.textOnPrimary,
+    },
+    // Error / skeletons / empty state, under the sticky controls.
+    listState: { paddingHorizontal: 20 },
     // Masthead: dateline over a bold display title, no rule — the page
     // background does the separating, cards carry their own edges.
     masthead: {
@@ -388,16 +474,25 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     },
     noticeTitle: { fontFamily: FONT.semibold, fontSize: 13.5, color: C.text },
     noticeSub: { ...T.caption, marginTop: 2 },
-    filters: { flexDirection: "row" as const, gap: 7, marginTop: 14, marginBottom: S.sm },
+    filters: { flexDirection: "row" as const, gap: 7, marginTop: S.lg, marginBottom: 2 },
+    // Day header. Sticky now (RN sticks all section headers or none), so it
+    // keeps its opaque background and carries the gutter itself. marginTop
+    // became paddingTop: a sticky header's margin sits outside the pinned
+    // box, which would leave a transparent strip above it with cards
+    // visible through the gap.
     sectionHead: {
       flexDirection: "row" as const, alignItems: "baseline" as const,
       justifyContent: "space-between" as const,
-      paddingBottom: 6, marginTop: 22, marginBottom: 10,
+      paddingHorizontal: 20,
+      paddingTop: 16, paddingBottom: 8, marginBottom: 10,
       backgroundColor: C.bg,
     },
     // A brief card: rounded, shadowed surface — the primary visual unit.
+    // Design unchanged; the 20px gutter it used to inherit from `container`
+    // is now marginHorizontal, since the list itself is full-bleed.
     brief: {
       backgroundColor: C.surface, borderRadius: R.card, padding: S.lg,
+      marginHorizontal: 20,
       marginBottom: S.md, shadowColor: C.shadow, ...ELEV.sm,
     },
     briefTop: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: S.md },
@@ -433,6 +528,39 @@ export default function DeskScreen() {
   // worth a place on MinuteX rather than being pure navigation chrome —
   // "3 open" is a reason to tap; a bare "Tasks" label is not.
   const [openTasks, setOpenTasks] = useState<number | null>(null);
+  // Whether the workspace tiles have collapsed into the pinned bar.
+  //
+  // The tiles are NAVIGATION, not decoration: reaching Tasks or Calendar must
+  // never require scrolling a long list back to offset 0. So the full row
+  // scrolls away with the masthead and a compact icon strip takes its place
+  // in the pinned bar.
+  //
+  // The threshold is MEASURED, never guessed. An earlier attempt hardcoded
+  // 120px; the row actually clears the top around 300, so between the two the
+  // full row and the strip were both on screen — the same four destinations
+  // and the same badge, duplicated. `wsBottom` is the row's own bottom edge
+  // reported by onLayout, so the strip can only appear once the row it
+  // replaces has genuinely gone.
+  const [collapsed, setCollapsed] = useState(false);
+  const wsBottom = useRef(0);
+  const onWorkspaceLayout = useCallback((e: LayoutChangeEvent) => {
+    const { y, height } = e.nativeEvent.layout;
+    // `y` is relative to the dashboard (the ListHeaderComponent), whose own
+    // top sits at contentContainerStyle.paddingTop in scroll coordinates —
+    // so add it to compare against contentOffset.y.
+    wsBottom.current = S.lg + y + height;
+  }, []);
+  const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const y = e.nativeEvent.contentOffset.y;
+    // Until onLayout has reported, collapse nothing — showing both is the
+    // one outcome worth avoiding.
+    const edge = wsBottom.current;
+    if (!edge) return;
+    // A 24px dead band: the strip appears once the row is fully past, and
+    // only goes away again once the row is properly back, so a scroll resting
+    // on the boundary cannot flicker between the two.
+    setCollapsed((prev) => (prev ? y > edge - 24 : y > edge));
+  }, []);
 
   const load = useCallback(async () => {
     setError("");
@@ -564,8 +692,19 @@ export default function DeskScreen() {
   const captured = weekCaptured(items);
   const filtering = !!query || filter !== "all";
 
-  return (
-    <View style={[st.container, { paddingTop: insets.top + S.lg }]}>
+  // The collapsing dashboard. This is the list's ListHeaderComponent rather
+  // than a sibling View: as a sibling it permanently consumed ~450px of a
+  // ~780px viewport, so the list it sat above could only ever show one and a
+  // half cards. Inside the list it scrolls away under the sticky controls and
+  // comes back on the way down — ordinary SectionList scrolling, with nothing
+  // interpolated and nothing to snap.
+  //
+  // Only the masthead and stats truly leave: they are decoration, read on
+  // arrival. The workspace tiles are navigation, so they reappear in the
+  // sticky bar as WorkspaceStrip rather than making you scroll a long list
+  // back to offset 0 to reach Tasks.
+  const dashboard = (
+    <View style={st.gutter}>
       {/* Device connectivity — top-left, above the masthead. Replaces the
           Device bottom tab. */}
       <DevicePill st={st} C={C} />
@@ -602,14 +741,18 @@ export default function DeskScreen() {
         />
       </View>
 
-      {/* Workspace — Tasks / Folders / People. On MinuteX itself, because
-          these are daily destinations, not settings. */}
-      <WorkspaceRow
-        st={st}
-        C={C}
-        openTasks={openTasks}
-        onPress={(path) => router.push(path as any)}
-      />
+      {/* Workspace — Tasks / Calendar / Folders / People. On MinuteX itself,
+          because these are daily destinations, not settings. onLayout reports
+          where this row ends so the pinned strip knows exactly when it has
+          scrolled past — see `collapsed`. */}
+      <View onLayout={onWorkspaceLayout}>
+        <WorkspaceRow
+          st={st}
+          C={C}
+          openTasks={openTasks}
+          onPress={(path) => router.push(path as any)}
+        />
+      </View>
 
       {/* Live recording bar */}
       {isRecording ? (
@@ -746,168 +889,204 @@ export default function DeskScreen() {
         </View>
       ))}
 
-      {/* Search + filters */}
-      <SearchBar value={query} onChangeText={setQuery} placeholder="Search briefs"
-        style={{ marginTop: S.lg }} />
+      {/* Filters. These scroll away with the dashboard rather than joining
+          the pinned bar: a filter is set occasionally and then left alone,
+          so it does not earn ~50px of permanent height the way search and
+          navigation do. */}
       <View style={st.filters}>
         <Chip label="All" active={filter === "all"} onPress={() => setFilter("all")} />
         <Chip label="Filed" active={filter === "ready"} onPress={() => setFilter("ready")} />
         <Chip label="In the works" active={filter === "processing"} onPress={() => setFilter("processing")} />
       </View>
+    </View>
+  );
 
-      {error ? (
-        <View>
-          <ErrorText>{error}</ErrorText>
-          <Button label="Try again" variant="secondary" onPress={() => { setLoading(true); load(); }}
-            style={{ marginTop: S.md, alignSelf: "flex-start", paddingHorizontal: S.xl }} />
+  return (
+    <View style={[st.container, { paddingTop: insets.top }]}>
+      {/* THE PINNED BAR — a sibling ABOVE the list, not inside it.
+
+          It was briefly a sticky section header, which does not work: RN
+          sticky headers are "the next header pushes the previous one off", so
+          every date header displaced the search bar as it arrived and the
+          controls vanished a screen or two down. Outside the list it simply
+          never moves. One fixed bar plus one list is not a nested scroll
+          view — the list below is still the only thing that scrolls. */}
+      <View style={st.bar}>
+        <SearchBar value={query} onChangeText={setQuery} placeholder="Search briefs"
+          style={{ flex: 1 }} />
+        {/* The workspace icons, revealed only once the full row has scrolled
+            past. Hidden with `display: none` rather than unmounted so the
+            bar's height never changes as it appears. */}
+        <View style={collapsed ? undefined : st.hidden} pointerEvents={collapsed ? "auto" : "none"}>
+          <WorkspaceStrip st={st} C={C} openTasks={openTasks}
+            onPress={(path) => router.push(path as any)} />
         </View>
-      ) : null}
+      </View>
 
-      {loading ? (
-        <View style={{ marginTop: S.lg }}>
-          <SkeletonCard />
-          <SkeletonCard />
-          <SkeletonCard />
-        </View>
-      ) : (
-        <SectionList
-          sections={sections}
-          keyExtractor={(i) => i.audio_s3_key}
-          showsVerticalScrollIndicator={false}
-          stickySectionHeadersEnabled={false}
-          contentContainerStyle={{ paddingBottom: 100 }}
-          refreshControl={
-            <RefreshControl refreshing={refreshing}
-              onRefresh={() => { setRefreshing(true); load(); }} tintColor={C.primary} />
-          }
-          ListEmptyComponent={
-            <EmptyState
-              title={filtering ? "Nothing matches that" : "Nothing on MinuteX yet"}
-              subtitle={filtering
-                ? "Try a different search or filter."
-                : "Record your next conversation and the first brief lands here in a couple of minutes."}
-              action={filtering ? undefined : (
-                <Button label="Start recording" onPress={() => router.push("/new-recording")} />
-              )}
-            />
-          }
-          renderSectionHeader={({ section }) => {
-            const s = section as Section;
-            return (
-              <View style={st.sectionHead}>
-                <Text style={T.label}>{s.title}</Text>
-                <Text style={{ ...T.caption }}>
-                  {s.data.length} brief{s.data.length === 1 ? "" : "s"}
-                </Text>
-              </View>
-            );
-          }}
-          renderItem={({ item }) => {
-            const status = statusMeta(item.status);
-            const ready = status.kind === "ready";
-            const failed = status.kind === "failed";
-            const deleting = deletingKey === item.audio_s3_key;
-            const source = sourceMeta(item);
-            const duration = fmtDuration(item.duration);
-            // Danger only for a genuinely failed brief; blue for the source
-            // icon otherwise — "ready" gets a quiet success check, not a
-            // loud color, since most rows are ready most of the time.
-            const kickerColor = failed ? C.danger : C.textFaint;
-            return (
-              <Pressable
-                style={({ pressed }) => [
-                  st.brief,
-                  pressed && { opacity: 0.7 },
-                  deleting && { opacity: 0.4 },
-                ]}
-                onPress={() => router.push({ pathname: "/recording/[key]", params: { key: item.audio_s3_key } })}
-                onLongPress={() => confirmDelete(item)}
-                delayLongPress={400}
-                accessibilityHint="Long press to move this brief to Trash"
-              >
-                <View style={st.briefTop}>
-                  <IconCircle
-                    name={failed ? "exclamationmark.triangle.fill" : source.icon}
-                    tint={failed ? C.danger : C.primary}
-                    bg={failed ? C.dangerSoft : C.primarySoft}
-                    size={40}
-                  />
-                  <View style={{ flex: 1 }}>
-                    {/* Kicker line: what kind of conversation, when, how long. */}
-                    <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
-                      <Text style={[st.kicker, { color: kickerColor }]}>
-                        {failed ? "Couldn't finish" : source.label}
-                      </Text>
-                      <Text style={st.briefMeta}>
-                        {fmtWhen(item.created_at)}{duration ? ` · ${duration}` : ""}
-                      </Text>
-                    </View>
-
-                    {/* The headline is what the AI wrote */}
-                    <Text style={st.headline} numberOfLines={3}>
-                      {item.title || "Untitled conversation"}
-                    </Text>
-                  </View>
-                  {ready ? (
-                    <Icon name="checkmark.circle.fill" tintColor={C.success} size={18} />
-                  ) : null}
-                </View>
-
-                {ready ? (
-                  <>
-                    {item.summary ? (
-                      <Text style={st.summary} numberOfLines={3}>{item.summary}</Text>
-                    ) : null}
-                    {/* The list endpoint returns no participant data — that
-                        only comes back on the detail fetch — so speaker
-                        avatars live on the brief screen, not here. */}
-                    <View style={st.metaRow}>
-                      {item.language ? (
-                        <Text style={{ ...T.caption }}>{item.language.toUpperCase()}</Text>
-                      ) : null}
-                      <View style={{ flex: 1, alignItems: "flex-end" }}>
-                        <Waveform seed={item.audio_s3_key} bars={28} height={16}
-                          color={C.border} dimColor={C.border} />
-                      </View>
-                    </View>
-                  </>
-                ) : failed ? (
-                  <>
-                    <Text style={st.summary} numberOfLines={2}>
-                      We stopped rather than guess. Open it to see why.
-                    </Text>
-                    {/* Visible on failed rows only. Long-press covers every
-                        brief, but it is invisible until someone discovers
-                        it — and a desk full of failures is exactly when a
-                        user needs the way out to be obvious. */}
-                    <Pressable
-                      onPress={() => confirmDelete(item)}
-                      disabled={deleting}
-                      hitSlop={8}
-                      accessibilityLabel="Move this brief to Trash"
-                      style={({ pressed }) => [
-                        { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 12 },
-                        pressed && { opacity: 0.6 },
-                      ]}
-                    >
-                      <Icon name="trash" tintColor={C.danger} size={14} />
-                      <Text style={{ fontFamily: FONT.bold, fontSize: 12.5, color: C.danger }}>
-                        {deleting ? "Moving…" : "Move to Trash"}
-                      </Text>
-                    </Pressable>
-                  </>
-                ) : (
-                  // Still being written — show the pipeline, not a summary.
-                  <View style={st.progressRow}>
-                    <View style={st.progressTrack}><View style={st.progressFill} /></View>
-                    <Text style={st.progressTxt}>{status.label}…</Text>
-                  </View>
+      <SectionList
+        sections={sections}
+        keyExtractor={(i) => i.audio_s3_key}
+        showsVerticalScrollIndicator={false}
+        // Date headers stick within the list, so the day you are reading
+        // stays labelled until the next one arrives.
+        stickySectionHeadersEnabled
+        // Drives the workspace collapse only. 64ms keeps the swap attached to
+        // the gesture without re-rendering on every frame — and since
+        // `collapsed` is a boolean behind a dead band, most of these events
+        // change no state at all.
+        onScroll={onScroll}
+        scrollEventThrottle={64}
+        ListHeaderComponent={dashboard}
+        // paddingBottom clears the absolutely-positioned tab bar and the
+        // floating record button, exactly as before.
+        contentContainerStyle={{ paddingTop: S.lg, paddingBottom: 100 }}
+        refreshControl={
+          <RefreshControl refreshing={refreshing}
+            onRefresh={() => { setRefreshing(true); load(); }} tintColor={C.primary} />
+        }
+        ListEmptyComponent={
+          loading ? (
+            <View style={st.listState}>
+              <SkeletonCard />
+              <SkeletonCard />
+              <SkeletonCard />
+            </View>
+          ) : error ? (
+            <View style={st.listState}>
+              <ErrorText>{error}</ErrorText>
+              <Button label="Try again" variant="secondary" onPress={() => { setLoading(true); load(); }}
+                style={{ marginTop: S.md, alignSelf: "flex-start", paddingHorizontal: S.xl }} />
+            </View>
+          ) : (
+            <View style={st.listState}>
+              <EmptyState
+                title={filtering ? "Nothing matches that" : "Nothing on MinuteX yet"}
+                subtitle={filtering
+                  ? "Try a different search or filter."
+                  : "Record your next conversation and the first brief lands here in a couple of minutes."}
+                action={filtering ? undefined : (
+                  <Button label="Start recording" onPress={() => router.push("/new-recording")} />
                 )}
-              </Pressable>
-            );
-          }}
-        />
-      )}
+              />
+            </View>
+          )
+        }
+        renderSectionHeader={({ section }) => {
+          const s = section as Section;
+          return (
+            <View style={st.sectionHead}>
+              <Text style={T.label}>{s.title}</Text>
+              <Text style={{ ...T.caption }}>
+                {s.data.length} brief{s.data.length === 1 ? "" : "s"}
+              </Text>
+            </View>
+          );
+        }}
+        renderItem={({ item }) => {
+          const status = statusMeta(item.status);
+          const ready = status.kind === "ready";
+          const failed = status.kind === "failed";
+          const deleting = deletingKey === item.audio_s3_key;
+          const source = sourceMeta(item);
+          const duration = fmtDuration(item.duration);
+          // Danger only for a genuinely failed brief; blue for the source
+          // icon otherwise — "ready" gets a quiet success check, not a
+          // loud color, since most rows are ready most of the time.
+          const kickerColor = failed ? C.danger : C.textFaint;
+          return (
+            <Pressable
+              style={({ pressed }) => [
+                st.brief,
+                pressed && { opacity: 0.7 },
+                deleting && { opacity: 0.4 },
+              ]}
+              onPress={() => router.push({ pathname: "/recording/[key]", params: { key: item.audio_s3_key } })}
+              onLongPress={() => confirmDelete(item)}
+              delayLongPress={400}
+              accessibilityHint="Long press to move this brief to Trash"
+            >
+              <View style={st.briefTop}>
+                <IconCircle
+                  name={failed ? "exclamationmark.triangle.fill" : source.icon}
+                  tint={failed ? C.danger : C.primary}
+                  bg={failed ? C.dangerSoft : C.primarySoft}
+                  size={40}
+                />
+                <View style={{ flex: 1 }}>
+                  {/* Kicker line: what kind of conversation, when, how long. */}
+                  <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
+                    <Text style={[st.kicker, { color: kickerColor }]}>
+                      {failed ? "Couldn't finish" : source.label}
+                    </Text>
+                    <Text style={st.briefMeta}>
+                      {fmtWhen(item.created_at)}{duration ? ` · ${duration}` : ""}
+                    </Text>
+                  </View>
+
+                  {/* The headline is what the AI wrote */}
+                  <Text style={st.headline} numberOfLines={3}>
+                    {item.title || "Untitled conversation"}
+                  </Text>
+                </View>
+                {ready ? (
+                  <Icon name="checkmark.circle.fill" tintColor={C.success} size={18} />
+                ) : null}
+              </View>
+
+              {ready ? (
+                <>
+                  {item.summary ? (
+                    <Text style={st.summary} numberOfLines={3}>{item.summary}</Text>
+                  ) : null}
+                  {/* The list endpoint returns no participant data — that
+                      only comes back on the detail fetch — so speaker
+                      avatars live on the brief screen, not here. */}
+                  <View style={st.metaRow}>
+                    {item.language ? (
+                      <Text style={{ ...T.caption }}>{item.language.toUpperCase()}</Text>
+                    ) : null}
+                    <View style={{ flex: 1, alignItems: "flex-end" }}>
+                      <Waveform seed={item.audio_s3_key} bars={28} height={16}
+                        color={C.border} dimColor={C.border} />
+                    </View>
+                  </View>
+                </>
+              ) : failed ? (
+                <>
+                  <Text style={st.summary} numberOfLines={2}>
+                    We stopped rather than guess. Open it to see why.
+                  </Text>
+                  {/* Visible on failed rows only. Long-press covers every
+                      brief, but it is invisible until someone discovers
+                      it — and a desk full of failures is exactly when a
+                      user needs the way out to be obvious. */}
+                  <Pressable
+                    onPress={() => confirmDelete(item)}
+                    disabled={deleting}
+                    hitSlop={8}
+                    accessibilityLabel="Move this brief to Trash"
+                    style={({ pressed }) => [
+                      { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 12 },
+                      pressed && { opacity: 0.6 },
+                    ]}
+                  >
+                    <Icon name="trash" tintColor={C.danger} size={14} />
+                    <Text style={{ fontFamily: FONT.bold, fontSize: 12.5, color: C.danger }}>
+                      {deleting ? "Moving…" : "Move to Trash"}
+                    </Text>
+                  </Pressable>
+                </>
+              ) : (
+                // Still being written — show the pipeline, not a summary.
+                <View style={st.progressRow}>
+                  <View style={st.progressTrack}><View style={st.progressFill} /></View>
+                  <Text style={st.progressTxt}>{status.label}…</Text>
+                </View>
+              )}
+            </Pressable>
+          );
+        }}
+      />
     </View>
   );
 }

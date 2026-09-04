@@ -316,16 +316,45 @@ class TestSpokenDates(unittest.TestCase):
                 self.assertEqual(self.r(phrase)[0], expected)
 
     def test_explicit_dates_are_exact(self):
+        # Meeting is 25 Aug 2026. A bare month+day anchors FORWARD, the same
+        # way a bare weekday does above: March is long past by August, so a
+        # deadline of "15th March" is next March. An explicitly spoken year
+        # is always taken at its word.
         for phrase, expected in [
-            ("15th March", "2026-03-15"),
-            ("March 15", "2026-03-15"),
+            ("15th March", "2027-03-15"),
+            ("March 15", "2027-03-15"),
             ("2026-03-15", "2026-03-15"),
             ("15 March 2027", "2027-03-15"),
+            ("15th December", "2026-12-15"),   # still ahead — this year
         ]:
             with self.subTest(phrase=phrase):
                 key, conf = self.r(phrase)
                 self.assertEqual(key, expected)
                 self.assertEqual(conf, "exact")
+
+    def test_month_day_rolls_into_next_year_rather_than_the_past(self):
+        """A December meeting agreeing "5th January" means the January three
+        weeks out, not the one eleven months gone.
+
+        Defaulting the year to the anchor's produced a deadline in the PAST
+        stamped "exact" — the highest confidence — so the task was overdue the
+        moment it was created and could fire an overdue notification for work
+        nobody had started. The near past is deliberately left alone: "the
+        15th" said on the 17th is a deadline just missed, not one 11.5 months
+        away.
+        """
+        dec = date(2026, 12, 20)
+        self.assertEqual(
+            spoken_dates.resolve_spoken_date("5th January", dec)[0],
+            "2027-01-05")
+        # Just-missed stays in the anchor's year.
+        self.assertEqual(
+            spoken_dates.resolve_spoken_date("15th December", dec)[0],
+            "2026-12-15")
+        # An explicit year is never second-guessed, even into the past.
+        self.assertEqual(
+            spoken_dates.resolve_spoken_date("5th January 2026", dec)[0],
+            "2026-01-05")
 
     def test_end_of_week_and_month(self):
         self.assertEqual(self.r("end of the week")[0], "2026-08-28")

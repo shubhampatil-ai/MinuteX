@@ -295,6 +295,199 @@ class CoercionIntegrationTests(unittest.TestCase):
         self.assertEqual(section["items"], ["Contract signed", "Rollout in Q3"])
 
 
+class CitationMarkerTests(unittest.TestCase):
+    """THE SECOND LEAK — the markers seen in AI Chat, which carry no seg_N.
+
+    Every string in `test_the_exact_markers_from_the_screenshot` is taken from
+    a real AI Chat reply. None of them contains the substring "seg_", which is
+    exactly why they shipped: strip_segment_ids() returns early unless it sees
+    one, so the whole sanitizer was a no-op on this format.
+    """
+
+    def test_the_exact_markers_from_the_screenshot(self):
+        """The reported strings, verbatim. 【】 / 【-6】 / 【-32】 / 【-94】."""
+        cases = [
+            (u"Harshal Sir said the Google integration uses an external ID "
+             u"(the Google record ID) for each account \u3010\u3011 .",
+             u"external ID"),
+            (u"Every account is assigned a unique ID; this applies to both "
+             u"manager accounts and sub-accounts \u3010\u3011 .",
+             u"sub-accounts"),
+            (u"In the Google case the unique ID is specifically the Google "
+             u"customer ID \u3010\u3011 \u3010\u3011 .",
+             u"customer ID"),
+            (u"How a project's launch inventory is set (e.g., 100 flats "
+             u"total, 20 flats for a Ganpati festival launch) \u3010-6\u3011",
+             u"Ganpati festival launch"),
+            (u"Budget sizing and cost-per-lead calculations (15k, 20k, 30k "
+             u"examples) \u3010-32\u3011",
+             u"cost-per-lead"),
+            (u"Architecture for integrating Google and Facebook accounts, "
+             u"using a manager-sub-account hierarchy \u3010-94\u3011",
+             u"manager-sub-account hierarchy"),
+        ]
+        for text, must_keep in cases:
+            with self.subTest(text=text):
+                out = ai_sanitize.sanitize_ai_user_output(text)
+                self.assertNotIn(u"\u3010", out)
+                self.assertNotIn(u"\u3011", out)
+                self.assertNotIn("[]", out)
+                self.assertNotIn("[-", out)
+                # The SENTENCE has to survive the marker's removal.
+                self.assertIn(must_keep, out)
+
+    def test_ascii_residue_forms(self):
+        """`[]` and `[-N]` reaching us as plain ASCII, not wrapped in 【】."""
+        self.assertEqual(
+            ai_sanitize.sanitize_ai_user_output("Budget was approved []."),
+            "Budget was approved.")
+        self.assertEqual(
+            ai_sanitize.sanitize_ai_user_output("Budget was approved [-6]."),
+            "Budget was approved.")
+        self.assertEqual(
+            ai_sanitize.sanitize_ai_user_output(
+                "Inventory [-6], budget [-32], architecture [-94]."),
+            "Inventory, budget, architecture.")
+        self.assertEqual(
+            ai_sanitize.sanitize_ai_user_output("Spaced out [ -94 ] here."),
+            "Spaced out here.")
+
+    def test_bracketed_segment_id_marker(self):
+        """`[seg_123]` — the form the old rules already covered, re-pinned
+        here so a refactor of either pass cannot drop it."""
+        out = ai_sanitize.sanitize_ai_user_output(
+            "The team agreed a 12% discount [seg_123].")
+        self.assertNotIn("seg_", out)
+        self.assertNotIn("[]", out)
+        self.assertEqual(out, "The team agreed a 12% discount.")
+
+    def test_corner_bracket_wrapping_a_segment_id(self):
+        """Both formats at once: 【seg_12】."""
+        out = ai_sanitize.sanitize_ai_user_output(
+            u"Every account gets a unique ID \u3010seg_12\u3011.")
+        self.assertNotIn("seg_", out)
+        self.assertNotIn(u"\u3010", out)
+        self.assertEqual(out, "Every account gets a unique ID.")
+
+    def test_prose_with_multiple_internal_references(self):
+        """A whole reply, in the shape the screenshot showed: several bullets,
+        each ending in a marker, plus Markdown that must survive."""
+        reply = (
+            u"The meeting was a **Marketing Campaign Integration** "
+            u"discussion covering:\n"
+            u"- How a project's launch inventory is set \u3010-6\u3011\n"
+            u"- Configuration of the enquiry-source picklist "
+            u"(Google, Facebook, Aggregators, etc.) \u3010\u3011\n"
+            u"- Budget sizing and cost-per-lead calculations \u3010-32\u3011\n"
+            u"- Architecture for integrating Google and Facebook \u3010-94\u3011"
+        )
+        out = ai_sanitize.sanitize_ai_user_output(reply)
+        for leaked in (u"\u3010", u"\u3011", "[]", "[-6]", "[-32]", "[-94]"):
+            self.assertNotIn(leaked, out)
+        # Content and Markdown intact.
+        self.assertIn("**Marketing Campaign Integration**", out)
+        self.assertIn("- How a project's launch inventory is set", out)
+        self.assertIn("(Google, Facebook, Aggregators, etc.)", out)
+        self.assertIn("- Budget sizing and cost-per-lead calculations", out)
+        # Four bullets in, four bullets out.
+        self.assertEqual(out.count("\n- "), 4)
+        self.assertEqual(len([l for l in out.split("\n")
+                              if l.startswith("- ")]), 4)
+
+    def test_unclosed_marker_from_a_truncated_reply(self):
+        out = ai_sanitize.sanitize_ai_user_output(u"The budget was cut \u3010")
+        self.assertNotIn(u"\u3010", out)
+        self.assertEqual(out, "The budget was cut")
+
+    def test_other_citation_payloads(self):
+        """The payload is not parsed — the BRACKET is the signal. So the
+        `4:2` and `turn0search1` styles go too."""
+        for text in (u"Agreed \u30104:2\u3011.",
+                     u"Agreed \u3010turn0search1\u3011.",
+                     u"Agreed \u3010source: transcript\u3011."):
+            with self.subTest(text=text):
+                out = ai_sanitize.sanitize_ai_user_output(text)
+                self.assertEqual(out, "Agreed.")
+
+    def test_has_citation_markers_detects_and_does_not_false_positive(self):
+        self.assertTrue(ai_sanitize.has_citation_markers(u"a \u3010-6\u3011"))
+        self.assertTrue(ai_sanitize.has_citation_markers("a []"))
+        self.assertTrue(ai_sanitize.has_citation_markers("a [-32]"))
+        self.assertFalse(ai_sanitize.has_citation_markers("a [2026]"))
+        self.assertFalse(ai_sanitize.has_citation_markers("plain prose"))
+        self.assertFalse(ai_sanitize.has_citation_markers(""))
+
+
+class CitationMarkerSafetyTests(unittest.TestCase):
+    """Requirement 10 — the half that matters more.
+
+    A rule that ate every `[...]` would silently corrupt correct answers, and
+    unlike the marker bug nobody would be able to see that it happened. So the
+    ASCII pass removes ONLY the two shapes that cannot be content: an empty
+    pair, and a negative-only number.
+    """
+
+    def test_legitimate_bracketed_content_survives(self):
+        for text in ("Sources included [Google, Facebook] as channels.",
+                     "The target year is [2026].",
+                     "See the [Launch Configuration] section.",
+                     "Footnote [6] and reference [32] stay.",
+                     "A [note] with [several] bracketed [words].",
+                     "The range is [10-20] units.",
+                     "Markdown link [text](https://example.com) is intact.",
+                     "Array access items[0] and config[key].",
+                     "[Bracketed] at the very start of a line."):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    ai_sanitize.sanitize_ai_user_output(text), text)
+
+    def test_positive_bracketed_numbers_are_content_not_citations(self):
+        """`[6]` is deliberately NOT stripped — a user's own footnote or index
+        looks exactly like that, and the observed defect was NEGATIVE."""
+        self.assertEqual(
+            ai_sanitize.sanitize_ai_user_output("Refer to clause [6] today."),
+            "Refer to clause [6] today.")
+
+    def test_ordinary_reply_still_passes_through_unchanged(self):
+        text = ("The client approved the proposal.\n\n"
+                "- Budget: $8,000\n- Deadline: Friday\n\n"
+                "**Priya** owns the follow-up.")
+        self.assertEqual(ai_sanitize.sanitize_ai_user_output(text), text)
+
+    def test_markdown_formatting_is_not_regressed(self):
+        """Requirement 11 — the `\\*` fix must still work, and must still work
+        ALONGSIDE the new pass."""
+        out = ai_sanitize.sanitize_ai_user_output(
+            u"The \\*budget\\* was approved \u3010-6\u3011 and "
+            u"\\*\\*Priya\\*\\* owns it [].")
+        self.assertEqual(out, "The *budget* was approved and **Priya** owns it.")
+
+    def test_non_markdown_escapes_still_survive_the_new_pass(self):
+        text = r"Path C:\Users\test and regex \d+ stay."
+        self.assertEqual(ai_sanitize.sanitize_ai_user_output(text), text)
+
+
+class CitationMarkerOverviewTests(unittest.TestCase):
+    """The overview boundary gets the new pass too — and STILL keeps its
+    evidence array, which is the whole reason the ids exist."""
+
+    def test_markers_stripped_from_prose_evidence_untouched(self):
+        out = ai_sanitize.sanitize_overview({"sections": [{
+            "title": u"Pricing \u3010-6\u3011",
+            "content": u"The team agreed a 12% discount \u3010-32\u3011.",
+            "items": [u"Contract signed []", u"Rollout in Q3 \u3010-94\u3011"],
+            "evidence_segment_ids": ["seg_1", "seg_2"],
+        }]})
+        section = out["sections"][0]
+        self.assertEqual(section["title"], "Pricing")
+        self.assertEqual(section["content"],
+                         "The team agreed a 12% discount.")
+        self.assertEqual(section["items"],
+                         ["Contract signed", "Rollout in Q3"])
+        # THE POINT: the structured evidence is NOT sanitized.
+        self.assertEqual(section["evidence_segment_ids"], ["seg_1", "seg_2"])
+
+
 class PromptRuleTests(unittest.TestCase):
     """The prompts are the PRIMARY fix — the sanitizer is the backstop.
 
@@ -322,6 +515,29 @@ class PromptRuleTests(unittest.TestCase):
                          self.prompts.ASSISTANT_TASK_RULES)
         self.assertIn("must NOT write one into your reply",
                       self.prompts.ASSISTANT_TASK_RULES)
+
+    def test_chat_prompts_forbid_citation_markers(self):
+        """The SECOND leak's primary fix. The 【】 markers were never named in
+        any prompt, so nothing told the model not to emit them."""
+        for name in ("CHAT_SYSTEM", "GROUNDED_CHAT_RULES",
+                     "ASSISTANT_SYSTEM"):
+            with self.subTest(prompt=name):
+                text = getattr(self.prompts, name)
+                self.assertIn("citation markers", text)
+                # The exact glyphs, so the model sees what it must not write.
+                self.assertIn(u"\u3010", text)
+                self.assertIn(u"\u3011", text)
+                self.assertIn("[-6]", text)
+
+    def test_grounded_rules_separate_evidence_from_prose(self):
+        """Requirement 8: the SOURCES line is the ONLY citation channel, and
+        the prompt now says so rather than leaving it implied."""
+        text = self.prompts.GROUNDED_CHAT_RULES
+        self.assertIn("MACHINE-READABLE", text)
+        self.assertIn("NOWHERE else", text)
+        # The SOURCES contract itself must survive — the structured `sources`
+        # array is built from it.
+        self.assertIn("SOURCES:", text)
 
     def test_overview_prompt_confines_ids_to_the_evidence_field(self):
         system = self.prompts.unified_analysis_system()

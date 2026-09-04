@@ -44,6 +44,11 @@ NONE = "none"
 
 UNPLACEABLE = ("", NONE)
 
+# How far into the past a spoken month+day with NO year may land before it is
+# read as next year's date instead. See _month_day_key: "the 15th" said on the
+# 17th is a date just missed; "5th January" said in December is next January.
+ROLLOVER_SLACK_DAYS = 90
+
 MONTHS = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
     "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
@@ -90,6 +95,37 @@ def _day_key(y, m, d):
         return ""
 
 
+def _month_day_key(anchor, month, day, spoken_year):
+    """YYYY-MM-DD for a spoken month+day, rolling into next year when needed.
+
+    When the speaker states the year ("5th January 2027") that year is used
+    verbatim — they said it, so there is nothing to infer.
+
+    With NO year spoken, the year is the anchor's, EXCEPT when that lands the
+    date well before the meeting. A deadline agreed in a meeting is essentially
+    always in that meeting's future, so a December meeting saying "5th January"
+    means the January that is three weeks away, not the one eleven months gone.
+    Defaulting to the anchor's year there produced a date in the past, stamped
+    EXACT (the highest confidence), which made the task overdue the moment it
+    was created and could fire an overdue notification for work not yet begun.
+
+    The rollover is deliberately NOT applied to a date merely a few days past:
+    a meeting that ends by agreeing a deadline of "the 15th" when it is the
+    17th is far more likely to be discussing something just missed than
+    something 11.5 months out. ROLLOVER_SLACK_DAYS marks that boundary — near
+    past means this year, deep past means next.
+    """
+    if spoken_year:
+        return _day_key(int(spoken_year), month, day)
+    key = _day_key(anchor.year, month, day)
+    if not key:
+        # Feb 29 in a non-leap anchor year is still a real date next year.
+        return _day_key(anchor.year + 1, month, day)
+    if (anchor - date.fromisoformat(key)).days > ROLLOVER_SLACK_DAYS:
+        return _day_key(anchor.year + 1, month, day) or key
+    return key
+
+
 def _start_of_week(anchor):
     """Monday of the week containing `anchor`."""
     return anchor - timedelta(days=anchor.weekday())
@@ -118,15 +154,15 @@ def resolve_spoken_date(when, anchor):
 
     dm = _DAY_MONTH.search(raw)
     if dm and dm.group(2) in MONTHS:
-        year = int(dm.group(3)) if dm.group(3) else anchor.year
-        key = _day_key(year, MONTHS[dm.group(2)], int(dm.group(1)))
+        key = _month_day_key(anchor, MONTHS[dm.group(2)], int(dm.group(1)),
+                             dm.group(3))
         if key:
             return (key, EXACT)
 
     md = _MONTH_DAY.search(raw)
     if md and md.group(1) in MONTHS:
-        year = int(md.group(3)) if md.group(3) else anchor.year
-        key = _day_key(year, MONTHS[md.group(1)], int(md.group(2)))
+        key = _month_day_key(anchor, MONTHS[md.group(1)], int(md.group(2)),
+                             md.group(3))
         if key:
             return (key, EXACT)
 

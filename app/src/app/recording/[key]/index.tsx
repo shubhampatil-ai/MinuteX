@@ -138,13 +138,30 @@ function buildStyles(C: ColorScale) {
 // slow would spend money re-doing work that was about to succeed.
 const LIKELY_STUCK_AFTER_MS = 15 * 60 * 1000;
 
+// Statuses the backend will actually replay — REPROCESSABLE_STATUSES in
+// cloud/functions/userapi/lambda_function.py. "uploading"/"uploaded" are
+// excluded there because the S3 trigger may still be about to fire for them,
+// so POST /recordings/ai/reprocess answers 409 for those two.
+//
+// The button is gated on this list because offering an action the server
+// always refuses is worse than offering none: a recording whose bytes never
+// landed sat at "Uploading" forever, showed the stalled banner, and every
+// press of "Start over" returned a 409 the user could do nothing about. They
+// still see the honest "this has stalled" copy — it just no longer promises a
+// recovery that does not exist for that state. Trash remains the way out.
+const REPROCESSABLE_STATUSES = new Set([
+  "failed", "transcribed", "transcribing", "generating_ai",
+]);
+
 function StillWriting({
-  st, C, stage, stuck, retrying, onRetry, retryNote,
+  st, C, stage, stuck, canRetry, retrying, onRetry, retryNote,
 }: {
   st: ReturnType<typeof buildStyles>;
   C: ColorScale;
   stage: number;
   stuck: boolean;
+  /** Whether the backend will accept a reprocess for this status. */
+  canRetry: boolean;
   retrying: boolean;
   onRetry: () => void;
   retryNote: string;
@@ -172,10 +189,12 @@ function StillWriting({
       </View>
       <Text style={{ fontFamily: FONT.regular, fontSize: 13.5, color: C.textDim, marginTop: 14 }}>
         {stuck
-          ? "This is taking much longer than usual. It may have stalled — you can start it over."
+          ? canRetry
+            ? "This is taking much longer than usual. It may have stalled — you can start it over."
+            : "This is taking much longer than usual. The audio may not have finished uploading — you can remove this recording and record again."
           : "Usually done in about two minutes. You can leave — it'll be here when it's ready."}
       </Text>
-      {stuck ? (
+      {stuck && canRetry ? (
         <>
           <Button
             label="Start over"
@@ -675,6 +694,7 @@ export default function MeetingDetailScreen() {
             <StillWriting
               st={st} C={C} stage={stage}
               stuck={likelyStuck}
+              canRetry={REPROCESSABLE_STATUSES.has(String(rec.status ?? ""))}
               retrying={retrying}
               onRetry={retryProcessing}
               retryNote={retryNote}

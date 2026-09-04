@@ -210,10 +210,16 @@ export default function TrashScreen() {
             />
           }
           ListEmptyComponent={
-            <EmptyState
-              title="Trash is empty"
-              subtitle="Briefs you delete land here, and can be restored until you remove them for good."
-            />
+            // Suppressed while an error is showing: a load that FAILED tells
+            // us nothing about whether Trash is empty, and rendering both
+            // "Could not load Trash" and "Trash is empty" together stated a
+            // fact we do not have and contradicted the retry sitting above it.
+            error ? null : (
+              <EmptyState
+                title="Trash is empty"
+                subtitle="Briefs you delete land here, and can be restored until you remove them for good."
+              />
+            )
           }
           renderItem={({ item }) => {
             const failed = statusMeta(item.status).kind === "failed";

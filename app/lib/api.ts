@@ -1087,6 +1087,14 @@ export async function requestUpload(params: {
   // cannot leave it unfiled. A folder the caller does not own fails the whole
   // request (404) rather than yielding an unfiled recording.
   folder_id?: string;
+  // RE-PRESIGN an upload already under way. A presigned PUT expires, so a
+  // large file on a slow link outlives its URL and needs a new one — and
+  // asking for a fresh identity there would create a SECOND timeline row and
+  // strand the first at "uploading" forever. Send the key this session was
+  // already given and the backend re-signs THAT key instead of minting one.
+  // Honoured only for the caller's own row that is still "uploading"; a stale
+  // or foreign key is ignored and a new recording is issued.
+  key?: string;
 }): Promise<UploadTicket> {
   return request<UploadTicket>("/recordings/upload-request", {
     method: "POST",
@@ -1224,7 +1232,25 @@ export function isNotReady(e: unknown): boolean {
 export async function getMeetingHighlights(
   key: string,
   regenerate = false
-): Promise<{ meeting_highlights: MeetingHighlights; cached: boolean }> {
+): Promise<{
+  meeting_highlights: MeetingHighlights;
+  cached: boolean;
+  /** How much of the meeting the model actually saw. A long transcript is
+   * truncated to fit API Gateway's 29s window, so these two can differ —
+   * `segments_covered < segments_total` means the highlights describe the
+   * START of a longer meeting, not all of it.
+   *
+   * The backend has always computed and returned these (and its tests pin
+   * both the complete and truncated cases), but they were omitted from this
+   * return type, so the honesty signal was dropped at the client boundary and
+   * no screen could read it. Typed here so a caller CAN surface it; nothing
+   * renders it yet — see the audit's open items.
+   *
+   * Optional because a cached response predating this may omit them; treat a
+   * missing value as "coverage unknown", never as "fully covered". */
+  segments_covered?: number;
+  segments_total?: number;
+}> {
   return request(aiPath("highlights", key), {
     method: "POST",
     body: { regenerate },
@@ -1533,29 +1559,253 @@ export async function clearAiChat(key: string): Promise<void> {
 // the signed-in account and nothing the client does can change that. Sending
 // an identity here would not widen access; it would just be dead weight.
 // ---------------------------------------------------------------------------
-export type AssistantReply = {
-  reply: string;
-  // Which backend tools answered this turn. Useful for debugging and for a
-  // future "sources" affordance; safe to ignore.
-  tools_used: string[];
+// Where a workspace answer came from. Same `seg_N` identity — and the same
+// deep-link — as ChatSource and a task's ai_evidence_segment_ids, with ONE
+// addition: `meeting_id`. The workspace assistant can cite several meetings in
+// a single answer, so a bare segment id would not say which transcript to
+// open; the per-meeting chat never had that problem because the screen already
+// knew the meeting.
+export type AssistantSource = ChatSource & { meeting_id: string };
+
+/** A task change the AI has DRAFTED. Nothing has been written.
+ *
+ * The backend validated and authorized it (so a proposal the user could not
+ * perform never arrives) and returned the exact patch to send. The app must
+ * show it and get an explicit confirmation before calling applyTaskProposal —
+ * see the Task AI screen. `applied` is always false on arrival; it exists so
+ * the shape cannot be mistaken for a completed mutation. */
+export type TaskProposal = {
+  applied: boolean;
+  requires_user_confirmation: boolean;
+  task: { id: string; title: string };
+  /** The values the change would replace, for rendering "Open → Completed". */
+  current: Partial<Record<"status" | "due_date" | "priority", string>>;
+  proposed: Partial<Record<"status" | "due_date" | "priority", string>>;
+  reason: string;
+  confirm: { method: string; path: string; body: Record<string, string> };
 };
 
+export type AssistantReply = {
+  /** The conversation this turn belongs to. Send it back on the next turn to
+   *  continue; store it to reopen the conversation later.
+   *
+   *  EMPTY means the backend could not persist the turn (its `persisted`
+   *  flag said so) — the answer is still valid, but there is nothing to
+   *  resume, so a client must not send "" as a session_id. */
+  session_id: string;
+  reply: string;
+  // Which backend tools answered this turn. Useful for debugging and for
+  // showing whether an answer was grounded in a transcript.
+  tools_used: string[];
+  /** Transcript evidence the backend actually retrieved. Empty for answers
+   *  that came from task rows alone, which is the ordinary case. */
+  sources: AssistantSource[];
+  /** Task changes awaiting the user's confirmation. Usually empty. */
+  proposals: TaskProposal[];
+  /** False only when the answer succeeded but storing it did not. The turn
+   *  is real and shown; it just will not be there when the user comes back. */
+  persisted: boolean;
+};
+
+/** Send one turn.
+ *
+ * `sessionId` continues an existing conversation; omitting it starts a new
+ * one and the reply carries the new id. `history` is still accepted by the
+ * backend as a fallback for a client with no session, but once a session
+ * exists the SERVER's stored copy is authoritative — so this does not send
+ * history when a session is named, which would be redundant bytes the
+ * backend ignores anyway.
+ */
 export async function sendAIMessage(
   message: string,
+  sessionId?: string,
   history?: ChatTurn[]
 ): Promise<AssistantReply> {
-  const res = await request<{ reply?: string; tools_used?: string[] }>("/ai/chat", {
-    method: "POST",
-    body: history?.length ? { message, history } : { message },
+  const body: Record<string, unknown> = { message };
+  if (sessionId) body.session_id = sessionId;
+  else if (history?.length) body.history = history;
+
+  const res = await request<{
+    session_id?: string;
+    reply?: string;
+    tools_used?: string[];
+    sources?: AssistantSource[];
+    proposals?: TaskProposal[];
+    persisted?: boolean;
+  }>("/ai/chat", { method: "POST", body });
+  // Every added key is defaulted: an older backend sends none of them, and
+  // most answers legitimately have no sources and no proposals. Defaulting
+  // here means no caller has to tell those cases apart.
+  return {
+    session_id: res.session_id ?? "",
+    reply: res.reply ?? "",
+    tools_used: res.tools_used ?? [],
+    sources: res.sources ?? [],
+    proposals: res.proposals ?? [],
+    // Absent means "persisted" — the backend only sends the flag on failure,
+    // and an older backend that never persisted anything is handled by
+    // session_id being empty rather than by this flag.
+    persisted: res.persisted ?? true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Workspace chat sessions — persistent, resumable conversations.
+//
+// SEPARATE from the meeting chat's history (getAiChat / clearAiChat above),
+// which lives on the recording row and is scoped to one meeting. These are
+// workspace-wide conversations about tasks, and the backend is the source of
+// truth for them — the screen holds no authoritative copy.
+// ---------------------------------------------------------------------------
+
+/** A conversation in the session list. Deliberately lightweight — no turns.
+ *  Fetch one session to get its messages. */
+export type ChatSessionSummary = {
+  session_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+  last_message_preview: string;
+};
+
+/** One persisted turn. Only role/content/at are stored server-side: no tool
+ *  arguments, no sources, no proposals — a stale proposal replayed from
+ *  history would be an offer the user may no longer be allowed to accept. */
+export type ChatSessionTurn = {
+  role: "user" | "assistant";
+  content: string;
+  at?: string;
+};
+
+export type ChatSessionDetail = ChatSessionSummary & {
+  /** Chronological, oldest first — the order the screen renders. */
+  turns: ChatSessionTurn[];
+};
+
+/** The caller's conversations, most recently updated first. Paged: the
+ *  backend caps `limit`, so this never returns an entire history. */
+export async function listChatSessions(
+  limit?: number
+): Promise<{ sessions: ChatSessionSummary[]; next_cursor: string }> {
+  const qs = limit ? `?limit=${encodeURIComponent(String(limit))}` : "";
+  const res = await request<{
+    sessions?: ChatSessionSummary[];
+    next_cursor?: string;
+  }>(`/ai/chat/sessions${qs}`);
+  return { sessions: res.sessions ?? [], next_cursor: res.next_cursor ?? "" };
+}
+
+/** One conversation with its turns. 404s for a session the caller does not
+ *  own — which is indistinguishable from one that never existed. */
+export async function getChatSession(
+  sessionId: string
+): Promise<ChatSessionDetail> {
+  const res = await request<{ session?: ChatSessionDetail }>(
+    `/ai/chat/sessions/${encodeURIComponent(sessionId)}`
+  );
+  const s = res.session;
+  return {
+    session_id: s?.session_id ?? "",
+    title: s?.title ?? "",
+    created_at: s?.created_at ?? "",
+    updated_at: s?.updated_at ?? "",
+    message_count: s?.message_count ?? 0,
+    last_message_preview: s?.last_message_preview ?? "",
+    turns: s?.turns ?? [],
+  };
+}
+
+/** Permanently delete a conversation. Hard delete, matching the rest of the
+ *  app's delete routes — the whole conversation is one row, so nothing is
+ *  left orphaned. */
+export async function deleteChatSession(sessionId: string): Promise<void> {
+  await request(`/ai/chat/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
   });
-  return { reply: res.reply ?? "", tools_used: res.tools_used ?? [] };
+}
+
+/** Apply a confirmed proposal through the EXISTING authorized task route.
+ *
+ * Deliberately routed through patchTaskById rather than through a new
+ * AI-specific mutation endpoint: the permission rules, the notification side
+ * effects and the response shape are already correct there, and a second
+ * write path would be a second place for them to be wrong. The AI's only
+ * contribution by this point is the contents of `confirm.body`, which the
+ * backend built and validated.
+ */
+export async function applyTaskProposal(p: TaskProposal): Promise<ApiTask> {
+  return patchTaskById(p.task.id, p.confirm.body as TaskPatch);
 }
 
 // Starter prompts, served by the backend so the catalogue lives in one place
 // rather than being hardcoded in the app (same reason getAiChat returns its).
-export async function getAISuggestions(): Promise<string[]> {
-  const res = await request<{ suggestions?: string[] }>("/ai/suggestions");
+//
+// `taskId` asks for the per-task catalogue instead of the workspace one. It
+// is a scope hint, not a permission: the backend returns literal strings and
+// authorizes nothing here, because there is nothing of the user's data in a
+// suggestion.
+export async function getAISuggestions(taskId?: string): Promise<string[]> {
+  const res = await request<{ suggestions?: string[] }>(
+    taskId ? `/ai/suggestions?task_id=${encodeURIComponent(taskId)}` : "/ai/suggestions"
+  );
   return res.suggestions ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Task intelligence — the dashboard's STRUCTURED AI.
+//
+// Distinct from sendAIMessage: that returns prose for a conversation, this
+// returns rows keyed by task id for fixed dashboard sections.
+//
+// WHAT THIS IS NOT: a source of task state. A row carries a judgement
+// (kind/reason/recommendation) and a task id, and nothing else — no status, no
+// assignee, no deadline. The app merges these onto the tasks it already loaded
+// from getAllTasks, which stays authoritative. So a stale or wrong
+// recommendation can mislabel a card but can never make the dashboard display
+// a task value that isn't real.
+// ---------------------------------------------------------------------------
+export type TaskIntelKind =
+  | "needs_attention"
+  | "priority"
+  | "overdue_risk"
+  | "stale"
+  | "duplicate";
+
+export type TaskIntelRow = {
+  task_id: string;
+  kind: TaskIntelKind;
+  reason: string;
+  recommendation: string;
+  /** Transcript segments backing the judgement. Usually empty — most of these
+   *  come from the task rows themselves and need no citation. */
+  evidence_segment_ids: string[];
+  /** Only on kind === "duplicate": the other task. Server-checked to be a real
+   *  task in the same request, so it is always safe to link to. */
+  related_task_id?: string;
+};
+
+export type TaskIntelligence = {
+  summary: string;
+  rows: TaskIntelRow[];
+  /** How many tasks were actually analysed. */
+  analyzed: number;
+  /** True when the user has more open tasks than were analysed — the UI must
+   *  not present a partial analysis as a complete one. */
+  partial: boolean;
+};
+
+export async function getTaskIntelligence(): Promise<TaskIntelligence> {
+  const res = await request<Partial<TaskIntelligence>>("/ai/task-intelligence", {
+    method: "POST",
+    body: {},
+  });
+  return {
+    summary: res.summary ?? "",
+    rows: res.rows ?? [],
+    analyzed: res.analyzed ?? 0,
+    partial: res.partial ?? false,
+  };
 }
 
 // ---------------------------------------------------------------------------

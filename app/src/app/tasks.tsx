@@ -16,9 +16,24 @@
 //     confirmed person — see TaskCard in lib/task-action-center.tsx. Resolve
 //     still goes to /task/[id], which owns the candidate flow.
 //   * TRUTHFUL CAPABILITIES. Nothing here claims a backend that does not
-//     exist. The AI chips run a local action and say so; Reassign opens the
-//     real resolution screen; Snooze is a real PATCH of due_date; the
-//     completion checkbox is a real PATCH of status.
+//     exist. The AI chips open the real assistant (POST /ai/chat, answered by
+//     the backend's task tools) with the question the chip names; Reassign
+//     opens the real resolution screen; Snooze is a real PATCH of due_date;
+//     the completion checkbox is a real PATCH of status.
+//
+// AI ON THIS SCREEN, and where the line sits. Two surfaces, deliberately
+// different:
+//
+//   * The AI card is a LAUNCHER. It sends a question to /assistant and gets
+//     out of the way; no answer is rendered inline, because a chat thread
+//     inside a FlatList header fights the list for scroll and re-measures it
+//     on every token.
+//   * The AI intelligence sections are RECOMMENDATIONS keyed by task id
+//     (POST /ai/task-intelligence). They are merged onto tasks this screen
+//     already loaded and are labelled as suggestions — the task's own values
+//     still come from the Tasks API, which stays authoritative. An AI row can
+//     therefore mislabel a card but can never make it display a value that
+//     is not real.
 //
 // WHAT IS COMPUTED VS FETCHED. The health cards, weekly progress, deadlines
 // and meeting insight are all derived in lib/task-insights.ts from the tasks
@@ -36,15 +51,16 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { S, useTheme, ColorScale } from "../../lib/theme";
 import { Button, EmptyState, ErrorText } from "../../lib/ui";
 import {
-  ApiError, ApiFolder, ApiTask, RecordingSummary, TaskFilters, getAllTasks,
-  getFolders, getMe, getRecordings, patchTaskById,
+  ApiError, ApiFolder, ApiTask, RecordingSummary, TaskFilters, TaskIntelRow,
+  getAllTasks, getFolders, getMe, getRecordings, getTaskIntelligence,
+  isRetryable, patchTaskById,
 } from "../../lib/api";
 import {
-  ActionCenterSkeleton, AIPromptKey, AttentionFilters, HealthKey,
+  ActionCenterSkeleton, AttentionFilters, HealthKey,
   MeetingTaskInsight,
   MinuteXAIActionCard, QuickAddTaskButton, SectionHeader, ShowMoreRow, TaskCard,
-  TaskHeader, TaskHealthCards, TaskSearchBar, UpcomingDeadlines,
-  WeeklyProgressCard,
+  TaskHeader, TaskHealthCards, TaskIntelSections, TaskSearchBar,
+  UpcomingDeadlines, WeeklyProgressCard,
 } from "../../lib/task-action-center";
 import { SwipeableRow } from "../../lib/swipeable-row";
 import { QuickAddTaskSheet } from "../../lib/quick-add-task-sheet";
@@ -204,8 +220,19 @@ export default function TasksScreen() {
   const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
   const [me, setMe] = useState<{ name: string; avatar_url: string } | null>(null);
   const [myUserId, setMyUserId] = useState("");
-  const [aiNote, setAiNote] = useState("");
   const [quickAdd, setQuickAdd] = useState(false);
+  // AI recommendations, keyed by task id. Loaded on demand rather than on
+  // mount: it costs a Groq call, and a dashboard that spends one on every
+  // visit would be both slow and expensive for a user who only wanted to
+  // tick something off.
+  const [intel, setIntel] = useState<TaskIntelRow[]>([]);
+  const [intelSummary, setIntelSummary] = useState("");
+  const [intelState, setIntelState] =
+    useState<"idle" | "loading" | "ready" | "error">("idle");
+  // Why the analysis failed, in the user's words. Distinguishing a missing
+  // endpoint from a busy model is what makes this screen debuggable.
+  const [intelError, setIntelError] = useState("");
+  const [intelPartial, setIntelPartial] = useState(false);
 
   const listRef = useRef<FlatList<ApiTask>>(null);
   // Read by loadMore, which must not re-create itself (and re-arm
@@ -329,6 +356,21 @@ export default function TasksScreen() {
   // Summaries prefer the wider insight read, falling back to the visible page
   // before it arrives so the cards are never blank after the list has painted.
   const summarySource = insightTasks.length ? insightTasks : tasks;
+
+  /** Task id -> the REAL task, for resolving an AI recommendation to a row.
+   *
+   * This is the join that keeps the AI honest. An intelligence row carries a
+   * task id and a judgement, never a task's values — so a card renders its
+   * title, status and deadline from THIS map, i.e. from what the Tasks API
+   * returned. A row whose id is not here is not rendered at all: the backend
+   * already drops ids it did not send to the model, and this drops anything
+   * that survived but which the screen cannot show truthfully.
+   */
+  const tasksById = useMemo(() => {
+    const map = new Map<string, ApiTask>();
+    for (const t of [...summarySource, ...tasks]) map.set(t.id, t);
+    return map;
+  }, [summarySource, tasks]);
 
   const counts = useMemo(
     () =>
@@ -512,37 +554,67 @@ export default function TasksScreen() {
     [router]
   );
 
-  // The AI chips (§4). There is no task-agent endpoint, so each chip performs
-  // the honest LOCAL equivalent and names it. No fabricated reply, no call to
-  // a route that does not exist.
-  const onPrompt = useCallback(
-    (key: AIPromptKey) => {
-      if (key === "prioritize") {
-        setFilter("all");
-        listRef.current?.scrollToOffset({ offset: 0, animated: true });
-        setAiNote(
-          "Sorted by what needs you first: overdue, then due today, then due soon, then tasks still waiting on a name."
-        );
-        return;
-      }
-      if (key === "overdue") {
-        setFilter("overdue");
-        listRef.current?.scrollToOffset({ offset: 0, animated: true });
-        setAiNote(
-          counts.overdue
-            ? `Showing ${counts.overdue} overdue task${counts.overdue === 1 ? "" : "s"}.`
-            : "Nothing is overdue right now."
-        );
-        return;
-      }
-      setAiNote(
-        week.total
-          ? `This week: ${week.completed} of ${week.total} done, ${counts.dueThisWeek} still due, ${counts.overdue} overdue.`
-          : "No tasks are due or completed this week yet."
-      );
+  // The AI chips (§4). Each opens the REAL assistant on the question it
+  // names — `q` is asked automatically so the user lands on the answer
+  // instead of on a composer they have to retype into.
+  //
+  // Navigation rather than an inline answer is a deliberate choice, not a
+  // shortcut: the answer is a conversation the user will want to follow up
+  // on, and a growing thread inside this FlatList's header would re-measure
+  // the list on every render.
+  const askAI = useCallback(
+    (question: string) => {
+      router.push({ pathname: "/assistant", params: { q: question } } as never);
     },
-    [counts, week]
+    [router]
   );
+
+  const openAI = useCallback(() => {
+    router.push({ pathname: "/assistant" } as never);
+  }, [router]);
+
+  /** Load the structured AI recommendations.
+   *
+   * ON DEMAND, and only on demand. This is one Groq call per press, so it is
+   * never part of `load` or of the focus effect — a user who opened the tab to
+   * tick one thing off should not pay for an analysis they did not ask for.
+   *
+   * A failure never touches the dashboard's own numbers, because they were
+   * never derived from this.
+   *
+   * THE MESSAGE IS CARRIED, not swallowed. A bare `catch {}` here is what made
+   * the original failure so hard to diagnose: a 404 from an endpoint that was
+   * never wired into API Gateway rendered exactly like a Groq outage, so
+   * "Could not analyze your tasks" was the only signal either way. The three
+   * causes need different actions from whoever is reading the screen, so they
+   * are told apart.
+   */
+  const loadIntel = useCallback(async () => {
+    setIntelState("loading");
+    setIntelError("");
+    try {
+      const res = await getTaskIntelligence();
+      setIntel(res.rows);
+      setIntelSummary(res.summary);
+      setIntelPartial(res.partial);
+      setIntelState("ready");
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) {
+        // The endpoint is not deployed on this backend. An older app build
+        // against a newer backend cannot happen (the app ships with its
+        // API), so this means the route is missing server-side — say so
+        // rather than implying the user's tasks are the problem.
+        setIntelError("Task analysis isn't available on this server yet.");
+      } else if (isRetryable(e)) {
+        setIntelError("The analysis service is busy. Try again in a moment.");
+      } else {
+        setIntelError(
+          e instanceof ApiError ? e.message : "Could not analyze your tasks."
+        );
+      }
+      setIntelState("error");
+    }
+  }, []);
 
   const onHealthSelect = useCallback((key: HealthKey) => {
     // Overdue and Needs Review both map onto a real filter, so tapping the
@@ -687,7 +759,22 @@ export default function TasksScreen() {
         <ActionCenterSkeleton />
       ) : (
         <>
-          <MinuteXAIActionCard onPrompt={onPrompt} note={aiNote} />
+          <MinuteXAIActionCard onAsk={askAI} onOpen={openAI} />
+
+          {/* AI recommendations, merged onto the tasks already loaded. Sits
+              directly under the AI card so both AI surfaces read as one
+              capability, and ABOVE the health cards so a recommendation never
+              looks like it is explaining a number it did not produce. */}
+          <TaskIntelSections
+            rows={intel}
+            summary={intelSummary}
+            state={intelState}
+            error={intelError}
+            partial={intelPartial}
+            tasksById={tasksById}
+            onAnalyze={loadIntel}
+            onOpenTask={openTask}
+          />
 
           <TaskHealthCards counts={counts} onSelect={onHealthSelect} />
           {counts.partial ? (

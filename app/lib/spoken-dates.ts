@@ -73,6 +73,40 @@ function dayKeyOf(y: number, m: number, d: number): string {
   return validDay(y, m, d) ? `${y}-${pad(m)}-${pad(d)}` : "";
 }
 
+/** How far into the past a spoken month+day with NO year may land before it
+ * is read as next year's date. Mirrors ROLLOVER_SLACK_DAYS in the Python
+ * twin (cloud/shared/spoken_dates.py) — change one, change both. */
+const ROLLOVER_SLACK_DAYS = 90;
+
+/** YYYY-MM-DD for a spoken month+day, rolling into next year when needed.
+ *
+ * A stated year is used verbatim. With no year spoken the anchor's year is
+ * used, EXCEPT when that lands the date well before the meeting: a deadline
+ * agreed in a meeting is essentially always in that meeting's future, so a
+ * December meeting saying "5th January" means the January three weeks out,
+ * not the one eleven months gone. That produced a date in the past stamped
+ * "exact", making the task overdue the moment it was created.
+ *
+ * The near past is deliberately left alone — "the 15th" said on the 17th is
+ * a deadline just missed, not one 11.5 months away. */
+function monthDayKeyOf(
+  anchor: Date,
+  month: number,
+  day: number,
+  spokenYear: string | undefined
+): string {
+  if (spokenYear) return dayKeyOf(+spokenYear, month, day);
+  const y0 = anchor.getFullYear();
+  const key = dayKeyOf(y0, month, day);
+  // Feb 29 in a non-leap anchor year is still a real date next year.
+  if (!key) return dayKeyOf(y0 + 1, month, day);
+  const days = Math.round(
+    (anchor.getTime() - new Date(`${key}T00:00:00Z`).getTime()) / 86400000
+  );
+  if (days > ROLLOVER_SLACK_DAYS) return dayKeyOf(y0 + 1, month, day) || key;
+  return key;
+}
+
 /** Resolve a spoken deadline against the date it was spoken on.
  *
  * `anchor` is the meeting's `recorded_at` — "next Tuesday" means nothing
@@ -91,8 +125,6 @@ export function resolveSpokenDate(
     return UNPLACEABLE;
   }
 
-  const y0 = anchor.getFullYear();
-
   // --- explicit calendar dates ---------------------------------------------
 
   // ISO: 2026-03-15
@@ -107,14 +139,12 @@ export function resolveSpokenDate(
     /\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?([a-z]+)(?:\s+(\d{4}))?\b/
   );
   if (dm && MONTHS[dm[2]]) {
-    const year = dm[3] ? +dm[3] : y0;
-    const key = dayKeyOf(year, MONTHS[dm[2]], +dm[1]);
+    const key = monthDayKeyOf(anchor, MONTHS[dm[2]], +dm[1], dm[3]);
     if (key) return { dayKey: key, confidence: "exact" };
   }
   const md = raw.match(/\b([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?\b/);
   if (md && MONTHS[md[1]]) {
-    const year = md[3] ? +md[3] : y0;
-    const key = dayKeyOf(year, MONTHS[md[1]], +md[2]);
+    const key = monthDayKeyOf(anchor, MONTHS[md[1]], +md[2], md[3]);
     if (key) return { dayKey: key, confidence: "exact" };
   }
 

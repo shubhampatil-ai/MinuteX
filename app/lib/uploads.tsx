@@ -457,12 +457,18 @@ async function driveSession(sessionId: string): Promise<string> {
         // trustworthy source. `input` only matters on the very first attempt,
         // and startUpload has already written it onto the session by then.
         folder_id: s.folderId || input?.folderId || undefined,
+        // The key from an earlier attempt, when this is a re-presign after
+        // expiry. Sending it is what keeps one session to one row — without
+        // it the backend mints a fresh identity and the first row is stranded
+        // at "uploading" forever as a phantom duplicate.
+        key: s.key || undefined,
       });
       // Keep the FIRST key if we already had one: a re-presign after
-      // expiry must not create a second recording. The backend issues a new
-      // URL for the same key when the key is supplied by the client stub, and
-      // if it hands back a different key we adopt it but log the fact, since
-      // that would mean a duplicate row exists server-side.
+      // expiry must not create a second recording. The backend re-signs the
+      // same key when it is supplied above, and if it hands back a different
+      // key we adopt it but log the fact, since that would mean the row was
+      // no longer re-signable (already uploaded, or trashed) and a duplicate
+      // now exists server-side.
       if (s.key && s.key !== ticket.key) {
         recLog("upload.failed", {
           note: "presign returned a different key; possible duplicate row",

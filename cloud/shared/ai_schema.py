@@ -14,6 +14,8 @@ storing, which is a much simpler question than "is this dict safe to index".
 import hashlib
 import re
 
+import ai_sanitize
+
 from decimal import Decimal
 
 # Bumped when a prompt or schema change makes previously stored AI output
@@ -329,10 +331,25 @@ def _overview_section(raw, index, valid_ids=None):
     if not isinstance(raw, dict):
         return None
 
-    title = s(raw.get("title"))[:MAX_OVERVIEW_TITLE_CHARS]
-    content = s(raw.get("content"))[:MAX_OVERVIEW_TEXT_CHARS]
-    items = [i[:MAX_OVERVIEW_ITEM_CHARS]
+    # SANITIZED AT COERCION, not at render. These three fields are the only
+    # ones a user READS, and the model composes them while looking at a
+    # transcript labelled `[seg_N] Speaker: ...` — so an id occasionally lands
+    # in the prose ("as noted in seg_12"). Cleaning here means it never enters
+    # DynamoDB, so an existing row is fixed on its next regeneration rather
+    # than needing every reader to remember to strip it.
+    #
+    # `evidence_segment_ids` below is deliberately NOT sanitized: that is the
+    # field the ids belong in, and the app turns it into a deep-link.
+    title = ai_sanitize.sanitize_ai_user_output(
+        s(raw.get("title")), "overview:title")[:MAX_OVERVIEW_TITLE_CHARS]
+    content = ai_sanitize.sanitize_ai_user_output(
+        s(raw.get("content")), "overview:content")[:MAX_OVERVIEW_TEXT_CHARS]
+    items = [ai_sanitize.sanitize_ai_user_output(i, "overview:item")
+             [:MAX_OVERVIEW_ITEM_CHARS]
              for i in slist(raw.get("items"))][:MAX_OVERVIEW_ITEMS]
+    # An item that was nothing BUT an id is empty now; a blank bullet is worse
+    # than a missing one.
+    items = [i for i in items if i.strip()]
 
     # No title, or nothing to say under it -> not a section. This is the rule
     # that keeps filler out: a model padding to look thorough emits exactly
@@ -1148,3 +1165,138 @@ def merge_unified(partials, roster=None):
     merged["meeting_highlights"] = merge_highlights(
         [p.get("meeting_highlights") or {} for p in dicts])
     return merged
+
+
+# ---------------------------------------------------------------------------
+# TASK INTELLIGENCE — the structured half of the AI Task Dashboard.
+#
+# WHY A SCHEMA AND NOT PROSE. The dashboard renders these as cards keyed by
+# task id, with a tap target per row. Prose cannot be keyed, and a model asked
+# for prose that the client then parses is a parser waiting to break. So the
+# model is asked for JSON and it is coerced here, through the same primitives
+# every other AI output in this file goes through.
+#
+# THE ONE RULE THAT MATTERS MOST: A REASON ABOUT AN UNKNOWN TASK IS NOISE.
+# Every row names a task_id, and `coerce_task_intelligence` is given the set
+# of ids that were actually sent to the model. A row whose id is not in that
+# set is DROPPED, not repaired — a model that invents "task_99" would
+# otherwise produce a card the user can tap and that goes nowhere, which is
+# exactly the failure _evidence_ids exists to prevent for segment references.
+# The same argument, one level up.
+#
+# WHAT IS DELIBERATELY *NOT* HERE: status, assignee, due_date, priority. The
+# model is not asked for them and they are not coerced, so an AI recommendation
+# structurally cannot carry a task's state — the app reads state from the Tasks
+# API and merges by id. That is the schema enforcing spec section 3's "AI
+# recommendations must NOT overwrite task state": there is no field to
+# overwrite it with.
+# ---------------------------------------------------------------------------
+
+# The buckets the dashboard renders. A fixed enum, unlike the Dynamic
+# Overview's free-form sections, because each one is a SECTION OF UI with its
+# own heading and empty state — a model inventing "kind" values would render
+# nowhere.
+TASK_INTEL_KINDS = (
+    "needs_attention",     # important or acting soon
+    "priority",            # do this first
+    "overdue_risk",        # late, or heading that way
+    "stale",               # open, untouched, no progress
+    "duplicate",           # this and another task look like the same work
+)
+
+MAX_INTEL_ROWS = 12
+MAX_INTEL_REASON_CHARS = 300
+MAX_INTEL_RECOMMENDATION_CHARS = 300
+MAX_INTEL_SUMMARY_CHARS = 600
+
+
+def _intel_row(raw, valid_task_ids, valid_ids=None):
+    """One coerced intelligence row, or None when it is unusable.
+
+    Unusable means exactly two things, and both would produce a broken card:
+      * the row names no task, or names a task that was not in the input —
+        see the module note above on why this is dropped rather than kept;
+      * the row says nothing (no reason and no recommendation). A card with a
+        heading and no content reads as an assertion the model never made.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    task_id = s(raw.get("task_id"))
+    if not task_id or task_id not in valid_task_ids:
+        return None
+
+    reason = s(raw.get("reason"))[:MAX_INTEL_REASON_CHARS]
+    recommendation = s(
+        raw.get("recommendation"))[:MAX_INTEL_RECOMMENDATION_CHARS]
+    if not reason and not recommendation:
+        return None
+
+    row = {
+        "task_id": task_id,
+        "kind": clamp(raw.get("kind"), set(TASK_INTEL_KINDS), "needs_attention"),
+        "reason": reason,
+        "recommendation": recommendation,
+        # Evidence is OPTIONAL here in a way it is not for a meeting answer:
+        # most of these judgements come from the task rows themselves (a date
+        # in the past needs no transcript), so a row with no citation is the
+        # normal case rather than a degraded one.
+        "evidence_segment_ids": _evidence_ids(
+            raw.get("evidence_segment_ids"), valid_ids),
+    }
+    # Only present when the model actually names a counterpart, and only when
+    # that counterpart is a REAL task in the input — a duplicate claim
+    # pointing at an invented id is the same broken card as above.
+    related = s(raw.get("related_task_id"))
+    if related and related != task_id and related in valid_task_ids:
+        row["related_task_id"] = related
+    return row
+
+
+def empty_task_intelligence():
+    """Fresh result; never shares mutable lists."""
+    return {"summary": "", "rows": []}
+
+
+def coerce_task_intelligence(obj, valid_task_ids=(), valid_ids=None):
+    """Strict coerce the model's dashboard intelligence.
+
+    `valid_task_ids` is the set of ids that were actually SENT to the model.
+    Passing it is not optional in spirit: with an empty set every row is
+    dropped, which is the safe direction — no cards rather than cards that go
+    nowhere.
+
+    NEVER RAISES, like every other coercer here. A model that answers with a
+    bare list, a string, or nothing comes back as an empty result the caller
+    can simply not render.
+    """
+    out = empty_task_intelligence()
+    if isinstance(obj, list):
+        # A model that skipped the envelope and answered with the rows alone.
+        obj = {"rows": obj}
+    if not isinstance(obj, dict):
+        return out
+
+    allowed = {s(t) for t in valid_task_ids if s(t)}
+    rows, seen = [], set()
+    raw_rows = obj.get("rows")
+    if not isinstance(raw_rows, list):
+        raw_rows = obj.get("tasks") if isinstance(obj.get("tasks"), list) else []
+
+    for raw in raw_rows:
+        row = _intel_row(raw, allowed, valid_ids)
+        if row is None:
+            continue
+        # One row per (task, kind). A model listing the same task twice under
+        # the same heading is padding, and the dashboard would render it twice.
+        ident = (row["task_id"], row["kind"])
+        if ident in seen:
+            continue
+        seen.add(ident)
+        rows.append(row)
+        if len(rows) >= MAX_INTEL_ROWS:
+            break
+
+    out["rows"] = rows
+    out["summary"] = s(obj.get("summary"))[:MAX_INTEL_SUMMARY_CHARS]
+    return out

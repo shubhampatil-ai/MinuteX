@@ -8,6 +8,7 @@
 // same subset.
 import { useMemo } from "react";
 import { StyleSheet, Text, View } from "react-native";
+import { unescapeMarkdown } from "./export-doc";
 import { CAPS, FONT, TABULAR, useTheme, type ColorScale } from "./theme";
 
 function buildStyles(C: ColorScale) {
@@ -28,7 +29,8 @@ function buildStyles(C: ColorScale) {
 }
 
 function inline(text: string, key: string, baseStyle: any) {
-  const parts = text.split(/(\*\*[^*]+\*\*|\*[^*\n]+\*)/g).filter(Boolean);
+  const parts = unescapeMarkdown(text)
+    .split(/(\*\*[^*]+\*\*|\*[^*\n]+\*)/g).filter(Boolean);
   return (
     <Text key={key} style={baseStyle}>
       {parts.map((p, i) => {
@@ -54,7 +56,9 @@ export function Markdown({ text }: { text: string }) {
     let i = 0;
 
     const isDivider = (l: string) => /^\|?[\s:|-]+\|[\s:|-]*$/.test(l) && l.includes("-");
-    const cells = (l: string) => l.replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+    // Cells render directly (not through inline()), so they unescape here.
+    const cells = (l: string) => l.replace(/^\||\|$/g, "").split("|")
+      .map((c) => unescapeMarkdown(c.trim()));
 
     while (i < lines.length) {
       const line = lines[i].trim();
@@ -88,7 +92,11 @@ export function Markdown({ text }: { text: string }) {
       const h = /^(#{1,6})\s+(.*)$/.exec(line);
       if (h) {
         out.push(
-          <Text key={`h${i}`} style={h[1].length <= 2 ? st.mdH2 : st.mdH3}>{h[2]}</Text>
+          // Unescaped explicitly: headings are the one block that renders its
+          // text directly rather than through inline().
+          <Text key={`h${i}`} style={h[1].length <= 2 ? st.mdH2 : st.mdH3}>
+            {unescapeMarkdown(h[2])}
+          </Text>
         );
         i++; continue;
       }

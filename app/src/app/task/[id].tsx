@@ -602,6 +602,46 @@ export default function TaskDetailScreen() {
         </View>
       </View>
 
+      {/* ---------------- ASK AI ABOUT THIS TASK (§4) ----------------
+          Placed between the task's own FACTS above and its PROVENANCE below,
+          because that is exactly what it bridges: it explains why this task
+          exists, using the meeting it came from, without ever restating the
+          state the screen already shows authoritatively.
+
+          A launcher rather than an inline answer. The assistant needs a
+          composer and a scrollable thread, and both belong on their own
+          screen; embedding them here would put a chat inside a ScrollView
+          that already owns the page's scroll. The task id is passed as a
+          route param so the conversation opens scoped to this task — the
+          backend still authorizes that id on every tool call, so the param
+          is addressing, not access. */}
+      <View style={{ marginTop: S.lg }}>
+        <SectionTitle>Ask AI</SectionTitle>
+        <Pressable
+          onPress={() =>
+            router.push({
+              pathname: "/assistant", params: { taskId: task.id },
+            } as never)
+          }
+          accessibilityRole="button"
+          accessibilityLabel="Ask AI about this task"
+          style={({ pressed }) => [st.askAi, pressed && { opacity: 0.7 }]}
+        >
+          <View style={st.askAiIcon}>
+            <Icon name="sparkles" size={15} tintColor={C.primary} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={st.askAiTitle}>Ask about this task</Text>
+            <Text style={st.askAiSub}>
+              {recording
+                ? "Why it was created, what was discussed, and what to do next."
+                : "What this task covers and what to do next."}
+            </Text>
+          </View>
+          <Icon name="chevron.right" size={14} tintColor={C.textFaint} />
+        </Pressable>
+      </View>
+
       {/* ---------------- CONTEXT: where and why ---------------- */}
       <View style={{ marginTop: S.lg }}>
         <SectionTitle>Where this came from</SectionTitle>
@@ -911,6 +951,20 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
       borderWidth: 1, borderColor: C.border, backgroundColor: C.surface,
     },
     statusBtnTxt: { fontFamily: FONT.semibold, fontSize: 12.5, color: C.textDim },
+    askAi: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: S.md,
+      backgroundColor: C.surface, borderWidth: 1, borderColor: C.border,
+      borderRadius: R.card, padding: 13, shadowColor: C.shadow, ...ELEV.sm,
+    },
+    askAiIcon: {
+      width: 32, height: 32, borderRadius: 10, backgroundColor: C.primarySoft,
+      alignItems: "center" as const, justifyContent: "center" as const,
+    },
+    askAiTitle: { fontFamily: FONT.semibold, fontSize: 13.5, color: C.text },
+    askAiSub: {
+      fontFamily: FONT.regular, fontSize: 11.5, lineHeight: 16,
+      color: C.textDim, marginTop: 2,
+    },
     ctxRow: {
       flexDirection: "row" as const, alignItems: "flex-start" as const,
       gap: S.md, paddingVertical: 11, borderBottomWidth: 1,

@@ -46,6 +46,15 @@ export type EngineStatus = {
   mediaServicesDidReset: boolean;
   durationMillis: number | null;
   url: string | null;
+  /**
+   * The engine itself has concluded the microphone was taken.
+   *
+   * Only the WAV engine can report this: it sees the PCM frames, so it can tell
+   * a zero-filled stream from a quiet room. The AAC path leaves it undefined
+   * and keeps relying on the controller's metering-based detector, so treat
+   * undefined as "no opinion", never as "the mic is fine".
+   */
+  micUnavailable?: boolean;
 };
 
 /** Floor used when the peak is exactly zero — log10(0) is undefined. */
@@ -109,6 +118,7 @@ export class WavEngineRecorder {
       mediaServicesDidReset: false,
       durationMillis: s.durationSeconds * 1000,
       url: this.uri,
+      micUnavailable: s.micUnavailable === true,
     };
   }
 
@@ -189,6 +199,7 @@ export class WavEngineRecorder {
         mediaServicesDidReset: false,
         durationMillis: s.durationSeconds * 1000,
         url: this.uri,
+        micUnavailable: s.micUnavailable === true,
       });
     });
   }

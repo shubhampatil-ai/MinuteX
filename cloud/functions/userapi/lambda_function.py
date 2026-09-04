@@ -220,6 +220,7 @@ from botocore.exceptions import ClientError
 
 # The shared AI core — the SAME modules transcribeRecording uses. Vendored flat
 # into this function's zip (see scripts/21_deploy_ai_workspace.sh).
+import ai_sanitize
 import ai_schema
 import email_message
 import groq_client
@@ -1438,6 +1439,38 @@ def request_upload(event):
     if folder_id:
         _owned_folder(user_id, folder_id)   # 404 if it isn't the caller's
 
+    # RE-PRESIGN of an upload already under way, when the client sends back the
+    # key it was given. A presigned PUT is only valid for UPLOAD_URL_EXPIRY, so
+    # a big file on a slow connection (or one resumed after the app was killed)
+    # outlives its URL and must ask for another. Minting a fresh identity there
+    # is what the client's "one session = one key" durability design is built
+    # to avoid: the second key becomes a SECOND timeline row, and the first is
+    # left at "uploading" forever — a phantom duplicate the user cannot clear
+    # except by trashing it, because reprocess refuses that status.
+    #
+    # Only the caller's OWN still-uploading row can be re-presigned. An
+    # unknown key, someone else's, or one that already reached "uploaded" or
+    # beyond falls through to a new identity, so this can never overwrite a
+    # finished recording or let a key be guessed onto another user's row.
+    prior_key = str(data.get("key") or "").strip()
+    if prior_key:
+        prior = _recordings.get_item(Key={"audio_s3_key": prior_key}).get("Item")
+        if (prior
+                and prior.get("user_id") == user_id
+                and prior.get("status") == STATUS_UPLOADING):
+            return _resp(200, {
+                "upload_url": _s3.generate_presigned_url(
+                    "put_object",
+                    Params={"Bucket": BUCKET_NAME, "Key": prior_key},
+                    ExpiresIn=UPLOAD_URL_EXPIRY,
+                ),
+                "key": prior_key,
+                "recording_id": prior.get("recording_id", ""),
+                "expires_in": UPLOAD_URL_EXPIRY,
+                "content_type": UPLOAD_FORMATS[fmt],
+                "folder_id": prior.get("folder_id", ""),
+            })
+
     # recording_id keeps the device convention "{meeting_id}_{timestamp}" so
     # the pipeline's one key parser works unchanged. e.g. mobile-3fa8c2_1754.
     prefix = "mobile" if source == SOURCE_MOBILE else "upload"
@@ -1564,6 +1597,33 @@ def complete_upload(event):
     return _resp(200, {"key": key, "status": current.get("status", "")})
 
 
+def _query_all(table, **kwargs):
+    """Every item matching a Query, following LastEvaluatedKey to the end.
+
+    DynamoDB caps a Query response at 1 MB and then stops, handing back a
+    LastEvaluatedKey instead of an error. A caller that ignores it silently
+    sees a PREFIX of the matches and cannot tell — which for a list endpoint
+    means a user's oldest rows quietly disappear from their own timeline. That
+    ceiling is reached far sooner than the row count suggests here, because
+    both Recordings GSIs project ALL: every item carries its full AI payload
+    (documents, mom, chat_history) even when the caller only wants a handful
+    of summary fields.
+
+    Use for the whole-collection reads (a user's recordings, their trash).
+    Cursor-paginated endpoints like /tasks page deliberately instead — this
+    walks the entire partition, and that is only correct when the caller
+    genuinely needs all of it.
+    """
+    items = []
+    while True:
+        res = table.query(**kwargs)
+        items.extend(res.get("Items", []))
+        last = res.get("LastEvaluatedKey")
+        if not last:
+            return items
+        kwargs["ExclusiveStartKey"] = last
+
+
 def list_recordings(event):
     """Recordings the user OWNS: user-index rows (new uploads carry user_id)
     unioned with legacy device-index rows for owned devices, deduped."""
@@ -1605,26 +1665,30 @@ def list_recordings(event):
     # user-index: user_id HASH, created_at RANGE. Newest first. This is the
     # primary (user-owned) path; it also covers recordings stamped to the
     # user by a past unpair, whose device is no longer in `devices`.
-    res = _recordings.query(
-        IndexName=USER_INDEX,
-        KeyConditionExpression=Key("user_id").eq(user_id),
-        ScanIndexForward=False,
-    )
-    items = res.get("Items", [])
-    if want:
-        items = [it for it in items if it.get("device_id") == want]
+    #
+    # PAGINATED, not a single query: DynamoDB caps a Query response at 1 MB,
+    # and BOTH indexes project ALL — so each item carries its full AI payload
+    # (documents, mom, chat_history, crm_records), not just the LIST_FIELDS
+    # this route returns. Without the LastEvaluatedKey loop a heavy account
+    # silently loses its OLDEST recordings off the end of the first page, with
+    # no error anywhere: the response still looks like a complete list. Matches
+    # the loop _recordings_in_folder already runs over this same index.
+    items = []
+    for row in _query_all(_recordings, IndexName=USER_INDEX,
+                          KeyConditionExpression=Key("user_id").eq(user_id),
+                          ScanIndexForward=False):
+        if want and row.get("device_id") != want:
+            continue
+        items.append(row)
     _collect(items)
 
     for dev in devices:
         # device-index: device_id HASH, created_at RANGE. Newest first.
         # Legacy rows (uploaded before user ownership) have no user_id and
         # are only reachable this way.
-        res = _recordings.query(
-            IndexName=DEVICE_INDEX,
-            KeyConditionExpression=Key("device_id").eq(dev),
-            ScanIndexForward=False,
-        )
-        _collect(res.get("Items", []))
+        _collect(_query_all(_recordings, IndexName=DEVICE_INDEX,
+                            KeyConditionExpression=Key("device_id").eq(dev),
+                            ScanIndexForward=False))
     # Merge across sources, newest first by created_at.
     out.sort(key=lambda r: r.get("created_at", ""), reverse=True)
     return _resp(200, {"recordings": out, "count": len(out)})
@@ -2024,20 +2088,17 @@ def list_trash(event):
             row["deleted_at"] = item.get("deleted_at", "")
             out.append(row)
 
-    res = _recordings.query(
-        IndexName=USER_INDEX,
-        KeyConditionExpression=Key("user_id").eq(user_id),
-        ScanIndexForward=False,
-    )
-    _collect(res.get("Items", []))
+    # Paginated for the same reason list_recordings is: a 1 MB Query page of
+    # ALL-projected rows would silently drop the oldest trashed recordings,
+    # and a user who cannot see a row in Trash cannot restore it.
+    _collect(_query_all(_recordings, IndexName=USER_INDEX,
+                        KeyConditionExpression=Key("user_id").eq(user_id),
+                        ScanIndexForward=False))
 
     for dev in devices:
-        res = _recordings.query(
-            IndexName=DEVICE_INDEX,
-            KeyConditionExpression=Key("device_id").eq(dev),
-            ScanIndexForward=False,
-        )
-        _collect(res.get("Items", []))
+        _collect(_query_all(_recordings, IndexName=DEVICE_INDEX,
+                            KeyConditionExpression=Key("device_id").eq(dev),
+                            ScanIndexForward=False))
 
     out.sort(key=lambda r: (r.get("deleted_at", ""), r.get("created_at", "")),
              reverse=True)
@@ -2146,6 +2207,14 @@ def get_recording(event):
     # any app-side change or new build. Legacy rows still holding the values
     # inline pass through untouched.
     item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+    # The dynamic overview is sanitized ON READ as well as on write.
+    # ai_schema._overview_section cleans every overview generated from now
+    # on, but rows analysed BEFORE that fix already carry a leaked seg_N in
+    # their prose, and this is the screen that renders them. Doing it here
+    # fixes the back catalogue without a migration or a re-analysis.
+    if isinstance(item.get("overview"), dict):
+        item = {**item, "overview": ai_sanitize.sanitize_overview(
+            item["overview"], label=f"overview:{key}")}
     return _resp(200, {"recording": _with_crm_records(
         _with_source({**item, "audio_url": audio_url}), user_id)})
 
@@ -2513,7 +2582,17 @@ def _generate_document(item, doc_type, system_prompt, label):
     except groq_client.GroqError as err:
         _groq_error(err, label)
 
-    content = (content or "").strip()
+    # Same user-output boundary chat and the overview already pass through.
+    # Documents are the most Markdown-heavy surface in the app (headings,
+    # bullets, bold — see _MARKDOWN_RULES), and they were the one prose
+    # surface skipping this: a model that escapes its own syntax sent
+    # "\*Important\*" straight to the renderer, which shows the backslashes.
+    # Applied BEFORE the length cap so the cap measures what is actually
+    # stored, not text that is about to get shorter.
+    content = ai_sanitize.sanitize_ai_user_output(
+        content or "", label=f"document:{doc_type}")
+
+    content = content.strip()
     if not content:
         raise ApiError(502, f"Unable to generate {label}. Please retry.")
     if len(content) > MAX_DOCUMENT_CHARS:
@@ -2614,6 +2693,10 @@ def generate_custom_document(event):
         ).strip().strip('"')
     except groq_client.GroqError as err:
         print(f"[ai] custom document title failed, using fallback: {err}")
+    # The title is model-written and shown as the document's name in the list,
+    # so it crosses the same user-output boundary the body does.
+    label = ai_sanitize.sanitize_ai_user_output(
+        label, label="custom-doc-title").strip()
     if not label:
         label = prompt[:60] + ("…" if len(prompt) > 60 else "")
 
@@ -3295,7 +3378,13 @@ def retrieve_meeting_context(item, key, question, system_prompt):
     # The budget must account for the MoM: it rides in the same window as the
     # transcript, and on a heavily-edited meeting it is not small.
     budget = _transcript_budget_chars(system_prompt + mom)
-    labelled = transcript_store.as_labelled_lines(transcript, timestamps)
+    # `names` is passed so a renamed speaker reads as "Ravi:" in the line
+    # itself, exactly as pageindex.render_segments already does on the
+    # retrieval path below. Without it this path handed the model
+    # "Speaker 0:" plus a distant roster line and made every name question a
+    # two-hop lookup — see transcript_store.as_labelled_lines.
+    labelled = transcript_store.as_labelled_lines(transcript, timestamps,
+                                                  names)
 
     metrics = {"retrieval_mode": "full", "retrieved_segments": 0,
                "nodes_selected": 0, "retrieval_ms": 0}
@@ -3552,6 +3641,12 @@ def chat(event):
         raise ApiError(502, "Unable to generate a reply. Please retry.")
 
     reply, sources = _split_sources(reply, retrieved)
+    # LAST HOP BEFORE THE USER. The transcript reaches the model as
+    # `[seg_N] Speaker: ...` lines because seg_N is what the app deep-links
+    # on, and a model reading an id on every line will occasionally cite one
+    # in its prose. The prompt forbids it (prompts.GROUNDED_CHAT_RULES); this
+    # guarantees it, and unescapes the Markdown the renderer cannot.
+    reply = ai_sanitize.sanitize_ai_user_output(reply, label=f"chat:{key}")
     if not reply:
         # The model answered with nothing but a SOURCES line. Rare, but a blank
         # bubble is worse than an honest one.
@@ -10119,6 +10214,92 @@ AI_TOOL_ROW_LIMIT = int(os.environ.get("AI_TOOL_ROW_LIMIT", "25"))
 MAX_AI_MESSAGE_CHARS = 2_000
 AI_HISTORY_TURNS = 6
 
+# ===========================================================================
+# WORKSPACE CHAT SESSIONS — persistent, resumable Task AI conversations.
+#
+# WHY ONE CAPPED ITEM AND NOT TWO TABLES.
+#
+# The obvious shape for a chat log is ChatSessions + ChatMessages with a
+# composite key. Two things ruled it out here, and both came from reading the
+# codebase rather than from preference:
+#
+#   1. MinuteX HAS NO COMPOSITE PK+SK TABLE. All sixteen tables are a single
+#      HASH key plus GSIs for listing (Notifications is the closest analogue:
+#      PK notification_id, GSI user_id+created_at). Introducing the first
+#      PK/SK table — and the first fan-out read — for a feature whose
+#      per-session volume is a few dozen short turns would be a new pattern
+#      to maintain for no measured benefit.
+#   2. THE MEETING CHAT ALREADY SOLVES THIS, in production, by storing a
+#      bounded `chat_history` list on the recording row and trimming it to
+#      MAX_CHAT_TURNS. Same problem, same scale, already proven.
+#
+# So a session is ONE item holding a bounded turn list. The 400 KB item
+# ceiling is respected by construction rather than by hoping:
+#
+#      MAX_SESSION_TURNS (40 turns = 20 exchanges)
+#    x MAX_AI_MESSAGE_CHARS (2 000 per user turn)
+#    + MAX_STORED_REPLY_CHARS (4 000 per assistant turn)
+#    ------------------------------------------------
+#      worst case ~120 KB, comfortably inside 400 KB
+#
+# There is no code path that appends without trimming: _append_turns is the
+# only writer and it slices before every write.
+#
+# STORAGE IS NOT CONTEXT. What is PERSISTED (40 turns) and what is SENT TO
+# GROQ (AI_HISTORY_TURNS = 6 exchanges) are deliberately different numbers,
+# because they answer different questions — "what can the user scroll back
+# to" versus "what fits the model's window without crowding out the answer".
+# _session_history does that narrowing, once.
+# ===========================================================================
+CHAT_SESSIONS_TABLE = os.environ.get("CHAT_SESSIONS_TABLE", "ChatSessions")
+# GSI: user_id (HASH) + updated_at (RANGE). The ONLY way a session list is
+# read, and a lookup path only — every row is still re-checked against the
+# caller, exactly as the Tasks indexes are.
+CHAT_SESSIONS_USER_INDEX = os.environ.get("CHAT_SESSIONS_USER_INDEX",
+                                          "user-index")
+
+# The hard ceiling on stored conversation. 40 turns = 20 exchanges, matching
+# the meeting chat's MAX_CHAT_TURNS so the two feel the same to a user.
+MAX_SESSION_TURNS = int(os.environ.get("MAX_SESSION_TURNS", "40"))
+
+# An assistant reply is stored truncated. Replies are normally a few hundred
+# characters; this only catches a runaway generation, and it is the second
+# half of the item-size arithmetic above.
+MAX_STORED_REPLY_CHARS = 4_000
+
+# Session list page size. A user with hundreds of conversations must not be
+# able to make the list route read all of them (spec section 6).
+SESSIONS_PAGE_DEFAULT = 20
+SESSIONS_PAGE_MAX = 50
+
+# Title length. Long enough to identify a conversation in a list, short
+# enough that it can never carry meaningful transcript content.
+MAX_SESSION_TITLE_CHARS = 60
+
+_chat_sessions = _ddb.Table(CHAT_SESSIONS_TABLE)
+
+# Starter prompts. Served from the backend rather than hardcoded in the app
+# for the same reason CHAT_SUGGESTIONS is: the catalogue belongs in one place,
+# and every one of these must be a question the tools can actually answer —
+# a suggested prompt that produces "I can't do that" is worse than no
+# suggestion, because the app itself proposed it.
+AI_SUGGESTIONS = [
+    "What needs my attention?",
+    "What's overdue?",
+    "What should I work on this week?",
+    "What did I commit to in my last meeting?",
+]
+
+# The per-task catalogue (spec section 4). Every one of these is answerable
+# from get_task plus get_meeting_context, and each is phrased so the answer
+# separates the task's CURRENT state from the meeting history behind it.
+AI_TASK_SUGGESTIONS = [
+    "What is this task about?",
+    "Why was this task created?",
+    "What was discussed about it?",
+    "What should happen next?",
+]
+
 
 class AIContext:
     """The authenticated caller, resolved ONCE per request from the JWT.
@@ -10133,10 +10314,23 @@ class AIContext:
     identity (the user_id is) — it is how the caller appears in task
     assignments, resolved through the existing owner+email index rather than
     invented.
+
+    `sources` accumulates the transcript evidence the tools actually retrieved
+    this request. It is a RECORD OF WHAT WAS READ, written only by the
+    retrieval tool and never by the model: an id the model invents cannot get
+    in here, which is what lets ai_chat return sources the app can trust
+    enough to deep-link. See _ai_note_sources.
+
+    `proposals` accumulates the task changes the model asked to make this
+    request. They are proposals ONLY — validated and authorized server-side,
+    but never applied here (spec section 8); ai_chat returns them for the app
+    to confirm with the user. Collected on the context rather than threaded
+    through the agent loop's return value so a tool result and its proposal
+    cannot drift apart.
     """
 
     __slots__ = ("user_id", "email", "display_name", "contact_id",
-                 "request_id", "_devices")
+                 "request_id", "_devices", "sources", "proposals")
 
     def __init__(self, user_id, email="", display_name="", contact_id="",
                  request_id=""):
@@ -10146,6 +10340,8 @@ class AIContext:
         self.contact_id = contact_id
         self.request_id = request_id
         self._devices = None
+        self.sources = []
+        self.proposals = []
 
     @property
     def devices(self):
@@ -10241,6 +10437,41 @@ def _assigned_to_me(row, ctx):
                    or row.get("assignee_speaker_id") or "").strip()
 
 
+def _ai_visible(row, ctx):
+    """May the caller SEE this task? Creator OR assignee — nothing else.
+
+    THE SAME predicate list_all_tasks._keep applies, and deliberately a
+    DIFFERENT question from _assigned_to_me above:
+
+      _ai_visible      "can I read this row" — the dashboard's universe.
+      _assigned_to_me  "is this MY commitment" — a narrower slice of it.
+
+    Conflating the two is what made the assistant disagree with the
+    dashboard. A task Alice created and delegated to Bob is VISIBLE to Alice
+    (her dashboard lists it) but is not HER commitment, so a tool that
+    filtered on _assigned_to_me alone could never return it — not even when
+    the user asked "what is due this week" while looking at it on screen.
+
+    Every tool now filters on this for reachability and uses
+    _assigned_to_me only to decide DEFAULT scope, so nothing the dashboard
+    shows is unreachable to the assistant.
+    """
+    return bool(_is_task_creator(ctx.user_id, row)
+                or _is_task_assignee(ctx.user_id, row))
+
+
+def _ai_scope(rows, ctx, mine_only):
+    """Apply the caller's requested scope to an already-visible row set.
+
+    One place, so "mine" means the same thing in every tool. `mine_only`
+    False keeps everything the caller can see — which is what a question
+    about a task on their dashboard needs.
+    """
+    if not mine_only:
+        return rows
+    return [r for r in rows if _assigned_to_me(r, ctx)]
+
+
 # ---------------------------------------------------------------------------
 # Tool output shaping
 # ---------------------------------------------------------------------------
@@ -10254,16 +10485,33 @@ def _ai_task_view(row, ctx, speaker_names=None):
     window.
     """
     pub = _public_task_v2(row, speaker_names)
+    day = _ai_due_day(row)
     view = {
         "id": pub["id"],
         "title": pub["title"],
         "status": pub["status"],
         "priority": pub["priority"],
-        "due_date": pub["due_date"],
+        # THE RESOLVED CALENDAR DAY, so the model can reason about it. It used
+        # to be the raw stored value, which on an AI-extracted task is a
+        # PHRASE ("Wednesday", "next week") — the model was then asked "what
+        # is due this week" while holding a field it could not compare, and
+        # would either ignore the task or invent a date for it.
+        "due_date": day,
         "is_overdue": pub["is_overdue"],
         "assigned_to_me": _assigned_to_me(row, ctx),
         "source": "meeting" if row.get("source_recording_id") else "manual",
     }
+    # What was SAID, kept alongside the resolved day and only when the two
+    # differ. The user asked for "Wednesday" and may well say "Wednesday"
+    # back; dropping the phrase would make the assistant's wording drift from
+    # the deadline the user set. Never used for comparison — that is `day`.
+    spoken = str(row.get("due_date") or "").strip()
+    if spoken and spoken[:10] != day:
+        view["due_date_spoken"] = spoken[:100]
+    if not day and spoken:
+        # A phrase nothing could place ("end of Q3"). Said plainly so the
+        # model reports "no firm date" rather than treating it as undated.
+        view["due_date_unplaceable"] = True
     if pub.get("description"):
         view["description"] = pub["description"][:500]
     # The display name only — never the assignee's contact id, which the model
@@ -10330,31 +10578,58 @@ class AIToolError(Exception):
     """
 
 
-def _ai_owner_tasks(ctx):
-    """Every task in the caller's workspace, newest first.
-
-    Uses the owner-index, whose hash key IS owner_user_id, and then re-checks
-    owner_user_id on every row anyway. That is not redundant paranoia — it is
-    the same rule list_all_tasks documents: the index is a lookup path, never
-    an authorization decision. If this query is ever re-pointed at another
-    index the check is already in the right place.
-    """
+def _ai_index_pages(index, field, value):
+    """Every row on one GSI partition, page-bounded. Rows are NOT filtered
+    here — the caller owns the authorization predicate, because an index is a
+    lookup path and never an authorization decision."""
     rows, start = [], None
     for _ in range(_SEARCH_MAX_PAGES):
         kwargs = {
-            "IndexName": TASKS_OWNER_INDEX,
-            "KeyConditionExpression": Key("owner_user_id").eq(ctx.user_id),
+            "IndexName": index,
+            "KeyConditionExpression": Key(field).eq(value),
             "ScanIndexForward": False,
         }
         if start:
             kwargs["ExclusiveStartKey"] = start
         res = _tasks.query(**kwargs)
-        rows.extend(r for r in res.get("Items", [])
-                    if r.get("owner_user_id") == ctx.user_id)
+        rows.extend(res.get("Items", []))
         start = res.get("LastEvaluatedKey")
         if not start:
             break
     return rows
+
+
+def _ai_owner_tasks(ctx):
+    """Every task this caller may SEE, newest first — created OR assigned.
+
+    TWO PARTITIONS, deliberately. A task lives in the creator's partition
+    (owner_user_id) but a task someone else created FOR this user lives in
+    theirs, keyed by assignee_user_id. Reading only the owner-index is what
+    used to make the assistant answer "you have no tasks" to a user whose
+    entire workload had been delegated to them — while the Task Dashboard,
+    which reads both (see list_all_tasks' extra_query), showed them all. The
+    assistant and the dashboard must not disagree about what tasks exist.
+
+    Every row is still re-checked with _is_task_creator / _is_task_assignee —
+    the SAME visibility predicate list_all_tasks._keep applies, so the two
+    read paths cannot drift on what "my task" means. Duplicates (a task the
+    caller both created and owns) are collapsed on task_id.
+    """
+    rows = _ai_index_pages(TASKS_OWNER_INDEX, "owner_user_id", ctx.user_id)
+    rows.extend(_ai_index_pages(TASKS_ASSIGNEE_USER_INDEX,
+                                "assignee_user_id", ctx.user_id))
+
+    out, seen = [], set()
+    for row in rows:
+        tid = str(row.get("task_id") or "")
+        if not tid or tid in seen:
+            continue
+        if not (_is_task_creator(ctx.user_id, row)
+                or _is_task_assignee(ctx.user_id, row)):
+            continue
+        seen.add(tid)
+        out.append(row)
+    return out
 
 
 def _ai_render_tasks(rows, ctx):
@@ -10367,12 +10642,44 @@ def _ai_render_tasks(rows, ctx):
             for r in rows]
 
 
+def _ai_due_day(row):
+    """The task's deadline as a comparable YYYY-MM-DD, or "".
+
+    THE BUG THIS FIXES, and it is the whole reason this helper exists.
+
+    A task carries TWO date fields, and they mean different things
+    (see _new_task_row): `due_date` keeps WHAT WAS SAID — "Wednesday",
+    "next week", "end of Q3" — and `due_date_normalized` is that phrase
+    resolved to a calendar day. Every comparison is supposed to use the
+    normalized one; the raw string exists so the record stays faithful.
+
+    The AI tools were comparing the RAW value. So an AI-extracted task due
+    "Wednesday" (normalized to 2026-09-03) passed the dashboard's due_before
+    filter and failed the assistant's regex, and the user got a dashboard
+    listing three upcoming tasks beside an assistant insisting there were
+    none. That is the exact inconsistency this pass was opened for.
+
+    The fallback order is IDENTICAL to list_all_tasks._keep — normalized
+    first, raw second — so the two read paths cannot disagree again. The raw
+    fallback matters for rows written before normalization existed and for
+    manual tasks the picker already stores as a real day.
+    """
+    day = str((row or {}).get("due_date_normalized") or "").strip()[:10]
+    if not day:
+        day = str((row or {}).get("due_date") or "").strip()[:10]
+    return day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) else ""
+
+
 def _ai_sort_by_due(rows):
     """Soonest due first, undated last. Undated tasks sort last rather than
     first because a task with no date is not urgent — putting it at the top of
-    "what is due" would be actively misleading."""
-    return sorted(rows, key=lambda r: (not str(r.get("due_date") or ""),
-                                       str(r.get("due_date") or "")))
+    "what is due" would be actively misleading.
+
+    Sorts on the RESOLVED day (_ai_due_day), not the raw string: sorting
+    "Wednesday" against "2026-09-11" alphabetically put every spoken date in
+    front of every real one, which is a silently wrong order rather than a
+    visible error. A row with no placeable day sorts last, as before."""
+    return sorted(rows, key=lambda r: (not _ai_due_day(r), _ai_due_day(r)))
 
 
 def _ai_clean_status(raw):
@@ -10417,9 +10724,8 @@ def _ai_today():
 def tool_get_my_tasks(ctx, status="", include_assigned_to_others=False,
                       limit=None):
     """Open work that belongs to the signed-in user."""
-    rows = _ai_owner_tasks(ctx)
-    if not include_assigned_to_others:
-        rows = [r for r in rows if _assigned_to_me(r, ctx)]
+    rows = [r for r in _ai_owner_tasks(ctx) if _ai_visible(r, ctx)]
+    rows = _ai_scope(rows, ctx, mine_only=not include_assigned_to_others)
     want = _ai_clean_status(status)
     if want:
         rows = [r for r in rows if r.get("status") == want]
@@ -10435,25 +10741,51 @@ def tool_get_my_tasks(ctx, status="", include_assigned_to_others=False,
                         filter=("all_statuses" if want else "outstanding_only"))
 
 
-def tool_get_overdue_tasks(ctx):
+def tool_get_overdue_tasks(ctx, include_assigned_to_others=True):
     """Past their due date and not finished. Overdue is COMPUTED from the
     clock by the same _is_overdue the REST layer uses, never read from a
-    stored flag that nothing updates at midnight."""
+    stored flag that nothing updates at midnight.
+
+    Scope defaults to EVERYTHING THE CALLER CAN SEE, not just their own
+    commitments. "What's overdue?" asked from a dashboard that is showing a
+    late delegated task must include that task — the dashboard's own Overdue
+    filter does (list_all_tasks applies no assignee narrowing unless
+    assigned_to_me is passed), and an assistant that quietly answered a
+    narrower question was the bug.
+    """
     rows = [r for r in _ai_owner_tasks(ctx)
-            if _assigned_to_me(r, ctx)
+            if _ai_visible(r, ctx)
             and _is_overdue(r.get("due_date"), r.get("status"),
                             r.get("due_date_normalized", ""))]
+    rows = _ai_scope(rows, ctx, mine_only=not include_assigned_to_others)
     rows = _ai_sort_by_due(rows)
     return _tool_result(_ai_render_tasks(rows, ctx), "tasks",
                         as_of=_ai_today())
 
 
-def tool_get_upcoming_tasks(ctx, due_before="", days=7):
+def tool_get_upcoming_tasks(ctx, due_before="", days=7,
+                            include_assigned_to_others=True):
     """Due between today and a horizon — "what do I need to finish this week".
 
     Already-overdue tasks are excluded: they are what get_overdue_tasks is
     for, and mixing them in makes "this week" quietly mean "this week plus
     everything I am already late on".
+
+    THIS TOOL WAS THE REPORTED BUG, and it had two independent causes, both
+    of which made it answer "no upcoming tasks" beside a dashboard listing
+    several:
+
+      1. IT COMPARED THE RAW `due_date`. An AI-extracted task due
+         "Wednesday" stores the phrase in due_date and the resolved day in
+         due_date_normalized. The raw phrase failed the YYYY-MM-DD check and
+         the task was skipped — while the dashboard, which resolves through
+         the normalized field, listed it. Now both go through _ai_due_day.
+      2. IT NARROWED TO _assigned_to_me. A task the caller created and
+         delegated is on their dashboard but was unreachable here. Scope now
+         defaults to everything the caller can SEE.
+
+    `days` counts from today INCLUSIVE, so days=7 answers "the next week"
+    the way a person means it.
     """
     horizon = _ai_clean_date(due_before, "due_before")
     if not horizon:
@@ -10467,39 +10799,50 @@ def tool_get_upcoming_tasks(ctx, due_before="", days=7):
     today = _ai_today()
     rows = []
     for r in _ai_owner_tasks(ctx):
-        if not _assigned_to_me(r, ctx):
+        if not _ai_visible(r, ctx):
             continue
         if r.get("status") in TASK_TERMINAL_STATUSES:
             continue
-        due = str(r.get("due_date") or "")
-        if not due:
-            continue
-        # Compare on the DATE part so a full ISO timestamp sorts against a
-        # bare date correctly; an unparseable AI date ("next Friday") simply
-        # does not match a range and is left out rather than guessed at.
-        day = due[:10]
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        # The RESOLVED day, so a spoken deadline is a real deadline here
+        # exactly as it is on the dashboard. A phrase that could not be
+        # placed on a calendar ("end of Q3") yields "" and is left out
+        # rather than guessed at — the one case where dropping is correct.
+        day = _ai_due_day(r)
+        if not day:
             continue
         if today <= day <= horizon:
             rows.append(r)
+    rows = _ai_scope(rows, ctx, mine_only=not include_assigned_to_others)
     return _tool_result(_ai_render_tasks(_ai_sort_by_due(rows), ctx), "tasks",
                         window={"from": today, "to": horizon})
 
 
-def tool_get_task(ctx, task_id=""):
-    """One task by id — ownership-checked, never trusted from the model.
+def _ai_visible_task(ctx, task_id, what="task_id"):
+    """One task row this caller may SEE, or AIToolError. THE task gate.
 
-    _owned_task is the SAME predicate GET /tasks/{id} enforces, and it answers
-    404 for a task belonging to anyone else. So a model that invents or is fed
-    another tenant's task id learns nothing beyond "not found".
+    _visible_task is the SAME predicate GET /tasks/{id} enforces — creator OR
+    assignee — and it answers 404 for everyone else, so a model that invents
+    or is fed another tenant's task id learns nothing beyond "not found". Used
+    by every tool that takes a task id, so there is exactly one place where a
+    model-supplied id becomes a row.
+
+    Why _visible_task rather than _owned_task (which this used to use): an
+    assignee reading their OWN assigned task is the ordinary case now that
+    _ai_owner_tasks returns both partitions. Listing a task and then 404-ing
+    on its detail would be the assistant contradicting itself.
     """
     tid = str(task_id or "").strip()
     if not tid:
-        raise AIToolError("task_id is required")
+        raise AIToolError(f"{what} is required")
     try:
-        row = _owned_task(ctx.user_id, tid)
+        return _visible_task(ctx.user_id, tid)
     except ApiError:
         raise AIToolError("No task with that id exists in your workspace.")
+
+
+def tool_get_task(ctx, task_id=""):
+    """One task by id — authorization-checked, never trusted from the model."""
+    row = _ai_visible_task(ctx, task_id)
 
     view = _ai_task_view(
         row, ctx, _speaker_names_for_recording(row.get("source_recording_id")))
@@ -10513,6 +10856,13 @@ def tool_get_task(ctx, task_id=""):
         rec = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
         if ctx.owns_recording(rec):
             out["meeting"] = _ai_meeting_view(rec)
+        elif _assignee_tasks_in_recording(ctx.user_id, key):
+            # An ASSIGNEE may name the meeting their work came from — the same
+            # provenance GET /tasks/{id} already returns to them. What they may
+            # not do is read its transcript; get_meeting_context enforces that
+            # separately, and this view carries no transcript content.
+            out["meeting"] = _ai_meeting_view(rec)
+            out["meeting_access"] = "assignee"
     fid = row.get("folder_id")
     if fid:
         folder = _folders.get_item(Key={"folder_id": fid}).get("Item")
@@ -10534,6 +10884,14 @@ def tool_search_my_tasks(ctx, query="", status="", include_completed=False):
     want = _ai_clean_status(status)
     rows = []
     for r in _ai_owner_tasks(ctx):
+        # Search deliberately spans everything the caller can SEE rather than
+        # only their own commitments: "find the task about the invoice" is a
+        # lookup, and a delegated task is exactly the kind of thing someone
+        # searches for. This is also why search already disagreed with
+        # get_my_tasks before this pass — it never applied the narrowing the
+        # other tools did. The re-check keeps the index honest either way.
+        if not _ai_visible(r, ctx):
+            continue
         if want and r.get("status") != want:
             continue
         if not include_completed and not want and \
@@ -10541,7 +10899,7 @@ def tool_search_my_tasks(ctx, query="", status="", include_completed=False):
             continue
         haystack = " ".join(str(r.get(f) or "") for f in
                             ("title", "description", "assignee_name",
-                             "ai_evidence")).casefold()
+                             "assignee_name_legacy", "ai_evidence")).casefold()
         if needle in haystack:
             rows.append(r)
     return _tool_result(_ai_render_tasks(_ai_sort_by_due(rows), ctx), "tasks",
@@ -10666,6 +11024,307 @@ def tool_list_my_meetings(ctx, limit=10):
     rows = _ai_recent_meetings(ctx, limit=max(count, 20))[:count]
     return _tool_result([_ai_meeting_view(r) for r in rows], "meetings")
 
+
+# ---------------------------------------------------------------------------
+# HISTORICAL MEETING CONTEXT — the task's "why", from the transcript.
+#
+# This is the one tool that reads meeting CONTENT, and it is the only place
+# the assistant can. Everything about its shape follows from two rules:
+#
+#   1. AUTHORIZE, THEN RETRIEVE — structurally, not by remembering to check.
+#      A task id is resolved to a row the caller may see, that row names its
+#      source_recording_id, and THAT recording is authorized on its own before
+#      retrieve_meeting_context is handed the already-hydrated item. There is
+#      deliberately no parameter that lets the model name a recording directly:
+#      transcript access is reachable ONLY through a task the caller can see,
+#      so an invented recording key has nowhere to go.
+#
+#   2. THE TRANSCRIPT IS HISTORY, NOT STATE. What the model gets back is
+#      labelled as the discussion that PRODUCED the task. Current status,
+#      assignee and deadline come from the Tasks table via the other tools and
+#      always win — see the prompt rules in ASSISTANT_TASK_RULES.
+#
+# It reuses retrieve_meeting_context() outright — the same _ensure_index (lazy
+# build, single-flight), _navigate (LLM pick, spread fallback) and
+# evidence_from_segments the per-meeting chat uses. A second retrieval system
+# would be a second thing to keep correct, and this one already handles the
+# long-meeting case that motivated PageIndex in the first place.
+# ---------------------------------------------------------------------------
+
+# The retrieval tool's own share of the request budget. Deliberately smaller
+# than ONDEMAND_DEADLINE_SECONDS: this runs INSIDE an agent hop that still has
+# to spend a Groq call turning the result into an answer, so a retrieval that
+# used the whole budget would strand the user with no reply at all.
+AI_CONTEXT_DEADLINE_SECONDS = int(
+    os.environ.get("AI_CONTEXT_DEADLINE_SECONDS", "9"))
+
+# How much retrieved transcript one tool result may carry back to the model.
+# The agent loop's context already holds the system prompt, the history and
+# every earlier tool result, so this cannot be the whole transcript budget.
+AI_CONTEXT_MAX_CHARS = int(os.environ.get("AI_CONTEXT_MAX_CHARS", "6000"))
+
+
+def _ai_note_sources(ctx, meeting_id, sources):
+    """Record retrieved evidence on the context, de-duplicated.
+
+    The ONLY writer of ctx.sources, and it writes what RETRIEVAL returned —
+    never anything the model said. That is what makes the `sources` array on
+    the /ai/chat response safe to deep-link from: every id in it was produced
+    by pageindex.evidence_from_segments over segments that actually exist in a
+    meeting this caller is authorized to read.
+
+    `meeting_id` is added here because the workspace assistant can answer
+    across several meetings in one turn, so a bare segment id is ambiguous in
+    a way the per-meeting chat's sources never are — the app needs to know
+    WHICH transcript to open (spec section 6).
+    """
+    seen = {(s.get("meeting_id"), s.get("segment_id")) for s in ctx.sources}
+    for src in sources or []:
+        ident = (meeting_id, src.get("segment_id"))
+        if not src.get("segment_id") or ident in seen:
+            continue
+        seen.add(ident)
+        row = dict(src)
+        row["meeting_id"] = meeting_id
+        ctx.sources.append(row)
+
+
+def _ai_readable_meeting_for_task(ctx, row):
+    """(key, hydrated item) for the meeting behind a task, or AIToolError.
+
+    The recording is authorized ON ITS OWN — `ctx.owns_recording` — rather
+    than inferred from the task pointing at it. A task the caller can see is
+    not by itself proof they may read that meeting's transcript, and this is
+    exactly where those two rights diverge:
+
+    AN ASSIGNEE IS REFUSED. A task assignee may read the meeting's NOTES
+    (GET /recordings/shared-with-me pins transcript_enabled and audio_enabled
+    OFF precisely so they cannot reach the raw record), so letting the AI hand
+    them labelled transcript segments would route around that decision — the
+    assistant must not be the weaker door. They get a clear "not available"
+    instead, and every task tool still works for them.
+    """
+    key = str(row.get("source_recording_id") or "")
+    if not key:
+        raise AIToolError(
+            "That task was created manually, so there is no meeting "
+            "discussion behind it.")
+
+    rec = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not rec or _is_trashed(rec):
+        raise AIToolError(
+            "The meeting this task came from is no longer available.")
+    if not ctx.owns_recording(rec):
+        raise AIToolError(
+            "You can see this task, but its meeting transcript belongs to "
+            "the person who shared it with you and is not available here.")
+
+    _require_transcript(rec)
+    # Hydrated because retrieval needs the transcript text and the timestamps,
+    # and a long transcript lives in S3 rather than on the row.
+    return key, transcript_store.hydrate(_s3, BUCKET_NAME, rec)
+
+
+def tool_get_meeting_context(ctx, task_id="", question=""):
+    """The meeting discussion behind ONE task, retrieved through PageIndex.
+
+    Answers "why was this task created", "what was discussed about it", "what
+    decision led to this". Returns transcript extracts with their seg_N ids
+    intact plus the structured evidence the app deep-links from.
+    """
+    row = _ai_visible_task(ctx, task_id)
+    key, item = _ai_readable_meeting_for_task(ctx, row)
+
+    # The question steers the PageIndex navigation. Falling back to the task's
+    # own title (rather than to a generic "what was discussed") keeps the
+    # retrieval pointed at this task even when the model forgets to pass one.
+    ask = str(question or "").strip()[:MAX_AI_MESSAGE_CHARS]
+    if not ask:
+        ask = str(row.get("title") or "").strip() or "what was discussed"
+
+    started = time.monotonic()
+    try:
+        # `system_prompt` sizes the retrieval budget. Passed as a string of the
+        # right ORDER OF MAGNITUDE rather than the real agent prompt: the tool
+        # result rides inside an agent conversation whose true overhead this
+        # function cannot see, and AI_CONTEXT_MAX_CHARS below is the real cap.
+        context, sources, metrics = retrieve_meeting_context(
+            item, key, ask, prompts.ASSISTANT_SYSTEM)
+    except groq_client.GroqError as err:
+        # Retrieval is an OPTIMISATION over an answer that can still be given
+        # from the task row. A Groq failure inside the tool must not fail the
+        # whole conversation, so the model is told what happened and answers
+        # from what it has.
+        print(f"[warn] ai.tool get_meeting_context retrieval failed for "
+              f"{ctx.user_id}: {err}")
+        raise AIToolError(
+            "The meeting discussion could not be retrieved just now. Answer "
+            "from the task's own details and say the meeting history was "
+            "unavailable.")
+
+    # Trimmed from the END: retrieve_meeting_context orders its extract
+    # best-first, so the tail is what matters least.
+    excerpt = (context or "")[:AI_CONTEXT_MAX_CHARS]
+    truncated = len(context or "") > AI_CONTEXT_MAX_CHARS
+
+    _ai_note_sources(ctx, key, sources)
+
+    print(f"[audit] ai.tool.meeting_context user={ctx.user_id} "
+          f"task={row.get('task_id')} meeting_mode="
+          f"{metrics.get('retrieval_mode')} segs="
+          f"{metrics.get('retrieved_segments')} "
+          f"ms={int((time.monotonic() - started) * 1000)} req={ctx.request_id}")
+
+    return {
+        # Named to say what it IS, so the model cannot mistake it for state.
+        "historical_discussion": excerpt,
+        "excerpt_truncated": truncated,
+        "meeting": _ai_meeting_view(item),
+        # The same shape the per-meeting chat's `sources` uses, plus the
+        # meeting id — reusing ai_evidence_segment_ids' seg_N identity rather
+        # than inventing a citation format (spec section 6).
+        "evidence": [dict(s, meeting_id=key) for s in sources],
+        "current_task_state": {
+            # Repeated INSIDE the retrieval result on purpose: this is the
+            # tool whose output most invites a model to describe stale
+            # transcript talk as the task's present state, and the correction
+            # is most effective next to the temptation.
+            "status": row.get("status") or TASK_STATUS_OPEN,
+            "due_date": row.get("due_date") or "",
+            "priority": row.get("priority") or "Medium",
+            "note": ("These fields are the task's CURRENT state from the "
+                     "Tasks database. The discussion above is history and "
+                     "must not be used to contradict them."),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# AI-ASSISTED TASK ACTIONS — proposed here, applied only by the user.
+#
+# THE RULE (spec section 8): the AI never silently mutates task state. It can
+# only PROPOSE, and the mutation happens through the existing authorized
+# PATCH /tasks/{task_id} after the user taps confirm.
+#
+# So this tool writes NOTHING. What it does instead is worth stating plainly,
+# because a proposal that cannot be applied is a worse outcome than a refusal:
+#
+#   * it validates the change the way the real route would, using the SAME
+#     _authorize_task_patch — so a proposal the user could not perform is
+#     refused HERE, before they are offered a button that would 403;
+#   * it returns the CURRENT value beside the proposed one, so the app can
+#     render "Open -> Completed" rather than an unanchored assertion;
+#   * it names the exact patch body the app should send, so the confirmation
+#     step is a straight pass-through to the existing route rather than the
+#     client re-deriving what the AI meant.
+#
+# There is deliberately no `assignee` field. Reassignment needs a resolved
+# Contact (see _clean_assignee and resolve_task_assignee), and a model naming
+# "Priya" is precisely the ambiguity the human resolution flow exists to
+# settle — a proposal carrying an unresolved name would either be unapplyable
+# or would invite the client to guess. Reassignment stays a UI flow.
+# ---------------------------------------------------------------------------
+
+# Fields the AI may propose, mapped to the PATCH body key the existing route
+# expects. Named explicitly (not derived) for the same reason
+# _TASK_CREATOR_ONLY_FIELDS is: a new writable field must be added on purpose.
+_AI_PROPOSABLE_FIELDS = ("status", "due_date", "priority")
+
+
+def tool_propose_task_change(ctx, task_id="", status="", due_date="",
+                             priority="", reason=""):
+    """Validate a proposed task change and hand it back for confirmation.
+
+    NEVER writes. Returns the proposal, the current values it would replace,
+    and the patch body the app sends to PATCH /tasks/{task_id} if the user
+    confirms.
+    """
+    row = _ai_visible_task(ctx, task_id)
+
+    proposed, patch = {}, {}
+    want_status = _ai_clean_status(status)
+    if str(status or "").strip() and not want_status:
+        raise AIToolError(
+            "That is not a task status. Use Open, In Progress, Completed or "
+            "Cancelled.")
+    if want_status:
+        proposed["status"] = want_status
+        patch["status"] = want_status
+
+    raw_due = str(due_date or "").strip()
+    if raw_due:
+        # Validated with the same _ai_clean_date every date-taking tool uses,
+        # so "next Friday" is refused here rather than becoming a deadline
+        # nobody asked for.
+        #
+        # A DEADLINE IS NEVER CLEARED THROUGH A PROPOSAL. An omitted argument
+        # and a deliberate "" are indistinguishable once they reach here, so
+        # honouring "" as "remove the deadline" would let a model that simply
+        # left the field out silently drop a date the user still needs. The
+        # user can clear a deadline in the date picker, where the intent is
+        # unambiguous.
+        proposed["due_date"] = _ai_clean_date(raw_due, "due_date")
+        patch["due"] = proposed["due_date"]
+
+    want_priority = str(priority or "").strip()
+    if want_priority:
+        if want_priority not in TASK_PRIORITIES:
+            raise AIToolError(
+                "That is not a task priority. Use Low, Medium or High.")
+        proposed["priority"] = want_priority
+        patch["priority"] = want_priority
+
+    if not proposed:
+        raise AIToolError(
+            "Nothing was proposed. Pass at least one of status, due_date or "
+            "priority.")
+
+    # THE AUTHORIZATION CHECK, against the same predicate the real PATCH
+    # enforces and against the same body shape. An assignee proposing a
+    # deadline change is refused now, so the app never renders a confirm
+    # button whose only possible outcome is a 403.
+    try:
+        _authorize_task_patch(ctx.user_id, row, patch)
+    except ApiError as err:
+        raise AIToolError(
+            f"You cannot make that change to this task: {err.message}")
+
+    current = {"status": row.get("status") or TASK_STATUS_OPEN,
+               "due_date": row.get("due_date") or "",
+               "priority": row.get("priority") or "Medium"}
+
+    print(f"[audit] ai.tool.proposal user={ctx.user_id} "
+          f"task={row.get('task_id')} fields={sorted(proposed)} "
+          f"req={ctx.request_id}")
+
+    out = {
+        # `applied: False` is stated rather than implied. A model reading this
+        # result should have no way to conclude the change went through, and
+        # the flag is what the app keys its confirmation UI off.
+        "applied": False,
+        "requires_user_confirmation": True,
+        "task": {"id": row.get("task_id", ""),
+                 "title": row.get("title", "")},
+        "current": {k: current[k] for k in proposed},
+        "proposed": proposed,
+        "reason": str(reason or "").strip()[:300],
+        # Exactly what the app must PATCH. Returned so the confirmation is a
+        # pass-through to the existing authorized route, not a re-derivation.
+        "confirm": {"method": "PATCH",
+                    "path": f"/tasks/{row.get('task_id', '')}",
+                    "body": patch},
+        "note": ("Nothing has changed yet. Tell the user what you propose and "
+                 "that they must confirm it."),
+    }
+    # Recorded for the RESPONSE, so the app renders a confirmation card from
+    # the server-validated proposal rather than from the model's prose (which
+    # may describe it loosely, or claim more than was proposed).
+    if not any(p["task"]["id"] == out["task"]["id"]
+               and p["proposed"] == out["proposed"] for p in ctx.proposals):
+        ctx.proposals.append(out)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas — what the MODEL is told exists.
 #
@@ -10698,22 +11357,38 @@ AI_TOOL_SCHEMAS = [
     {"type": "function", "function": {
         "name": "get_overdue_tasks",
         "description": (
-            "The signed-in user's tasks whose due date has passed and which "
-            "are not finished. Use for 'what is overdue', 'what am I late "
-            "on', 'what did I miss'."),
-        "parameters": {"type": "object", "properties": {}, "required": []}}},
+            "Tasks whose due date has passed and which are not finished. Use "
+            "for 'what is overdue', 'what am I late on', 'what did I miss'. "
+            "Includes tasks the user delegated to other people, matching what "
+            "their Task dashboard shows; pass "
+            "include_assigned_to_others=false to narrow it to only the work "
+            "they owe themselves."),
+        "parameters": {"type": "object", "properties": {
+            "include_assigned_to_others": {
+                "type": "boolean",
+                "description": "Default true. Set false for only the tasks "
+                               "assigned to the signed-in user."},
+        }, "required": []}}},
     {"type": "function", "function": {
         "name": "get_upcoming_tasks",
         "description": (
-            "The signed-in user's tasks due between today and a horizon. Use "
-            "for 'what is due this week', 'what is coming up', 'what do I "
-            "need to finish by Friday'. Excludes already-overdue tasks."),
+            "Tasks due between today and a horizon. Use for 'what is due this "
+            "week', 'what is coming up', 'what do I need to finish by "
+            "Friday', 'show me my upcoming tasks'. Excludes already-overdue "
+            "tasks (get_overdue_tasks covers those). Includes tasks the user "
+            "delegated to other people, matching what their Task dashboard "
+            "shows."),
         "parameters": {"type": "object", "properties": {
             "days": {"type": "integer",
-                     "description": "Days ahead to look. Default 7."},
+                     "description": "Days ahead to look, counting today. "
+                                    "Default 7."},
             "due_before": {"type": "string",
                            "description": "Explicit horizon as YYYY-MM-DD. "
                                           "Overrides days."},
+            "include_assigned_to_others": {
+                "type": "boolean",
+                "description": "Default true. Set false for only the tasks "
+                               "assigned to the signed-in user."},
         }, "required": []}}},
     {"type": "function", "function": {
         "name": "search_my_tasks",
@@ -10762,6 +11437,52 @@ AI_TOOL_SCHEMAS = [
             "limit": {"type": "integer",
                       "description": "How many to return. Default 10."},
         }, "required": []}}},
+    {"type": "function", "function": {
+        "name": "get_meeting_context",
+        "description": (
+            "The MEETING DISCUSSION behind one task — why it was created, what "
+            "was said about it, what decision produced it. Use for 'why does "
+            "this task exist', 'what was discussed about this', 'what decision "
+            "led to this', 'what happened with this task'. Searches the "
+            "transcript of the meeting the task came from and returns the "
+            "relevant sections with their [seg_N] ids. "
+            "The discussion returned is HISTORY: it explains the task's "
+            "origin and must never be used to state the task's current "
+            "status, assignee or deadline — those come from get_task."),
+        "parameters": {"type": "object", "properties": {
+            "task_id": {"type": "string",
+                        "description": "Task id from an earlier tool result."},
+            "question": {"type": "string",
+                         "description": "What to look for in the meeting, in "
+                                        "the user's own words. Steers which "
+                                        "sections are retrieved."},
+        }, "required": ["task_id"]}}},
+    {"type": "function", "function": {
+        "name": "propose_task_change",
+        "description": (
+            "PROPOSE a change to one task for the user to confirm. This does "
+            "NOT change anything — it returns a proposal the app shows the "
+            "user, who then approves or rejects it. Use when the user asks you "
+            "to complete, reschedule, reprioritize or reopen a task. Say in "
+            "your reply what you have proposed and that it needs their "
+            "confirmation. Never claim the change has been made."),
+        "parameters": {"type": "object", "properties": {
+            "task_id": {"type": "string",
+                        "description": "Task id from an earlier tool result."},
+            "status": {"type": "string",
+                       "enum": ["Open", "In Progress", "Completed",
+                                "Cancelled"],
+                       "description": "Proposed new status."},
+            "due_date": {"type": "string",
+                         "description": "Proposed new deadline as YYYY-MM-DD. "
+                                        "Omit unless the user asked to "
+                                        "reschedule."},
+            "priority": {"type": "string", "enum": ["Low", "Medium", "High"],
+                         "description": "Proposed new priority."},
+            "reason": {"type": "string",
+                       "description": "One short sentence on why, shown to "
+                                      "the user beside the proposal."},
+        }, "required": ["task_id"]}}},
 ]
 
 # name -> (implementation, accepted argument names). The dispatcher below is
@@ -10776,14 +11497,28 @@ AI_TOOL_SCHEMAS = [
 AI_TOOLS = {
     "get_my_tasks": (tool_get_my_tasks,
                      ("status", "include_assigned_to_others", "limit")),
-    "get_overdue_tasks": (tool_get_overdue_tasks, ()),
-    "get_upcoming_tasks": (tool_get_upcoming_tasks, ("due_before", "days")),
+    "get_overdue_tasks": (tool_get_overdue_tasks,
+                          ("include_assigned_to_others",)),
+    "get_upcoming_tasks": (tool_get_upcoming_tasks,
+                           ("due_before", "days",
+                            "include_assigned_to_others")),
     "search_my_tasks": (tool_search_my_tasks,
                         ("query", "status", "include_completed")),
     "get_task": (tool_get_task, ("task_id",)),
     "get_tasks_from_meeting": (tool_get_tasks_from_meeting,
                                ("recording_key", "meeting_query")),
     "list_my_meetings": (tool_list_my_meetings, ("limit",)),
+    # Reads meeting CONTENT, and the only tool that does. Note it takes a
+    # task_id and NOT a recording key: transcript access is reachable only
+    # through a task the caller can see, so there is no argument a model could
+    # fill in to reach an arbitrary meeting's index.
+    "get_meeting_context": (tool_get_meeting_context, ("task_id", "question")),
+    # WRITES NOTHING. Named "propose_" rather than "update_"/"complete_" so
+    # the read-only-tools assertion in the test suite keeps holding and so the
+    # name itself cannot mislead a model into reporting a change as done.
+    "propose_task_change": (tool_propose_task_change,
+                            ("task_id", "status", "due_date", "priority",
+                             "reason")),
 }
 
 # Arguments the model is NEVER allowed to set, whatever the schemas say. The
@@ -10844,6 +11579,214 @@ def _ai_dispatch(ctx, name, raw_args):
 
 
 # ---------------------------------------------------------------------------
+# Session storage — the persistence layer for workspace chat.
+#
+# THE ONE RULE, and every function below follows from it: A STORED
+# CONVERSATION IS NOT AN AUTHORIZATION GRANT.
+#
+# A session's turns are text the assistant produced from data the caller
+# could read AT THE TIME. Access can be revoked afterwards — a task
+# reassigned, a meeting trashed, a contact unlinked. So replaying a session
+# must never re-expose that data as though the check still passed:
+#
+#   * a session is authorized on OWNERSHIP of the session, which only
+#     controls who may read their own past messages;
+#   * every NEW answer re-runs the tools, which re-authorize from scratch
+#     against the live tables. History is never a data source for the model's
+#     factual claims, only conversational context (spec section 11).
+#
+# That is why history rides in the message list as plain prose and no tool
+# result is ever persisted or replayed: there is nothing in a stored session
+# that a tool would trust.
+# ---------------------------------------------------------------------------
+def _session_title(message):
+    """A session's title, derived from the FIRST user message.
+
+    Deterministic and free (spec section 7): no extra Groq call for a label,
+    which would double the cost of starting a conversation and could fail or
+    return something odd. Cut on a word boundary where one is close enough,
+    so the title reads as a phrase rather than a severed word.
+
+    Bounded hard at MAX_SESSION_TITLE_CHARS, which is also what stops a
+    title carrying meaningful content: 60 characters cannot hold a
+    transcript excerpt.
+    """
+    text = " ".join(str(message or "").split())
+    if not text:
+        return "New conversation"
+    if len(text) <= MAX_SESSION_TITLE_CHARS:
+        return text
+    cut = text[:MAX_SESSION_TITLE_CHARS]
+    space = cut.rfind(" ")
+    if space > MAX_SESSION_TITLE_CHARS // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,.;:!?-") + "…"
+
+
+def _stored_turns(row):
+    """The session's persisted turns, defensively.
+
+    A row whose `turns` is missing or the wrong type reads as an empty
+    conversation rather than raising: a corrupt session must degrade to "no
+    history" and keep answering, never 500 the chat route.
+    """
+    turns = (row or {}).get("turns")
+    return turns if isinstance(turns, list) else []
+
+
+def _public_session(row, *, with_turns=False):
+    """A session as the API returns it.
+
+    The LIST shape is deliberately lightweight (spec section 6) — no turns at
+    all, because a session list that carried every conversation's full text
+    would be the most expensive read in the app and is never what a list
+    needs. `with_turns` is the detail route's opt-in.
+    """
+    out = {
+        "session_id": str((row or {}).get("session_id") or ""),
+        "title": str((row or {}).get("title") or ""),
+        "created_at": str((row or {}).get("created_at") or ""),
+        "updated_at": str((row or {}).get("updated_at") or ""),
+        # Stored rather than derived so the list route does not have to read
+        # the turn array to count it. Kept in step by _append_turns, which is
+        # the only writer.
+        "message_count": int((row or {}).get("message_count") or 0),
+        "last_message_preview": str(
+            (row or {}).get("last_message_preview") or ""),
+    }
+    if with_turns:
+        # CHRONOLOGICAL, oldest first — the order the screen renders and the
+        # order the turns are stored in. Stated explicitly because a chat that
+        # renders backwards is a subtle, confusing bug.
+        out["turns"] = _stored_turns(row)
+    return out
+
+
+def _owned_session(user_id, session_id):
+    """The session, if this caller owns it. 404 otherwise.
+
+    THE AUTHORIZATION GATE for every session route, and shaped exactly like
+    _owned_task / _owned_folder / _owned_contact so it reads the same at every
+    call site.
+
+    404 AND NEVER 403, matching the rest of this file: a 403 would confirm
+    that a session id exists, which is precisely what an attacker enumerating
+    ids wants to learn. A session belonging to someone else is
+    indistinguishable from one that never existed.
+
+    The user_id comes from the caller's JWT via _require_auth. There is no
+    parameter here a client or a model could fill in to change whose session
+    is loaded (spec section 12).
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise ApiError(400, "session id required")
+    # A malformed id is not found rather than a 400: the client did not
+    # necessarily send it (the model may have), and "no such session" is the
+    # honest answer either way.
+    if len(sid) > 64:
+        raise ApiError(404, "conversation not found")
+    try:
+        row = _chat_sessions.get_item(Key={"session_id": sid}).get("Item")
+    except ClientError as err:
+        # A read failure is NOT "not found" — treating it as a new session
+        # would silently start a fresh conversation while the user's own one
+        # still exists, and (worse) is the shape spec section 14 forbids:
+        # never let a load failure look like an absent session.
+        print(f"[error] ai.session read failed for {user_id}: {err}")
+        raise ApiError(503, "Could not load that conversation. Please retry.")
+    if not row or str(row.get("user_id") or "") != user_id:
+        raise ApiError(404, "conversation not found")
+    return row
+
+
+def _new_session(user_id, first_message):
+    """Create a session row for this caller. Returns the row.
+
+    `user_id` is the AUTHENTICATED caller, passed in by the route from
+    _require_auth — never read from a body field.
+    """
+    now = _now_iso()
+    row = {
+        "session_id": uuid.uuid4().hex[:16],
+        "user_id": user_id,
+        "title": _session_title(first_message),
+        "created_at": now,
+        "updated_at": now,
+        "message_count": 0,
+        "last_message_preview": "",
+        "turns": [],
+    }
+    _chat_sessions.put_item(Item=row)
+    return row
+
+
+def _append_turns(row, user_message, reply):
+    """Persist one exchange, trimmed. Returns the updated row.
+
+    THE ONLY WRITER of `turns`, which is what makes the bound real rather
+    than aspirational: it slices to MAX_SESSION_TURNS before every write, so
+    there is no path that appends without trimming.
+
+    Trimmed OLDEST-FIRST, matching the meeting chat. `message_count` keeps
+    counting the whole conversation rather than the stored window — the user
+    did send those messages, and a count that reset would be a lie; it is
+    metadata, not an index into the array.
+
+    WHAT IS NOT STORED, and each for a reason from spec section 4:
+      * tool ARGUMENTS — they can name task and recording ids, and a stored
+        id is a durable reference to data whose access may be revoked;
+      * tool RESULTS — the same, in bulk, plus they are the model's inputs
+        rather than the conversation;
+      * sources / proposals — a proposal is a live offer validated against
+        current permissions, so replaying a stale one would be offering a
+        change the user may no longer be allowed to make;
+      * anything about identity beyond the owning user_id.
+    Only `role`, `content` and `at` are persisted.
+    """
+    now = _now_iso()
+    turns = _stored_turns(row) + [
+        {"role": "user", "content": str(user_message)[:MAX_AI_MESSAGE_CHARS],
+         "at": now},
+        {"role": "assistant", "content": str(reply)[:MAX_STORED_REPLY_CHARS],
+         "at": now},
+    ]
+    turns = turns[-MAX_SESSION_TURNS:]
+
+    count = int(row.get("message_count") or 0) + 2
+    # A short, safe label for the session list. Bounded to a title's length
+    # for the same reason: it must not become a place conversation content
+    # accumulates.
+    preview = " ".join(str(reply or "").split())[:MAX_SESSION_TITLE_CHARS]
+
+    _chat_sessions.update_item(
+        Key={"session_id": row["session_id"]},
+        UpdateExpression=("SET turns = :t, updated_at = :now, "
+                          "message_count = :c, last_message_preview = :p"),
+        ExpressionAttributeValues={":t": turns, ":now": now, ":c": count,
+                                   ":p": preview},
+    )
+    return {**row, "turns": turns, "updated_at": now,
+            "message_count": count, "last_message_preview": preview}
+
+
+def _session_history(row):
+    """The stored conversation, narrowed to what GROQ should see.
+
+    STORAGE AND CONTEXT ARE SEPARATE CONCERNS (spec section 8). A session
+    holds up to MAX_SESSION_TURNS so the user can scroll back; the model gets
+    AI_HISTORY_TURNS exchanges, because the rest would crowd out the answer
+    and cost tokens for context the question does not need.
+
+    Reuses _ai_clean_ai_history — the SAME validator applied to client-sent
+    history — so a stored turn and a client turn cannot reach the model
+    through different rules. That matters because these rows were written by
+    this service but read back much later, possibly after a schema change.
+    """
+    return _ai_clean_ai_history(_stored_turns(row))
+
+
+# ---------------------------------------------------------------------------
 # The agent loop
 # ---------------------------------------------------------------------------
 def _ai_clean_ai_history(raw):
@@ -10873,7 +11816,8 @@ def _ai_run_agent(ctx, message, history):
     tools past the budget is answered from what it has rather than left to be
     killed mid-call.
     """
-    system = (prompts.ASSISTANT_SYSTEM + "\n"
+    system = (prompts.ASSISTANT_SYSTEM
+              + prompts.ASSISTANT_TASK_RULES + "\n"
               + prompts.assistant_identity(
                   display_name=ctx.display_name, email=ctx.email,
                   today=_ai_today()))
@@ -10935,15 +11879,43 @@ def _ai_run_agent(ctx, message, history):
 
 
 def ai_chat(event):
-    """POST /ai/chat {message, history?} -> {reply, tools_used}
+    """POST /ai/chat {message, session_id?, history?}
+       -> {session_id, reply, tools_used, sources, proposals}
 
-    The workspace-wide assistant. The client sends ONLY a message: identity
-    comes from the Authorization header via _ai_context, and any user_id or
-    contact_id in the body is ignored outright (section 5/19).
+    The workspace-wide assistant. Identity comes from the Authorization header
+    via _ai_context, and any user_id or contact_id in the body is ignored
+    outright (section 5/19).
 
-    Stateless by design — history round-trips through the client, as the
-    meeting chat already allows. There is no conversation store to build
-    (and no DynamoDB item to grow) until the product decides it needs one.
+    SESSIONS. The conversation is now PERSISTED, so leaving the screen no
+    longer loses it:
+
+      * no `session_id`      -> a new session is created and its id returned;
+      * a `session_id`       -> authorized against the caller via
+                                _owned_session, then continued;
+      * someone else's id    -> 404, indistinguishable from one that never
+                                existed.
+
+    `history` is still ACCEPTED but is now a FALLBACK, not the source of
+    truth. That ordering is what keeps the deployed app working: a client that
+    sends only history (no session_id) gets exactly the behaviour it always
+    had, plus a session id it is free to ignore. When a session IS named, the
+    stored conversation wins — the server's copy is authoritative, and a
+    client's replay of it could be stale or trimmed differently.
+
+    `sources` and `proposals` are ADDITIVE keys. Both come from the CONTEXT,
+    not from the model's prose:
+
+      * `sources` is the transcript evidence retrieval actually read, each row
+        carrying the meeting id the segment belongs to so the app can
+        deep-link with the mechanism it already has
+        (/recording/{key}/transcript?evidence=seg_N). A model cannot put an
+        invented id here — only _ai_note_sources writes it.
+      * `proposals` is the set of task changes the model drafted, each already
+        validated and authorized server-side and each carrying the exact patch
+        to send if the user confirms. NOTHING has been written; the app must
+        ask before applying (section 8).
+
+    An older app build ignores every added key and behaves exactly as before.
     """
     ctx = _ai_context(event)
     data = _body(event)
@@ -10955,10 +11927,21 @@ def ai_chat(event):
         raise ApiError(400,
                        f"message too long (max {MAX_AI_MESSAGE_CHARS} chars)")
 
-    history = _ai_clean_ai_history(data.get("history"))
+    # AUTHORIZE THE SESSION BEFORE ANYTHING ELSE. Done here, before the Groq
+    # call, so an unauthorized id costs one GetItem rather than a generation —
+    # and so a 404 can never be confused with an answer.
+    requested = str(data.get("session_id") or "").strip()
+    session = _owned_session(ctx.user_id, requested) if requested else None
 
-    print(f"[audit] ai.chat user={ctx.user_id} chars={len(message)} "
-          f"turns={len(history)} req={ctx.request_id}")
+    if session is not None:
+        # The STORED conversation wins over anything the client replayed.
+        history = _session_history(session)
+    else:
+        history = _ai_clean_ai_history(data.get("history"))
+
+    print(f"[audit] ai.chat user={ctx.user_id} "
+          f"session={session['session_id'] if session else 'new'} "
+          f"chars={len(message)} turns={len(history)} req={ctx.request_id}")
 
     try:
         reply, used = _ai_run_agent(ctx, message, history)
@@ -10967,7 +11950,172 @@ def ai_chat(event):
 
     if not reply:
         raise ApiError(502, "Unable to generate a reply. Please retry.")
-    return _resp(200, {"reply": reply, "tools_used": used})
+
+    # Same boundary as the per-meeting chat: get_meeting_context hands the
+    # model labelled transcript, so the ids are in front of it here too. The
+    # structured `sources` below is where they legitimately live — it is
+    # written by _ai_note_sources from retrieval, never from this prose.
+    reply = ai_sanitize.sanitize_ai_user_output(
+        reply, label=f"ai_chat:{ctx.user_id}")
+    if not reply:
+        raise ApiError(502, "Unable to generate a reply. Please retry.")
+
+    # PERSISTENCE COMES AFTER A SUCCESSFUL ANSWER, and cannot fail it.
+    #
+    # Spec section 14, and the reason this block is a try/except rather than
+    # part of the happy path: the model has already been paid for and the
+    # answer is already correct. Turning that into a generic AI failure
+    # because a DynamoDB write blipped would lose the user real work and
+    # misattribute the fault. So a persistence failure is LOGGED, flagged on
+    # the response, and the answer is returned anyway.
+    #
+    # `session_id` is empty in that case, which is deliberate and honest: the
+    # client has nothing to resume, and telling it otherwise would have it
+    # send an id that does not exist on the next turn.
+    session_id, saved = "", True
+    try:
+        if session is None:
+            session = _new_session(ctx.user_id, message)
+        session = _append_turns(session, message, reply)
+        session_id = session["session_id"]
+    except ClientError as err:
+        saved = False
+        print(f"[error] ai.chat persist FAILED user={ctx.user_id} "
+              f"session={requested or 'new'} req={ctx.request_id}: {err}")
+
+    print(f"[ai_metrics] " + json.dumps({
+        "evt": "ai_chat",
+        "user_id": ctx.user_id,
+        "session_id": session_id,
+        # Counts and outcomes only — never the question, never the answer.
+        # These logs are retained and broadly readable (section 17).
+        "message_count": int((session or {}).get("message_count") or 0),
+        "history_turns": len(history),
+        "tools_used": used,
+        "persistence_success": saved,
+    }, default=str))
+
+    body = {
+        "session_id": session_id,
+        "reply": reply,
+        "tools_used": used,
+        "sources": ctx.sources[:MAX_CHAT_SOURCES],
+        "proposals": ctx.proposals,
+    }
+    if not saved:
+        # Stated so the app can tell the user this turn was not kept, rather
+        # than silently losing it from a conversation they will reopen later.
+        body["persisted"] = False
+    return _resp(200, body)
+
+
+def ai_list_sessions(event):
+    """GET /ai/chat/sessions?limit=&cursor= -> {sessions, count, next_cursor}
+
+    The caller's conversations, most recently updated first.
+
+    LIGHTWEIGHT BY DESIGN (spec section 6): no turns are returned. A list that
+    carried every conversation's full text would be the most expensive read in
+    the app, and a list never needs it — `title`, `message_count` and
+    `last_message_preview` are what a row renders.
+
+    Read off the user-index, whose hash key IS user_id, and then re-checked
+    against the caller anyway. Not redundant paranoia — the same rule the
+    Tasks routes document: an index is a lookup path, never an authorization
+    decision.
+    """
+    user_id = _require_auth(event)
+    qs = event.get("queryStringParameters") or {}
+    limit = _clean_limit(qs.get("limit"), SESSIONS_PAGE_DEFAULT,
+                         SESSIONS_PAGE_MAX)
+
+    query = {
+        "IndexName": CHAT_SESSIONS_USER_INDEX,
+        "KeyConditionExpression": Key("user_id").eq(user_id),
+        # updated_at is the index's range key, so "most recent first" is the
+        # index's own order rather than a sort in memory.
+        "ScanIndexForward": False,
+        "Limit": limit,
+    }
+    cursor = _decode_cursor(qs.get("cursor"))
+    if cursor:
+        query["ExclusiveStartKey"] = cursor
+
+    try:
+        res = _chat_sessions.query(**query)
+    except ClientError as err:
+        # The GSI may not exist on an environment that has not run the
+        # create-table script. Loud in the logs, and an empty list rather
+        # than a 500 — the chat itself still works without a list.
+        code = err.response.get("Error", {}).get("Code")
+        if code in ("ValidationException", "ResourceNotFoundException"):
+            print(f"[warn] {CHAT_SESSIONS_USER_INDEX} unavailable: {err}")
+            return _resp(200, {"sessions": [], "count": 0, "next_cursor": ""})
+        raise
+
+    rows = [r for r in res.get("Items", [])
+            if str(r.get("user_id") or "") == user_id]
+
+    # DETERMINISTIC ORDER WITHIN A PAGE.
+    #
+    # updated_at is the index's range key, so DynamoDB already returns the
+    # page newest-first — but two sessions CAN share a timestamp, and then
+    # the order between them is whatever the index happens to give. That is
+    # not theoretical: _now_iso() is evaluated per Lambda invocation and
+    # returns the same microsecond for two writes in one request, and two
+    # sessions touched in the same second are ordinary.
+    #
+    # Re-sorting the page (not the table — the query already bounded it)
+    # makes the list stable, with session_id as the tie-break so the same
+    # data always renders in the same order. A list that reshuffled on
+    # refresh reads as a bug even when every row is correct.
+    rows.sort(key=lambda r: (str(r.get("updated_at") or ""),
+                             str(r.get("session_id") or "")),
+              reverse=True)
+    sessions = [_public_session(r) for r in rows]
+    return _resp(200, {
+        "sessions": sessions,
+        "count": len(sessions),
+        "next_cursor": _encode_cursor(res.get("LastEvaluatedKey")),
+    })
+
+
+def ai_get_session(event):
+    """GET /ai/chat/sessions/{session_id} -> {session}
+
+    One conversation and its persisted turns, oldest first.
+
+    Authorized by _owned_session, which 404s for anyone else's id. Note what
+    replaying this does NOT do: it re-runs no tools and re-reads no task, so
+    a turn that once described Task A does not re-expose Task A. It is text
+    the caller was already shown (spec section 11).
+    """
+    user_id = _require_auth(event)
+    sid = (event.get("pathParameters") or {}).get("session_id", "")
+    row = _owned_session(user_id, sid)
+    return _resp(200, {"session": _public_session(row, with_turns=True)})
+
+
+def ai_delete_session(event):
+    """DELETE /ai/chat/sessions/{session_id} -> {deleted, session_id}
+
+    HARD delete, matching every other delete route in this file (folders,
+    contacts, tasks): the row goes, rather than gaining an `archived` flag
+    the rest of the codebase has no convention for. One item holds the whole
+    conversation, so there is no separate message store left orphaned — which
+    is a direct benefit of the single-item design (spec section 6).
+
+    Authorized first: a caller can only ever delete their own session, and
+    someone else's id is a 404 that deletes nothing.
+    """
+    user_id = _require_auth(event)
+    sid = (event.get("pathParameters") or {}).get("session_id", "")
+    row = _owned_session(user_id, sid)
+
+    _chat_sessions.delete_item(Key={"session_id": row["session_id"]})
+    print(f"[audit] ai.session.deleted user={user_id} "
+          f"session={row['session_id']}")
+    return _resp(200, {"deleted": True, "session_id": row["session_id"]})
 
 
 def ai_suggestions(event):
@@ -10976,14 +12124,167 @@ def ai_suggestions(event):
     Starter prompts, served from the backend for the same reason the meeting
     chat serves its own: the catalogue belongs in one place, not hardcoded in
     the app. Authenticated so it cannot be used to probe the API anonymously.
+
+    `task_id` narrows the catalogue to the per-task questions (spec section 4).
+    The id is NOT authorized here and deliberately not read from the store —
+    these are literal strings with nothing of the user's data in them, so
+    there is nothing to leak; the tools authorize when the question is
+    actually asked.
     """
     _require_auth(event)
-    return _resp(200, {"suggestions": [
-        "What are my tasks?",
-        "What's overdue?",
-        "What do I need to finish this week?",
-        "What did I commit to in my last meeting?",
-    ]})
+    qs = event.get("queryStringParameters") or {}
+    if str(qs.get("task_id") or "").strip():
+        return _resp(200, {"suggestions": AI_TASK_SUGGESTIONS})
+    return _resp(200, {"suggestions": AI_SUGGESTIONS})
+
+
+# ---------------------------------------------------------------------------
+# TASK INTELLIGENCE — the dashboard's structured AI, on its own route.
+#
+# WHY NOT /ai/chat. The dashboard does not want a paragraph; it wants rows it
+# can key by task id, group under fixed headings and make tappable. Getting
+# that out of the conversational agent would mean either parsing its prose
+# (fragile) or teaching it to emit two output shapes (worse). Spec section 7
+# allows a dedicated endpoint where it is cleaner, and this is that case: one
+# Groq call, JSON mode, strict coercion, no tool loop.
+#
+# WHAT IT IS NOT. It is not a second source of truth for tasks. The response
+# carries JUDGEMENTS keyed by task id and nothing else — no status, no
+# assignee, no deadline (the schema has no field for them). The app merges
+# these onto the rows it already loaded from GET /tasks, which stays
+# authoritative. That is what keeps "AI recommendations must not overwrite
+# task state" true by construction rather than by discipline.
+#
+# COST. One call over at most AI_INTEL_MAX_TASKS task views. The tasks are
+# read through the SAME _ai_owner_tasks the tools use, so this route can see
+# neither more nor less than the assistant can.
+# ---------------------------------------------------------------------------
+
+# How many tasks are sent for analysis. The binding constraint is the context
+# window, not the row count: each view is a few hundred characters, so this is
+# comfortably inside one call while still covering a real backlog. Tasks are
+# sent MOST-URGENT-FIRST, so a user with more than this loses the least
+# interesting tail rather than a random slice.
+AI_INTEL_MAX_TASKS = int(os.environ.get("AI_INTEL_MAX_TASKS", "60"))
+
+
+def _ai_intel_task_view(row, ctx, speaker_names=None):
+    """A task as the INTELLIGENCE prompt sees it.
+
+    Narrower than _ai_task_view and shaped by one question: what does a model
+    need in order to judge urgency, staleness and duplication? Dates and text,
+    essentially. `created_at` is included here (the chat view omits it)
+    because "open since March" is the only evidence for staleness there is.
+    """
+    pub = _public_task_v2(row, speaker_names)
+    view = {
+        "id": pub["id"],
+        "title": pub["title"],
+        "status": pub["status"],
+        "priority": pub["priority"],
+        # The RESOLVED day, for the same reason _ai_task_view uses it: a model
+        # asked to judge urgency cannot compare "Wednesday" to today.
+        "due_date": _ai_due_day(row),
+        "is_overdue": pub["is_overdue"],
+        "created_at": str(pub.get("created_at") or "")[:10],
+        "assigned_to_me": _assigned_to_me(row, ctx),
+        "source": "meeting" if row.get("source_recording_id") else "manual",
+        "needs_review": pub["needs_review"],
+    }
+    if pub.get("description"):
+        view["description"] = pub["description"][:300]
+    name = (pub.get("assignee") or {}).get("name") or ""
+    if name:
+        view["assignee_name"] = name
+    if row.get("ai_evidence"):
+        view["evidence"] = str(row["ai_evidence"])[:200]
+    return view
+
+
+def ai_task_intelligence(event):
+    """POST /ai/task-intelligence -> {summary, rows, analyzed, partial}
+
+    Structured judgements over the caller's own open tasks, for the dashboard.
+    Recommendations only: every row is a (task_id, kind, reason,
+    recommendation) and the app merges them onto task rows it already has.
+    """
+    ctx = _ai_context(event)
+
+    # Everything the caller can SEE and has not finished — the same universe
+    # the dashboard renders, so an analysis cannot omit a task the user is
+    # looking at while it runs.
+    rows = [r for r in _ai_owner_tasks(ctx)
+            if _ai_visible(r, ctx)
+            and r.get("status") not in TASK_TERMINAL_STATUSES]
+    # Most-urgent-first, so a truncated list keeps the tasks worth judging.
+    rows = _ai_sort_by_due(rows)
+    total = len(rows)
+    rows = rows[:AI_INTEL_MAX_TASKS]
+
+    if not rows:
+        # Nothing open. Answered WITHOUT a Groq call: there is nothing to
+        # judge, and paying for a model to say so would be both slower and an
+        # invitation to invent something.
+        return _resp(200, {"summary": "", "rows": [], "analyzed": 0,
+                           "partial": False})
+
+    cache = {}
+    views = [_ai_intel_task_view(
+                r, ctx,
+                _speaker_names_for_recording(r.get("source_recording_id"), cache))
+             for r in rows]
+
+    # TRIM TO WHAT ACTUALLY FITS ONE CALL.
+    #
+    # AI_INTEL_MAX_TASKS bounds the COUNT, but a task view's size varies a
+    # lot — a long title, a 300-char description and an evidence sentence is
+    # an order of magnitude bigger than a bare title. 60 fat rows measured
+    # ~15.6k tokens, which is over the 12k TPM a default-configured account
+    # has, and a 429 that cannot be retried inside the request deadline
+    # surfaces to the user as "Could not analyze your tasks".
+    #
+    # So the batch is cut to the SAME budget the rest of the on-demand AI
+    # uses (single_pass_budget_chars, which accounts for the system prompt
+    # and the reply reserve). Dropped from the END, after the urgency sort,
+    # so what survives is the work most worth judging.
+    budget = groq_client.single_pass_budget_chars(
+        prompts.TASK_INTELLIGENCE_SYSTEM)
+    while len(views) > 1 and len(
+            prompts.task_intelligence_request(views, today=_ai_today())) > budget:
+        views.pop()
+
+    valid_ids = {v["id"] for v in views}
+
+    print(f"[audit] ai.task_intelligence user={ctx.user_id} "
+          f"tasks={len(views)} of={total} req={ctx.request_id}")
+
+    try:
+        raw = groq_client.complete_json(
+            prompts.TASK_INTELLIGENCE_SYSTEM,
+            prompts.task_intelligence_request(views, today=_ai_today()),
+            label="task-intelligence", temperature=0.2,
+            deadline=time.monotonic() + ONDEMAND_DEADLINE_SECONDS)
+    except groq_client.GroqError as err:
+        _groq_error(err, "task intelligence")
+
+    # Coerced against the ids ACTUALLY SENT, so a judgement about a task the
+    # model invented is dropped rather than rendered as a card that goes
+    # nowhere. `valid_ids=None` for segments: these rows may cite evidence
+    # from any of several meetings, so membership cannot be checked against
+    # one transcript here — the shape still is, and the app resolves a
+    # segment id against the meeting it opens.
+    result = ai_schema.coerce_task_intelligence(raw, valid_task_ids=valid_ids)
+
+    return _resp(200, {
+        "summary": result["summary"],
+        "rows": result["rows"],
+        "analyzed": len(views),
+        # Says so when the user has more open tasks than were analysed —
+        # whether they were cut by the COUNT cap or by the token budget above.
+        # Same reason _tool_result stamps `truncated`: a partial analysis the
+        # UI presents as complete is a claim the data does not support.
+        "partial": total > len(views),
+    })
 
 
 # ===========================================================================
@@ -13627,6 +14928,24 @@ _ROUTES = {
     # tools. The client sends only {message}; identity comes from the JWT.
     ("POST", "/ai/chat"): ai_chat,
     ("GET", "/ai/suggestions"): ai_suggestions,
+    # Persistent workspace conversations. All three are STATIC paths with a
+    # non-greedy {session_id}, so none of the greedy-{key+} ordering
+    # constraints that shape the /recordings/ai/* routes apply — and
+    # "/ai/chat/sessions" cannot collide with "/ai/chat" because API Gateway
+    # matches the full path, not a prefix.
+    #
+    # SEPARATE FROM MEETING CHAT PERSISTENCE, deliberately (spec section 15):
+    # /recordings/ai/chat/{key+} stores its history on the recording row and
+    # is untouched by any of this.
+    ("GET", "/ai/chat/sessions"): ai_list_sessions,
+    ("GET", "/ai/chat/sessions/{session_id}"): ai_get_session,
+    ("DELETE", "/ai/chat/sessions/{session_id}"): ai_delete_session,
+    # The dashboard's STRUCTURED AI. Separate from /ai/chat because the answer
+    # is rows keyed by task id rather than prose — see the section above for
+    # why parsing the conversational agent's output was the wrong alternative.
+    # POST despite being a read: it runs a generation, so it must not be
+    # cached or retried by a proxy that assumes GET is free.
+    ("POST", "/ai/task-intelligence"): ai_task_intelligence,
     # CRM — Salesforce connect (Phase 1). /callback is the one route in this
     # file Salesforce's browser redirect calls directly — no JWT, verified
     # via `state` instead. See the section above for the full flow.

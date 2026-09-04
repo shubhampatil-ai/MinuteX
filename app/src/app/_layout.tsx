@@ -254,6 +254,11 @@ function RootContent() {
         <Stack.Screen name="contact/[id]" options={{ title: "Contact" }} />
         <Stack.Screen name="tasks" options={{ title: "Tasks" }} />
         <Stack.Screen name="task/[id]" options={{ title: "Task" }} />
+        {/* The workspace Task AI. A normal pushed screen rather than a modal:
+            it sets its own title (workspace vs one task) and, unlike the
+            meeting assistant, a source tap pushes the transcript ON TOP of
+            it — which a modal presentation would trap underneath. */}
+        <Stack.Screen name="assistant" options={{ title: "MinuteX AI" }} />
         <Stack.Screen name="calendar" options={{ title: "Calendar" }} />
         <Stack.Screen name="notifications" options={{ title: "Notifications" }} />
       </Stack>

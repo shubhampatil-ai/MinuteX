@@ -537,4 +537,12 @@ def build_tables():
         "users": FakeTable(
             "Users", "user_id",
             indexes={"email-index": ("email", None)}),
+        # Persistent workspace AI conversations. One item per conversation,
+        # holding a bounded turn list — see the WORKSPACE CHAT SESSIONS
+        # section in userapi. The index's RANGE key is updated_at because
+        # the session list is "most recently updated first", which is then
+        # the index's own order rather than a sort in memory.
+        "chat_sessions": FakeTable(
+            "ChatSessions", "session_id",
+            indexes={"user-index": ("user_id", "updated_at")}),
     }

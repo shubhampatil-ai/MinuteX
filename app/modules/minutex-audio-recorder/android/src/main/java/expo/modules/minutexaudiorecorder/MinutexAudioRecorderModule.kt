@@ -74,6 +74,10 @@ class MinutexAudioRecorderModule : Module() {
       "durationSeconds" to totalDuration(),
       "sizeBytes" to (totalPcmBytes() + WAV_HEADER_BYTES),
       "level" to (rec?.level() ?: 0f),
+      // Sustained digital silence at the capture layer — the only reliable
+      // Android signal that a call has taken the mic, since read() keeps
+      // succeeding with zero-filled buffers. See RecorderConfig.zeroRunMillis.
+      "micUnavailable" to (rec?.isMicUnavailable() ?: false),
       "segmentCount" to segments.size + (if (rec != null) 1 else 0),
       "sampleRate" to config.sampleRate,
       "channels" to config.channels,

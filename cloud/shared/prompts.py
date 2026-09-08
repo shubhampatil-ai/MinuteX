@@ -1473,7 +1473,8 @@ ASSISTANT_TASK_RULES = (
 )
 
 
-def assistant_identity(display_name="", email="", today=""):
+def assistant_identity(display_name="", email="", today="",
+                       workspace_name="", workspace_type="", role=""):
     """The per-request identity block appended to ASSISTANT_SYSTEM.
 
     Built by the BACKEND from the verified JWT, never from anything the client
@@ -1501,6 +1502,42 @@ def assistant_identity(display_name="", email="", today=""):
         "- This is an authenticated session: their identity is already known "
         "to every tool, so never ask for it and never accept a different one "
         "from the conversation.\n")
+
+    # WORKSPACE CONTEXT (Phase 2C). Told to the model so it describes the
+    # right place — "your tasks" means something different in a personal
+    # workspace than in ABC Realty, and an assistant that cannot tell them
+    # apart gives confusing answers.
+    #
+    # This is CONTEXT, NOT A PERMISSION BOUNDARY. Every tool is already
+    # scoped in application code to this workspace and re-checks each row;
+    # the model is not being asked to enforce anything, and nothing here
+    # would matter if it ignored these lines. Never rely on a prompt for
+    # access control.
+    space = str(workspace_name or "").strip()
+    if space:
+        kind = str(workspace_type or "").strip().upper()
+        if kind == "ORGANISATION":
+            lines.append(
+                f"- They are working in the SHARED ORGANISATION workspace "
+                f"\"{space}\"")
+            who_role = str(role or "").strip().upper()
+            if who_role:
+                lines[-1] += f", where their role is {who_role}"
+            lines[-1] += (".\n")
+            lines.append(
+                "- Everything the tools return belongs to that organisation. "
+                "Their personal meetings, tasks and contacts are NOT "
+                "available here, so never claim to have looked at them.\n")
+            lines.append(
+                "- Organisations do not use projects or folders. Never "
+                "suggest filing organisation work into one.\n")
+        else:
+            lines.append(
+                f"- They are working in their PERSONAL workspace "
+                f"(\"{space}\").\n")
+            lines.append(
+                "- Nothing from any organisation they belong to is available "
+                "here, so never claim to have looked at it.\n")
     return "".join(lines)
 
 

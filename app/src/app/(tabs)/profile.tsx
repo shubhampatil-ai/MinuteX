@@ -24,6 +24,9 @@ import {
   canUseWavEngine, getRecEngine, loadRecEngine, setRecEngine,
 } from "../../../lib/rec-engine";
 import { useDevice } from "../../../lib/device-context";
+import {
+  useWorkspace, workspaceIcon, workspaceLabel, roleLabel,
+} from "../../../lib/workspace-context";
 import { getRecordings, RecordingSummary } from "../../../lib/api";
 import {
   getMe, updateMe, changePassword, clearToken, UserProfile, ApiError,
@@ -80,6 +83,9 @@ export default function ProfileScreen() {
   const insets = useSafeAreaInsets();
   const st = useMemo(() => buildStyles(C, T), [C, T]);
   const { disconnect } = useDevice();
+  // Display only. The backend re-resolves membership and role on every
+  // request, so nothing shown here is trusted for authorization.
+  const { active: activeWorkspace, role: workspaceRole } = useWorkspace();
   const [me, setMe] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -297,6 +303,30 @@ export default function ProfileScreen() {
             than settings — putting them in this list was the wrong call and
             cost a tap on the most-used screens in the app. Only Contacts keeps
             a secondary entry point below, next to the account it belongs to. */}
+        {/* Workspace. Placed ABOVE Settings because it changes what every
+            other screen shows — it is context, not a preference. The current
+            workspace is named in the row's subtitle so the answer to "where
+            am I working?" is visible without a tap. */}
+        <SectionRule>Workspace</SectionRule>
+        <ListRow
+          icon={workspaceIcon(activeWorkspace)}
+          label={workspaceLabel(activeWorkspace)}
+          sub={
+            activeWorkspace && !activeWorkspace.is_personal
+              ? `${roleLabel(workspaceRole)} · Switch workspace`
+              : "Only you · Switch workspace"
+          }
+          onPress={() => router.push("/workspaces")}
+        />
+        {activeWorkspace && !activeWorkspace.is_personal ? (
+          <ListRow
+            icon="building.2.fill"
+            label="Organisation"
+            sub="Members, contacts and settings"
+            onPress={() => router.push("/organisation")}
+          />
+        ) : null}
+
         {/* Settings */}
         <SectionRule>Settings</SectionRule>
         <ListRow icon="person.2.fill" label="Contacts"

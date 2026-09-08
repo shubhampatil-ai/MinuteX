@@ -234,6 +234,7 @@ import prompts
 import share_schema
 import stt_result
 import transcript_store
+import workspace_schema
 
 REGION = os.environ.get("AWS_REGION")
 USERS_TABLE = os.environ.get("USERS_TABLE", "Users")
@@ -244,8 +245,6 @@ RECORDINGS_TABLE = os.environ.get("RECORDINGS_TABLE", "Recordings")
 CRM_CONNECTIONS_TABLE = os.environ.get("CRM_CONNECTIONS_TABLE", "CrmConnections")
 INTEGRATIONS_TABLE = os.environ.get("INTEGRATIONS_TABLE", "Integrations")
 CONTACTS_TABLE = os.environ.get("CONTACTS_TABLE", "Contacts")
-FOLDERS_TABLE = os.environ.get("FOLDERS_TABLE", "Folders")
-FOLDER_CONTACTS_TABLE = os.environ.get("FOLDER_CONTACTS_TABLE", "FolderContacts")
 MEETING_PARTICIPANTS_TABLE = os.environ.get("MEETING_PARTICIPANTS_TABLE",
                                             "MeetingParticipants")
 TASKS_TABLE = os.environ.get("TASKS_TABLE", "Tasks")
@@ -259,16 +258,24 @@ EMAIL_INDEX = os.environ.get("EMAIL_INDEX", "email-index")
 # Indexes on the organization-layer tables (see
 # scripts/31_create_workspace_tables.sh for the full key schema of each).
 CONTACTS_OWNER_INDEX = os.environ.get("CONTACTS_OWNER_INDEX", "owner-index")
+# SHARED organisation contacts (Phase 2C). Sparse: personal rows carry no
+# workspace_id and stay absent, which is correct — they are served by
+# owner-index, the path they have always used.
+CONTACTS_WORKSPACE_INDEX = os.environ.get("CONTACTS_WORKSPACE_INDEX",
+                                          "workspace-index")
+# Dedupe within a shared workspace. owner-email-index cannot answer "does
+# this organisation already have this person", because its HASH key is the
+# OWNER — two members adding the same client would each get their own row and
+# create_contact would report 201 "created" instead of 200 "existing". This
+# index is what makes shared dedupe correct rather than owner-local.
+CONTACTS_WORKSPACE_EMAIL_INDEX = os.environ.get(
+    "CONTACTS_WORKSPACE_EMAIL_INDEX", "workspace-email-index")
 CONTACTS_EMAIL_INDEX = os.environ.get("CONTACTS_EMAIL_INDEX", "owner-email-index")
 CONTACTS_PHONE_INDEX = os.environ.get("CONTACTS_PHONE_INDEX", "owner-phone-index")
-FOLDERS_OWNER_INDEX = os.environ.get("FOLDERS_OWNER_INDEX", "owner-index")
-FOLDER_CONTACTS_CONTACT_INDEX = os.environ.get("FOLDER_CONTACTS_CONTACT_INDEX",
-                                               "contact-index")
 PARTICIPANTS_CONTACT_INDEX = os.environ.get("PARTICIPANTS_CONTACT_INDEX",
                                             "contact-index")
 TASKS_OWNER_INDEX = os.environ.get("TASKS_OWNER_INDEX", "owner-index")
 TASKS_MEETING_INDEX = os.environ.get("TASKS_MEETING_INDEX", "meeting-index")
-TASKS_FOLDER_INDEX = os.environ.get("TASKS_FOLDER_INDEX", "folder-index")
 TASKS_ASSIGNEE_INDEX = os.environ.get("TASKS_ASSIGNEE_INDEX", "assignee-index")
 # Tasks assigned to a MinuteX ACCOUNT (not a contact). The assignee-index
 # above is keyed on assignee_contact_id — an address-book record, which is
@@ -282,6 +289,37 @@ NOTIFICATIONS_USER_INDEX = os.environ.get("NOTIFICATIONS_USER_INDEX",
                                           "user-index")
 NOTIFICATIONS_UNREAD_INDEX = os.environ.get("NOTIFICATIONS_UNREAD_INDEX",
                                             "user-unread-index")
+# --- Workspace layer (Phase 2A). Tables created by
+# scripts/50_create_workspace_tables.sh. Nothing below reads these unless a
+# workspace row actually exists, so an environment where the script has not
+# run behaves exactly as it did before — see _workspace_membership.
+WORKSPACES_TABLE = os.environ.get("WORKSPACES_TABLE", "Workspaces")
+WORKSPACE_MEMBERSHIPS_TABLE = os.environ.get("WORKSPACE_MEMBERSHIPS_TABLE",
+                                             "WorkspaceMemberships")
+WORKSPACE_INVITATIONS_TABLE = os.environ.get("WORKSPACE_INVITATIONS_TABLE",
+                                             "WorkspaceInvitations")
+WORKSPACES_OWNER_INDEX = os.environ.get("WORKSPACES_OWNER_INDEX", "owner-index")
+MEMBERSHIPS_USER_INDEX = os.environ.get("MEMBERSHIPS_USER_INDEX", "user-index")
+INVITATIONS_TOKEN_INDEX = os.environ.get("INVITATIONS_TOKEN_INDEX",
+                                         "token-index")
+INVITATIONS_WORKSPACE_INDEX = os.environ.get("INVITATIONS_WORKSPACE_INDEX",
+                                             "workspace-index")
+INVITATIONS_EMAIL_INDEX = os.environ.get("INVITATIONS_EMAIL_INDEX",
+                                         "email-index")
+# Per-meeting access grants (Phase 2B). Only ever written for ORGANISATION
+# meetings — in a personal workspace the owner is the only member, so a grant
+# row could never change an answer.
+MEETING_ACCESS_TABLE = os.environ.get("MEETING_ACCESS_TABLE", "MeetingAccess")
+MEETING_ACCESS_USER_INDEX = os.environ.get("MEETING_ACCESS_USER_INDEX",
+                                           "user-index")
+# Workspace listing indexes (Phase 2B). SPARSE by construction: only rows
+# stamped with a workspace_id enter them, so every pre-Phase-2B row is simply
+# absent — which is correct, because those rows are personal and are served by
+# the existing owner indexes. Nothing needs backfilling for reads to be right.
+RECORDINGS_WORKSPACE_INDEX = os.environ.get("RECORDINGS_WORKSPACE_INDEX",
+                                            "workspace-index")
+TASKS_WORKSPACE_INDEX = os.environ.get("TASKS_WORKSPACE_INDEX",
+                                       "workspace-index")
 JWT_TTL = int(os.environ.get("JWT_TTL", "86400"))  # seconds (default 24h)
 PAIRING_CODE_TTL = int(os.environ.get("PAIRING_CODE_TTL", "300"))  # seconds
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
@@ -451,13 +489,9 @@ STATUS_UPLOADING = "uploading"
 STATUS_UPLOADED = "uploaded"
 
 # Fields returned in the LIST view (lightweight — no transcript/timestamps).
-# `folder_id` rides along so MinuteX and the folder views can filter the ONE
-# master list client-side without a second request per meeting. Absent on rows
-# with no folder, which is what "General" means.
 LIST_FIELDS = ("audio_s3_key", "recording_id", "user_id", "device_id",
                "source", "meeting_id", "recorded_at", "duration",
-               "title", "summary", "language", "status", "created_at",
-               "folder_id")
+               "title", "summary", "language", "status", "created_at")
 
 _ddb = boto3.resource("dynamodb", region_name=REGION)
 _users = _ddb.Table(USERS_TABLE)
@@ -476,6 +510,13 @@ _crm_connections = _ddb.Table(CRM_CONNECTIONS_TABLE)
 _integrations = _ddb.Table(INTEGRATIONS_TABLE)
 _notifications = _ddb.Table(NOTIFICATIONS_TABLE)
 _notification_dedupe = _ddb.Table(NOTIFICATION_DEDUPE_TABLE)
+# Workspace layer (Phase 2A). Constructing a Table handle is a local operation
+# — no network call, no existence check — so these are safe to build even in an
+# environment where scripts/50 has not run yet.
+_workspaces = _ddb.Table(WORKSPACES_TABLE)
+_memberships = _ddb.Table(WORKSPACE_MEMBERSHIPS_TABLE)
+_invitations = _ddb.Table(WORKSPACE_INVITATIONS_TABLE)
+_meeting_access = _ddb.Table(MEETING_ACCESS_TABLE)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -628,7 +669,11 @@ def signup(event):
     if len(password) < 8:
         raise ApiError(400, "password must be at least 8 characters")
 
-    # Reject duplicate email (GSI lookup).
+    # Fast rejection of an email that is ALREADY taken (GSI lookup). This is
+    # the friendly path, not the guarantee: the index is eventually consistent,
+    # so it can miss a signup that landed moments ago. The claim row below is
+    # what actually enforces uniqueness — this read only turns the common case
+    # into a clean 409 without a write.
     existing = _users.query(IndexName=EMAIL_INDEX,
                             KeyConditionExpression=Key("email").eq(email))
     if existing.get("Items"):
@@ -637,16 +682,68 @@ def signup(event):
     name = (data.get("name") or "").strip()[:100]
     user_id = str(uuid.uuid4())
     salt_b64, hash_b64 = _hash_password(password)
-    _users.put_item(
-        Item={"user_id": user_id, "email": email,
-              "password_hash": hash_b64, "salt": salt_b64,
-              "name": name, "avatar_url": "",
-              "created_at": _now_iso()},
-        # Guard against a race creating the same user_id (uuid collision ~never).
-        ConditionExpression="attribute_not_exists(user_id)",
-    )
+
+    # ATOMIC EMAIL UNIQUENESS.
+    #
+    # The read above cannot enforce this on its own, and the put's
+    # ConditionExpression cannot either: it guards `user_id`, a fresh uuid that
+    # never collides, so it says nothing about the email. Two concurrent
+    # signups for the same address could both read "not found" from the
+    # eventually-consistent GSI and both succeed — leaving two accounts on one
+    # email, which login (`items[0]`) then resolves arbitrarily.
+    #
+    # The fix is the pattern this codebase already uses for folder names
+    # (_folder_name_claim): claim a DETERMINISTIC row whose PRIMARY KEY encodes
+    # the constraint, conditionally. DynamoDB evaluates a condition on the item
+    # being written with full consistency, so exactly one of two racing
+    # requests can create "email#{address}" and the other gets 409.
+    #
+    # The claim lives in the Users table under a key shape no real user_id can
+    # take (a real one is a uuid4 string, which always contains hyphens and
+    # never a "#"), so claims and accounts cannot collide. _is_user_claim
+    # filters them out of the one read path that scans this table.
+    claim_id = _user_email_claim(email)
+    try:
+        _users.put_item(
+            Item={"user_id": claim_id, "claims_email": email,
+                  "claims_user_id": user_id, "created_at": _now_iso()},
+            ConditionExpression="attribute_not_exists(user_id)")
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                == "ConditionalCheckFailedException":
+            raise ApiError(409, "email already registered")
+        raise
+
+    try:
+        _users.put_item(
+            Item={"user_id": user_id, "email": email,
+                  "password_hash": hash_b64, "salt": salt_b64,
+                  "name": name, "avatar_url": "",
+                  "created_at": _now_iso()},
+            # Guard against a race creating the same user_id (uuid collision ~never).
+            ConditionExpression="attribute_not_exists(user_id)",
+        )
+    except Exception:
+        # Never leave a claim behind that no account owns — it would make the
+        # address permanently unregisterable. Same rollback create_folder does.
+        _users.delete_item(Key={"user_id": claim_id})
+        raise
     return _resp(201, {"token": _mint_for(user_id, email),
                        "user_id": user_id, "email": email, "name": name})
+
+
+def _user_email_claim(email):
+    """The deterministic uniqueness-row id for an email address.
+
+    Lives in the Users table under a key no uuid4 can produce, so claim rows
+    and account rows never collide. See the reasoning in signup().
+    """
+    return f"email#{str(email or '').strip().lower()}"
+
+
+def _is_user_claim(item):
+    """True for an email-uniqueness claim row rather than a real account."""
+    return str((item or {}).get("user_id", "")).startswith("email#")
 
 
 def login(event):
@@ -786,7 +883,11 @@ def request_avatar_upload(event):
         # would be rejected.
         subject = str(data.get("contact_id") or "").strip()
         if subject:
-            _owned_contact(user_id, subject)
+            # write=True for the reason the comment above states: the photo
+            # is stored by a follow-up PATCH /contacts, so presigning here
+            # for someone who cannot make that PATCH would hand out a usable
+            # upload URL for an edit that will be refused.
+            _owned_contact(user_id, subject, write=True)
         else:
             subject = "new"
     else:
@@ -817,10 +918,22 @@ def _public_user(item):
     stored value is a key rather than a URL. Clients render
     `avatar_view_url` and treat "" as "no photo, fall back to initials".
     """
+    # `name` stays the RAW stored value here — "" when unset. This is the
+    # caller's own profile, the one place that distinction matters: the
+    # onboarding gate keys off it, and substituting a derived name would make
+    # every account look like it had already chosen one.
+    #
+    # `suggested_name` is that derived guess, offered separately so the gate
+    # can PRE-FILL the field instead of presenting an empty box. Advisory: it
+    # is never stored unless the user actually saves it.
+    stored_name = item.get("name", "")
+    suggested = workspace_schema.display_name(item, fallback_user_id="")
     return {
         "user_id": item.get("user_id", ""),
         "email": item.get("email", ""),
-        "name": item.get("name", ""),
+        "name": stored_name,
+        "name_set": bool(str(stored_name or "").strip()),
+        "suggested_name": "" if str(stored_name or "").strip() else suggested,
         "avatar_url": item.get("avatar_url", ""),
         "avatar_view_url": _avatar_view_url(item.get("avatar_url", "")),
         "created_at": item.get("created_at", ""),
@@ -1296,6 +1409,584 @@ def _owned_devices(user_id: str) -> list:
     return sorted(ids)
 
 
+# ===========================================================================
+# WORKSPACE AUTHORIZATION (Phase 2A)
+#
+# The layer the AI TENANCY block predicted: "MinuteX has no organizations
+# table: a user's workspace IS the tenant... If an org layer is added later,
+# AIContext is the one place that has to learn about it."
+#
+# THE ONE RULE
+#
+#   The workspace a request acts in is RESOLVED FROM THE DATABASE, never
+#   accepted from the caller.
+#
+# A client says which workspace it WANTS (a header — see _workspace_context).
+# That is a request, not a claim. Membership and role are then read from
+# WorkspaceMemberships and the caller gets whatever that row says, or 404.
+#
+# WHY MEMBERSHIP IS READ ON EVERY REQUEST AND NOT PUT IN THE JWT.
+# The JWT here lasts 24h (JWT_TTL) and there is no refresh token, no denylist
+# and no server-side logout — clearToken() on the client is all "sign out"
+# does. So a role or membership copied into a token would stay valid for up to
+# a day after it was revoked. Removing a member has to STOP ACCESS NOW, which
+# makes this GetItem the revocation mechanism. It is one strongly-consistent
+# point read on a PK+SK table, which is why the table is shaped that way.
+#
+# WHY 404 AND NOT 403, everywhere in this section: the same reason the rest of
+# this file does it (see the _owned_* helpers). Telling an outsider that a
+# workspace EXISTS but is closed to them is itself a disclosure.
+#
+# WHAT THIS SECTION DOES NOT DO, in Phase 2A:
+#   - It does not decide which MEETINGS a member may read. Actions and
+#     visibility are separate concerns; resource-level access is Phase 2B.
+#   - It changes no existing route. Every helper here is currently called only
+#     by the workspace routes and by tests.
+#   - It does not touch authentication. _require_auth is unchanged.
+# ===========================================================================
+def _personal_workspace_id(user_id):
+    """This user's personal workspace id. Derived, so it needs no lookup."""
+    return workspace_schema.personal_workspace_id(user_id)
+
+
+def _workspace_row(workspace_id):
+    """The Workspaces row, or None. Never raises for a missing table.
+
+    Tolerating a missing table matters during rollout: scripts/50 creates the
+    tables and scripts/52 backfills them, and between those two the code is
+    already deployed. A ResourceNotFound here must read as "no workspace yet",
+    which is exactly how the personal fallback below treats it — not as a 500
+    on a route that has nothing to do with workspaces.
+    """
+    wid = str(workspace_id or "").strip()
+    if not wid:
+        return None
+    try:
+        return _workspaces.get_item(Key={"workspace_id": wid}).get("Item")
+    except ClientError as err:
+        print(f"[workspace] read failed for {wid}: {err}")
+        return None
+
+
+def _workspace_membership(workspace_id, user_id, *, consistent=True):
+    """The caller's membership row in this workspace, or None.
+
+    CONSISTENT READ BY DEFAULT, and that is the whole point of this function.
+    An eventually-consistent read here would let a just-removed member keep
+    working for the length of the replication lag, which is precisely the
+    window this design exists to close.
+
+    THE PERSONAL SHORT-CIRCUIT. A personal workspace id encodes its owner
+    (workspace_schema.personal_workspace_id), so membership in it is decidable
+    without any read at all: you are the sole OWNER of your own personal
+    workspace and nobody else is a member of it, ever. This is not an
+    optimization — it is what lets every existing user behave normally before
+    the backfill has written a single row.
+    """
+    wid = str(workspace_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not wid or not uid:
+        return None
+
+    if workspace_schema.is_personal_workspace_id(wid):
+        owner = workspace_schema.user_id_from_personal_workspace(wid)
+        if owner != uid:
+            return None
+        return workspace_schema.new_membership(
+            wid, uid, workspace_schema.ROLE_OWNER, _now_iso())
+
+    try:
+        return _memberships.get_item(
+            Key={"workspace_id": wid, "user_id": uid},
+            ConsistentRead=consistent,
+        ).get("Item")
+    except ClientError as err:
+        # Fail CLOSED. A membership read that errors must deny, never allow —
+        # the opposite of the best-effort reads elsewhere in this file, which
+        # degrade a display. This one is an authorization decision.
+        print(f"[workspace] membership read failed {wid}/{uid}: {err}")
+        return None
+
+
+def _active_membership(workspace_id, user_id):
+    """Membership only when it currently grants access.
+
+    Both halves are required and neither implies the other: a REMOVED member
+    still has a row (kept for audit), and an ACTIVE member of a SUSPENDED or
+    DELETED workspace must not get in either.
+    """
+    membership = _workspace_membership(workspace_id, user_id)
+    if not workspace_schema.membership_is_active(membership):
+        return None
+    if workspace_schema.is_personal_workspace_id(workspace_id):
+        # A personal workspace need not have a row yet (see the short-circuit
+        # above); when it does exist it must still be active.
+        row = _workspace_row(workspace_id)
+        if row and not workspace_schema.workspace_is_active(row):
+            return None
+        return membership
+    row = _workspace_row(workspace_id)
+    if not workspace_schema.workspace_is_active(row):
+        return None
+    return membership
+
+
+def _require_workspace_member(event, workspace_id=None):
+    """(user_id, workspace_id, membership) or 404.
+
+    THE entry point for every workspace-scoped route. Identity comes from the
+    JWT via _require_auth; the workspace comes from the path or the header and
+    is then VERIFIED, never trusted.
+    """
+    user_id = _require_auth(event)
+    wid = str(workspace_id or "").strip() or _requested_workspace_id(event)
+    if not wid:
+        wid = _personal_workspace_id(user_id)
+    membership = _active_membership(wid, user_id)
+    if not membership:
+        raise ApiError(404, "workspace not found")
+    return user_id, wid, membership
+
+
+def _require_workspace_role(event, minimum, workspace_id=None):
+    """As _require_workspace_member, but the role must reach `minimum`.
+
+    403 here, NOT 404 — and the difference from the helpers above is
+    deliberate. A member who lacks a capability already knows the workspace
+    exists (they are in it), so 404 would be a lie that makes the UI
+    unexplainable. 404 hides existence from OUTSIDERS; 403 tells an insider
+    they lack a right.
+    """
+    user_id, wid, membership = _require_workspace_member(
+        event, workspace_id=workspace_id)
+    if not workspace_schema.role_at_least(membership.get("role"), minimum):
+        raise ApiError(403, f"this action requires the {minimum} role")
+    return user_id, wid, membership
+
+
+def _require_workspace_capability(event, capability, workspace_id=None):
+    """Role check expressed as a CAPABILITY rather than a rank.
+
+    Preferred at call sites: `_require_workspace_capability(event,
+    CAP_MANAGE_MEMBERS)` states the intent, so changing which role may manage
+    members is a one-line edit in workspace_schema rather than a hunt through
+    routes for the right comparison.
+    """
+    user_id, wid, membership = _require_workspace_member(
+        event, workspace_id=workspace_id)
+    if not workspace_schema.role_can(membership.get("role"), capability):
+        raise ApiError(403, f"this action requires the {capability} permission")
+    return user_id, wid, membership
+
+
+# The header a client uses to say which workspace it is acting in. A HINT: it
+# names a workspace, it never proves membership of one. Every read of it goes
+# straight into _active_membership before anything is returned.
+WORKSPACE_HEADER = "x-minutex-workspace"
+
+# 409 + a stable machine-readable code, following the same pattern
+# SalesforceReconnectRequired uses: the request is authenticated and
+# well-formed but conflicts with the current state of the identity, and the
+# app must branch on `code` rather than on wording.
+#
+# Lowercase snake_case to match the existing codes
+# (salesforce_reconnect_required, integration_not_connected).
+ORG_EMAIL_CONFLICT_CODE = "organisation_email_conflict"
+
+
+class OrganisationEmailConflict(ApiError):
+    """The invited address belongs to a PERSONAL MinuteX account.
+
+    The agreed identity model forbids both merging and converting, so the
+    invitation cannot be accepted by this identity — the person needs a work
+    email. Never 401: that would clear the JWT and sign the user out of the
+    personal account the message tells them to keep.
+    """
+
+    def __init__(self, message):
+        super().__init__(409, message)
+        self.code = ORG_EMAIL_CONFLICT_CODE
+
+
+# The creation-side twin of the above. A DISTINCT code, not a reuse: the two
+# cases need different screens. organisation_email_conflict says "you were
+# invited on the wrong address"; this one says "this account already has
+# personal data, start the organisation from a work account". Collapsing them
+# would leave the app unable to tell the user what to actually do.
+PERSONAL_WORKSPACE_IN_USE_CODE = "personal_workspace_in_use"
+
+
+class PersonalWorkspaceInUse(ApiError):
+    """This identity has personal data, so it cannot become an organisation
+    owner. Never converts and never merges — the personal account and its
+    data are left exactly as they are."""
+
+    def __init__(self, message):
+        super().__init__(409, message)
+        self.code = PERSONAL_WORKSPACE_IN_USE_CODE
+
+
+def _requested_workspace_id(event):
+    """The workspace the client ASKED for, or "" — unverified by construction.
+
+    Deliberately not called anywhere except _require_workspace_member, so
+    there is no path on which this value reaches a query without having been
+    checked first. The body is never consulted: a workspace id arriving in a
+    JSON payload would be one more place to forget to verify, and the header
+    is the one the app already has a natural place to set.
+    """
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    return str(headers.get(WORKSPACE_HEADER) or "").strip()
+
+
+def _user_workspaces(user_id):
+    """Every workspace this user can act in, personal first.
+
+    The personal workspace is SYNTHESIZED when no row exists yet, so this
+    returns a correct answer before the backfill runs and an identical one
+    after it. That property is what makes scripts/52 an optimization rather
+    than a correctness gate — and it is why the migration can be re-run,
+    interrupted, or skipped entirely without breaking a user.
+
+    The user-index is used only to ENUMERATE. Each row is still resolved
+    through _active_membership, so a stale index entry cannot grant access:
+    an index is a lookup path, never an authorization decision.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return []
+
+    out = []
+    personal_id = _personal_workspace_id(uid)
+    personal = _workspace_row(personal_id)
+    if personal is None:
+        personal = workspace_schema.new_personal_workspace(uid, _now_iso())
+    if workspace_schema.workspace_is_active(personal):
+        out.append((personal, workspace_schema.ROLE_OWNER, None))
+
+    try:
+        rows = _query_all(_memberships, IndexName=MEMBERSHIPS_USER_INDEX,
+                          KeyConditionExpression=Key("user_id").eq(uid))
+    except ClientError as err:
+        # The personal workspace is still returned: a failure to list
+        # ORGANISATIONS must not cost the user their own workspace.
+        print(f"[workspace] membership list failed for {uid}: {err}")
+        return out
+
+    for row in rows:
+        wid = str(row.get("workspace_id") or "")
+        if not wid or wid == personal_id:
+            continue
+        membership = _active_membership(wid, uid)
+        if not membership:
+            continue
+        workspace = _workspace_row(wid)
+        if not workspace:
+            continue
+        out.append((workspace, membership.get("role", ""), membership))
+    return out
+
+
+def _ensure_personal_workspace(user_id):
+    """Create this user's personal workspace row if it is absent. Idempotent.
+
+    LAZY MIGRATION. Called from the workspace routes rather than from login,
+    so it costs nothing on the hot auth path and needs no backfill to have
+    run. The conditional write makes a concurrent double-call safe, and an
+    already-present row is left exactly as it is — including a renamed one,
+    which a blind put would have silently reset.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return None
+    wid = _personal_workspace_id(uid)
+    existing = _workspace_row(wid)
+    if existing:
+        return existing
+
+    item = workspace_schema.new_personal_workspace(uid, _now_iso())
+    try:
+        _workspaces.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(workspace_id)")
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                == "ConditionalCheckFailedException":
+            # Another request created it between our read and our write.
+            return _workspace_row(wid) or item
+        raise
+    _audit("workspace.personal_created", uid, wid)
+    return item
+
+
+def _has_personal_resources(user_id):
+    """Has this identity actually USED its personal workspace?
+
+    The enforceable form of "already has a Personal Workspace" — see the
+    ORGANISATION CREATION block in workspace_schema for why the literal
+    reading is impossible (personal workspace ids are derived, so every
+    identity has one from signup).
+
+    A personal RESOURCE is the honest signal: a recording, a task, a folder
+    or a contact the identity owns. Any one of them means this is a personal
+    account with data to lose, and making it an organisation owner would be
+    the silent conversion the identity model forbids.
+
+    THREE Limit=1 POINT QUERIES, short-circuiting on the first hit — each one
+    is an existing owner-partitioned GSI, so this is O(1) and runs only on
+    organisation CREATION, never on a hot path.
+
+    FAILS CLOSED. A read error returns True (treat as "has data"), which
+    refuses the creation rather than risking the conversion. The user gets a
+    retryable 409 instead of an irreversible account change.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False
+
+    probes = (
+        (_recordings, USER_INDEX, "user_id"),
+        (_tasks, TASKS_OWNER_INDEX, "owner_user_id"),
+        (_contacts, CONTACTS_OWNER_INDEX, "owner_user_id"),
+    )
+    for table, index, attr in probes:
+        try:
+            res = table.query(IndexName=index,
+                              KeyConditionExpression=Key(attr).eq(uid),
+                              Limit=1)
+        except ClientError as err:
+            print(f"[workspace] personal-resource probe failed on "
+                  f"{index}/{attr} for {uid}: {err}")
+            return True
+        if res.get("Items"):
+            return True
+    return False
+
+
+def _has_organisation_membership(user_id):
+    """Does this identity belong to ANY organisation?
+
+    The derived signal that separates an ORGANISATION identity from a
+    PERSONAL-ONLY one (see the IDENTITY block in workspace_schema). Derived
+    rather than stored, so there is no account-kind column to keep in step and
+    no way for it to disagree with the memberships that actually exist.
+
+    Fails CLOSED: a read error returns True, which makes acceptance fall
+    through to the ordinary membership checks instead of wrongly telling a
+    real organisation user that their address is personal-only. The wrong
+    direction here would be an insulting and unfixable error message.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False
+    try:
+        rows = _query_all(_memberships, IndexName=MEMBERSHIPS_USER_INDEX,
+                          KeyConditionExpression=Key("user_id").eq(uid))
+    except ClientError as err:
+        print(f"[workspace] org-membership probe failed for {uid}: {err}")
+        return True
+    for row in rows:
+        if not workspace_schema.is_organisation_workspace_id(
+                row.get("workspace_id")):
+            continue
+        if row.get("status") in (workspace_schema.MEMBERSHIP_ACTIVE,
+                                 workspace_schema.MEMBERSHIP_INVITED):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# RESOURCE OWNERSHIP (Phase 2B)
+#
+# THE ONE RULE, and it is the reason this reads the row rather than the
+# request:
+#
+#     A resource's workspace is whatever its STORED ROW says. The client is
+#     asked which workspace it wants only at CREATION, and even then the
+#     answer is verified against membership before it is written.
+#
+# After creation the row is authoritative forever. That is what makes the
+# asynchronous pipeline safe: transcribeRecording, the STT webhook and the
+# tasks.seed invoke all resolve ownership by loading the recording, so a
+# retry, a replay, or a forged event payload cannot move a meeting between
+# workspaces.
+# ---------------------------------------------------------------------------
+def _row_workspace_id(row, owner_field="user_id"):
+    """The workspace a stored row belongs to.
+
+    An absent workspace_id means the row predates Phase 2B, which means it is
+    PERSONAL to its owner — the only thing it could have been. Resolved, not
+    guessed, and it can never resolve to an organisation.
+    """
+    return workspace_schema.resolve_workspace_id(row, owner_field=owner_field)
+
+
+def _creation_workspace(event, user_id):
+    """The workspace a NEW resource should be created in.
+
+    The client's header is a REQUEST. It is verified against membership here,
+    once, and the verified id is what gets written to the row — after which
+    nothing reads the header again for that resource.
+
+    Falls back to the caller's personal workspace when no header is sent, so
+    every existing client keeps creating personal resources exactly as before
+    without being changed at all.
+    """
+    requested = _requested_workspace_id(event)
+    if not requested:
+        return _personal_workspace_id(user_id)
+    membership = _active_membership(requested, user_id)
+    if not membership:
+        # Same 404 an unknown workspace gets — an outsider must not learn
+        # that this one exists.
+        raise ApiError(404, "workspace not found")
+    return requested
+
+
+def _workspace_role(workspace_id, user_id):
+    """The caller's role in a workspace, or "" when they are not a member."""
+    membership = _active_membership(workspace_id, user_id)
+    return str((membership or {}).get("role") or "")
+
+
+def _can_read_meeting(user_id, item, *, role=None, devices=None):
+    """May this caller READ this meeting? The whole visibility rule, once.
+
+    ORDER MATTERS, AND THIS IS THE ORDER (remediation of the P0 finding):
+
+        1. what workspace owns the row?
+        2. is it an ORGANISATION?
+        3. if so: does the caller hold an ACTIVE membership? no -> DENY
+        4. only then: creator / role / explicit grant
+
+    THE BUG THIS FIXES. The creator branch used to run FIRST, so
+    `item["user_id"] == user_id` returned "OWNER" before anything looked at
+    membership. A member who was removed from an organisation therefore kept
+    read AND write access to every meeting they had created there — for the
+    ~30 mutating routes behind _owned_recording as well as create_share and
+    crm_sync_record. Removal has to stop access to ORGANISATION-OWNED data
+    even when the caller made it: the meeting belongs to the organisation,
+    which is the whole point of workspace_id being the ownership boundary.
+
+    PERSONAL IS UNCHANGED. A row with no workspace_id, or one whose workspace
+    is personal, never reaches the membership gate — it takes the original
+    creator/device test exactly as before. Personal resources must not start
+    requiring organisation membership.
+
+    `role` and `devices` let a LIST resolve both once for the whole page
+    instead of per row (see _list_workspace_recordings). Passing them is an
+    optimization only: omitting them changes no decision, it just costs
+    reads.
+
+    Returns the access reason ("OWNER", "ROLE", or a workspace_schema.ACCESS_*
+    value), or "" for denied, so callers can report WHY without re-deriving.
+    """
+    if not item:
+        return ""
+
+    workspace_id = _row_workspace_id(item)
+    is_org = workspace_schema.is_organisation_workspace_id(workspace_id)
+
+    if is_org:
+        # THE GATE. Before creator, before role, before any grant.
+        if role is None:
+            role = _workspace_role(workspace_id, user_id)
+        if not role:
+            # No active membership in the owning organisation. Nothing below
+            # may rescue that — not being the creator, not owning the device,
+            # and not holding a MeetingAccess row.
+            return ""
+
+    if item.get("user_id") == user_id:
+        return "OWNER"
+    if devices is None:
+        devices = _owned_devices(user_id)
+    if item.get("device_id") in devices:
+        return "OWNER"
+
+    if is_org:
+        if workspace_schema.role_sees_all_meetings(role):
+            return "ROLE"
+        granted = _meeting_access_row(item.get("audio_s3_key", ""), user_id)
+        if granted:
+            return str(granted.get("access_type")
+                       or workspace_schema.ACCESS_EXPLICIT)
+    return ""
+
+
+def _can_write_meeting(user_id, item, *, role=None, devices=None):
+    """May this caller MUTATE this meeting?
+
+    Narrower than _can_read_meeting on purpose, and the two must stay
+    different: a MANAGER may READ a colleague's meeting but must not be able
+    to edit its MoM, regenerate its documents or delete it. Only the
+    CREATOR (or the owner of the device that recorded it) may write.
+
+    The organisation membership gate applies here too, and for the same
+    reason — a removed member must not keep editing the organisation's data
+    just because they created it.
+    """
+    if not item:
+        return False
+
+    workspace_id = _row_workspace_id(item)
+    if workspace_schema.is_organisation_workspace_id(workspace_id):
+        if role is None:
+            role = _workspace_role(workspace_id, user_id)
+        if not role:
+            return False
+
+    if item.get("user_id") == user_id:
+        return True
+    if devices is None:
+        devices = _owned_devices(user_id)
+    return item.get("device_id") in devices
+
+
+def _meeting_access_row(meeting_id, user_id):
+    """The MeetingAccess row granting this user access, or None.
+
+    Best-effort: a missing table (the feature not yet deployed) reads as "no
+    explicit grant" rather than failing the request, because every other
+    branch of _can_read_meeting still works without it.
+    """
+    mid = str(meeting_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not mid or not uid:
+        return None
+    try:
+        return _meeting_access.get_item(
+            Key={"meeting_id": mid, "user_id": uid}).get("Item")
+    except ClientError as err:
+        print(f"[workspace] meeting access read failed {mid}/{uid}: {err}")
+        return None
+
+
+def _grant_meeting_access(meeting_id, user_id, access_type, *,
+                          workspace_id="", granted_by=""):
+    """Record that a user may reach a meeting. Idempotent.
+
+    Only ever called for ORGANISATION meetings: in a personal workspace the
+    owner is the only member, so a grant row would be noise that can never
+    change an answer.
+    """
+    mid = str(meeting_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not mid or not uid:
+        return None
+    if not workspace_schema.is_organisation_workspace_id(workspace_id):
+        return None
+    item = workspace_schema.new_meeting_access(
+        mid, uid, access_type, _now_iso(),
+        workspace_id=workspace_id, granted_by=granted_by)
+    try:
+        _meeting_access.put_item(Item=item)
+    except ClientError as err:
+        print(f"[workspace] meeting access write failed {mid}/{uid}: {err}")
+        return None
+    return item
+
+
 def list_devices(event):
     user_id = _require_auth(event)
     ids = _owned_devices(user_id)
@@ -1392,6 +2083,11 @@ def request_upload(event):
     user_id = _require_auth(event)
     if not BUCKET_NAME:
         raise ApiError(500, "server misconfigured (no bucket)")
+    # The workspace this meeting will belong to, VERIFIED against membership
+    # before anything is presigned or written. Resolved here — before the S3
+    # key is built — so a caller with no right to the requested workspace is
+    # refused without a presigned URL ever being minted.
+    workspace_id = _creation_workspace(event, user_id)
     data = _body(event)
 
     source = str(data.get("source") or "").strip().upper()
@@ -1429,16 +2125,6 @@ def request_upload(event):
     # Optional folder, for a recording started from inside one. Validated
     # BEFORE anything is written or presigned: a bad folder id must fail the
     # request outright rather than produce an unfiled recording the user then
-    # has to find and move by hand.
-    #
-    # Filing happens HERE rather than after the upload completes, so the row is
-    # created already carrying its folder. There is no window in which the
-    # meeting shows up in General and then jumps, and killing the app mid-upload
-    # cannot leave it unfiled.
-    folder_id = str(data.get("folder_id") or "").strip()
-    if folder_id:
-        _owned_folder(user_id, folder_id)   # 404 if it isn't the caller's
-
     # RE-PRESIGN of an upload already under way, when the client sends back the
     # key it was given. A presigned PUT is only valid for UPLOAD_URL_EXPIRY, so
     # a big file on a slow connection (or one resumed after the app was killed)
@@ -1455,8 +2141,11 @@ def request_upload(event):
     prior_key = str(data.get("key") or "").strip()
     if prior_key:
         prior = _recordings.get_item(Key={"audio_s3_key": prior_key}).get("Item")
+        # _can_write_meeting rather than a bare creator test: a member removed
+        # from the owning organisation must not be handed a fresh presigned
+        # PUT for an upload they started there. Personal rows are unaffected.
         if (prior
-                and prior.get("user_id") == user_id
+                and _can_write_meeting(user_id, prior)
                 and prior.get("status") == STATUS_UPLOADING):
             return _resp(200, {
                 "upload_url": _s3.generate_presigned_url(
@@ -1468,7 +2157,6 @@ def request_upload(event):
                 "recording_id": prior.get("recording_id", ""),
                 "expires_in": UPLOAD_URL_EXPIRY,
                 "content_type": UPLOAD_FORMATS[fmt],
-                "folder_id": prior.get("folder_id", ""),
             })
 
     # recording_id keeps the device convention "{meeting_id}_{timestamp}" so
@@ -1526,12 +2214,18 @@ def request_upload(event):
         ":uploading": STATUS_UPLOADING, ":emptymap": {},
         ":now": _now_iso(),
     }
-    # Only written when a folder was given. Absent means General, which is the
-    # one representation the rest of the system expects — writing "" here would
-    # also break the sparse folder-index rule the Tasks table lives by.
-    if folder_id:
-        sets += ", folder_id = :fid"
-        values[":fid"] = folder_id
+    # WORKSPACE OWNERSHIP (Phase 2B). Stamped ONCE, at creation, from a
+    # membership that was verified by _creation_workspace — after this the row
+    # is authoritative and no later request (or async event) re-reads the
+    # client's header for this meeting.
+    #
+    # if_not_exists on BOTH fields: request_upload is re-entered when a client
+    # re-presigns a still-uploading recording, and a second call must not be
+    # able to move an existing meeting into a different workspace.
+    sets += (", workspace_id = if_not_exists(workspace_id, :wsid)"
+             ", created_by = if_not_exists(created_by, :cby)")
+    values[":wsid"] = workspace_id
+    values[":cby"] = user_id
     _recordings.update_item(
         Key={"audio_s3_key": key},
         UpdateExpression=sets,
@@ -1541,8 +2235,7 @@ def request_upload(event):
     return _resp(200, {"upload_url": upload_url, "key": key,
                        "recording_id": recording_id,
                        "expires_in": UPLOAD_URL_EXPIRY,
-                       "content_type": content_type,
-                       "folder_id": folder_id})
+                       "content_type": content_type})
 
 
 def complete_upload(event):
@@ -1561,7 +2254,10 @@ def complete_upload(event):
 
     item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
     # 404 (not 403) for both missing and someone else's — don't leak keys.
-    if not item or item.get("user_id") != user_id:
+    # _can_write_meeting rather than a bare creator test: a member removed
+    # from the owning organisation must not be able to finalize an upload
+    # into it, even one they started.
+    if not item or not _can_write_meeting(user_id, item):
         raise ApiError(404, "recording not found")
 
     duration = _as_duration(data.get("duration"))
@@ -1624,10 +2320,142 @@ def _query_all(table, **kwargs):
         kwargs["ExclusiveStartKey"] = last
 
 
+def _list_workspace_recordings(event, user_id, workspace_id):
+    """The ORGANISATION half of list_recordings.
+
+    Membership is resolved ONCE for the whole page rather than per row — a
+    per-row membership read would turn one list into N authorization reads,
+    which is the N+1 the brief's performance section rules out. The role it
+    yields is then passed into every _can_read_meeting call.
+    """
+    membership = _active_membership(workspace_id, user_id)
+    if not membership:
+        # An outsider must not learn the workspace exists.
+        raise ApiError(404, "workspace not found")
+    role = str(membership.get("role") or "")
+    # Resolved ONCE for the page, like the role. _owned_devices costs two
+    # DynamoDB queries, so leaving _can_read_meeting to fetch it per row made
+    # this 2N reads — the N+1 the performance requirement rules out (P2
+    # remediation). Device ownership is a property of the CALLER, not of the
+    # row, so hoisting it changes no decision.
+    devices = _owned_devices(user_id)
+
+    # Optional ?user_id= — "show me only Priya's meetings".
+    #
+    # Applied AFTER _can_read_meeting, never instead of it. That ordering is
+    # the whole security property: a MEMBER passing someone else's id gets the
+    # intersection of "their meetings" and "what I may read", which is their
+    # own shared-with-me set — not a way to enumerate a colleague's meeting
+    # count. Only the display shrinks; authorization is untouched.
+    qs = event.get("queryStringParameters") or {}
+    only_user = (qs.get("user_id") or "").strip()
+
+    out = []
+    for row in _query_all(_recordings, IndexName=RECORDINGS_WORKSPACE_INDEX,
+                          KeyConditionExpression=Key(
+                              "workspace_id").eq(workspace_id),
+                          ScanIndexForward=False):
+        if _is_trashed(row):
+            continue
+        # The index found the row; this decides whether the caller may see it.
+        if not _can_read_meeting(user_id, row, role=role, devices=devices):
+            continue
+        if only_user and _recorded_by(row) != only_user:
+            continue
+        out.append(_with_source({k: row.get(k, "") for k in LIST_FIELDS}))
+
+    out.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    _attach_recorder(out)
+    return _resp(200, {"recordings": out, "count": len(out),
+                       "workspace_id": workspace_id})
+
+
+def _recorded_by(row):
+    """WHO recorded a meeting.
+
+    `created_by` is the workspace-era stamp (workspace_schema.stamp); `user_id`
+    is what every row predating it carries. Preferring created_by and falling
+    back keeps attribution correct across both without a backfill.
+    """
+    return (str((row or {}).get("created_by") or "").strip()
+            or str((row or {}).get("user_id") or "").strip())
+
+
+def _attach_recorder(rows):
+    """Add recorded_by_name / recorded_by_avatar to a page of recordings.
+
+    ONE BatchGetItem for the whole page, not a read per row — a 200-meeting
+    org list would otherwise be 200 profile reads. Mutates in place.
+
+    Only ever called on the ORGANISATION path: in a personal workspace every
+    row is the caller's own, so an attribution column there would be the same
+    name repeated down the page.
+    """
+    if not rows:
+        return
+    users = _users_by_ids([_recorded_by(r) for r in rows])
+    for row in rows:
+        who = _recorded_by(row)
+        profile = users.get(who)
+        row["recorded_by"] = who
+        row["recorded_by_name"] = workspace_schema.display_name(
+            profile, fallback_user_id="")
+        # Presigned, not the raw key: the stored value is an S3 key and the
+        # app renders a signed GET (see _public_user). Handing over the key
+        # would render nothing.
+        row["recorded_by_avatar"] = _avatar_view_url(
+            str((profile or {}).get("avatar_url") or ""))
+
+
+def _list_workspace_trash(event, user_id, workspace_id):
+    """The ORGANISATION half of list_trash. Mirrors _list_workspace_recordings.
+
+    Membership and device ownership are both resolved ONCE for the whole page
+    and passed into every _can_read_meeting call, so this is 2 authorization
+    reads per request rather than 2 per row.
+    """
+    membership = _active_membership(workspace_id, user_id)
+    if not membership:
+        raise ApiError(404, "workspace not found")
+    role = str(membership.get("role") or "")
+    devices = _owned_devices(user_id)
+
+    out = []
+    for row in _query_all(_recordings, IndexName=RECORDINGS_WORKSPACE_INDEX,
+                          KeyConditionExpression=Key(
+                              "workspace_id").eq(workspace_id),
+                          ScanIndexForward=False):
+        if not _is_trashed(row):
+            continue
+        if not _can_read_meeting(user_id, row, role=role, devices=devices):
+            continue
+        summary = _with_source({k: row.get(k, "") for k in LIST_FIELDS})
+        summary["deleted_at"] = row.get("deleted_at", "")
+        out.append(summary)
+
+    out.sort(key=lambda r: (r.get("deleted_at", ""), r.get("created_at", "")),
+             reverse=True)
+    return _resp(200, {"recordings": out, "count": len(out),
+                       "workspace_id": workspace_id})
+
+
 def list_recordings(event):
-    """Recordings the user OWNS: user-index rows (new uploads carry user_id)
-    unioned with legacy device-index rows for owned devices, deduped."""
+    """Recordings visible in the ACTIVE workspace.
+
+    PERSONAL (the default, and what every existing client gets): unchanged —
+    user-index rows unioned with legacy device-index rows for owned devices,
+    deduped. A row with no workspace_id is personal to its owner
+    (_row_workspace_id), so nothing needs backfilling for this to be right.
+
+    ORGANISATION: the workspace-index is queried instead, and each row is then
+    put through _can_read_meeting — so an OWNER/MANAGER sees every meeting,
+    while a MEMBER sees only their own plus those explicitly granted. The index
+    is a lookup path; the predicate is the authorization.
+    """
     user_id = _require_auth(event)
+    requested = _requested_workspace_id(event)
+    if requested and not workspace_schema.is_personal_workspace_id(requested):
+        return _list_workspace_recordings(event, user_id, requested)
     devices = _owned_devices(user_id)
 
     # Optional ?device_id= filter (must be one the user owns).
@@ -1763,8 +2591,10 @@ def patch_recording(event):
     item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
     if not item:
         raise ApiError(404, "recording not found")
-    if item.get("user_id") != user_id and \
-            item.get("device_id") not in _owned_devices(user_id):
+    # A metadata WRITE (title, speaker names, site-visit number), so the
+    # write predicate — which also denies a member removed from the owning
+    # organisation.
+    if not _can_write_meeting(user_id, item):
         raise ApiError(404, "recording not found")
 
     data = _body(event)
@@ -2073,6 +2903,15 @@ def list_trash(event):
     delete) and covers legacy rows with no stamp.
     """
     user_id = _require_auth(event)
+    # ORGANISATION Trash (P1 remediation). Without this an organisation
+    # OWNER/MANAGER could read a workspace meeting through GET /recordings but
+    # got an empty Trash for the same workspace — and a removed member's own
+    # trashed rows stayed visible to them. Both are now decided by the ONE
+    # predicate, with membership resolved once for the whole page.
+    requested = _requested_workspace_id(event)
+    if requested and not workspace_schema.is_personal_workspace_id(requested):
+        return _list_workspace_trash(event, user_id, requested)
+
     devices = _owned_devices(user_id)
 
     seen = set()
@@ -2082,6 +2921,11 @@ def list_trash(event):
         for item in items:
             key = item.get("audio_s3_key", "")
             if key in seen or not _is_trashed(item):
+                continue
+            # PERSONAL rows only reach here (the organisation branch returned
+            # above), but a row may have been MOVED into an organisation since
+            # it was trashed, so it is still checked rather than assumed.
+            if not _can_read_meeting(user_id, item, devices=devices):
                 continue
             seen.add(key)
             row = _with_source({k: item.get(k, "") for k in LIST_FIELDS})
@@ -2179,9 +3023,10 @@ def get_recording(event):
         raise ApiError(404, "recording not found")
     # Ownership check: the recording is stamped with the user's user_id
     # (user-owned uploads / unpair backfill), or — legacy rows only — its
-    # device is one the user currently owns.
-    if item.get("user_id") != user_id and \
-            item.get("device_id") not in _owned_devices(user_id):
+    # device is one the user currently owns. Since Phase 2B this also admits
+    # an ORGANISATION reader (OWNER/MANAGER, or an explicit grant) via
+    # _can_read_meeting, which returns "" for everyone else.
+    if not _can_read_meeting(user_id, item):
         # Do not leak existence of recordings owned by others.
         raise ApiError(404, "recording not found")
 
@@ -2350,8 +3195,20 @@ def _owned_recording(event, hydrate=True):
     item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
     if not item:
         raise ApiError(404, "recording not found")
-    if item.get("user_id") != user_id and \
-            item.get("device_id") not in _owned_devices(user_id):
+    # WRITE-CAPABLE PREDICATE — deliberately NARROWER than _can_read_meeting.
+    #
+    # This helper gates roughly thirty routes, most of which MUTATE the
+    # meeting (generate a document, edit the MoM, create a task, remap a
+    # speaker, reprocess, delete). Read visibility and write authority are
+    # different questions, and widening this to everyone who may READ an
+    # organisation meeting would silently hand a MANAGER edit rights over a
+    # colleague's recording — a permission nobody asked for.
+    #
+    # _can_write_meeting keeps that narrowness (creator/device only) AND adds
+    # the organisation membership gate, so a REMOVED member can no longer
+    # mutate organisation meetings they created. Personal rows are unaffected:
+    # they never reach the gate.
+    if not _can_write_meeting(user_id, item):
         raise ApiError(404, "recording not found")
     # Hydrated AFTER the ownership check, never before: an unauthorized caller
     # must not be able to make us spend an S3 GET on someone else's transcript.
@@ -4439,46 +5296,6 @@ CONTACT_PHONE_MAX = 32
 CONTACT_COMPANY_MAX = 120
 CONTACT_ROLE_MAX = 80
 CONTACT_NOTES_MAX = 500
-FOLDER_NAME_MAX = 80
-FOLDER_DESCRIPTION_MAX = 300
-
-# Folder appearance — a colour and an icon, both chosen from a CLOSED SET
-# rather than accepted as free text.
-#
-# Why an enum and not a hex string / arbitrary icon name: these values are
-# rendered directly into the app's UI, and the palette has to stay coherent in
-# both light and dark themes. Letting a client store "#000000" or "puce" would
-# either break contrast somewhere or render nothing at all, and there would be
-# no way to re-theme later without rewriting stored data. The client sends a
-# TOKEN; the app owns what each token looks like.
-FOLDER_COLORS = ("slate", "blue", "green", "amber", "teal", "red", "purple")
-FOLDER_COLOR_DEFAULT = "slate"
-
-# Icon tokens map to the app's existing SF-Symbol vocabulary (lib/icons.tsx).
-# Kept deliberately small — a folder icon is a glanceable category hint, not a
-# sticker library.
-FOLDER_ICONS = ("folder", "briefcase", "person.2", "building", "chart",
-                "lightbulb", "flag", "heart", "star", "phone", "cart", "gear")
-FOLDER_ICON_DEFAULT = "folder"
-
-
-def _clean_folder_color(raw, current=FOLDER_COLOR_DEFAULT):
-    """A colour token from the closed set. Unknown/empty falls back rather than
-    erroring: appearance is cosmetic, and refusing to save a folder because a
-    newer client sent a colour this deploy doesn't know yet would be worse than
-    showing the default."""
-    token = str(raw or "").strip().lower()
-    if not token:
-        return current
-    return token if token in FOLDER_COLORS else current
-
-
-def _clean_folder_icon(raw, current=FOLDER_ICON_DEFAULT):
-    """An icon token from the closed set. Same fallback reasoning as colour."""
-    token = str(raw or "").strip().lower()
-    if not token:
-        return current
-    return token if token in FOLDER_ICONS else current
 PARTICIPANT_ROLE_MAX = 80
 
 # Page sizes for the list routes. A mobile client never needs more in one
@@ -4487,7 +5304,6 @@ CONTACTS_PAGE_DEFAULT = 50
 CONTACTS_PAGE_MAX = 200
 TASKS_PAGE_DEFAULT = 50
 TASKS_PAGE_MAX = 200
-FOLDERS_MAX = 500              # a user's whole folder list, one query
 
 # Task vocabulary. The three legacy statuses the embedded map has always used
 # stay EXACTLY as they are ("Open"/"In Progress"/"Completed") because existing
@@ -4538,8 +5354,6 @@ TASK_SOURCE_LEGACY = "LEGACY"     # migrated out of the embedded map
 TASK_SOURCES = (TASK_SOURCE_AI, TASK_SOURCE_MANUAL, TASK_SOURCE_LEGACY)
 
 _contacts = _ddb.Table(CONTACTS_TABLE)
-_folders = _ddb.Table(FOLDERS_TABLE)
-_folder_contacts = _ddb.Table(FOLDER_CONTACTS_TABLE)
 _meeting_participants = _ddb.Table(MEETING_PARTICIPANTS_TABLE)
 _tasks = _ddb.Table(TASKS_TABLE)
 
@@ -4598,13 +5412,6 @@ def _norm_name(raw):
     return re.sub(r"\s+", " ", str(raw or "").strip()).casefold()
 
 
-def _norm_folder_name(raw):
-    """Folder display name -> comparison key. Same idea as _norm_name; this is
-    what makes "Client Alpha" and "client  alpha" one folder, which is what a
-    user expects from a folder list."""
-    return re.sub(r"\s+", " ", str(raw or "").strip()).casefold()
-
-
 # ---------------------------------------------------------------------------
 # Contacts — public shape + ownership
 # ---------------------------------------------------------------------------
@@ -4629,6 +5436,20 @@ def _public_contact(item, linked_avatars=None):
         "role": item.get("role", ""),
         "notes": item.get("notes", ""),
         "minutex_user_id": item.get("minutex_user_id", ""),
+        # WHERE this contact lives (Phase 2C). Resolved rather than copied
+        # raw, so a pre-Phase-2C row reads as its owner's personal workspace
+        # instead of "". The app uses `shared` to label a shared entry and to
+        # decide whether to offer Edit/Delete — presentation only; the backend
+        # enforces the rule in _owned_contact.
+        "workspace_id": _row_workspace_id(item,
+                                          owner_field="owner_user_id"),
+        "shared": workspace_schema.is_organisation_workspace_id(
+            _row_workspace_id(item, owner_field="owner_user_id")),
+        # Provenance. "manual" today; CRM-imported contacts will carry their
+        # own source once that integration lands, and the field exists now so
+        # the UI does not have to change shape then.
+        "source": item.get("source", "manual"),
+        "created_by": item.get("created_by", ""),
         "created_at": item.get("created_at", ""),
         "updated_at": item.get("updated_at", ""),
     }
@@ -4736,16 +5557,80 @@ def _public_contacts(items):
     return [_public_contact(c, linked) for c in items]
 
 
-def _owned_contact(user_id, contact_id):
-    """The Contact row, or 404. The ownership check is the whole point."""
+def _owned_contact(user_id, contact_id, *, write=False):
+    """The Contact row, or 404/403. THE single contact authorization gate.
+
+    PERSONAL contacts (the default, and every row written before Phase 2C):
+    unchanged — the owner and nobody else, 404 for everyone.
+
+    ORGANISATION contacts (Phase 2C): SHARED workspace resources.
+
+        READ / CREATE   every ACTIVE member
+        UPDATE / DELETE OWNER and MANAGER only
+
+    `write=True` asks for the mutating right; the default asks only to read.
+    Callers that mutate must pass it — the deny-by-default direction, so a
+    new mutating route that forgets is refused rather than silently allowed.
+
+    WHY 403 AND NOT 404 FOR A MEMBER WHO MAY ONLY READ: they can already see
+    the contact, so 404 would be a lie that makes the UI unexplainable. 404
+    still hides existence from non-members, exactly as before.
+
+    THE MEMBERSHIP GATE COMES FIRST for organisation rows, for the same
+    reason it does on meetings (the Phase 2B P0): a member removed from the
+    organisation must lose access even to contacts they created themselves.
+    """
     cid = str(contact_id or "").strip()
     if not cid:
         raise ApiError(400, "contact id required")
     item = _contacts.get_item(Key={"contact_id": cid}).get("Item")
-    if not item or item.get("owner_user_id") != user_id:
+    if not item:
+        raise ApiError(404, "contact not found")
+
+    workspace_id = _row_workspace_id(item, owner_field="owner_user_id")
+    if workspace_schema.is_organisation_workspace_id(workspace_id):
+        role = _workspace_role(workspace_id, user_id)
+        if not role:
+            # Not (or no longer) a member of the owning organisation. Being
+            # the creator does not rescue this.
+            raise ApiError(404, "contact not found")
+        if write and not workspace_schema.role_can(
+                role, workspace_schema.CAP_MANAGE_CONTACTS):
+            raise ApiError(403, "only an owner or manager can change "
+                                "organisation contacts")
+        return item
+
+    # PERSONAL — the original rule, byte for byte.
+    if item.get("owner_user_id") != user_id:
         # 404 not 403 — see this section's header.
         raise ApiError(404, "contact not found")
     return item
+
+
+def _readable_contact(user_id, contact_id):
+    """The contact if this caller may READ it, else None. Never raises.
+
+    The soft twin of _owned_contact, for the HYDRATION paths — the places
+    that decorate something else (a participant row, an email recipient list,
+    a task card) with contact details and must skip a contact they cannot
+    read rather than fail the whole request.
+
+    Those call sites used to compare `owner_user_id == user_id` inline. That
+    is still correct for a personal contact and became INCOMPLETE for a
+    shared organisation one: a manager hydrating a participant mapped to a
+    colleague's shared contact would silently get no name. Fail-closed, so
+    never a leak — but the shared address book is meant to be shared.
+
+    Delegates to _owned_contact so there is ONE contact authorization rule,
+    and swallows its ApiError because "not readable" is an ordinary outcome
+    here rather than a request-ending one.
+    """
+    if not contact_id:
+        return None
+    try:
+        return _owned_contact(user_id, contact_id)
+    except ApiError:
+        return None
 
 
 def _resolve_minutex_user(email_lc):
@@ -4774,23 +5659,61 @@ def _resolve_minutex_user(email_lc):
     return items[0].get("user_id", "") if items else ""
 
 
-def _find_contact_by_email(user_id, email_lc):
-    """Exact-email match within this owner's namespace, or None."""
+# ---------------------------------------------------------------------------
+# CONTACT LOOKUP SCOPE (Phase 2C).
+#
+# Every helper below takes an OPTIONAL workspace_id. When it names an
+# ORGANISATION the lookup is partitioned by the WORKSPACE — because an
+# organisation address book is shared, and "does this organisation already
+# have this client" cannot be answered from one member's namespace. Two
+# colleagues adding the same person would otherwise each get a row and
+# create_contact would report 201 "created" rather than 200 "existing".
+#
+# Omitted or personal -> the original owner-partitioned path, unchanged. That
+# is also what serves every pre-Phase-2C row, since those carry no
+# workspace_id and are absent from the sparse workspace indexes.
+# ---------------------------------------------------------------------------
+def _contact_scope_is_org(workspace_id):
+    return workspace_schema.is_organisation_workspace_id(workspace_id)
+
+
+def _find_contact_by_email(user_id, email_lc, workspace_id=""):
+    """Exact-email match within this owner's (or workspace's) namespace."""
     if not email_lc:
         return None
-    res = _contacts.query(
-        IndexName=CONTACTS_EMAIL_INDEX,
-        KeyConditionExpression=Key("owner_user_id").eq(user_id)
-                               & Key("email_lc").eq(email_lc),
-        Limit=1,
-    )
+    if _contact_scope_is_org(workspace_id):
+        res = _contacts.query(
+            IndexName=CONTACTS_WORKSPACE_EMAIL_INDEX,
+            KeyConditionExpression=Key("workspace_id").eq(workspace_id)
+                                   & Key("email_lc").eq(email_lc),
+            Limit=1,
+        )
+    else:
+        res = _contacts.query(
+            IndexName=CONTACTS_EMAIL_INDEX,
+            KeyConditionExpression=Key("owner_user_id").eq(user_id)
+                                   & Key("email_lc").eq(email_lc),
+            Limit=1,
+        )
     items = res.get("Items", [])
     return items[0] if items else None
 
 
-def _find_contact_by_phone(user_id, phone_e164):
-    """Exact-phone match within this owner's namespace, or None."""
+def _find_contact_by_phone(user_id, phone_e164, workspace_id=""):
+    """Exact-phone match within this owner's (or workspace's) namespace.
+
+    NOTE the asymmetry with email: there is no workspace-phone index, so an
+    organisation phone lookup filters the workspace page in memory instead.
+    Deliberate — phone is the WEAKER of the two strong identifiers and the
+    less common input, so it does not justify a fourth Contacts GSI on the
+    hot create path. Bounded by CONTACTS_PAGE_MAX exactly as the name path is.
+    """
     if not phone_e164:
+        return None
+    if _contact_scope_is_org(workspace_id):
+        for row in _all_contacts(user_id, workspace_id=workspace_id):
+            if row.get("phone_e164") == phone_e164:
+                return row
         return None
     res = _contacts.query(
         IndexName=CONTACTS_PHONE_INDEX,
@@ -4802,20 +5725,29 @@ def _find_contact_by_phone(user_id, phone_e164):
     return items[0] if items else None
 
 
-def _all_contacts(user_id, limit=CONTACTS_PAGE_MAX):
-    """This owner's contacts via owner-index. Bounded: the name-matching paths
-    below need to compare against the set, and an unbounded read of a large
-    account inside a 29s request is not something to leave lying around."""
-    res = _contacts.query(
-        IndexName=CONTACTS_OWNER_INDEX,
-        KeyConditionExpression=Key("owner_user_id").eq(user_id),
-        ScanIndexForward=False,
-        Limit=limit,
-    )
+def _all_contacts(user_id, limit=CONTACTS_PAGE_MAX, workspace_id=""):
+    """This owner's — or this organisation's — contacts. Bounded: the
+    name-matching paths below need to compare against the set, and an
+    unbounded read of a large account inside a 29s request is not something to
+    leave lying around."""
+    if _contact_scope_is_org(workspace_id):
+        res = _contacts.query(
+            IndexName=CONTACTS_WORKSPACE_INDEX,
+            KeyConditionExpression=Key("workspace_id").eq(workspace_id),
+            ScanIndexForward=False,
+            Limit=limit,
+        )
+    else:
+        res = _contacts.query(
+            IndexName=CONTACTS_OWNER_INDEX,
+            KeyConditionExpression=Key("owner_user_id").eq(user_id),
+            ScanIndexForward=False,
+            Limit=limit,
+        )
     return res.get("Items", [])
 
 
-def _match_contacts(user_id, name="", email="", phone=""):
+def _match_contacts(user_id, name="", email="", phone="", workspace_id=""):
     """Find the contact(s) a (name, email, phone) triple could refer to.
 
     Returns (status, matches):
@@ -4834,18 +5766,20 @@ def _match_contacts(user_id, name="", email="", phone=""):
     phone_e164 = _norm_phone(phone)
 
     if email_lc:
-        hit = _find_contact_by_email(user_id, email_lc)
+        hit = _find_contact_by_email(user_id, email_lc,
+                                     workspace_id=workspace_id)
         if hit:
             return "exact", [hit]
     if phone_e164:
-        hit = _find_contact_by_phone(user_id, phone_e164)
+        hit = _find_contact_by_phone(user_id, phone_e164,
+                                     workspace_id=workspace_id)
         if hit:
             return "exact", [hit]
 
     wanted = _norm_name(name)
     if not wanted:
         return "none", []
-    matches = [c for c in _all_contacts(user_id)
+    matches = [c for c in _all_contacts(user_id, workspace_id=workspace_id)
                if _norm_name(c.get("name")) == wanted]
     if not matches:
         return "none", []
@@ -4853,7 +5787,7 @@ def _match_contacts(user_id, name="", email="", phone=""):
 
 
 def _contact_item(user_id, name, email="", phone="", company="", role="",
-                  notes="", avatar_url=""):
+                  notes="", avatar_url="", workspace_id=""):
     """Build a Contact row. Optional GSI key attributes (email_lc, phone_e164)
     are OMITTED when empty rather than written as "" — DynamoDB rejects an
     empty-string index key outright, so writing one would fail the whole put.
@@ -4868,7 +5802,16 @@ def _contact_item(user_id, name, email="", phone="", company="", role="",
     phone_e164 = _norm_phone(phone)
     item = {
         "contact_id": uuid.uuid4().hex[:16],
+        # owner_user_id stays THE authorization key for contacts in Phase 2B,
+        # and every existing ownership check is untouched. workspace_id is
+        # recorded ALONGSIDE it as provenance, so the eventual shared-contact
+        # migration has the data it needs and no backfill of historical rows
+        # is required later. It does NOT yet widen visibility — see the
+        # CONTACTS STOP note above create_contact for why sharing needs a new
+        # GSI and a decision that has not been made.
         "owner_user_id": user_id,
+        "workspace_id": workspace_id or _personal_workspace_id(user_id),
+        "created_by": user_id,
         "name": str(name or "").strip()[:CONTACT_NAME_MAX],
         "email": email_lc,
         "phone": str(phone or "").strip()[:CONTACT_PHONE_MAX],
@@ -4890,10 +5833,49 @@ def _contact_item(user_id, name, email="", phone="", company="", role="",
     return item
 
 
+# ===========================================================================
+# CONTACTS AND WORKSPACES — A DELIBERATE STOP (Phase 2B, brief section 25/39)
+#
+# Contacts are STAMPED with workspace_id from this phase on, but organisation
+# contacts are NOT yet SHARED between members. That is a stop, not an
+# oversight, and the brief asks for exactly this when a change would need a
+# key redesign.
+#
+# WHY SHARING CANNOT BE SWITCHED ON HERE.
+#
+#  1. DEDUPE IS HARD-PARTITIONED ON THE OWNER. _find_contact_by_email and
+#     _find_contact_by_phone query owner-email-index / owner-phone-index with
+#     `owner_user_id` as the HASH key. In a shared workspace two members
+#     adding the same person would each create a row, and create_contact would
+#     answer 201 "created" instead of 200 "existing" — a CORRECTNESS
+#     regression in the exact feature those indexes exist to provide. No
+#     amount of filtering fixes it: the partition key forces you to already
+#     know whose namespace to look in.
+#
+#  2. A SHARED LIST NEEDS A NEW GSI *AND* A BACKFILL. A workspace-index would
+#     be sparse, so every pre-Phase-2B contact (which has no workspace_id)
+#     would be invisible in it — a silently empty contact list for existing
+#     users until a backfill completes. Unlike Recordings and Tasks, where the
+#     personal path still runs off the untouched owner indexes, contacts have
+#     nowhere else to fall back to for a SHARED read.
+#
+#  3. TWENTY-FOUR EXPLICIT `owner_user_id == user_id` RE-CHECKS would each
+#     have to become a membership check. Every one of them is currently the
+#     only thing standing between a PK `get_item` and a cross-tenant read, so
+#     loosening them piecemeal is precisely how a leak gets introduced.
+#
+# WHAT PHASE 2B DOES INSTEAD: records workspace_id on every new contact, so
+# the data needed for that migration accumulates from now on and the eventual
+# backfill covers a shrinking tail. Existing behaviour is bit-for-bit
+# unchanged — no read path consults the new attribute.
+#
+# THE DECISION NEEDED BEFORE SHARING SHIPS is recorded in the Phase 2B report:
+# whether org contacts are visible to every member or only to OWNER/MANAGER,
+# and what happens to the personal contacts a member already had.
+# ===========================================================================
 def create_contact(event):
-    """POST /contacts {name, email?, phone?, company?, role?, notes?,
-    folder_id?} -> 201 {contact, folder_id?} | 200 {contact, existing:true}
-                 | 409 {ambiguous}
+    """POST /contacts {name, email?, phone?, company?, role?, notes?}
+       -> 201 {contact} | 200 {contact, existing:true} | 409 {ambiguous}
 
     Deduplication is by STRONG identifier only:
       * an email or phone that already exists returns the EXISTING contact
@@ -4902,9 +5884,6 @@ def create_contact(event):
         two people can share a name and picking one for the user is exactly
         the silent-merge section 5 forbids. Send `force:true` to say "yes, this
         really is a different person" and create it anyway.
-
-    `folder_id` is the create-from-inside-a-folder path (section 7): the
-    contact is created globally and associated with that folder in one call.
     """
     user_id = _require_auth(event)
     data = _body(event)
@@ -4928,17 +5907,18 @@ def create_contact(event):
         raise ApiError(400, "avatar_url must be a key from "
                             "POST /avatars/upload-request")
 
-    # A folder_id, if given, must be the caller's before anything is written —
-    # otherwise a failed association would leave an orphaned contact behind.
-    folder_id = str(data.get("folder_id") or "").strip()
-    if folder_id:
-        _owned_folder(user_id, folder_id)
+    # The workspace this contact will belong to, VERIFIED against membership
+    # before anything is read or written. Every ACTIVE member may create an
+    # organisation contact (a shared address book nobody can add to is
+    # useless), so no capability is required here — only membership.
+    contact_workspace = _creation_workspace(event, user_id)
 
-    status, matches = _match_contacts(user_id, name, raw_email, raw_phone)
+    # Deduplicated within the WORKSPACE for an organisation, so two members
+    # adding the same client converge on one row instead of two.
+    status, matches = _match_contacts(user_id, name, raw_email, raw_phone,
+                                      workspace_id=contact_workspace)
     if status == "exact":
         existing = matches[0]
-        if folder_id:
-            _link_folder_contact(folder_id, existing["contact_id"])
         # A photo offered for someone we already know FILLS A GAP, it never
         # overwrites. The phone-import path reaches here whenever the person is
         # already a contact, and dropping their address-book picture would mean
@@ -4963,20 +5943,15 @@ def create_contact(event):
 
     item = _contact_item(user_id, name, raw_email, raw_phone,
                          data.get("company"), data.get("role"),
-                         data.get("notes"), avatar_url)
+                         data.get("notes"), avatar_url,
+                         workspace_id=contact_workspace)
     # attribute_not_exists on the PK: a uuid collision is astronomically
     # unlikely, but "astronomically unlikely" is not "cannot silently
     # overwrite a real person's record".
     _contacts.put_item(Item=item,
                        ConditionExpression="attribute_not_exists(contact_id)")
-    if folder_id:
-        _link_folder_contact(folder_id, item["contact_id"])
-    _audit("contact.created", user_id, item["contact_id"],
-           folder_id=folder_id or None)
-    out = {"contact": _public_contact(item)}
-    if folder_id:
-        out["folder_id"] = folder_id
-    return _resp(201, out)
+    _audit("contact.created", user_id, item["contact_id"])
+    return _resp(201, {"contact": _public_contact(item)})
 
 
 class AmbiguousContact(ApiError):
@@ -5011,11 +5986,31 @@ def list_contacts(event):
                          CONTACTS_PAGE_MAX)
     search = str(qs.get("search") or "").strip().casefold()
 
-    query = {
-        "IndexName": CONTACTS_OWNER_INDEX,
-        "KeyConditionExpression": Key("owner_user_id").eq(user_id),
-        "ScanIndexForward": False,
-    }
+    # ORGANISATION contacts are SHARED, so the list is partitioned by the
+    # WORKSPACE rather than by the owner (Phase 2C). Membership is verified
+    # before the query — the index is a lookup path, never the decision.
+    #
+    # Personal keeps the original owner-index path byte for byte, which is
+    # also what every pre-Phase-2C row is served by: those rows carry no
+    # workspace_id and are therefore absent from the sparse workspace index,
+    # which is correct because they are personal.
+    requested = _requested_workspace_id(event)
+    if requested and not workspace_schema.is_personal_workspace_id(requested):
+        if not _active_membership(requested, user_id):
+            raise ApiError(404, "workspace not found")
+        scope_workspace_id = requested
+        query = {
+            "IndexName": CONTACTS_WORKSPACE_INDEX,
+            "KeyConditionExpression": Key("workspace_id").eq(requested),
+            "ScanIndexForward": False,
+        }
+    else:
+        scope_workspace_id = _personal_workspace_id(user_id)
+        query = {
+            "IndexName": CONTACTS_OWNER_INDEX,
+            "KeyConditionExpression": Key("owner_user_id").eq(user_id),
+            "ScanIndexForward": False,
+        }
     cursor = _decode_cursor(qs.get("cursor"))
     if cursor:
         query["ExclusiveStartKey"] = cursor
@@ -5029,6 +6024,18 @@ def list_contacts(event):
         res = _contacts.query(**query)
         for item in res.get("Items", []):
             if search and not _contact_matches_search(item, search):
+                continue
+            # The PERSONAL page reads owner-index, which returns every row
+            # this user owns — INCLUDING organisation contacts they created,
+            # because they are still the owner of those. Those belong to the
+            # organisation's shared book, not to their private one, so they
+            # are filtered out here. Without this, switching to Personal
+            # would leak the organisation's address book into it.
+            # Resolved, not compared raw: a pre-Phase-2C row carries no
+            # workspace_id and is PERSONAL to its owner, so it must still
+            # appear in their personal list.
+            if _row_workspace_id(item, owner_field="owner_user_id") \
+                    != scope_workspace_id:
                 continue
             out.append(item)
         last_key = res.get("LastEvaluatedKey")
@@ -5064,21 +6071,11 @@ def _contact_matches_search(item, needle):
 def get_contact(event):
     """GET /contacts/{contact_id} -> {contact, folders}
 
-    Returns the folders the contact is associated with alongside it: the
-    contact detail screen shows exactly that, and it saves a second round trip.
     """
     user_id = _require_auth(event)
     contact_id = (event.get("pathParameters") or {}).get("contact_id", "")
     item = _owned_contact(user_id, contact_id)
-    folder_ids = _folders_for_contact(item["contact_id"])
-    folders = []
-    for fid in folder_ids:
-        row = _folders.get_item(Key={"folder_id": fid}).get("Item")
-        # Ownership re-checked per folder: an association row is not authority
-        # to read a folder, and a stale one must not leak another user's name.
-        if row and row.get("owner_user_id") == user_id:
-            folders.append(_public_folder(row))
-    return _resp(200, {"contact": _public_contact(item), "folders": folders})
+    return _resp(200, {"contact": _public_contact(item)})
 
 
 def update_contact(event):
@@ -5092,7 +6089,8 @@ def update_contact(event):
     """
     user_id = _require_auth(event)
     contact_id = (event.get("pathParameters") or {}).get("contact_id", "")
-    item = _owned_contact(user_id, contact_id)
+    # write=True: editing a shared organisation contact is OWNER/MANAGER only.
+    item = _owned_contact(user_id, contact_id, write=True)
     data = _body(event)
 
     updates, removes = {}, []
@@ -5110,7 +6108,14 @@ def update_contact(event):
             email_lc = _norm_email(raw)
             if not email_lc:
                 raise ApiError(400, "email is not a valid address")
-            clash = _find_contact_by_email(user_id, email_lc)
+            # Scoped to the row's OWN workspace, taken from the stored item —
+            # not from the request. For an organisation contact the clash
+            # question is "does this organisation already use this email",
+            # which owner-index cannot answer.
+            clash = _find_contact_by_email(
+                user_id, email_lc,
+                workspace_id=_row_workspace_id(
+                    item, owner_field="owner_user_id"))
             if clash and clash.get("contact_id") != item["contact_id"]:
                 raise ApiError(409, "another contact already uses this email")
             updates["email"] = email_lc
@@ -5132,7 +6137,10 @@ def update_contact(event):
             phone_e164 = _norm_phone(raw)
             if not phone_e164:
                 raise ApiError(400, "phone is not a usable number")
-            clash = _find_contact_by_phone(user_id, phone_e164)
+            clash = _find_contact_by_phone(
+                user_id, phone_e164,
+                workspace_id=_row_workspace_id(
+                    item, owner_field="owner_user_id"))
             if clash and clash.get("contact_id") != item["contact_id"]:
                 raise ApiError(409, "another contact already uses this phone")
             updates["phone"] = raw[:CONTACT_PHONE_MAX]
@@ -5193,13 +6201,9 @@ def delete_contact(event):
     """
     user_id = _require_auth(event)
     contact_id = (event.get("pathParameters") or {}).get("contact_id", "")
-    item = _owned_contact(user_id, contact_id)
+    # write=True: deleting a shared organisation contact is OWNER/MANAGER only.
+    item = _owned_contact(user_id, contact_id, write=True)
     cid = item["contact_id"]
-
-    unlinked = 0
-    for fid in _folders_for_contact(cid):
-        _folder_contacts.delete_item(Key={"folder_id": fid, "contact_id": cid})
-        unlinked += 1
 
     participants = 0
     res = _meeting_participants.query(
@@ -5235,503 +6239,10 @@ def delete_contact(event):
     # contact's OWN key is ever stored on the row (see _contact_avatar_fields),
     # and _delete_avatar_object refuses anything outside avatars/.
     _delete_avatar_object(item.get("avatar_url"))
-    _audit("contact.deleted", user_id, cid, unlinked_folders=unlinked,
-           unassigned_tasks=unassigned)
+    _audit("contact.deleted", user_id, cid, unassigned_tasks=unassigned)
     return _resp(200, {"deleted": True, "id": cid,
-                       "unlinked_folders": unlinked,
                        "unlinked_participants": participants,
                        "unassigned_tasks": unassigned})
-
-
-# ---------------------------------------------------------------------------
-# Folders
-# ---------------------------------------------------------------------------
-def _public_folder(item, meeting_count=None):
-    out = {
-        "id": item.get("folder_id", ""),
-        "name": item.get("name", ""),
-        "description": item.get("description", ""),
-        # Appearance tokens, never raw colours — see FOLDER_COLORS. Defaulted
-        # on read so folders created before these existed render normally
-        # instead of the app having to handle a missing value everywhere.
-        "color": item.get("color") or FOLDER_COLOR_DEFAULT,
-        "icon": item.get("icon") or FOLDER_ICON_DEFAULT,
-        "created_at": item.get("created_at", ""),
-        "updated_at": item.get("updated_at", ""),
-    }
-    if meeting_count is not None:
-        out["meeting_count"] = meeting_count
-    return out
-
-
-def _owned_folder(user_id, folder_id):
-    """The Folder row, or 404 (never 403 — see the section header)."""
-    fid = str(folder_id or "").strip()
-    if not fid:
-        raise ApiError(400, "folder id required")
-    item = _folders.get_item(Key={"folder_id": fid}).get("Item")
-    if not item or item.get("owner_user_id") != user_id:
-        raise ApiError(404, "folder not found")
-    return item
-
-
-def _folder_by_name(user_id, name_lc):
-    """Existing folder with this normalized name, or None. Uses owner-index's
-    range key, so this is a point query rather than a scan."""
-    if not name_lc:
-        return None
-    res = _folders.query(
-        IndexName=FOLDERS_OWNER_INDEX,
-        KeyConditionExpression=Key("owner_user_id").eq(user_id)
-                               & Key("name_lc").eq(name_lc),
-        Limit=1,
-    )
-    items = res.get("Items", [])
-    return items[0] if items else None
-
-
-def create_folder(event):
-    """POST /folders {name, description?, color?, icon?} -> 201 {folder}
-
-    `color` and `icon` are TOKENS from a closed set (FOLDER_COLORS /
-    FOLDER_ICONS), not hex or arbitrary names — see those constants.
-
-    Names are unique per owner (case- and whitespace-insensitively): a folder
-    list with two "Client Alpha"s is a bug from the user's point of view, not a
-    feature. Enforced with a conditional write on a deterministic uniqueness
-    row rather than a read-then-write, so two simultaneous creates cannot both
-    succeed (section 25).
-    """
-    user_id = _require_auth(event)
-    data = _body(event)
-    name = str(data.get("name") or "").strip()[:FOLDER_NAME_MAX]
-    if not name:
-        raise ApiError(400, "name required")
-    name_lc = _norm_folder_name(name)
-
-    now = _now_iso()
-    item = {
-        "folder_id": uuid.uuid4().hex[:16],
-        "owner_user_id": user_id,
-        "name": name,
-        "name_lc": name_lc,
-        "description": str(data.get("description")
-                           or "").strip()[:FOLDER_DESCRIPTION_MAX],
-        "color": _clean_folder_color(data.get("color")),
-        "icon": _clean_folder_icon(data.get("icon")),
-        "created_at": now,
-        "updated_at": now,
-    }
-
-    # Uniqueness is claimed on a SEPARATE deterministic row
-    # (folder_id = "name#{owner}#{name_lc}") whose primary key encodes the
-    # constraint. A GSI cannot be given a uniqueness condition — DynamoDB
-    # conditions only apply to the item being written, and the name index is
-    # eventually consistent, so a read-then-write against it genuinely does let
-    # two concurrent creates both see "no duplicate" and both succeed. Claiming
-    # the key first turns that race into a ConditionalCheckFailed for exactly
-    # one of them.
-    claim_id = _folder_name_claim(user_id, name_lc)
-    try:
-        _folders.put_item(
-            Item={"folder_id": claim_id, "owner_user_id": user_id,
-                  "claims_folder_id": item["folder_id"], "created_at": now},
-            ConditionExpression="attribute_not_exists(folder_id)")
-    except ClientError as err:
-        if err.response.get("Error", {}).get("Code") \
-                == "ConditionalCheckFailedException":
-            raise ApiError(409, "a folder with this name already exists")
-        raise
-
-    try:
-        _folders.put_item(
-            Item=item,
-            ConditionExpression="attribute_not_exists(folder_id)")
-    except Exception:
-        # Never leave a claim behind that no folder owns — it would make the
-        # name permanently unusable.
-        _folders.delete_item(Key={"folder_id": claim_id})
-        raise
-
-    _audit("folder.created", user_id, item["folder_id"])
-    return _resp(201, {"folder": _public_folder(item, meeting_count=0)})
-
-
-def _folder_name_claim(user_id, name_lc):
-    """The deterministic uniqueness-row id for (owner, normalized name).
-
-    Lives in the Folders table under a key shape no real folder_id can take (a
-    real one is a 16-char uuid hex), so claims and folders never collide.
-    Claim rows are filtered out of every read path by _is_folder_claim.
-    """
-    return f"name#{user_id}#{name_lc}"
-
-
-def _is_folder_claim(item):
-    return str(item.get("folder_id", "")).startswith("name#")
-
-
-def list_folders(event):
-    """GET /folders -> {folders, count}
-
-    Each folder carries its meeting_count, which is what the folder list
-    screen renders. Counts come from ONE query of the recordings user-index
-    tallied in memory, not one query per folder — the N+1 section 31 forbids.
-    """
-    user_id = _require_auth(event)
-    res = _folders.query(
-        IndexName=FOLDERS_OWNER_INDEX,
-        KeyConditionExpression=Key("owner_user_id").eq(user_id),
-        Limit=FOLDERS_MAX,
-    )
-    rows = [r for r in res.get("Items", []) if not _is_folder_claim(r)]
-    counts = _folder_meeting_counts(user_id)
-    folders = [_public_folder(r, meeting_count=counts.get(r["folder_id"], 0))
-               for r in rows]
-    folders.sort(key=lambda f: _norm_folder_name(f["name"]))
-    return _resp(200, {"folders": folders, "count": len(folders),
-                       "general_count": counts.get("", 0)})
-
-
-def _folder_meeting_counts(user_id):
-    """{folder_id: count} across the user's recordings, plus "" for General.
-
-    One user-index query, tallied here. Trashed rows are excluded so a count
-    matches what the folder actually shows.
-    """
-    counts = {}
-    kwargs = {
-        "IndexName": USER_INDEX,
-        "KeyConditionExpression": Key("user_id").eq(user_id),
-        "ProjectionExpression": "folder_id, recording_status",
-    }
-    while True:
-        res = _recordings.query(**kwargs)
-        for row in res.get("Items", []):
-            if _is_trashed(row):
-                continue
-            fid = str(row.get("folder_id") or "")
-            counts[fid] = counts.get(fid, 0) + 1
-        last = res.get("LastEvaluatedKey")
-        if not last:
-            break
-        kwargs["ExclusiveStartKey"] = last
-    return counts
-
-
-def get_folder(event):
-    """GET /folders/{folder_id} -> {folder, contacts}"""
-    user_id = _require_auth(event)
-    folder_id = (event.get("pathParameters") or {}).get("folder_id", "")
-    item = _owned_folder(user_id, folder_id)
-    counts = _folder_meeting_counts(user_id)
-    contacts = _folder_contact_rows(user_id, item["folder_id"])
-    return _resp(200, {
-        "folder": _public_folder(item,
-                                 meeting_count=counts.get(item["folder_id"], 0)),
-        "contacts": _public_contacts(contacts),
-    })
-
-
-def update_folder(event):
-    """PATCH /folders/{folder_id} {name?, description?, color?, icon?}
-       -> {folder}
-
-    A rename moves the uniqueness claim: the new name is claimed first, and
-    only once that succeeds is the old claim released — so a failed rename
-    never frees a name that is still in use.
-    """
-    user_id = _require_auth(event)
-    folder_id = (event.get("pathParameters") or {}).get("folder_id", "")
-    item = _owned_folder(user_id, folder_id)
-    data = _body(event)
-
-    updates = {}
-    old_claim = None
-
-    if "name" in data:
-        name = str(data.get("name") or "").strip()[:FOLDER_NAME_MAX]
-        if not name:
-            raise ApiError(400, "name cannot be empty")
-        name_lc = _norm_folder_name(name)
-        if name_lc != item.get("name_lc"):
-            claim_id = _folder_name_claim(user_id, name_lc)
-            try:
-                _folders.put_item(
-                    Item={"folder_id": claim_id, "owner_user_id": user_id,
-                          "claims_folder_id": item["folder_id"],
-                          "created_at": _now_iso()},
-                    ConditionExpression="attribute_not_exists(folder_id)")
-            except ClientError as err:
-                if err.response.get("Error", {}).get("Code") \
-                        == "ConditionalCheckFailedException":
-                    raise ApiError(409,
-                                   "a folder with this name already exists")
-                raise
-            old_claim = _folder_name_claim(user_id, item.get("name_lc") or "")
-        updates["name"] = name
-        updates["name_lc"] = name_lc
-
-    if "description" in data:
-        updates["description"] = str(
-            data.get("description") or "").strip()[:FOLDER_DESCRIPTION_MAX]
-
-    if "color" in data:
-        updates["color"] = _clean_folder_color(
-            data.get("color"), item.get("color") or FOLDER_COLOR_DEFAULT)
-    if "icon" in data:
-        updates["icon"] = _clean_folder_icon(
-            data.get("icon"), item.get("icon") or FOLDER_ICON_DEFAULT)
-
-    if not updates:
-        raise ApiError(400, "nothing to update — send name, description, "
-                            "color and/or icon")
-
-    updates["updated_at"] = _now_iso()
-    try:
-        _apply_update(_folders, {"folder_id": item["folder_id"]}, updates, [])
-    except Exception:
-        if old_claim is not None:
-            # Roll the new claim back so a failed rename doesn't reserve a name.
-            _folders.delete_item(
-                Key={"folder_id": _folder_name_claim(user_id,
-                                                     updates["name_lc"])})
-        raise
-    if old_claim:
-        _folders.delete_item(Key={"folder_id": old_claim})
-
-    fresh = _folders.get_item(
-        Key={"folder_id": item["folder_id"]}).get("Item") or {}
-    counts = _folder_meeting_counts(user_id)
-    _audit("folder.updated", user_id, item["folder_id"])
-    return _resp(200, {"folder": _public_folder(
-        fresh, meeting_count=counts.get(item["folder_id"], 0))})
-
-
-def delete_folder(event):
-    """DELETE /folders/{folder_id} -> {deleted, id, meetings_moved,
-    contacts_unlinked, tasks_unfiled}
-
-    Deleting the ORGANIZATION never deletes the CONTENT (section 24). Meetings
-    in the folder move to General (folder_id removed), tasks lose their folder
-    context the same way, contact associations go (the folder they pointed at
-    is gone) but the Contacts themselves are untouched.
-    """
-    user_id = _require_auth(event)
-    folder_id = (event.get("pathParameters") or {}).get("folder_id", "")
-    item = _owned_folder(user_id, folder_id)
-    fid = item["folder_id"]
-
-    moved = 0
-    for row in _recordings_in_folder(user_id, fid):
-        _apply_update(_recordings, {"audio_s3_key": row["audio_s3_key"]},
-                      {"updated_at": _now_iso()}, ["folder_id"])
-        moved += 1
-
-    unfiled = 0
-    res = _tasks.query(
-        IndexName=TASKS_FOLDER_INDEX,
-        KeyConditionExpression=Key("folder_id").eq(fid),
-    )
-    for row in res.get("Items", []):
-        if row.get("owner_user_id") != user_id:
-            continue
-        _apply_update(_tasks, {"task_id": row["task_id"]},
-                      {"updated_at": _now_iso()}, ["folder_id"])
-        unfiled += 1
-
-    unlinked = 0
-    res = _folder_contacts.query(
-        KeyConditionExpression=Key("folder_id").eq(fid))
-    for row in res.get("Items", []):
-        _folder_contacts.delete_item(
-            Key={"folder_id": fid, "contact_id": row["contact_id"]})
-        unlinked += 1
-
-    _folders.delete_item(Key={"folder_id": fid})
-    claim = _folder_name_claim(user_id, item.get("name_lc") or "")
-    _folders.delete_item(Key={"folder_id": claim})
-
-    _audit("folder.deleted", user_id, fid, meetings_moved=moved,
-           tasks_unfiled=unfiled, contacts_unlinked=unlinked)
-    return _resp(200, {"deleted": True, "id": fid, "meetings_moved": moved,
-                       "contacts_unlinked": unlinked, "tasks_unfiled": unfiled})
-
-
-def _recordings_in_folder(user_id, folder_id):
-    """The user's recordings carrying this folder_id.
-
-    Filtered on the user-index rather than indexed by folder: a recording's
-    folder changes often and a dedicated GSI on the Recordings table would add
-    write cost to the hot upload path for a query that only runs on folder
-    delete and folder browse.
-    """
-    out = []
-    kwargs = {
-        "IndexName": USER_INDEX,
-        "KeyConditionExpression": Key("user_id").eq(user_id),
-    }
-    while True:
-        res = _recordings.query(**kwargs)
-        for row in res.get("Items", []):
-            if str(row.get("folder_id") or "") == folder_id:
-                out.append(row)
-        last = res.get("LastEvaluatedKey")
-        if not last:
-            break
-        kwargs["ExclusiveStartKey"] = last
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Folder <-> Contact association
-# ---------------------------------------------------------------------------
-def _link_folder_contact(folder_id, contact_id):
-    """Idempotent association write. The composite PK (folder_id, contact_id)
-    means a repeat is an overwrite of an identical row, so "add twice" cannot
-    produce two associations — the constraint is structural, not checked."""
-    _folder_contacts.put_item(Item={
-        "folder_id": folder_id,
-        "contact_id": contact_id,
-        "created_at": _now_iso(),
-    })
-
-
-def _folders_for_contact(contact_id):
-    """Folder ids this contact is associated with (reverse lookup via GSI)."""
-    res = _folder_contacts.query(
-        IndexName=FOLDER_CONTACTS_CONTACT_INDEX,
-        KeyConditionExpression=Key("contact_id").eq(contact_id),
-    )
-    return [r["folder_id"] for r in res.get("Items", [])]
-
-
-def _folder_contact_rows(user_id, folder_id):
-    """Hydrated Contact rows for a folder.
-
-    Association rows are ids only, so each one is fetched — bounded by the
-    association count, and each is re-ownership-checked so a stale row can
-    never surface another user's contact.
-    """
-    res = _folder_contacts.query(
-        KeyConditionExpression=Key("folder_id").eq(folder_id))
-    out = []
-    for row in res.get("Items", []):
-        c = _contacts.get_item(
-            Key={"contact_id": row["contact_id"]}).get("Item")
-        if c and c.get("owner_user_id") == user_id:
-            out.append(c)
-    out.sort(key=lambda c: _norm_name(c.get("name")))
-    return out
-
-
-def add_folder_contact(event):
-    """POST /folders/{folder_id}/contacts/{contact_id} -> {linked}
-
-    Both ids are ownership-checked before anything is written: this is the
-    route that would otherwise let a caller attach ANOTHER tenant's contact to
-    their own folder, which is the cross-tenant hole section 22 names.
-    """
-    user_id = _require_auth(event)
-    params = event.get("pathParameters") or {}
-    folder = _owned_folder(user_id, params.get("folder_id", ""))
-    contact = _owned_contact(user_id, params.get("contact_id", ""))
-    _link_folder_contact(folder["folder_id"], contact["contact_id"])
-    _audit("folder.contact_linked", user_id, folder["folder_id"],
-           contact_id=contact["contact_id"])
-    return _resp(200, {"linked": True, "folder_id": folder["folder_id"],
-                       "contact_id": contact["contact_id"],
-                       "contact": _public_contact(contact)})
-
-
-def remove_folder_contact(event):
-    """DELETE /folders/{folder_id}/contacts/{contact_id} -> {unlinked}
-
-    Removes the ASSOCIATION only. The global Contact survives — it is still a
-    real person, possibly in other folders (section 36).
-    """
-    user_id = _require_auth(event)
-    params = event.get("pathParameters") or {}
-    folder = _owned_folder(user_id, params.get("folder_id", ""))
-    contact = _owned_contact(user_id, params.get("contact_id", ""))
-    _folder_contacts.delete_item(Key={"folder_id": folder["folder_id"],
-                                      "contact_id": contact["contact_id"]})
-    _audit("folder.contact_unlinked", user_id, folder["folder_id"],
-           contact_id=contact["contact_id"])
-    return _resp(200, {"unlinked": True, "folder_id": folder["folder_id"],
-                       "contact_id": contact["contact_id"]})
-
-
-def list_folder_contacts(event):
-    """GET /folders/{folder_id}/contacts -> {contacts, count}"""
-    user_id = _require_auth(event)
-    folder_id = (event.get("pathParameters") or {}).get("folder_id", "")
-    folder = _owned_folder(user_id, folder_id)
-    rows = _folder_contact_rows(user_id, folder["folder_id"])
-    return _resp(200, {"contacts": _public_contacts(rows),
-                       "count": len(rows)})
-
-
-# ---------------------------------------------------------------------------
-# Meeting <-> Folder
-# ---------------------------------------------------------------------------
-def move_recording_to_folder(event):
-    """PATCH /recordings/folder/{key+} {folder_id} -> {recording}
-
-    ONE attribute changes. The meeting is never copied, never duplicated, and
-    keeps its identity, transcript, AI output and tasks (section 1).
-    `folder_id: null` moves it to General by REMOVING the attribute, so
-    "General" has exactly one representation (absent) rather than two (absent
-    or "").
-
-    Tasks sourced from this meeting follow it, because a task's folder is
-    inherited from its meeting — leaving them behind would file a task under a
-    folder its own meeting is no longer in.
-
-    The action comes first and {key+} last for the same hard API Gateway reason
-    as every other keyed route here (a greedy variable is only legal in the
-    final position).
-    """
-    user_id, key, item = _owned_recording(event, hydrate=False)
-    data = _body(event)
-    if "folder_id" not in data:
-        raise ApiError(400, "folder_id required (send null for General)")
-
-    raw = data.get("folder_id")
-    updates = {"updated_at": _now_iso()}
-    removes = []
-    folder_id = ""
-    if raw is None or str(raw).strip() == "":
-        removes.append("folder_id")
-    else:
-        folder = _owned_folder(user_id, str(raw).strip())
-        folder_id = folder["folder_id"]
-        updates["folder_id"] = folder_id
-
-    _apply_update(_recordings, {"audio_s3_key": key}, updates, removes)
-
-    moved_tasks = 0
-    for row in _tasks_for_recording(key):
-        if row.get("owner_user_id") != user_id:
-            continue
-        if folder_id:
-            _apply_update(_tasks, {"task_id": row["task_id"]},
-                          {"folder_id": folder_id,
-                           "updated_at": _now_iso()}, [])
-        else:
-            _apply_update(_tasks, {"task_id": row["task_id"]},
-                          {"updated_at": _now_iso()}, ["folder_id"])
-        moved_tasks += 1
-
-    _audit("meeting.folder_changed", user_id, key,
-           folder_id=folder_id or None, tasks_moved=moved_tasks)
-    fresh = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") or {}
-    fresh = transcript_store.hydrate(_s3, BUCKET_NAME, fresh)
-    return _resp(200, {
-        "recording": _with_crm_records(_with_source(fresh), user_id),
-        "folder_id": folder_id,
-        "tasks_moved": moved_tasks,
-    })
 
 
 # ---------------------------------------------------------------------------
@@ -5814,10 +6325,8 @@ def list_participants(event):
     folder_contacts, folder_id}
 
     Everything the speaker-mapping screen needs in ONE call: the labels the
-    transcript actually contains, whatever each is already mapped to, and the
-    folder's contacts to offer FIRST in the picker (section 10). The global
-    contact list stays a separate paged call — offering the folder's people
-    first is a shortcut, never a restriction.
+    transcript actually contains and whatever each is already mapped to. The
+    contact list stays a separate paged call.
     """
     user_id, key, item = _owned_recording(event)
     rows = _participant_rows(key)
@@ -5827,9 +6336,9 @@ def list_participants(event):
         contact = None
         cid = row.get("contact_id")
         if cid:
-            c = _contacts.get_item(Key={"contact_id": cid}).get("Item")
-            if c and c.get("owner_user_id") == user_id:
-                contact = c
+            # Central gate, so a SHARED organisation contact hydrates for
+            # every member rather than only for whoever created it.
+            contact = _readable_contact(user_id, cid)
         participants.append(_public_participant(row, contact))
     # Speakers first in speaker order, then attendance-only rows by name.
     # _speaker_sort_key already puts non-numeric labels after numeric ones, so
@@ -5839,14 +6348,6 @@ def list_participants(event):
         1 if p.get("attendance_only") else 0,
         _speaker_sort_key(p["speaker_id"]),
     ))
-
-    folder_id = str(item.get("folder_id") or "")
-    folder_contacts = []
-    if folder_id:
-        folder = _folders.get_item(Key={"folder_id": folder_id}).get("Item")
-        if folder and folder.get("owner_user_id") == user_id:
-            folder_contacts = _public_contacts(
-                _folder_contact_rows(user_id, folder_id))
 
     return _resp(200, {
         "participants": participants,
@@ -5858,8 +6359,6 @@ def list_participants(event):
         # already finished, which is a promise it could not keep. The row is
         # already read for the ownership check, so this costs nothing.
         "recording_status": str(item.get("status") or ""),
-        "folder_id": folder_id,
-        "folder_contacts": folder_contacts,
     })
 
 
@@ -6237,7 +6736,6 @@ def _public_task_v2(row, speaker_names=None):
         # has been attached, so the app can still say where it came from.
         "speaker_name": speaker_name,
         "resolution_status": row.get("resolution_status", RESOLUTION_NONE),
-        "folder_id": row.get("folder_id", ""),
         "source_recording_id": row.get("source_recording_id", ""),
         "source_type": row.get("source_type", TASK_SOURCE_MANUAL),
         "ai_confidence": row.get("ai_confidence", ""),
@@ -6522,16 +7020,16 @@ def _task_permissions(user_id, row):
 # field added here is a decision, a field forgotten is a vulnerability.
 _TASK_CREATOR_ONLY_FIELDS = (
     "task", "title", "description", "due", "due_date", "priority",
-    "assignee", "assignee_contact_id", "notify_channels", "folder_id",
+    "assignee", "assignee_contact_id", "notify_channels",
 )
 
 
 def _write_task(row):
     """Put a Task row, omitting every empty GSI key attribute.
 
-    folder_id / assignee_contact_id / fingerprint are all index keys, and
-    DynamoDB rejects an empty string as one — so "no folder" must be an ABSENT
-    attribute, not "". Centralized here so no caller has to remember.
+    assignee_contact_id / fingerprint are all index keys, and DynamoDB rejects
+    an empty string as one — so "unset" must be an ABSENT attribute, not "".
+    Centralized here so no caller has to remember.
     """
     clean = {k: v for k, v in row.items()
              if not (k in _TASK_SPARSE_KEYS and not v)}
@@ -6539,8 +7037,8 @@ def _write_task(row):
     return clean
 
 
-_TASK_SPARSE_KEYS = ("folder_id", "assignee_contact_id", "fingerprint",
-                     "assignee_user_id")
+_TASK_SPARSE_KEYS = ("assignee_contact_id", "fingerprint",
+                     "assignee_user_id", "workspace_id")
 
 # The key attributes of each Tasks index, used to build a resume cursor that is
 # valid for the index the query actually ran against (see list_all_tasks). A
@@ -6549,18 +7047,18 @@ _TASK_INDEX_KEYS = {
     TASKS_OWNER_INDEX: ("owner_user_id", "created_at"),
     TASKS_ASSIGNEE_USER_INDEX: ("assignee_user_id", "created_at"),
     TASKS_MEETING_INDEX: ("source_recording_id", "created_at"),
-    TASKS_FOLDER_INDEX: ("folder_id", "created_at"),
     TASKS_ASSIGNEE_INDEX: ("assignee_contact_id", "created_at"),
     TASKS_DEDUPE_INDEX: ("owner_user_id", "fingerprint"),
 }
 
 
-def _new_task_row(user_id, title, *, recording_key="", folder_id="",
+def _new_task_row(user_id, title, *, recording_key="",
                   description="", due="", priority="Medium",
                   status=TASK_STATUS_OPEN, source_type=TASK_SOURCE_MANUAL,
                   assignee_contact=None, assignee_name="",
                   assignee_speaker_id="", ai_confidence="", ai_evidence="",
-                  fingerprint="", notified_via=None, due_normalized=""):
+                  fingerprint="", notified_via=None, due_normalized="",
+                  workspace_id=""):
     """Assemble a Task row, deriving the identity fields consistently.
 
     The resolution_status logic is the important part and lives ONLY here:
@@ -6575,6 +7073,18 @@ def _new_task_row(user_id, title, *, recording_key="", folder_id="",
     row = {
         "task_id": uuid.uuid4().hex[:16],
         "owner_user_id": user_id,
+        # WORKSPACE (Phase 2B). INHERITED from the parent meeting where there
+        # is one — never derived from whoever happens to be calling. That is
+        # what stops an AI-extracted task from a workspace-A meeting landing in
+        # workspace B because a differently-scoped request triggered the
+        # seeding. Empty for a personal task, and _write_task strips it (it is
+        # a sparse index key), so a personal task is simply absent from the
+        # workspace index and is resolved by _row_workspace_id instead.
+        "workspace_id": workspace_id or "",
+        # WHO made it. owner_user_id remains the CREATOR and keeps every
+        # permission it already had — this is provenance that survives the
+        # creator leaving an organisation, not a second authorization input.
+        "created_by": user_id,
         "title": str(title or "").strip()[:MAX_TASK_TEXT],
         "description": str(description or "").strip()[:MAX_TASK_NOTE_TEXT],
         "status": status,
@@ -6585,7 +7095,6 @@ def _new_task_row(user_id, title, *, recording_key="", folder_id="",
         # actually said; every comparison uses this. Storing both is the
         # point: the record stays faithful AND the machinery can compare.
         "due_date_normalized": str(due_normalized or "").strip()[:10],
-        "folder_id": folder_id or "",
         "source_recording_id": recording_key or "",
         "source_type": source_type,
         "ai_confidence": str(ai_confidence or "")[:32],
@@ -6675,7 +7184,6 @@ def _migrate_embedded_tasks(user_id, key, item):
     if not stored:
         return 0
     existing = {r.get("legacy_task_id") for r in _tasks_for_recording(key)}
-    folder_id = str(item.get("folder_id") or "")
     created = 0
     for legacy_id, t in stored.items():
         if not isinstance(t, dict) or legacy_id in existing:
@@ -6697,7 +7205,8 @@ def _migrate_embedded_tasks(user_id, key, item):
                                               TASK_STATUS_OPEN)
         row = _new_task_row(
             user_id, t.get("task", ""),
-            recording_key=key, folder_id=folder_id,
+            recording_key=key,
+            workspace_id=_row_workspace_id(item),
             due=t.get("due", ""),
             priority=t.get("priority") or "Medium",
             status=status,
@@ -6837,7 +7346,6 @@ def _seed_ai_tasks(user_id, key, item):
     if not isinstance(source, list) or not source:
         return 0
 
-    folder_id = str(item.get("folder_id") or "")
     # Speaker -> Contact for this meeting, so an AI task naming a mapped
     # speaker resolves immediately instead of waiting to be resolved twice.
     by_speaker = {}
@@ -6893,7 +7401,11 @@ def _seed_ai_tasks(user_id, key, item):
             raw.get("confidence"), contact, assignee_name)
         row = _new_task_row(
             user_id, title,
-            recording_key=key, folder_id=folder_id,
+            recording_key=key,
+            # Inherited from the MEETING, never from the caller: AI seeding
+            # runs from an async invoke where "the caller" is a Lambda, not a
+            # person. Section 20 of the brief.
+            workspace_id=_row_workspace_id(item),
             due=spoken_due,
             due_normalized=spoken_dates.normalize_spoken_date(
                 spoken_due, anchor),
@@ -7064,7 +7576,7 @@ def create_meeting_task(event):
     row = _new_task_row(
         user_id, title,
         recording_key=key,
-        folder_id=str(item.get("folder_id") or ""),
+        workspace_id=_row_workspace_id(item),
         description=data.get("description") or "",
         due=_manual_due(data),
         due_normalized=spoken_dates.normalize_spoken_date(
@@ -7275,17 +7787,17 @@ def delete_meeting_task(event):
 
 
 def list_all_tasks(event):
-    """GET /tasks?status=&folder_id=&assignee_contact_id=&recording_key=
+    """GET /tasks?status=&assignee_contact_id=&recording_key=
                   &overdue=&due_before=&assigned_to_me=&limit=&cursor=
        -> {tasks, count, next_cursor}
 
     The cross-meeting task query the Task Tracker is built on (section 21).
     Every filter is applied SERVER-side, and the query is driven off whichever
-    GSI the filter set makes cheapest — folder-index for a folder filter,
-    assignee-index for an assignee, meeting-index for one meeting, otherwise
-    owner-index. Filters that DynamoDB cannot express as a key condition
-    (overdue, which depends on the current time) are applied after the read,
-    which is why the page loop below keeps reading until the page fills.
+    GSI the filter set makes cheapest — assignee-index for an assignee,
+    meeting-index for one meeting, otherwise owner-index. Filters that
+    DynamoDB cannot express as a key condition (overdue, which depends on the
+    current time) are applied after the read, which is why the page loop below
+    keeps reading until the page fills.
     """
     user_id = _require_auth(event)
     qs = event.get("queryStringParameters") or {}
@@ -7293,7 +7805,6 @@ def list_all_tasks(event):
 
     status = str(qs.get("status") or "").strip()
     status = _clean_task_status(status) if status else ""
-    folder_id = str(qs.get("folder_id") or "").strip()
     assignee_contact_id = str(qs.get("assignee_contact_id") or "").strip()
     recording_key = _url_unquote(str(qs.get("recording_key") or "").strip())
     overdue_only = str(qs.get("overdue") or "").strip().lower() in ("1", "true")
@@ -7302,10 +7813,8 @@ def list_all_tasks(event):
     due_before = str(qs.get("due_before") or "").strip()
 
     # Ownership of a filter target is checked BEFORE it is used as a key: a
-    # folder or contact id the caller doesn't own must 404, not silently
-    # return that other tenant's tasks.
-    if folder_id:
-        _owned_folder(user_id, folder_id)
+    # contact id the caller doesn't own must 404, not silently return that
+    # other tenant's tasks.
     if assignee_contact_id:
         _owned_contact(user_id, assignee_contact_id)
 
@@ -7314,10 +7823,7 @@ def list_all_tasks(event):
     # which already names the one partition it wants.
     extra_query = None
 
-    if folder_id:
-        base = {"IndexName": TASKS_FOLDER_INDEX,
-                "KeyConditionExpression": Key("folder_id").eq(folder_id)}
-    elif assignee_contact_id:
+    if assignee_contact_id:
         base = {"IndexName": TASKS_ASSIGNEE_INDEX,
                 "KeyConditionExpression":
                     Key("assignee_contact_id").eq(assignee_contact_id)}
@@ -7556,11 +8062,6 @@ def get_task(event):
                 "email": row.get("assignee_email", ""),
                 "phone": row.get("assignee_phone", ""),
             }
-    fid = row.get("folder_id")
-    if fid:
-        f = _folders.get_item(Key={"folder_id": fid}).get("Item")
-        if f and f.get("owner_user_id") == user_id:
-            out["folder"] = _public_folder(f)
     # The recording is read for the `recording` block anyway, so its
     # speaker_names come along free — no second read to resolve the assignee.
     # `speaker_names` is also returned so the detail screen can render the
@@ -7569,16 +8070,16 @@ def get_task(event):
     key = row.get("source_recording_id")
     if key:
         rec = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
-        owns_recording = bool(rec) and (
-            rec.get("user_id") == user_id
-            or rec.get("device_id") in _owned_devices(user_id))
+        # Speaker names are meeting CONTENT, so they follow meeting read
+        # authorization rather than a local creator test — which also means a
+        # member removed from the owning organisation stops seeing them.
+        owns_recording = bool(_can_read_meeting(user_id, rec))
         if owns_recording:
             got = rec.get("speaker_names")
             speaker_names = got if isinstance(got, dict) else {}
             out["recording"] = {"audio_s3_key": key,
                                 "title": rec.get("title", ""),
                                 "recorded_at": rec.get("recorded_at", ""),
-                                "folder_id": str(rec.get("folder_id") or ""),
                                 "speaker_names": speaker_names,
                                 # The full meeting screen. Stated rather than
                                 # implied by the absence of the assignee
@@ -7605,7 +8106,6 @@ def get_task(event):
             out["recording"] = {"audio_s3_key": key,
                                 "title": rec.get("title", ""),
                                 "recorded_at": rec.get("recorded_at", ""),
-                                "folder_id": "",
                                 "speaker_names": {},
                                 # Read-only notes, not the full meeting. The
                                 # server enforces this either way; the field
@@ -7626,8 +8126,12 @@ def get_task(event):
     # with the creator's account beyond this task, and an address is contact
     # detail, not provenance.
     if not creator:
+        # Projected, so the promise above is enforced by the QUERY and not
+        # merely by which keys the dict literal happens to copy.
         u = _users.get_item(
-            Key={"user_id": _task_creator(row)}).get("Item") or {}
+            Key={"user_id": _task_creator(row)},
+            ProjectionExpression="#n, avatar_url",
+            ExpressionAttributeNames={"#n": "name"}).get("Item") or {}
         if u:
             out["assigned_by"] = {
                 "name": u.get("name", ""),
@@ -7774,8 +8278,8 @@ def suggest_task_assignees(event):
     CREATOR ONLY (via _owned_task): these are candidate people from the
     creator's own address book, and only the creator can act on the answer.
 
-    Who an unresolved task's NAME might refer to, ranked by the folder it is
-    in. Returns candidates for the user to choose from — it never picks. The
+    Who an unresolved task's NAME might refer to. Returns candidates for the
+    user to choose from — it never picks. The
     `status` mirrors _match_contacts: "ambiguous" with one candidate still
     means "you decide", because a lone name match is not an identity.
     """
@@ -7788,31 +8292,12 @@ def suggest_task_assignees(event):
                            "searched_name": ""})
 
     status, matches = _match_contacts(user_id, name=name)
-    folder_id = str(row.get("folder_id") or "")
-    in_folder = set(_folder_contact_ids(folder_id)) if folder_id else set()
-    # Folder members first: a name spoken in a Client Alpha meeting most likely
-    # means the Client Alpha contact. A ranking hint for the human, not a
-    # decision — the status stays "ambiguous" either way.
-    candidates = sorted(
-        matches,
-        key=lambda c: (0 if c["contact_id"] in in_folder else 1,
-                       _norm_name(c.get("name"))))
+    candidates = sorted(matches, key=lambda c: _norm_name(c.get("name")))
     return _resp(200, {
         "status": status,
         "searched_name": name,
-        "candidates": [{**pub,
-                        "in_folder": raw["contact_id"] in in_folder}
-                       for raw, pub in zip(candidates,
-                                           _public_contacts(candidates))],
+        "candidates": _public_contacts(candidates),
     })
-
-
-def _folder_contact_ids(folder_id):
-    if not folder_id:
-        return []
-    res = _folder_contacts.query(
-        KeyConditionExpression=Key("folder_id").eq(folder_id))
-    return [r["contact_id"] for r in res.get("Items", [])]
 
 
 # ---------------------------------------------------------------------------
@@ -10330,18 +10815,37 @@ class AIContext:
     """
 
     __slots__ = ("user_id", "email", "display_name", "contact_id",
-                 "request_id", "_devices", "sources", "proposals")
+                 "request_id", "_devices", "sources", "proposals",
+                 "workspace_id", "workspace_name", "role")
 
     def __init__(self, user_id, email="", display_name="", contact_id="",
-                 request_id=""):
+                 request_id="", workspace_id="", workspace_name="", role=""):
         self.user_id = user_id
         self.email = email
         self.display_name = display_name
         self.contact_id = contact_id
         self.request_id = request_id
+        # WORKSPACE CONTEXT (Phase 2C). Resolved by _ai_context from a
+        # VERIFIED membership — never from the model, never from a tool
+        # argument (see _AI_FORBIDDEN_ARGS), never from the request body.
+        #
+        # This is CONTEXT, not authorization. It tells the tools which
+        # workspace the user is working in so they read the right address
+        # book and the right meeting list; it does not decide what they may
+        # see. Every row is still checked by the same application predicates
+        # the REST routes use (_can_read_meeting, _owned_contact,
+        # _ai_visible). An LLM is never the enforcement point.
+        self.workspace_id = workspace_id
+        self.workspace_name = workspace_name
+        self.role = role
         self._devices = None
         self.sources = []
         self.proposals = []
+
+    @property
+    def is_organisation(self):
+        return workspace_schema.is_organisation_workspace_id(
+            self.workspace_id)
 
     @property
     def devices(self):
@@ -10353,28 +10857,47 @@ class AIContext:
 
     def owns_recording(self, item):
         """The SAME predicate _owned_recording enforces, applied to a row we
-        already hold. Kept as one expression so the AI path and the REST path
-        cannot drift apart on what "my meeting" means."""
+        already hold. Kept as one CALL — not a copy of the expression — so the
+        AI path and the REST path cannot drift apart on what "my meeting"
+        means.
+
+        THE DRIFT THIS FIXES (P2/AI remediation). This used to inline
+        `user_id == self.user_id or device_id in self.devices`, which is
+        exactly what _owned_recording said before the organisation membership
+        gate was added. When that gate landed on the REST side, this copy
+        silently became the weaker door: a member removed from an organisation
+        could still pull labelled transcript segments for a meeting they had
+        created there, through get_meeting_context. Delegating removes the
+        possibility of that happening again.
+
+        `devices` is passed through so the AI path keeps its per-request
+        device cache instead of re-reading it here.
+        """
         if not item:
             return False
-        return (item.get("user_id") == self.user_id
-                or item.get("device_id") in self.devices)
+        return _can_write_meeting(self.user_id, item, devices=self.devices)
 
 
-def _self_contact_id(user_id, email_lc):
-    """The caller's OWN contact row in their own workspace, or "".
+def _self_contact_id(user_id, email_lc, workspace_id=""):
+    """The caller's OWN contact row in the ACTIVE workspace, or "".
 
     Task assignment in MinuteX is contact-based as well as user-based (a task
     can carry assignee_contact_id, assignee_user_id, or a bare speaker), so
     "assigned to me" has to consider both. This resolves the contact half
-    through the existing owner+email index — the same lookup create_contact
-    uses — rather than adding a second notion of "who am I".
+    through the existing email index — the same lookup create_contact uses —
+    rather than adding a second notion of "who am I".
+
+    SCOPED TO THE WORKSPACE (Phase 2C): inside an organisation, "me" is my
+    entry in the SHARED address book. Resolving it against my personal
+    contacts there would make "my tasks" miss work assigned to my
+    organisation contact row. Omitted/personal keeps the original behaviour.
     """
     email_lc = (email_lc or "").strip().lower()
     if not email_lc:
         return ""
     try:
-        row = _find_contact_by_email(user_id, email_lc)
+        row = _find_contact_by_email(user_id, email_lc,
+                                     workspace_id=workspace_id)
     except ClientError as err:
         print(f"[warn] ai: self-contact lookup failed for {user_id}: {err}")
         return ""
@@ -10402,13 +10925,36 @@ def _ai_context(event):
         # address the user politely in the prompt.
         print(f"[warn] ai: profile read failed for {user_id}: {err}")
 
+    # WORKSPACE CONTEXT (Phase 2C). The header is a REQUEST; membership is
+    # resolved here and the VERIFIED result is what the tools see. A caller
+    # naming a workspace they are not in falls back to their personal one
+    # rather than erroring, exactly as list_workspaces does — an invalid hint
+    # must not break the assistant.
+    requested = _requested_workspace_id(event)
+    workspace_id = _personal_workspace_id(user_id)
+    workspace_name = "Personal"
+    role = workspace_schema.ROLE_OWNER
+    if requested and requested != workspace_id:
+        membership = _active_membership(requested, user_id)
+        if membership:
+            workspace_id = requested
+            role = str(membership.get("role") or "")
+            workspace_name = str(
+                (_workspace_row(requested) or {}).get("name") or "")
+
     rc = event.get("requestContext") or {}
     return AIContext(
         user_id=user_id,
         email=email,
         display_name=display_name,
-        contact_id=_self_contact_id(user_id, email),
+        # The caller's own contact row, resolved IN the active workspace: in
+        # an organisation "me" is my entry in the shared address book, not
+        # the one in my personal one.
+        contact_id=_self_contact_id(user_id, email, workspace_id=workspace_id),
         request_id=str(rc.get("requestId") or ""),
+        workspace_id=workspace_id,
+        workspace_name=workspace_name,
+        role=role,
     )
 
 
@@ -10537,7 +11083,6 @@ def _ai_meeting_view(item):
         "recording_key": item.get("audio_s3_key", ""),
         "title": item.get("title", "") or "Untitled meeting",
         "date": item.get("recorded_at", "") or item.get("created_at", ""),
-        "folder_id": str(item.get("folder_id") or ""),
     }
 
 
@@ -10626,6 +11171,28 @@ def _ai_owner_tasks(ctx):
             continue
         if not (_is_task_creator(ctx.user_id, row)
                 or _is_task_assignee(ctx.user_id, row)):
+            continue
+        # SCOPED TO THE ACTIVE WORKSPACE (Phase 2C). Authorization already
+        # passed above — this is CONTEXT: asking the assistant about ABC
+        # Realty must not answer with personal tasks, and vice versa.
+        #
+        # ONLY STAMPED ROWS ARE FILTERED. A DELEGATED task — created by
+        # someone else and assigned to me — carries THEIR owner_user_id, so
+        # resolving an unstamped row would place it in the CREATOR's personal
+        # workspace and hide work that is legitimately mine. That was the
+        # regression test_a_task_assigned_to_me_by_someone_else caught.
+        #
+        # So: a row that names its workspace must match the active one; a row
+        # with no workspace_id predates Phase 2B and is treated as in-scope,
+        # which is the same permissive reading every other unstamped-row path
+        # takes. Authorization is unaffected either way — that was decided
+        # above by creator/assignee.
+        stamped = str(row.get("workspace_id") or "").strip()
+        if stamped and stamped != ctx.workspace_id:
+            continue
+        # And in an ORGANISATION, an unstamped (personal-era) row is not part
+        # of the organisation's work.
+        if not stamped and ctx.is_organisation:
             continue
         seen.add(tid)
         out.append(row)
@@ -10863,11 +11430,6 @@ def tool_get_task(ctx, task_id=""):
             # separately, and this view carries no transcript content.
             out["meeting"] = _ai_meeting_view(rec)
             out["meeting_access"] = "assignee"
-    fid = row.get("folder_id")
-    if fid:
-        folder = _folders.get_item(Key={"folder_id": fid}).get("Item")
-        if folder and folder.get("owner_user_id") == ctx.user_id:
-            out["folder_name"] = folder.get("name", "")
     return out
 
 
@@ -10937,11 +11499,21 @@ def tool_get_tasks_from_meeting(ctx, recording_key="", meeting_query=""):
 
 
 def _ai_recent_meetings(ctx, limit=40):
-    """The caller's recent meetings, newest first.
+    """The recent meetings the caller may see IN THE ACTIVE WORKSPACE.
 
-    Mirrors list_recordings' union (user-index for user-owned rows, plus the
-    legacy device-index path) so the assistant can see exactly the meetings
-    MinuteX shows — no more, and no fewer.
+    Mirrors list_recordings exactly — including its workspace split — so the
+    assistant sees precisely what MinuteX shows the same user on the same
+    screen: no more, and no fewer.
+
+    ORGANISATION: the workspace index, then _can_read_meeting per row with
+    the role and devices resolved ONCE. An OWNER/MANAGER therefore sees the
+    organisation's meetings and a plain MEMBER sees only their own — the same
+    answer the REST list gives.
+
+    PERSONAL: the original user-index + legacy device-index union, unchanged.
+    A personal request can never surface an organisation row, because those
+    carry an organisation workspace_id and _can_read_meeting rejects them for
+    a caller acting personally.
     """
     seen, out = set(), []
 
@@ -10953,18 +11525,33 @@ def _ai_recent_meetings(ctx, limit=40):
             seen.add(key)
             out.append(item)
 
-    res = _recordings.query(
-        IndexName=USER_INDEX,
-        KeyConditionExpression=Key("user_id").eq(ctx.user_id),
-        ScanIndexForward=False, Limit=limit)
-    _collect(res.get("Items", []))
-
-    for device_id in ctx.devices:
+    if ctx.is_organisation:
+        devices = ctx.devices
         res = _recordings.query(
-            IndexName=DEVICE_INDEX,
-            KeyConditionExpression=Key("device_id").eq(device_id),
+            IndexName=RECORDINGS_WORKSPACE_INDEX,
+            KeyConditionExpression=Key("workspace_id").eq(ctx.workspace_id),
             ScanIndexForward=False, Limit=limit)
-        _collect(r for r in res.get("Items", []) if ctx.owns_recording(r))
+        _collect(r for r in res.get("Items", [])
+                 if _can_read_meeting(ctx.user_id, r, role=ctx.role,
+                                      devices=devices))
+    else:
+        res = _recordings.query(
+            IndexName=USER_INDEX,
+            KeyConditionExpression=Key("user_id").eq(ctx.user_id),
+            ScanIndexForward=False, Limit=limit)
+        # Filtered so a PERSONAL request cannot surface a row that has since
+        # been stamped into an organisation.
+        _collect(r for r in res.get("Items", [])
+                 if not workspace_schema.is_organisation_workspace_id(
+                     _row_workspace_id(r)))
+
+        for device_id in ctx.devices:
+            res = _recordings.query(
+                IndexName=DEVICE_INDEX,
+                KeyConditionExpression=Key("device_id").eq(device_id),
+                ScanIndexForward=False, Limit=limit)
+            _collect(r for r in res.get("Items", [])
+                     if ctx.owns_recording(r))
 
     out.sort(key=lambda r: str(r.get("recorded_at") or r.get("created_at") or ""),
              reverse=True)
@@ -11528,7 +12115,13 @@ AI_TOOLS = {
 # rule this whole section exists to enforce.
 _AI_FORBIDDEN_ARGS = ("user_id", "owner_user_id", "contact_id", "assignee_user_id",
                       "organization_id", "org_id", "tenant_id", "account_id",
-                      "email", "ctx", "context")
+                      "email", "ctx", "context",
+                      # Phase 2C. The active workspace now genuinely exists on
+                      # AIContext, which makes it a real escalation target
+                      # rather than a hypothetical one: a model that could
+                      # name a workspace could ask for a colleague's. It
+                      # arrives from the verified header and nowhere else.
+                      "workspace_id", "workspace", "created_by", "role")
 
 
 def _ai_dispatch(ctx, name, raw_args):
@@ -11820,7 +12413,14 @@ def _ai_run_agent(ctx, message, history):
               + prompts.ASSISTANT_TASK_RULES + "\n"
               + prompts.assistant_identity(
                   display_name=ctx.display_name, email=ctx.email,
-                  today=_ai_today()))
+                  today=_ai_today(),
+                  # Context only — the tools are already scoped and every row
+                  # is re-checked. See the note in assistant_identity.
+                  workspace_name=ctx.workspace_name,
+                  workspace_type=(workspace_schema.TYPE_ORGANISATION
+                                  if ctx.is_organisation
+                                  else workspace_schema.TYPE_PERSONAL),
+                  role=ctx.role))
 
     messages = [{"role": "system", "content": system}]
     messages.extend(history)
@@ -12610,9 +13210,17 @@ def _assignee_readable_recording(event):
     if not item or _is_trashed(item):
         raise ApiError(404, "recording not found")
 
-    owns = item.get("user_id") == user_id or \
-        item.get("device_id") in _owned_devices(user_id)
-    if not owns and not _assignee_tasks_in_recording(user_id, key):
+    # Routed through the ONE authoritative predicate rather than repeating a
+    # creator test (P1 remediation): this now admits an organisation
+    # OWNER/MANAGER — who could already open the meeting through
+    # get_recording, so 404-ing them here made the API inconsistent — and it
+    # DENIES a member removed from the owning organisation.
+    #
+    # The assignee fallback is preserved exactly: a task assignee who is not
+    # a workspace member still reads the meeting their work came from, which
+    # is the Phase-1 behaviour this route exists for.
+    if not _can_read_meeting(user_id, item) \
+            and not _assignee_tasks_in_recording(user_id, key):
         raise ApiError(404, "recording not found")
     return user_id, key, item
 
@@ -13911,9 +14519,10 @@ def _recipient_payload(data) -> list:
 
 def _resolve_contact_recipients(user_id: str, requested) -> tuple:
     """Turn requested recipients into (resolved, unresolved), resolving any
-    contact_id through the OWNER'S contacts.
+    contact_id through the contacts this caller may READ — their own personal
+    ones, plus the shared address book of the organisation they are acting in.
 
-    A contact_id that is not this user's resolves to nothing and lands in
+    A contact_id the caller cannot read resolves to nothing and lands in
     `unresolved` rather than raising — the caller reports "no email address
     for this person", which is also the honest answer for a contact that does
     not exist as far as this user is concerned. Same reasoning as the 404-not-
@@ -13926,8 +14535,12 @@ def _resolve_contact_recipients(user_id: str, requested) -> tuple:
         name = str(entry.get("name") or "").strip()
         email = str(entry.get("email") or "").strip()
         if contact_id:
-            row = _contacts.get_item(Key={"contact_id": contact_id}).get("Item")
-            if row and row.get("owner_user_id") == user_id:
+            # Central gate: a SHARED organisation contact resolves for every
+            # member, so emailing a colleague's client works. A contact the
+            # caller may not read still lands in `unresolved` rather than
+            # raising, exactly as before.
+            row = _readable_contact(user_id, contact_id)
+            if row:
                 # The stored contact is authoritative for the address — a
                 # client-supplied email alongside a contact_id would otherwise
                 # be a way to send to an arbitrary address while looking like
@@ -14007,8 +14620,8 @@ def gmail_meeting_recipients(event):
         contact_id = str(row.get("contact_id") or "")
         if not contact_id:
             continue
-        contact = _contacts.get_item(Key={"contact_id": contact_id}).get("Item")
-        if not contact or contact.get("owner_user_id") != user_id:
+        contact = _readable_contact(user_id, contact_id)
+        if not contact:
             continue
         name = str(contact.get("name") or "")
         email = email_message.normalize_email(contact.get("email"))
@@ -14816,6 +15429,619 @@ def handle_seed_tasks_event(event):
     return {"seeded": seeded, "migrated": migrated, "key": key}
 
 
+# ===========================================================================
+# WORKSPACE ROUTES (Phase 2A — READ ONLY)
+#
+# Two routes, both reads. Phase 2A deliberately ships NO route that creates an
+# organisation, invites anyone, or changes a role: those depend on the
+# unresolved identity decision recorded at the bottom of workspace_schema.py,
+# and shipping half of an invitation flow would bake in an answer to a question
+# the product has not settled.
+#
+# What these two DO give is the thing every later phase needs: a client can
+# discover which workspaces it may act in, and the server has one verified
+# place that decides. Personal-only users see exactly what they see today.
+# ===========================================================================
+def list_workspaces(event):
+    """GET /workspaces -> {workspaces, count, current_workspace_id}
+
+    Every workspace the caller may act in, personal first. The personal one is
+    SYNTHESIZED when its row does not exist yet, so this returns the right
+    answer before the backfill has run — see _user_workspaces.
+
+    Creating the row is a side effect of the first read rather than a
+    migration step (_ensure_personal_workspace is idempotent and conditional),
+    which is what makes scripts/52 optional rather than required.
+    """
+    user_id = _require_auth(event)
+    _ensure_personal_workspace(user_id)
+
+    out = []
+    for workspace, role, membership in _user_workspaces(user_id):
+        out.append(workspace_schema.public_workspace(
+            workspace, role=role, membership=membership))
+
+    # What the CLIENT asked for, echoed back only when it is genuinely usable.
+    # A header naming a workspace the caller is not in resolves to their
+    # personal workspace instead of erroring: the request is a hint, and an
+    # invalid hint should not break a list route.
+    requested = _requested_workspace_id(event)
+    current = _personal_workspace_id(user_id)
+    if requested and _active_membership(requested, user_id):
+        current = requested
+
+    return _resp(200, {"workspaces": out, "count": len(out),
+                       "current_workspace_id": current})
+
+
+def get_workspace(event):
+    """GET /workspaces/{workspace_id} -> {workspace}
+
+    404 for a workspace the caller is not an active member of — the same
+    answer a nonexistent id gets, for the same reason every _owned_* helper in
+    this file returns 404 rather than 403.
+    """
+    workspace_id = _url_unquote(
+        (event.get("pathParameters") or {}).get("workspace_id", ""))
+    user_id, wid, membership = _require_workspace_member(
+        event, workspace_id=workspace_id)
+
+    workspace = _workspace_row(wid)
+    if workspace is None and workspace_schema.is_personal_workspace_id(wid):
+        # Personal workspace that has never been written. Synthesize rather
+        # than 404: it exists conceptually for every user from signup onward.
+        workspace = _ensure_personal_workspace(user_id)
+    if not workspace:
+        raise ApiError(404, "workspace not found")
+
+    return _resp(200, {"workspace": workspace_schema.public_workspace(
+        workspace, role=membership.get("role", ""), membership=membership)})
+
+
+def create_workspace(event):
+    """POST /workspaces {name, company_name?, domain?, ...} -> 201 {workspace}
+
+    Creates an ORGANISATION. Personal workspaces are never created here — they
+    are derived from the user id and materialized by _ensure_personal_workspace,
+    so there is nothing for a client to create and no way to ask for a second
+    one.
+
+    IDEMPOTENT AGAINST CLIENT RETRIES. A double-tap or a retried request would
+    otherwise leave the user owning two identical organisations, which is not
+    something they can easily undo (organisation deletion is a later phase).
+    An `idempotency_key` from the client is claimed exactly once, using the
+    same conditional-claim-row pattern folder names and signup emails use.
+    Without a key the request is still safe — it just cannot be deduplicated,
+    so the client is expected to send one.
+    """
+    user_id = _require_auth(event)
+    data = _body(event)
+
+    try:
+        name = workspace_schema.clean_name(data.get("name"))
+        profile = workspace_schema.clean_org_profile(data)
+    except workspace_schema.WorkspaceValidationError as err:
+        raise ApiError(400, str(err))
+
+    # THE IDENTITY GATE (Phase 2C). An identity that has already USED its
+    # personal workspace must not also become an organisation owner — that is
+    # the silent conversion the identity model forbids. See the ORGANISATION
+    # CREATION block in workspace_schema for why this tests for personal
+    # RESOURCES rather than for the existence of the derived workspace row.
+    #
+    # Checked BEFORE the idempotency claim and before any write, so a refused
+    # attempt leaves nothing behind and can be retried from a work identity.
+    #
+    # An identity that is ALREADY an organisation member is exempt: it has
+    # demonstrably not been converted (it was an organisation identity when it
+    # joined), and blocking it would stop a legitimate owner from starting a
+    # second organisation.
+    if not _has_organisation_membership(user_id) \
+            and _has_personal_resources(user_id):
+        raise PersonalWorkspaceInUse(
+            workspace_schema.PERSONAL_WORKSPACE_IN_USE_MESSAGE)
+
+    # The retry guard. Claimed BEFORE the workspace so a retry that arrives
+    # while the first is still in flight loses the race rather than creating
+    # a twin.
+    claim_id = ""
+    idem = str(data.get("idempotency_key") or "").strip()[:64]
+    if idem:
+        claim_id = f"idem#{user_id}#{idem}"
+        try:
+            _workspaces.put_item(
+                Item={"workspace_id": claim_id, "owner_user_id": user_id,
+                      "created_at": _now_iso()},
+                ConditionExpression="attribute_not_exists(workspace_id)")
+        except ClientError as err:
+            if err.response.get("Error", {}).get("Code") \
+                    == "ConditionalCheckFailedException":
+                raise ApiError(409, "this organisation was already created")
+            raise
+
+    workspace = workspace_schema.new_organisation_workspace(
+        user_id, name, _now_iso(), profile=profile)
+    workspace_id = workspace["workspace_id"]
+
+    try:
+        _workspaces.put_item(
+            Item=workspace,
+            ConditionExpression="attribute_not_exists(workspace_id)")
+        # The OWNER membership is what makes the workspace usable — without it
+        # the creator could not read back what they just made. Written second
+        # so a failure here leaves a workspace with no members rather than a
+        # membership pointing at nothing; the former is recoverable by
+        # re-running, the latter is a dangling grant.
+        _memberships.put_item(
+            Item=workspace_schema.new_membership(
+                workspace_id, user_id, workspace_schema.ROLE_OWNER,
+                _now_iso()))
+    except Exception:
+        if claim_id:
+            # Never strand a claim: it would make that idempotency key
+            # permanently unusable for this user.
+            _workspaces.delete_item(Key={"workspace_id": claim_id})
+        raise
+
+    _audit("workspace.created", user_id, workspace_id)
+    return _resp(201, {"workspace": workspace_schema.public_workspace(
+        workspace, role=workspace_schema.ROLE_OWNER)})
+
+
+def list_members(event):
+    """GET /workspaces/{workspace_id}/members -> {members, count}
+
+    Any ACTIVE member may see who else is in their organisation — knowing your
+    colleagues is not a privileged action, and hiding it would make task
+    assignment unusable. Managing them is separate and gated below.
+
+    REMOVED rows are filtered out rather than returned with a status: a former
+    member is not a member, and listing them invites a client to render them.
+    """
+    workspace_id = _url_unquote(
+        (event.get("pathParameters") or {}).get("workspace_id", ""))
+    user_id, wid, _ = _require_workspace_member(event,
+                                                workspace_id=workspace_id)
+
+    rows = _query_all(_memberships,
+                      KeyConditionExpression=Key("workspace_id").eq(wid))
+    active = [r for r in rows
+              if r.get("status") == workspace_schema.MEMBERSHIP_ACTIVE]
+
+    # One BatchGetItem for the profiles rather than a GetItem per member —
+    # the N+1 the brief's performance section rules out.
+    users = _users_by_ids([r.get("user_id", "") for r in active])
+    members = [workspace_schema.public_member(r, users.get(r.get("user_id")))
+               for r in active]
+    # workspace_schema is pure (no S3 client), so the stored avatar KEY is
+    # turned into a presigned GET here — the same contract _public_user has.
+    # Without this the app gets a key it cannot render and every member falls
+    # back to initials.
+    for m in members:
+        m["avatar_view_url"] = _avatar_view_url(m.get("avatar_url", ""))
+    members.sort(key=lambda m: (workspace_schema.ROLES.index(m["role"])
+                                if m["role"] in workspace_schema.ROLES else -1,
+                                m.get("email", "")), reverse=True)
+    return _resp(200, {"members": members, "count": len(members),
+                       "workspace_id": wid})
+
+
+def _users_by_ids(user_ids):
+    """{user_id: row} for a list of ids, batched.
+
+    Narrow by construction: only the display fields a members list needs are
+    projected, so no password material or unrelated account state can reach a
+    caller through this path. Same discipline as _linked_avatar_map.
+    """
+    ids = {str(u).strip() for u in (user_ids or []) if str(u or "").strip()}
+    if not ids or not USERS_TABLE:
+        return {}
+    out = {}
+    ids = list(ids)
+    try:
+        for start in range(0, len(ids), 100):  # BatchGetItem caps at 100
+            chunk = ids[start:start + 100]
+            resp = _ddb.batch_get_item(RequestItems={USERS_TABLE: {
+                "Keys": [{"user_id": u} for u in chunk],
+                "ProjectionExpression": "user_id, email, #n, avatar_url",
+                "ExpressionAttributeNames": {"#n": "name"},
+            }})
+            for row in resp.get("Responses", {}).get(USERS_TABLE, []):
+                out[row.get("user_id")] = row
+    except ClientError as err:
+        # A profile read failure must not empty the members list — the
+        # memberships themselves are the authoritative part.
+        print(f"[workspace] member profile read failed: {err}")
+    return out
+
+
+def invite_member(event):
+    """POST /workspaces/{workspace_id}/members/invite {email, role}
+       -> 201 {invitation, invite_token}
+
+    OWNER/MANAGER only. The RAW token is returned exactly once, here, and is
+    never stored or logged — only its sha256 goes to the database, the same
+    one-shot contract share links use.
+    """
+    workspace_id = _url_unquote(
+        (event.get("pathParameters") or {}).get("workspace_id", ""))
+    user_id, wid, _ = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_MEMBERS, workspace_id=workspace_id)
+
+    workspace = _workspace_row(wid)
+    if not workspace_schema.is_organisation_workspace_id(wid):
+        raise ApiError(400, "only an organisation can have members")
+
+    data = _body(event)
+    try:
+        email = workspace_schema.clean_email(data.get("email"))
+        role = workspace_schema.clean_role(data.get("role"))
+    except workspace_schema.WorkspaceValidationError as err:
+        raise ApiError(400, str(err))
+
+    # A MANAGER cannot mint an OWNER. Ownership is transferred deliberately,
+    # by an owner, through a route that does not exist yet — not handed out
+    # with an invitation.
+    if role == workspace_schema.ROLE_OWNER:
+        raise ApiError(403, "an organisation owner cannot be invited; "
+                            "transfer ownership instead")
+
+    # Already a member? Say so rather than sending a link that would no-op.
+    existing_user = _user_by_email(email)
+    if existing_user:
+        current = _active_membership(wid, existing_user.get("user_id", ""))
+        if current:
+            raise ApiError(409, "this person is already a member")
+
+    token = workspace_schema.new_invite_token()
+    invitation = workspace_schema.new_invitation(
+        wid, email, role, user_id, token, _now_iso())
+    _invitations.put_item(Item=invitation)
+
+    # entity is the invitation id, never the email or the token — the audit
+    # trail carries ids and counts only (see _audit).
+    _audit("workspace.invited", user_id, invitation["invitation_id"],
+           workspace=wid, role=role)
+    return _resp(201, {
+        "invitation": workspace_schema.public_invitation(invitation),
+        # The ONE time this exists outside the client's hands.
+        "invite_token": token,
+        "workspace_name": (workspace or {}).get("name", ""),
+    })
+
+
+def _user_by_email(email_lc):
+    """The Users row for an email, or None. Claim rows can never match."""
+    if not email_lc:
+        return None
+    try:
+        res = _users.query(IndexName=EMAIL_INDEX,
+                           KeyConditionExpression=Key("email").eq(email_lc),
+                           Limit=1)
+    except ClientError as err:
+        print(f"[workspace] user lookup failed: {err}")
+        return None
+    items = res.get("Items") or []
+    return items[0] if items else None
+
+
+def _invitation_by_token(token):
+    """The invitation a raw token addresses, or None.
+
+    The token is hashed before it is used as a key, so the raw value never
+    reaches a query, a log or an index.
+    """
+    if not workspace_schema.token_looks_valid(token):
+        return None
+    try:
+        res = _invitations.query(
+            IndexName=INVITATIONS_TOKEN_INDEX,
+            KeyConditionExpression=Key("token_hash").eq(
+                workspace_schema.hash_invite_token(token)),
+            Limit=1)
+    except ClientError as err:
+        print(f"[workspace] invitation lookup failed: {err}")
+        return None
+    items = res.get("Items") or []
+    return items[0] if items else None
+
+
+def accept_invitation(event):
+    """POST /workspace-invitations/{token}/accept -> {workspace, role}
+
+    THE IDENTITY RULE LIVES HERE (workspace_schema, IDENTITY (DECIDED)).
+    Four outcomes, and only the last creates anything:
+
+      Case D  the authenticated identity is not the invited email     -> 403
+      Case C  the invited email is a PERSONAL-only identity           -> 409
+      idem.   already an active member                                -> 200
+      Case B  an organisation identity accepting                      -> 201
+
+    SINGLE-USE is enforced by a CONDITIONAL status transition, not by a read
+    followed by a write: two requests racing on one token both see PENDING,
+    and exactly one of them can move it to ACCEPTED.
+    """
+    token = _url_unquote((event.get("pathParameters") or {}).get("token", ""))
+    user_id = _require_auth(event)
+
+    invitation = _invitation_by_token(token)
+    if not invitation:
+        raise ApiError(404, "this invitation is no longer valid")
+
+    user = _users.get_item(Key={"user_id": user_id}).get("Item") or {}
+    email = str(user.get("email") or "")
+    wid = str(invitation.get("workspace_id") or "")
+
+    already = _active_membership(wid, user_id)
+
+    # THE CLOSED-INVITATION GATE, and it deliberately runs AFTER the
+    # membership read.
+    #
+    # The bug this ordering fixes: accepting sets the invitation to ACCEPTED,
+    # which makes invite_is_open false — so gating on it first meant the
+    # already-a-member branch below could never be reached, and the person who
+    # had just joined got 404 for re-opening their own link. Tapping an
+    # invitation twice is ordinary behaviour, not an error.
+    #
+    # An ALREADY-MEMBER caller is therefore let through to the idempotent
+    # branch even on a closed invitation. Everyone else gets one answer for
+    # "no such token", "cancelled", "expired" and "mid-flight", so a caller
+    # holding a dead link learns nothing about which kind of dead it is — and
+    # no membership can be created from one, because the conditional claim
+    # further down still requires PENDING.
+    if not workspace_schema.invite_is_open(invitation) and not already:
+        raise ApiError(404, "this invitation is no longer valid")
+    verdict = workspace_schema.acceptance_verdict(
+        email, invitation,
+        has_org_membership=_has_organisation_membership(user_id),
+        already_member=bool(already),
+        # The SAME probe create_workspace uses, so the two identity paths
+        # cannot disagree about what "a personal account" means. Every signup
+        # gets a derived Personal workspace, so its mere existence proves
+        # nothing — actual personal DATA is the signal.
+        has_personal_data=_has_personal_resources(user_id))
+
+    if verdict == workspace_schema.ACCEPT_WRONG_IDENTITY:
+        # Deliberately does NOT name the invited address: the token holder may
+        # not be the intended recipient, and echoing the target would turn a
+        # leaked link into an email-address disclosure.
+        raise ApiError(403, "this invitation was sent to a different email "
+                            "address. Sign in as the invited account to "
+                            "accept it.")
+
+    if verdict == workspace_schema.ACCEPT_PERSONAL_IDENTITY:
+        # Case C. NOT a merge and NOT a conversion — the agreed model forbids
+        # both. 409 rather than 403 because the request is well-formed and
+        # will succeed once the right identity is used; and never 401, which
+        # would clear the JWT and sign the user out of the very personal
+        # account this message tells them to keep.
+        #
+        # Carries a stable `code` (P2 remediation) so the app branches on
+        # identity rather than on wording — the same contract
+        # SalesforceReconnectRequired established.
+        raise OrganisationEmailConflict(
+            workspace_schema.PERSONAL_IDENTITY_MESSAGE)
+
+    workspace = _workspace_row(wid)
+    if not workspace or not workspace_schema.workspace_is_active(workspace):
+        raise ApiError(404, "this invitation is no longer valid")
+
+    if verdict == workspace_schema.ACCEPT_ALREADY_MEMBER:
+        # Idempotent: re-opening the link after accepting is a normal thing to
+        # do and must not error. The invitation is closed off on the way out.
+        _close_invitation(invitation, user_id)
+        return _resp(200, {
+            "workspace": workspace_schema.public_workspace(
+                workspace, role=already.get("role", "")),
+            "role": already.get("role", ""), "already_member": True})
+
+    # ---------------------------------------------------------------
+    # ATOMICITY (P0 remediation). The required invariant is:
+    #
+    #     membership exists AND invitation = ACCEPTED
+    #   OR
+    #     membership absent AND invitation still USABLE
+    #
+    #   never: invitation = ACCEPTED with no membership.
+    #
+    # The old order flipped the status FIRST and wrote the membership second,
+    # so a failed membership write spent the token and left the invitee
+    # permanently locked out with no way to retry.
+    #
+    # WHY NOT TransactWriteItems. It would be the textbook answer, but it
+    # needs a dynamodb CLIENT (this module holds only resource-level Table
+    # handles), a new IAM action, and it cannot be exercised by the offline
+    # test harness — so the atomicity fix itself would ship untested. The
+    # three-step claim below gives the same invariant using only the
+    # conditional writes this codebase already relies on everywhere else
+    # (_folder_name_claim, the signup email claim, create_workspace).
+    #
+    # THREE STEPS:
+    #   1. CLAIM the invitation (PENDING -> ACCEPTING). Conditional, so
+    #      exactly one of N racing requests proceeds — single-use is enforced
+    #      here, before anything is created.
+    #   2. Write the membership. Now the grant exists.
+    #   3. FINALIZE (ACCEPTING -> ACCEPTED).
+    #
+    # If step 2 or 3 fails, step 1 is COMPENSATED back to PENDING, so the
+    # invitation stays usable and the invitee can simply retry. ACCEPTING is
+    # never treated as open by invite_is_open, so a token stranded mid-flight
+    # (a Lambda timeout between 1 and 3) cannot be replayed — it fails closed
+    # and an owner can re-invite.
+    # ---------------------------------------------------------------
+    invitation_id = invitation["invitation_id"]
+    role = str(invitation.get("role") or workspace_schema.ROLE_MEMBER)
+    now = _now_iso()
+
+    try:
+        _invitations.update_item(
+            Key={"invitation_id": invitation_id},
+            UpdateExpression=("SET #s = :accepting, accepted_by = :uid, "
+                              "updated_at = :now"),
+            ConditionExpression="#s = :pending",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":accepting": workspace_schema.INVITE_ACCEPTING,
+                ":pending": workspace_schema.INVITE_PENDING,
+                ":uid": user_id, ":now": now})
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") \
+                == "ConditionalCheckFailedException":
+            raise ApiError(409, "this invitation has already been used")
+        raise
+
+    try:
+        _memberships.put_item(Item=workspace_schema.new_membership(
+            wid, user_id, role, now,
+            invited_by=str(invitation.get("invited_by") or "")))
+        _invitations.update_item(
+            Key={"invitation_id": invitation_id},
+            UpdateExpression=("SET #s = :accepted, accepted_at = :now, "
+                              "updated_at = :now"),
+            ConditionExpression="#s = :accepting",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":accepted": workspace_schema.INVITE_ACCEPTED,
+                ":accepting": workspace_schema.INVITE_ACCEPTING,
+                ":now": now})
+    except Exception:
+        # COMPENSATE. Return the invitation to PENDING so the invitee can
+        # retry — the alternative is a spent token and a person who cannot
+        # join. Best-effort and conditional on OUR claim still standing, so
+        # it can never reopen an invitation somebody else has since accepted.
+        try:
+            _invitations.update_item(
+                Key={"invitation_id": invitation_id},
+                UpdateExpression="SET #s = :pending, updated_at = :now",
+                ConditionExpression="#s = :accepting",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":pending": workspace_schema.INVITE_PENDING,
+                    ":accepting": workspace_schema.INVITE_ACCEPTING,
+                    ":now": _now_iso()})
+        except ClientError as rollback_err:
+            # Loud: the invitation is now stranded in ACCEPTING and an owner
+            # must re-invite. Fails CLOSED (the token is unusable), so this is
+            # a support problem, never a security one.
+            print(f"[workspace] invitation {invitation_id} left ACCEPTING; "
+                  f"rollback failed: {rollback_err}")
+        raise
+
+    _audit("workspace.joined", user_id, wid, role=role)
+    return _resp(201, {
+        "workspace": workspace_schema.public_workspace(workspace, role=role),
+        "role": role, "already_member": False})
+
+
+def _close_invitation(invitation, user_id):
+    """Mark an invitation ACCEPTED, best-effort and only if still PENDING."""
+    try:
+        _invitations.update_item(
+            Key={"invitation_id": invitation["invitation_id"]},
+            UpdateExpression=("SET #s = :accepted, accepted_by = :uid, "
+                              "accepted_at = :now, updated_at = :now"),
+            ConditionExpression="#s = :pending",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":accepted": workspace_schema.INVITE_ACCEPTED,
+                ":pending": workspace_schema.INVITE_PENDING,
+                ":uid": user_id, ":now": _now_iso()})
+    except ClientError:
+        pass  # already closed — nothing to do
+
+
+def update_member(event):
+    """PATCH /workspaces/{workspace_id}/members/{user_id} {role} -> {member}
+
+    Role changes, with the four safety rules from section 11:
+
+      * the target must be an ACTIVE member of THIS workspace;
+      * OWNER cannot be granted here — ownership transfer is its own
+        operation and does not exist yet, so this route must not become a
+        back door to it;
+      * the current OWNER's role cannot be changed, which is what keeps the
+        organisation from becoming ownerless;
+      * a MANAGER cannot promote themselves (they cannot reach OWNER at all,
+        by the second rule).
+    """
+    params = event.get("pathParameters") or {}
+    workspace_id = _url_unquote(params.get("workspace_id", ""))
+    target_id = _url_unquote(params.get("user_id", ""))
+    actor_id, wid, _ = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_MEMBERS, workspace_id=workspace_id)
+
+    data = _body(event)
+    try:
+        role = workspace_schema.clean_role(data.get("role"), default=None)
+    except workspace_schema.WorkspaceValidationError as err:
+        raise ApiError(400, str(err))
+
+    if role == workspace_schema.ROLE_OWNER:
+        raise ApiError(403, "ownership cannot be granted here; "
+                            "use ownership transfer")
+
+    target = _active_membership(wid, target_id)
+    if not target:
+        raise ApiError(404, "member not found")
+    if target.get("role") == workspace_schema.ROLE_OWNER:
+        raise ApiError(403, "the organisation owner's role cannot be changed")
+
+    _memberships.update_item(
+        Key={"workspace_id": wid, "user_id": target_id},
+        UpdateExpression="SET #r = :role, updated_at = :now",
+        ExpressionAttributeNames={"#r": "role"},
+        ExpressionAttributeValues={":role": role, ":now": _now_iso()})
+
+    _audit("workspace.role_changed", actor_id, wid,
+           target=target_id, role=role)
+    updated = _workspace_membership(wid, target_id)
+    return _resp(200, {"member": workspace_schema.public_member(
+        updated, _users_by_ids([target_id]).get(target_id))})
+
+
+def remove_member(event):
+    """DELETE /workspaces/{workspace_id}/members/{user_id} -> {removed}
+
+    REMOVES ACCESS ONLY. Organisation-owned data is deliberately untouched:
+    a meeting recorded for ABC Realty belongs to ABC Realty, not to the person
+    who pressed record, so it must survive them leaving. "Remove + delete
+    data" is a later phase and is not reachable from here.
+
+    The row is marked REMOVED rather than deleted, so "was this person ever a
+    member" stays answerable and a re-invitation is an update rather than a
+    resurrection. _active_membership already treats REMOVED as no access, and
+    because membership is re-read on every request the revocation takes effect
+    on the target's very next call — which is the whole reason it is not in
+    the JWT.
+    """
+    params = event.get("pathParameters") or {}
+    workspace_id = _url_unquote(params.get("workspace_id", ""))
+    target_id = _url_unquote(params.get("user_id", ""))
+    actor_id, wid, _ = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_MEMBERS, workspace_id=workspace_id)
+
+    target = _active_membership(wid, target_id)
+    if not target:
+        raise ApiError(404, "member not found")
+    if target.get("role") == workspace_schema.ROLE_OWNER:
+        # An ownerless organisation must never exist.
+        raise ApiError(403, "the organisation owner cannot be removed; "
+                            "transfer ownership first")
+
+    _memberships.update_item(
+        Key={"workspace_id": wid, "user_id": target_id},
+        UpdateExpression=("SET #s = :removed, removed_at = :now, "
+                          "removed_by = :actor, updated_at = :now"),
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":removed": workspace_schema.MEMBERSHIP_REMOVED,
+            ":now": _now_iso(), ":actor": actor_id})
+
+    _audit("workspace.member_removed", actor_id, wid, target=target_id)
+    return _resp(200, {"removed": True, "user_id": target_id,
+                       "workspace_id": wid})
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -14884,7 +16110,6 @@ _ROUTES = {
     # first and {key+} last for the same API Gateway reason as the AI routes.
     ("GET", "/recordings/participants/{key+}"): list_participants,
     ("PUT", "/recordings/participants/{key+}"): set_participant,
-    ("PATCH", "/recordings/folder/{key+}"): move_recording_to_folder,
     ("GET", "/recordings/{key+}"): get_recording,
     ("PATCH", "/recordings/{key+}"): patch_recording,
     # Trash. DELETE /recordings/{key+} is a SOFT delete (see the Trash
@@ -14902,14 +16127,6 @@ _ROUTES = {
     ("DELETE", "/recordings/permanent/{key+}"): permanently_delete_recording,
     ("GET", "/trash"): list_trash,
     # Folders — organizational views over the ONE master meeting collection.
-    ("POST", "/folders"): create_folder,
-    ("GET", "/folders"): list_folders,
-    ("GET", "/folders/{folder_id}"): get_folder,
-    ("PATCH", "/folders/{folder_id}"): update_folder,
-    ("DELETE", "/folders/{folder_id}"): delete_folder,
-    ("GET", "/folders/{folder_id}/contacts"): list_folder_contacts,
-    ("POST", "/folders/{folder_id}/contacts/{contact_id}"): add_folder_contact,
-    ("DELETE", "/folders/{folder_id}/contacts/{contact_id}"): remove_folder_contact,
     # Contacts — global per owner, never owned by a folder.
     ("POST", "/contacts"): create_contact,
     ("GET", "/contacts"): list_contacts,
@@ -15011,6 +16228,23 @@ _ROUTES = {
     ("GET", "/notifications/unread-count"): get_unread_count,
     ("POST", "/notifications/{notification_id}/read"): mark_notification_read,
     ("POST", "/notifications/read-all"): mark_all_notifications_read,
+    # --- Workspaces (Phase 2A). READ ONLY, deliberately: creation,
+    # invitation and role changes wait on the identity decision documented at
+    # the end of shared/workspace_schema.py. Both are JWT-authenticated and
+    # resolve membership from the database — a workspace_id in a header or a
+    # path is a request, never a claim.
+    ("GET", "/workspaces"): list_workspaces,
+    ("GET", "/workspaces/{workspace_id}"): get_workspace,
+    # Organisation write surface (Phase 2B). Every one resolves membership
+    # and role from the database; none reads a role from the client.
+    ("POST", "/workspaces"): create_workspace,
+    ("GET", "/workspaces/{workspace_id}/members"): list_members,
+    ("POST", "/workspaces/{workspace_id}/members/invite"): invite_member,
+    ("PATCH", "/workspaces/{workspace_id}/members/{user_id}"): update_member,
+    ("DELETE", "/workspaces/{workspace_id}/members/{user_id}"): remove_member,
+    # Acceptance is JWT-authenticated: the token proves possession of the
+    # link, the JWT proves WHO is spending it, and both must agree.
+    ("POST", "/workspace-invitations/{token}/accept"): accept_invitation,
     ("POST", "/webhooks/elevenlabs/stt"): stt_webhook,
     # Recover a job whose webhook never arrived, by asking ElevenLabs directly.
     # JWT-authenticated and owner-scoped — this one is for the user/operator,

@@ -8,18 +8,28 @@
 // action — the hardware is an *additional* source, never a prerequisite.
 import { useEffect, useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { Stack, useRouter, type Href, useLocalSearchParams } from "expo-router";
+import { Stack, useRouter, type Href } from "expo-router";
 import { Icon } from "../../lib/icons";
 import { S, R, CAPS, FONT, ELEV, useTheme, ColorScale } from "../../lib/theme";
 import { SoonBadge, IconCircle } from "../../lib/ui";
 import { useDevice } from "../../lib/device-context";
 import { getDevicesList } from "../../lib/api";
+import { useWorkspace, workspaceLabel } from "../../lib/workspace-context";
 
 function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
   return StyleSheet.create({
     container: { flex: 1, backgroundColor: C.bg, paddingHorizontal: 20 },
     title: { ...T.headline, fontSize: 30, lineHeight: 34, marginTop: 10 },
     sub: { ...T.bodyDim, marginTop: 10 },
+    // "Recording in <workspace>" — a quiet tinted strip rather than a card,
+    // so it reads as context for what follows and not as a fourth option.
+    wsBanner: {
+      flexDirection: "row", alignItems: "center", gap: 7,
+      marginTop: 18, paddingVertical: 9, paddingHorizontal: 12,
+      backgroundColor: C.primarySoft, borderRadius: R.sm,
+    },
+    wsLabel: { ...T.caption, color: C.textDim },
+    wsName: { ...T.caption, color: C.primary, fontWeight: "700", flexShrink: 1 },
     // A single elevated card holding all three source rows.
     card: {
       backgroundColor: C.surface, borderRadius: R.card,
@@ -75,10 +85,6 @@ function Option({ n, icon, title, subtitle, onPress, disabled, soon, live, first
 
 export default function NewRecordingScreen() {
   const router = useRouter();
-  // Carried through from the folder detail screen, so "Record" inside a folder
-  // files into that folder regardless of WHICH source the user then picks.
-  const { folderId: folderParam } = useLocalSearchParams<{ folderId?: string }>();
-  const folderId = String(folderParam || "");
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C, T), [C, T]);
   const { device, status, connState } = useDevice();
@@ -96,6 +102,16 @@ export default function NewRecordingScreen() {
     return () => { cancelled = true; };
   }, []);
 
+  // The workspace this recording will belong to. Read from the SHARED
+  // provider rather than fetched here, so this banner cannot disagree with
+  // the switcher the user just used — a per-screen fetch is exactly how they
+  // drift apart.
+  //
+  // Display only: the backend re-resolves the workspace from the membership
+  // behind the request and is the sole authority on what the row is stamped
+  // with. A tampered value produces a 404, not a misfiled meeting.
+  const { active: workspace } = useWorkspace();
+
   const connected = connState === "connected" && !!device;
   const deviceAvailable = paired === true || connected;
 
@@ -103,13 +119,6 @@ export default function NewRecordingScreen() {
     // Swap the chooser out for the destination so "back" from the recorder
     // returns to where the user actually was, not to this sheet.
     //
-    // The folder rides along as a query param: the phone recorder and the
-    // upload screen both file into it, so which source the user picks does not
-    // change where the meeting lands.
-    if (folderId && typeof href === "string") {
-      router.replace({ pathname: href, params: { folderId } } as never);
-      return;
-    }
     router.replace(href);
   };
 
@@ -119,6 +128,26 @@ export default function NewRecordingScreen() {
 
       <Text style={st.title}>What are we{"\n"}listening to?</Text>
       <Text style={st.sub}>However it's captured, you get the same brief at the end.</Text>
+
+      {/* WHERE this recording will land. Shown before any source is chosen,
+          because a recording must never be started in an ambiguous context —
+          filing a client meeting into a personal workspace by accident is not
+          something the user can easily undo. Personal renders too, not just
+          organisations: "no banner" would be indistinguishable from "still
+          loading" and would train people to ignore it. */}
+      {workspace ? (
+        <View style={st.wsBanner}>
+          <Icon
+            name={workspace.is_personal ? "person.fill" : "building.2.fill"}
+            tintColor={C.primary}
+            size={15}
+          />
+          <Text style={st.wsLabel}>Recording in</Text>
+          <Text style={st.wsName} numberOfLines={1}>
+            {workspaceLabel(workspace)}
+          </Text>
+        </View>
+      ) : null}
 
       <View style={[st.card, { marginTop: 22 }]}>
         <Option

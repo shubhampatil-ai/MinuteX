@@ -487,7 +487,14 @@ class FakeResource:
                 raise ClientError(
                     "ValidationException",
                     "Too many items requested for the BatchGetItem call")
-            projection = [f.strip() for f in
+            # Placeholders are RESOLVED, not ignored. `name` is a DynamoDB
+            # reserved word, so the only way to project it is "#n" plus
+            # ExpressionAttributeNames — which _users_by_ids does. A fake that
+            # dropped the mapping would filter `name` straight back out and
+            # report an empty members list as correct, hiding the exact bug
+            # this path exists to prevent.
+            attr_names = spec.get("ExpressionAttributeNames") or {}
+            projection = [attr_names.get(f.strip(), f.strip()) for f in
                           (spec.get("ProjectionExpression") or "").split(",")
                           if f.strip()]
             rows = []
@@ -508,18 +515,25 @@ def build_tables():
         "recordings": FakeTable(
             "Recordings", "audio_s3_key",
             indexes={"user-index": ("user_id", "created_at"),
-                     "device-index": ("device_id", "created_at")}),
+                     "device-index": ("device_id", "created_at"),
+                     # Phase 2B. SPARSE: rows written before workspaces
+                     # existed carry no workspace_id and are simply not in
+                     # this index — which is correct, because they are
+                     # personal and the user-index already serves them.
+                     "workspace-index": ("workspace_id", "created_at")}),
         "contacts": FakeTable(
             "Contacts", "contact_id",
             indexes={"owner-index": ("owner_user_id", "created_at"),
                      "owner-email-index": ("owner_user_id", "email_lc"),
-                     "owner-phone-index": ("owner_user_id", "phone_e164")}),
-        "folders": FakeTable(
-            "Folders", "folder_id",
-            indexes={"owner-index": ("owner_user_id", "name_lc")}),
-        "folder_contacts": FakeTable(
-            "FolderContacts", "folder_id", "contact_id",
-            indexes={"contact-index": ("contact_id", "folder_id")}),
+                     "owner-phone-index": ("owner_user_id", "phone_e164"),
+                     # SHARED organisation contacts (Phase 2C). Sparse:
+                     # personal rows carry no workspace_id and stay out,
+                     # which is correct — owner-index serves them.
+                     "workspace-index": ("workspace_id", "created_at"),
+                     # Workspace-scoped dedupe. owner-email-index cannot
+                     # answer "does this ORGANISATION already have this
+                     # person" because its HASH key is the owner.
+                     "workspace-email-index": ("workspace_id", "email_lc")}),
         "participants": FakeTable(
             "MeetingParticipants", "audio_s3_key", "speaker_id",
             indexes={"contact-index": ("contact_id", "audio_s3_key")}),
@@ -527,13 +541,14 @@ def build_tables():
             "Tasks", "task_id",
             indexes={"owner-index": ("owner_user_id", "created_at"),
                      "meeting-index": ("source_recording_id", "created_at"),
-                     "folder-index": ("folder_id", "created_at"),
                      "assignee-index": ("assignee_contact_id", "created_at"),
                      # "tasks I must DO" — keyed on the MinuteX ACCOUNT, which
                      # is what lets an assignee see work created by someone
                      # else. Sparse, exactly as in the real table.
                      "assignee-user-index": ("assignee_user_id", "created_at"),
-                     "dedupe-index": ("owner_user_id", "fingerprint")}),
+                     "dedupe-index": ("owner_user_id", "fingerprint"),
+                     # Phase 2B, sparse for the same reason as Recordings.
+                     "workspace-index": ("workspace_id", "created_at")}),
         "users": FakeTable(
             "Users", "user_id",
             indexes={"email-index": ("email", None)}),
@@ -545,4 +560,26 @@ def build_tables():
         "chat_sessions": FakeTable(
             "ChatSessions", "session_id",
             indexes={"user-index": ("user_id", "updated_at")}),
+        # --- Workspace layer (Phase 2A). Key schemas mirror
+        # scripts/50_create_workspace_tables.sh exactly; a divergence here
+        # would make the tests agree with themselves and not with AWS.
+        "workspaces": FakeTable(
+            "Workspaces", "workspace_id",
+            indexes={"owner-index": ("owner_user_id", "created_at")}),
+        # The only PK+SK table on the authorization path. Membership is a
+        # single point read (workspace_id, user_id) precisely so a removed
+        # member loses access on the next request rather than eventually.
+        "memberships": FakeTable(
+            "WorkspaceMemberships", "workspace_id", "user_id",
+            indexes={"user-index": ("user_id", "workspace_id")}),
+        "invitations": FakeTable(
+            "WorkspaceInvitations", "invitation_id",
+            indexes={"token-index": ("token_hash", None),
+                     "workspace-index": ("workspace_id", "created_at"),
+                     "email-index": ("email", "created_at")}),
+        # Per-meeting grants (Phase 2B). PK+SK so "may this user reach this
+        # meeting" is one point read, like WorkspaceMemberships.
+        "meeting_access": FakeTable(
+            "MeetingAccess", "meeting_id", "user_id",
+            indexes={"user-index": ("user_id", "meeting_id")}),
     }

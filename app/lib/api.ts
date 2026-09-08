@@ -87,10 +87,14 @@ export type RecordingSummary = {
   // be corrected at any time, including on old recordings. Absent until the
   // user names someone.
   speaker_names?: Record<string, string> | null;
-  // The folder this meeting is filed under, or "" for General (= no folder).
-  // A meeting belongs to at most ONE folder and is never duplicated across
-  // them — folder views filter this one master list.
-  folder_id?: string;
+  // WHO recorded it. Present only on an ORGANISATION list — in a personal
+  // workspace every row is yours, so the column would be your own name
+  // repeated. `recorded_by` is the user id; `recorded_by_name` is the display
+  // name (already falling back to a derived name, then the email, so it is
+  // never a raw uuid); `recorded_by_avatar` is a short-lived presigned GET.
+  recorded_by?: string;
+  recorded_by_name?: string;
+  recorded_by_avatar?: string;
 };
 
 // A recording in Trash: the same summary MinuteX renders, plus when it was
@@ -366,7 +370,17 @@ export type LoginResult = { token: string; user_id: string; email: string; name?
 export type UserProfile = {
   user_id: string;
   email: string;
+  /** The RAW stored name — "" when the user has never set one. On /me this is
+   * deliberately NOT the derived display name, because the onboarding gate has
+   * to be able to tell "never chose" from "chose". Use `suggested_name` for
+   * the pre-fill and `name_set` for the decision. */
   name: string;
+  /** Whether `name` was actually set by the user. Drives the onboarding gate. */
+  name_set?: boolean;
+  /** A server-derived guess from the email local-part ("shubham.patil@…" ->
+   * "Shubham Patil"), present only while `name` is unset. Advisory: it is
+   * never stored unless the user saves it. */
+  suggested_name?: string;
   /** The stored S3 KEY, not a URL. Send it back on PATCH /me; never render it. */
   avatar_url: string;
   /** A short-lived presigned GET, re-signed by the backend on every read.
@@ -502,6 +516,63 @@ export async function getToken(): Promise<string | null> {
 
 export async function clearToken(): Promise<void> {
   await store.deleteItemAsync(TOKEN_KEY);
+  // Signing out must not leave the next account pointed at the previous
+  // one's organisation. Harmless if it did — the server would 404 a
+  // workspace they are not in — but it would make the first screen after
+  // login render an error instead of their own data.
+  await clearActiveWorkspace();
+}
+
+// ---------------------------------------------------------------------------
+// ACTIVE WORKSPACE — UI/application state, and nothing more.
+//
+// The header this produces names the workspace the user is looking at. It is
+// NOT a credential and grants nothing: the backend resolves membership and
+// role from the database on every request (see _require_workspace_member in
+// userapi), so a tampered value produces a 404 rather than access.
+//
+// Cached in memory as well as in the store because request() reads it on
+// EVERY call — an async storage read per request would put storage latency on
+// the hot path of every screen.
+//
+// PERSONAL IS THE ABSENCE OF A VALUE. Storing "personal" explicitly would
+// mean sending a header on every ordinary request and would make "never
+// switched workspace" indistinguishable from "chose personal". Absent means
+// personal, which is also exactly what the pre-workspace client sent.
+// ---------------------------------------------------------------------------
+export const WORKSPACE_HEADER = "x-minutex-workspace";
+const WORKSPACE_KEY = "minutex.workspace";
+
+let activeWorkspaceCache: string | null | undefined;
+
+export async function getActiveWorkspaceId(): Promise<string | null> {
+  if (activeWorkspaceCache !== undefined) return activeWorkspaceCache;
+  try {
+    activeWorkspaceCache = await store.getItemAsync(WORKSPACE_KEY);
+  } catch {
+    // Storage can be unavailable (see lib/storage.ts). Personal is the safe
+    // fallback: the user sees their own data rather than an error.
+    activeWorkspaceCache = null;
+  }
+  return activeWorkspaceCache;
+}
+
+export async function setActiveWorkspace(workspaceId: string | null): Promise<void> {
+  // A personal workspace id is derivable, so it never needs storing — and
+  // storing it would send a header where none is needed.
+  const value = workspaceId && !workspaceId.startsWith("wsp_") ? workspaceId : null;
+  activeWorkspaceCache = value;
+  try {
+    if (value) await store.setItemAsync(WORKSPACE_KEY, value);
+    else await store.deleteItemAsync(WORKSPACE_KEY);
+  } catch {
+    // The in-memory cache still holds for this session; only persistence
+    // across a restart is lost, which is a preference, not correctness.
+  }
+}
+
+export async function clearActiveWorkspace(): Promise<void> {
+  await setActiveWorkspace(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +626,20 @@ async function request<T>(
   if (auth) {
     const token = await getToken();
     if (token) headers["Authorization"] = `Bearer ${token}`;
+    // ACTIVE WORKSPACE — a HINT, never a credential.
+    //
+    // Attached at the same single choke point the Bearer token is, so no
+    // screen has to remember it and none can forget. The backend treats this
+    // as a REQUEST: it re-reads membership from the database on every call
+    // and answers 404 if the caller is not in the named workspace. Nothing
+    // here grants access, and setting it to someone else's workspace achieves
+    // exactly nothing.
+    //
+    // Omitted when personal, so a client that never switches workspace sends
+    // byte-identical requests to the ones it sent before workspaces existed —
+    // which is what keeps every existing screen working untouched.
+    const ws = await getActiveWorkspaceId();
+    if (ws) headers[WORKSPACE_HEADER] = ws;
   }
 
   let resp: Response;
@@ -619,6 +704,152 @@ export async function signup(
   });
   await saveToken(res.token);
   return res;
+}
+
+// ---- Workspaces ----
+//
+// Phase 2B surface only. The switcher UI, Members screen and organisation
+// dashboard are Phase 2C; these are the calls those screens will use, plus
+// the two the recording flow needs today (list, and setting the active one).
+
+export type WorkspaceRole = "OWNER" | "MANAGER" | "MEMBER";
+
+export type ApiWorkspace = {
+  workspace_id: string;
+  type: "PERSONAL" | "ORGANISATION";
+  name: string;
+  status: string;
+  is_personal: boolean;
+  role?: WorkspaceRole;
+  capabilities?: Record<string, boolean>;
+  company_name?: string;
+  domain?: string;
+  industry?: string;
+  created_at?: string;
+};
+
+/** A member as the API returns them. `name` here IS the display name — the
+ * server falls back to a derived name and then the email, so it is never a
+ * raw uuid. `name_set` says whether the person actually chose it. */
+export type ApiMember = {
+  user_id: string;
+  role: WorkspaceRole;
+  status: string;
+  email?: string;
+  /** Display name: the chosen name, else derived from email, else the email.
+   * Never a raw user_id when the profile read succeeded. */
+  name?: string;
+  /** True only when the user actually chose their name. */
+  name_set?: boolean;
+  /** The stored S3 KEY — do not render it. */
+  avatar_url?: string;
+  /** Short-lived presigned GET. Render this; "" means fall back to initials. */
+  avatar_view_url?: string;
+  joined_at?: string;
+};
+
+export async function getWorkspaces(): Promise<{
+  workspaces: ApiWorkspace[];
+  count: number;
+  current_workspace_id: string;
+}> {
+  return request("/workspaces");
+}
+
+export async function createOrganisation(input: {
+  name: string;
+  company_name?: string;
+  company_email?: string;
+  domain?: string;
+  phone?: string;
+  address?: string;
+  industry?: string;
+}): Promise<{ workspace: ApiWorkspace }> {
+  return request("/workspaces", {
+    method: "POST",
+    // A retry that reaches the server twice must not leave the user owning
+    // two identical organisations — there is no way to delete one yet.
+    body: { ...input, idempotency_key: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}` },
+  });
+}
+
+export async function getWorkspaceMembers(
+  workspaceId: string
+): Promise<{ members: ApiMember[]; count: number }> {
+  return request(`/workspaces/${encodeURIComponent(workspaceId)}/members`);
+}
+
+// The RAW invite token comes back exactly once, here. It is never readable
+// again — the server stores only its hash — so whatever shows this response
+// is the user's single chance to copy the link.
+export async function inviteMember(
+  workspaceId: string,
+  email: string,
+  role: WorkspaceRole
+): Promise<{ invitation: any; invite_token: string; workspace_name: string }> {
+  return request(`/workspaces/${encodeURIComponent(workspaceId)}/members/invite`, {
+    method: "POST",
+    body: { email, role },
+  });
+}
+
+export async function updateMemberRole(
+  workspaceId: string,
+  userId: string,
+  role: WorkspaceRole
+): Promise<{ member: ApiMember }> {
+  return request(
+    `/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`,
+    { method: "PATCH", body: { role } }
+  );
+}
+
+export async function removeMember(
+  workspaceId: string,
+  userId: string
+): Promise<{ removed: boolean }> {
+  return request(
+    `/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE" }
+  );
+}
+
+// The invited address belongs to a PERSONAL MinuteX account, so the agreed
+// identity model will not let it join an organisation (no merge, no
+// conversion) — the person needs a work email. Branch on this CODE, never on
+// the message text, and never on the bare 409: acceptance has other 409s
+// (an already-spent invitation) that mean something completely different.
+//
+// Deliberately not a 401, for the same reason as SALESFORCE_RECONNECT_CODE:
+// a 401 clears the JWT and would sign the user out of the very personal
+// account this error tells them to keep.
+export const ORGANISATION_EMAIL_CONFLICT_CODE = "organisation_email_conflict";
+
+export function isOrganisationEmailConflict(e: unknown): boolean {
+  return e instanceof ApiError && e.code === ORGANISATION_EMAIL_CONFLICT_CODE;
+}
+
+// The CREATION-side twin. A DISTINCT code, because the two need different
+// screens: the one above says "you were invited on the wrong address"; this
+// one says "this account already has personal data, so create the
+// organisation from a work account instead". Both are 409, so branching on
+// the status alone could not tell them apart.
+export const PERSONAL_WORKSPACE_IN_USE_CODE = "personal_workspace_in_use";
+
+export function isPersonalWorkspaceInUse(e: unknown): boolean {
+  return e instanceof ApiError && e.code === PERSONAL_WORKSPACE_IN_USE_CODE;
+}
+
+// Accepting an invitation is authenticated: the token proves possession of
+// the link, the JWT proves WHO is spending it, and the server requires both
+// to agree. Use isOrganisationEmailConflict(e) to detect the personal-email
+// case rather than inspecting the status or the wording.
+export async function acceptInvitation(
+  token: string
+): Promise<{ workspace: ApiWorkspace; role: WorkspaceRole; already_member: boolean }> {
+  return request(`/workspace-invitations/${encodeURIComponent(token)}/accept`, {
+    method: "POST",
+  });
 }
 
 // ---- Profile ----
@@ -1040,8 +1271,24 @@ export async function sendGmailEmail(
   });
 }
 
-export async function getRecordings(): Promise<RecordingSummary[]> {
-  const res = await request<{ recordings: RecordingSummary[] }>("/recordings");
+/**
+ * Recordings in the ACTIVE workspace (the workspace header is applied by
+ * `request`, so this needs no workspace argument).
+ *
+ * `userId` narrows the list to one person's meetings — the "whose meetings?"
+ * filter an owner or manager uses on an organisation. It is applied by the
+ * SERVER, and only ever AFTER its own read check, so passing someone else's
+ * id can never widen what comes back: a member who tries it gets the
+ * intersection with what they were already allowed to see. In a personal
+ * workspace it is ignored, because every row there is already yours.
+ */
+export async function getRecordings(
+  opts: { userId?: string } = {}
+): Promise<RecordingSummary[]> {
+  const uid = (opts.userId || "").trim();
+  const res = await request<{ recordings: RecordingSummary[] }>(
+    uid ? `/recordings?user_id=${encodeURIComponent(uid)}` : "/recordings"
+  );
   return res.recordings ?? [];
 }
 
@@ -1071,8 +1318,6 @@ export type UploadTicket = {
   // signed one would be a 403, so lib/uploads.tsx sends none at all. Do not
   // "fix" this by signing it.
   content_type: string;
-  /** The folder the row was filed into, or "" for General. */
-  folder_id?: string;
 };
 
 export async function requestUpload(params: {
@@ -1081,12 +1326,6 @@ export async function requestUpload(params: {
   title?: string;
   duration?: number; // seconds, if known
   size?: number;     // bytes, if known — backend rejects oversize before the PUT
-  // File the recording into a folder at PRESIGN time, for a recording started
-  // from inside one. The row is created already carrying its folder, so the
-  // meeting is never briefly visible in General and killing the app mid-upload
-  // cannot leave it unfiled. A folder the caller does not own fails the whole
-  // request (404) rather than yielding an unfiled recording.
-  folder_id?: string;
   // RE-PRESIGN an upload already under way. A presigned PUT expires, so a
   // large file on a slow link outlives its URL and needs a new one — and
   // asking for a fresh identity there would create a SECOND timeline row and
@@ -1877,7 +2116,6 @@ export type ApiTask = {
   // the label itself. Empty when the task never came from a speaker.
   speaker_name?: string;
   resolution_status?: TaskResolutionStatus;
-  folder_id?: string;
   source_recording_id?: string;
   source_type?: TaskSourceType;
   /** The MODEL's own confidence in this extraction: "high" | "medium" | "low",
@@ -1978,21 +2216,49 @@ export async function updateTask(key: string, id: string, patch: TaskPatch): Pro
 export async function deleteTask(key: string, id: string): Promise<void> {
   await request(aiPath("tasks", key), { method: "DELETE", body: { id } });
 }
+export type ApiParticipant = {
+  speaker_id: string;
+  contact_id: string;
+  participant_role: string;
+  created_at: string;
+  updated_at: string;
+  contact?: ApiContact;
+  /** Present but NOT a voice in the transcript — someone who self-tagged as
+   * having attended without speaking.
+   *
+   * The backend decides this and sends it as a boolean; the storage shape
+   * behind it (a reserved speaker_id) is deliberately not something the app
+   * parses. An attendance row is never a speaker: it is not in speaker_names,
+   * no generated document names it as one, and it never resolves an AI task. */
+  attendance_only?: boolean;
+};
+
+/** Returned as a 409 when a contact name matches people we already know
+ * about. Carries the candidates so the UI can ask "which Rahul?" instead of
+ * failing outright. */
+export const CONTACT_AMBIGUOUS_CODE = "contact_ambiguous";
+
+export function isAmbiguousContact(e: unknown): boolean {
+  return e instanceof ApiError && e.code === CONTACT_AMBIGUOUS_CODE;
+}
+
+/** The candidate list carried on an ambiguous-contact 409. Read off the error
+ * so the caller can render a chooser without a second round trip. */
+export function ambiguousCandidates(e: unknown): ApiContact[] {
+  if (!(e instanceof ApiError)) return [];
+  const list = (e as any).candidates;
+  return Array.isArray(list) ? (list as ApiContact[]) : [];
+}
+
 // ---------------------------------------------------------------------------
-// FOLDERS, CONTACTS, PARTICIPANTS and cross-meeting TASKS.
+// CONTACTS, PARTICIPANTS and cross-meeting TASKS.
 //
-// The organization layer. Three things worth knowing before using these:
+// The organization layer. Two things worth knowing before using these:
 //
-//  1. A meeting belongs to ZERO OR ONE folder, and moving it rewrites one
-//     attribute — there is no copy, and `folder_id: null` means General. So
-//     "which meetings are in this folder" is a filter over the one master
-//     list, never a separate collection.
+//  1. A contact is GLOBAL per account — one row per person, so editing them
+//     once edits them everywhere they appear.
 //
-//  2. A contact is GLOBAL per account. Adding one to a folder creates an
-//     association, not a second person, so the same contact_id appears in as
-//     many folders as you like and editing them once edits them everywhere.
-//
-//  3. Speaker labels in the transcript ("0", "1", …) are NEVER rewritten.
+//  2. Speaker labels in the transcript ("0", "1", …) are NEVER rewritten.
 //     setParticipant maps a label to a contact alongside the transcript; the
 //     backend also syncs the recording speaker_names map, which is what the
 //     already-shipped surfaces (documents, highlights, transcript) render.
@@ -2029,173 +2295,6 @@ export type ApiContact = {
 
 export type ContactAvatarSource = "" | "own" | "minutex";
 
-// Folder appearance is a TOKEN, never a hex colour or a raw icon name: the
-// backend stores the token and the app owns what it looks like, so the palette
-// stays coherent in light and dark and can be re-themed without rewriting
-// stored data. See FOLDER_COLORS / FOLDER_ICONS in lambda-userapi.
-export type FolderColor =
-  | "slate" | "blue" | "green" | "amber" | "teal" | "red" | "purple";
-export type FolderIconToken =
-  | "folder" | "briefcase" | "person.2" | "building" | "chart"
-  | "lightbulb" | "flag" | "heart" | "star" | "phone" | "cart" | "gear";
-
-export type ApiFolder = {
-  id: string;
-  name: string;
-  description: string;
-  // Always present on read — the backend defaults them, so folders created
-  // before appearance existed render normally rather than needing a fallback
-  // at every call site.
-  color: FolderColor;
-  icon: FolderIconToken;
-  created_at: string;
-  updated_at: string;
-  meeting_count?: number;
-};
-
-export type ApiParticipant = {
-  speaker_id: string;
-  contact_id: string;
-  participant_role: string;
-  created_at: string;
-  updated_at: string;
-  contact?: ApiContact;
-  /** Present but NOT a voice in the transcript — someone who self-tagged as
-   * having attended without speaking.
-   *
-   * The backend decides this and sends it as a boolean; the storage shape
-   * behind it (a reserved speaker_id) is deliberately not something the app
-   * parses. An attendance row is never a speaker: it is not in speaker_names,
-   * no generated document names it as one, and it never resolves an AI task. */
-  attendance_only?: boolean;
-};
-
-/** Returned as a 409 when a contact name matches people we already know
- * about. Carries the candidates so the UI can ask "which Rahul?" instead of
- * failing outright. */
-export const CONTACT_AMBIGUOUS_CODE = "contact_ambiguous";
-
-export function isAmbiguousContact(e: unknown): boolean {
-  return e instanceof ApiError && e.code === CONTACT_AMBIGUOUS_CODE;
-}
-
-/** The candidate list carried on an ambiguous-contact 409. Read off the error
- * so the caller can render a chooser without a second round trip. */
-export function ambiguousCandidates(e: unknown): ApiContact[] {
-  if (!(e instanceof ApiError)) return [];
-  const list = (e as any).candidates;
-  return Array.isArray(list) ? (list as ApiContact[]) : [];
-}
-
-// -- Folders ----------------------------------------------------------------
-export async function getFolders(): Promise<{
-  folders: ApiFolder[];
-  general_count: number;
-}> {
-  const res = await request<{ folders: ApiFolder[]; general_count: number }>(
-    "/folders"
-  );
-  return { folders: res.folders ?? [], general_count: res.general_count ?? 0 };
-}
-
-export async function getFolder(
-  folderId: string
-): Promise<{ folder: ApiFolder; contacts: ApiContact[] }> {
-  const res = await request<{ folder: ApiFolder; contacts: ApiContact[] }>(
-    `/folders/${encodeURIComponent(folderId)}`
-  );
-  return { folder: res.folder, contacts: res.contacts ?? [] };
-}
-
-export async function createFolder(input: {
-  name: string;
-  description?: string;
-  color?: FolderColor;
-  icon?: FolderIconToken;
-}): Promise<ApiFolder> {
-  const res = await request<{ folder: ApiFolder }>("/folders", {
-    method: "POST",
-    body: input,
-  });
-  return res.folder;
-}
-
-export async function updateFolder(
-  folderId: string,
-  patch: {
-    name?: string;
-    description?: string;
-    color?: FolderColor;
-    icon?: FolderIconToken;
-  }
-): Promise<ApiFolder> {
-  const res = await request<{ folder: ApiFolder }>(
-    `/folders/${encodeURIComponent(folderId)}`,
-    { method: "PATCH", body: patch }
-  );
-  return res.folder;
-}
-
-/** Deletes the FOLDER only. Its meetings move to General and its contacts and
- * tasks survive — the counts in the result say how many of each were touched,
- * which is what the confirmation screen should show. */
-export async function deleteFolder(folderId: string): Promise<{
-  meetings_moved: number;
-  contacts_unlinked: number;
-  tasks_unfiled: number;
-}> {
-  return request(`/folders/${encodeURIComponent(folderId)}`, {
-    method: "DELETE",
-  });
-}
-
-export async function getFolderContacts(
-  folderId: string
-): Promise<ApiContact[]> {
-  const res = await request<{ contacts: ApiContact[] }>(
-    `/folders/${encodeURIComponent(folderId)}/contacts`
-  );
-  return res.contacts ?? [];
-}
-
-export async function addContactToFolder(
-  folderId: string,
-  contactId: string
-): Promise<ApiContact> {
-  const res = await request<{ contact: ApiContact }>(
-    `/folders/${encodeURIComponent(folderId)}/contacts/${encodeURIComponent(
-      contactId
-    )}`,
-    { method: "POST" }
-  );
-  return res.contact;
-}
-
-/** Removes the ASSOCIATION. The contact itself is untouched. */
-export async function removeContactFromFolder(
-  folderId: string,
-  contactId: string
-): Promise<void> {
-  await request(
-    `/folders/${encodeURIComponent(folderId)}/contacts/${encodeURIComponent(
-      contactId
-    )}`,
-    { method: "DELETE" }
-  );
-}
-
-/** Move a meeting into a folder, or to General with folderId = null. The
- * meeting is never duplicated — this rewrites one attribute. */
-export async function moveRecordingToFolder(
-  key: string,
-  folderId: string | null
-): Promise<{ folder_id: string; tasks_moved: number }> {
-  return request(`/recordings/folder/${encodeURIComponent(key)}`, {
-    method: "PATCH",
-    body: { folder_id: folderId },
-  });
-}
-
 // -- Contacts ---------------------------------------------------------------
 export async function getContacts(params?: {
   search?: string;
@@ -2215,11 +2314,11 @@ export async function getContacts(params?: {
 
 export async function getContact(
   contactId: string
-): Promise<{ contact: ApiContact; folders: ApiFolder[] }> {
-  const res = await request<{ contact: ApiContact; folders: ApiFolder[] }>(
+): Promise<{ contact: ApiContact }> {
+  const res = await request<{ contact: ApiContact }>(
     `/contacts/${encodeURIComponent(contactId)}`
   );
-  return { contact: res.contact, folders: res.folders ?? [] };
+  return { contact: res.contact };
 }
 
 export type CreateContactInput = {
@@ -2234,8 +2333,6 @@ export type CreateContactInput = {
    * contact. On a create that resolves to an EXISTING person, the backend only
    * fills a gap with it — it never overwrites a photo already there. */
   avatar_url?: string;
-  /** Create and associate with this folder in one call. */
-  folder_id?: string;
   /** "Yes, this really is a different person" — bypasses the name-ambiguity
    * 409. Only send this after the user has seen the candidates and said so. */
   force?: boolean;
@@ -2258,7 +2355,7 @@ export async function createContact(
 
 export async function updateContact(
   contactId: string,
-  patch: Partial<Omit<CreateContactInput, "folder_id" | "force">>
+  patch: Partial<Omit<CreateContactInput, "force">>
 ): Promise<ApiContact> {
   const res = await request<{ contact: ApiContact }>(
     `/contacts/${encodeURIComponent(contactId)}`,
@@ -2269,7 +2366,6 @@ export async function updateContact(
 
 /** Deletes the PERSON. Their tasks survive, reverting to unresolved. */
 export async function deleteContact(contactId: string): Promise<{
-  unlinked_folders: number;
   unassigned_tasks: number;
 }> {
   return request(`/contacts/${encodeURIComponent(contactId)}`, {
@@ -2287,10 +2383,6 @@ export type ParticipantsResponse = {
    * read correctly: still processing (voices may yet appear) versus finished
    * with none found (they will not). Optional — an older backend omits it. */
   recording_status?: RecordingStatus | string;
-  folder_id: string;
-  /** Offered FIRST in the picker — a shortcut, never a restriction. Any global
-   * contact can still be chosen. */
-  folder_contacts: ApiContact[];
 };
 
 export async function getParticipants(
@@ -2303,8 +2395,6 @@ export async function getParticipants(
     participants: res.participants ?? [],
     speakers: res.speakers ?? [],
     speaker_names: res.speaker_names ?? {},
-    folder_id: res.folder_id ?? "",
-    folder_contacts: res.folder_contacts ?? [],
   };
 }
 
@@ -2353,7 +2443,6 @@ export async function tagAttendee(
 // -- Cross-meeting tasks ----------------------------------------------------
 export type TaskFilters = {
   status?: TaskStatusV2;
-  folder_id?: string;
   assignee_contact_id?: string;
   recording_key?: string;
   overdue?: boolean;
@@ -2370,7 +2459,6 @@ export async function getAllTasks(
 ): Promise<{ tasks: ApiTask[]; next_cursor: string }> {
   const qs = new URLSearchParams();
   if (filters?.status) qs.set("status", filters.status);
-  if (filters?.folder_id) qs.set("folder_id", filters.folder_id);
   if (filters?.assignee_contact_id)
     qs.set("assignee_contact_id", filters.assignee_contact_id);
   if (filters?.recording_key) qs.set("recording_key", filters.recording_key);
@@ -2431,12 +2519,10 @@ export type TaskDetail = {
    * relationship with that account beyond this one task. */
   assigned_by?: { name: string; avatar_view_url?: string };
   contact?: ApiContact;
-  folder?: ApiFolder;
   recording?: {
     audio_s3_key: string;
     title: string;
     recorded_at: string;
-    folder_id: string;
     // The meeting's speaker_names, so the detail screen can name the speaker
     // a task came from without a second call to getParticipants.
     speaker_names?: Record<string, string>;
@@ -2540,11 +2626,11 @@ export async function resolveTaskAssignee(
   return res.task;
 }
 
-export type AssigneeCandidate = ApiContact & { in_folder: boolean };
+export type AssigneeCandidate = ApiContact;
 
-/** Who an unresolved task name MIGHT refer to. Folder members rank first as a
- * hint for the human; the status stays "ambiguous" either way, because a lone
- * name match is still not proof of identity. */
+/** Who an unresolved task name MIGHT refer to. The status stays "ambiguous"
+ * whenever more than one person matches, because a lone name match is still
+ * not proof of identity. */
 export async function getAssigneeCandidates(taskId: string): Promise<{
   status: "exact" | "ambiguous" | "none";
   searched_name: string;

@@ -52,9 +52,6 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
 
 export default function UploadScreen() {
   const router = useRouter();
-  // Present when the import was started from inside a folder.
-  const { folderId: folderParam } = useLocalSearchParams<{ folderId?: string }>();
-  const folderId = String(folderParam || "");
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C, T), [C, T]);
 
@@ -123,8 +120,6 @@ export default function UploadScreen() {
       // (record-phone.tsx never sends a title either).
       title: title.trim() || undefined,
       size: file.size ?? undefined,
-      // Set when the import began inside a folder — filed at presign time.
-      folderId: folderId || undefined,
     }).catch(() => { /* surfaced by the Files-screen upload banner */ });
     router.back();
   };

@@ -57,7 +57,6 @@ import { ContactPicker } from "../../../../lib/contact-picker";
 import { avatarColorFor, initialsOf } from "../../../../lib/task-model";
 import {
   ApiError, isAlreadyRunning, isStillUploading, reprocessRecording, trashRecording,
-  ApiFolder, getFolders, moveRecordingToFolder,
   ApiContact, getParticipants, setParticipant,
 } from "../../../../lib/api";
 
@@ -237,12 +236,6 @@ export default function MeetingDetailScreen() {
   const [titleDraft, setTitleDraft] = useState("");
   const [savingTitle, setSavingTitle] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
-  // Folder filing. The list is fetched when the picker opens rather than on
-  // mount: most visits to a meeting never touch it, and it is one more request
-  // on a screen that already makes several.
-  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
-  const [folderOptions, setFolderOptions] = useState<ApiFolder[]>([]);
-  const [movingFolder, setMovingFolder] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   // The structured MoM editor. Full-screen rather than a route so the
   // Overview state underneath (documents, tasks) survives closing it.
@@ -346,42 +339,6 @@ export default function MeetingDetailScreen() {
   }, [key, router]);
 
   const speakerNames = rec?.speaker_names ?? undefined;
-  // The folder this meeting is filed under, resolved for display. Falls back to
-  // "" (General) when unset or when the folder list has not been fetched yet.
-  const currentFolderName = useMemo(() => {
-    const fid = (rec as any)?.folder_id || "";
-    if (!fid) return "";
-    return folderOptions.find((f) => f.id === fid)?.name || "";
-  }, [rec, folderOptions]);
-
-  // Fetch the folder list only when the picker is actually opened.
-  useEffect(() => {
-    if (!folderPickerOpen) return;
-    getFolders()
-      .then((r) => setFolderOptions(r.folders))
-      .catch(() => setFolderOptions([]));
-  }, [folderPickerOpen]);
-
-  const moveToFolder = useCallback(
-    async (folderId: string | null) => {
-      setMovingFolder(true);
-      try {
-        await moveRecordingToFolder(key, folderId);
-        setFolderPickerOpen(false);
-        // Re-read the meeting so the menu label and any folder-derived UI
-        // reflect the move without a manual refresh.
-        reload();
-      } catch (e) {
-        Alert.alert(
-          "Could not move",
-          e instanceof ApiError ? e.message : "Please try again."
-        );
-      } finally {
-        setMovingFolder(false);
-      }
-    },
-    [key, reload]
-  );
 
   const openRenameTitle = () => {
     setTitleDraft(rec?.title || "");
@@ -425,7 +382,6 @@ export default function MeetingDetailScreen() {
   const [addTaskOpen, setAddTaskOpen] = useState(false);
   const [speakerPickerOpen, setSpeakerPickerOpen] = useState(false);
   const [speakerContacts, setSpeakerContacts] = useState<ApiContact[]>([]);
-  const [speakerFolderContacts, setSpeakerFolderContacts] = useState<ApiContact[]>([]);
   const [taggedContact, setTaggedContact] = useState<ApiContact | null>(null);
 
   const openRenameSpeaker = (label: string) => {
@@ -433,9 +389,9 @@ export default function MeetingDetailScreen() {
     setEditingSpeaker(raw);
     setSpeakerDraft(speakerNames?.[raw] ?? "");
     setTaggedContact(null);
-    // Load who is already tagged in this meeting (and its folder) so the
-    // picker can rank them first. Best-effort: a failure only affects
-    // ORDERING, never whether the sheet works.
+    // Load who is already tagged in this meeting so the picker can rank
+    // them first. Best-effort: a failure only affects ORDERING, never
+    // whether the sheet works.
     void getParticipants(String(key))
       .then((p) => {
         setSpeakerContacts(
@@ -443,7 +399,6 @@ export default function MeetingDetailScreen() {
             .map((x) => x.contact)
             .filter((c): c is ApiContact => !!c)
         );
-        setSpeakerFolderContacts(p.folder_contacts);
         // Show what this speaker is CURRENTLY tagged as, so the sheet reflects
         // reality rather than looking untagged every time it opens.
         const mine = p.participants.find((x) => x.speaker_id === raw);
@@ -451,7 +406,6 @@ export default function MeetingDetailScreen() {
       })
       .catch(() => {
         setSpeakerContacts([]);
-        setSpeakerFolderContacts([]);
       });
   };
 
@@ -901,20 +855,6 @@ export default function MeetingDetailScreen() {
                 <Icon name="person.2.fill" tintColor={C.text} size={18} />
                 <Text style={st.menuTxt}>Participants &amp; speakers</Text>
               </Pressable>
-              {/* Filing the meeting. Never a copy — this rewrites one field. */}
-              <Pressable
-                style={st.menuRow}
-                onPress={() => {
-                  setMenuOpen(false);
-                  setFolderPickerOpen(true);
-                }}
-                accessibilityLabel="Move meeting to a folder"
-              >
-                <Icon name="folder" tintColor={C.text} size={18} />
-                <Text style={st.menuTxt}>
-                  {currentFolderName ? `Folder: ${currentFolderName}` : "Move to folder"}
-                </Text>
-              </Pressable>
               {/* Destructive last and coloured, so it is never the row a
                   thumb lands on by accident reaching for Share. */}
               <Pressable
@@ -928,83 +868,6 @@ export default function MeetingDetailScreen() {
                   {deleting ? "Moving…" : "Move to Trash"}
                 </Text>
               </Pressable>
-            </Pressable>
-          </Pressable>
-        </Modal>
-
-        {/* ---- Move to folder ----
-            One list, one tap. "General" is offered as the first row rather
-            than as a separate "remove" action, because to the user it IS a
-            destination — it just happens to be represented server-side by the
-            absence of a folder. */}
-        <Modal
-          visible={folderPickerOpen}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setFolderPickerOpen(false)}
-        >
-          <Pressable
-            style={st.sheetBackdrop}
-            onPress={() => setFolderPickerOpen(false)}
-          >
-            <Pressable style={st.sheet} onPress={() => { }}>
-              <Text style={{
-                fontFamily: FONT.semibold, fontSize: 11, color: C.textFaint,
-                textTransform: "uppercase", letterSpacing: 0.6,
-              }}>
-                Organize
-              </Text>
-              <Text style={st.sheetTitle}>Move to folder</Text>
-              <Text style={{
-                fontFamily: FONT.regular, fontSize: 13, color: C.textDim,
-                marginTop: 4, marginBottom: 10, lineHeight: 19,
-              }}>
-                The meeting moves — it is never copied. Its tasks follow it.
-              </Text>
-
-              <Pressable
-                style={st.menuRow}
-                onPress={() => moveToFolder(null)}
-                disabled={movingFolder}
-                accessibilityLabel="Move to General"
-              >
-                <Icon name="tray.fill" tintColor={C.text} size={18} />
-                <Text style={[st.menuTxt, { flex: 1 }]}>General (no folder)</Text>
-                {!(rec as any)?.folder_id && (
-                  <Icon name="checkmark" tintColor={C.primary} size={16} />
-                )}
-              </Pressable>
-
-              {folderOptions.map((f, i) => {
-                const active = (rec as any)?.folder_id === f.id;
-                return (
-                  <Pressable
-                    key={f.id}
-                    style={[
-                      st.menuRow,
-                      i === folderOptions.length - 1 && { borderBottomWidth: 0 },
-                    ]}
-                    onPress={() => moveToFolder(f.id)}
-                    disabled={movingFolder || active}
-                    accessibilityLabel={`Move to ${f.name}`}
-                  >
-                    <Icon name="folder" tintColor={C.text} size={18} />
-                    <Text style={[st.menuTxt, { flex: 1 }]}>{f.name}</Text>
-                    {active && (
-                      <Icon name="checkmark" tintColor={C.primary} size={16} />
-                    )}
-                  </Pressable>
-                );
-              })}
-
-              {folderOptions.length === 0 && (
-                <Text style={{
-                  fontFamily: FONT.regular, fontSize: 13, color: C.textFaint,
-                  paddingVertical: 14,
-                }}>
-                  No folders yet. Create one from You › Folders.
-                </Text>
-              )}
             </Pressable>
           </Pressable>
         </Modal>
@@ -1124,8 +987,8 @@ export default function MeetingDetailScreen() {
             unreliable on Android (the inner one can render behind), and this
             way the rename sheet stays open underneath so cancelling the picker
             returns to it rather than losing the user's place.
-            Ordering: people already tagged in this meeting, then the folder's
-            contacts, then everyone — plus create-new and phone import. */}
+            Ordering: people already tagged in this meeting, then everyone
+            — plus create-new and phone import. */}
         <AddTaskSheet
           visible={addTaskOpen}
           onClose={() => setAddTaskOpen(false)}
@@ -1169,8 +1032,6 @@ export default function MeetingDetailScreen() {
             void tagSpeakerContact(c);
           }}
           meetingContacts={speakerContacts}
-          folderContacts={speakerFolderContacts}
-          folderId={rec?.folder_id || undefined}
           title={
             editingSpeaker != null
               ? `Who is Speaker ${editingSpeaker}?`

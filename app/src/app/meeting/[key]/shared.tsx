@@ -4,7 +4,7 @@
 //
 // recording/[key]/index.tsx is the owner's meeting: it mounts MeetingProvider,
 // fetches the full recording, presents an audio player, four AI tabs, a
-// floating Assistant button, rename, folder-move, speaker mapping, task
+// floating Assistant button, rename, speaker mapping, task
 // creation and share-link management. Threading an `isReadOnly` flag through
 // all of that would leave every one of those write paths one bad conditional
 // away from an assignee — and the conditional that matters would be in the

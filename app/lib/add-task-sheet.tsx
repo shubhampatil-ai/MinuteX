@@ -57,8 +57,6 @@ export function AddTaskSheet({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [dueOpen, setDueOpen] = useState(false);
   const [meetingContacts, setMeetingContacts] = useState<ApiContact[]>([]);
-  const [folderContacts, setFolderContacts] = useState<ApiContact[]>([]);
-  const [folderId, setFolderId] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -74,9 +72,9 @@ export function AddTaskSheet({
     setDueOpen(false);
     setError("");
 
-    // Ranking context for the assignee picker: who is tagged in this meeting,
-    // then this folder. Best-effort — a failure only affects ORDERING, and the
-    // picker still lists every contact.
+    // Ranking context for the assignee picker: who is tagged in this meeting.
+    // Best-effort — a failure only affects ORDERING, and the picker still
+    // lists every contact.
     let alive = true;
     getParticipants(recordingKey)
       .then((p) => {
@@ -86,8 +84,6 @@ export function AddTaskSheet({
             .map((x) => x.contact)
             .filter((c): c is ApiContact => !!c)
         );
-        setFolderContacts(p.folder_contacts);
-        setFolderId(p.folder_id);
       })
       .catch(() => {
         if (alive) setMeetingContacts([]);
@@ -277,8 +273,6 @@ export function AddTaskSheet({
         }}
         onClear={assignee ? () => setAssignee(null) : undefined}
         meetingContacts={meetingContacts}
-        folderContacts={folderContacts}
-        folderId={folderId}
         title="Assign Task To"
       />
     </Modal>

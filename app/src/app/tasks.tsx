@@ -51,8 +51,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { S, useTheme, ColorScale } from "../../lib/theme";
 import { Button, EmptyState, ErrorText } from "../../lib/ui";
 import {
-  ApiError, ApiFolder, ApiTask, RecordingSummary, TaskFilters, TaskIntelRow,
-  getAllTasks, getFolders, getMe, getRecordings, getTaskIntelligence,
+  ApiError, ApiTask, RecordingSummary, TaskFilters, TaskIntelRow,
+  getAllTasks, getMe, getRecordings, getTaskIntelligence,
   isRetryable, patchTaskById,
 } from "../../lib/api";
 import {
@@ -214,9 +214,8 @@ export default function TasksScreen() {
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState("");
 
-  // Context for the derived sections and for naming a task's folder.
+  // Context for the derived sections.
   const [insightTasks, setInsightTasks] = useState<ApiTask[]>([]);
-  const [folders, setFolders] = useState<ApiFolder[]>([]);
   const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
   const [me, setMe] = useState<{ name: string; avatar_url: string } | null>(null);
   const [myUserId, setMyUserId] = useState("");
@@ -295,9 +294,6 @@ export default function TasksScreen() {
     } catch {
       setInsightTasks([]);
     }
-    getFolders()
-      .then((r) => setFolders(r.folders))
-      .catch(() => setFolders([]));
     getRecordings()
       .then(setRecordings)
       .catch(() => setRecordings([]));
@@ -385,11 +381,6 @@ export default function TasksScreen() {
     [summarySource, now]
   );
 
-  const folderNames = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const f of folders) m.set(f.id, f.name);
-    return m;
-  }, [folders]);
 
   const meetingTitles = useMemo(() => {
     const m = new Map<string, string>();
@@ -531,7 +522,7 @@ export default function TasksScreen() {
   );
 
   // Reassign and Resolve are the same destination: the task detail screen owns
-  // the candidate list, the folder hint and the contact picker. Duplicating any
+  // the candidate list and the contact picker. Duplicating any
   // of that here would be a second, divergent copy of the identity rules.
   const openResolve = useCallback(
     (t: ApiTask) => {
@@ -726,7 +717,6 @@ export default function TasksScreen() {
         <TaskCard
           task={item}
           now={now}
-          folderName={folderNames.get(String(item.folder_id || ""))}
           meetingTitle={meetingTitles.get(String(item.source_recording_id || ""))}
           busy={busyId === item.id}
           onPress={openTask}
@@ -737,7 +727,7 @@ export default function TasksScreen() {
       </SwipeableRow>
     ),
     [
-      C, now, folderNames, meetingTitles, busyId, openTask, toggleComplete,
+      C, now, meetingTitles, busyId, openTask, toggleComplete,
       openResolve, openMeeting, snooze,
     ]
   );
@@ -888,7 +878,6 @@ export default function TasksScreen() {
             />
             <UpcomingDeadlines
               items={deadlines}
-              folderNames={folderNames}
               onPress={openTask}
             />
           </>

@@ -1,12 +1,11 @@
 // lib/contact-picker.tsx — the "choose a person" sheet, shared by speaker
 // mapping and task assignment.
 //
-// Ordering is the whole design. When a meeting sits in a folder, that folder's
-// contacts come FIRST under their own heading, because a name spoken in a
-// Client Alpha meeting is usually a Client Alpha person. Every other contact
-// follows under "All Contacts", and search covers both — the folder is a
-// shortcut, never a restriction (spec section 10). Creating a new contact is
-// always available at the bottom.
+// Ordering is the whole design. People already tagged in THIS meeting come
+// FIRST under their own heading, because a name spoken in a meeting usually
+// belongs to someone in it. Every other contact follows under "All Contacts",
+// and search covers both — the meeting tier is a shortcut, never a
+// restriction. Creating a new contact is always available at the bottom.
 //
 // Search is SERVER-side (getContacts({search})), debounced. Filtering a
 // downloaded list on-device would break the moment an account has more
@@ -34,6 +33,7 @@ import {
 import {
   ContactPickResult, requestContactsPermissionDetailed, searchPhoneContacts,
 } from "./contacts";
+import { roleLabel } from "./workspace-context";
 import { uploadPhoneContactPhoto } from "./avatars";
 
 const SEARCH_DEBOUNCE_MS = 300;
@@ -41,7 +41,7 @@ const PAGE_SIZE = 50;
 
 type Section =
   | { kind: "heading"; label: string; hint?: string }
-  | { kind: "contact"; contact: ApiContact; inFolder: boolean };
+  | { kind: "contact"; contact: ApiContact };
 
 // One row per PERSON, keeping first appearance. Callers pass speaker→contact
 // mappings, where the same person legitimately appears more than once (one
@@ -60,16 +60,11 @@ export type ContactPickerProps = {
   onClose: () => void;
   onPick: (contact: ApiContact) => void;
   /**
-   * People already tagged in THIS meeting — ranked above the folder, because a
+   * People already tagged in THIS meeting — ranked first, because a
    * task from a meeting almost always belongs to someone who was in it.
    * Optional: screens with no meeting context simply omit it.
    */
   meetingContacts?: ApiContact[];
-  /** Contacts to offer first, under a folder heading. */
-  folderContacts?: ApiContact[];
-  folderName?: string;
-  /** When set, a contact created from this sheet is also linked to the folder. */
-  folderId?: string;
   title?: string;
   /** Shown as a "remove" affordance when the caller already has a selection. */
   onClear?: () => void;
@@ -86,8 +81,8 @@ export type ContactPickerProps = {
 };
 
 export function ContactPicker({
-  visible, onClose, onPick, meetingContacts = [], folderContacts = [],
-  folderName = "", folderId = "", title = "Select Contact", onClear,
+  visible, onClose, onPick, meetingContacts = [],
+  title = "Select Contact", onClear,
   allowSelf = false,
 }: ContactPickerProps) {
   const { C, T } = useTheme();
@@ -242,7 +237,6 @@ export function ContactPicker({
   }, [cursor, debounced, loadingMore]);
 
   const sections: Section[] = useMemo(() => {
-    const folderIds = new Set(folderContacts.map((c) => c.id));
     const needle = debounced.toLowerCase();
     const matches = (c: ApiContact) =>
       !needle ||
@@ -250,10 +244,10 @@ export function ContactPicker({
         (f || "").toLowerCase().includes(needle)
       );
 
-    // Three tiers, narrowest context first: this meeting, then this folder,
-    // then everyone. Each contact appears exactly ONCE, in the most specific
-    // tier it qualifies for — a duplicate would make the list look longer
-    // while offering no new choice.
+    // Two tiers, narrowest context first: this meeting, then everyone. Each
+    // contact appears exactly ONCE, in the most specific tier it qualifies
+    // for — a duplicate would make the list look longer while offering no
+    // new choice.
     const out: Section[] = [];
     const seen = new Set<string>();
 
@@ -269,38 +263,41 @@ export function ContactPicker({
       });
       meetingMatches.forEach((c) => {
         seen.add(c.id);
-        out.push({ kind: "contact", contact: c, inFolder: folderIds.has(c.id) });
-      });
-    }
-
-    const folderMatches = dedupById(
-      folderContacts.filter((c) => matches(c) && !seen.has(c.id))
-    );
-    if (folderMatches.length) {
-      out.push({
-        kind: "heading",
-        label: folderName ? `${folderName} Contacts` : "Folder Contacts",
-        hint: "In this folder",
-      });
-      folderMatches.forEach((c) => {
-        seen.add(c.id);
-        out.push({ kind: "contact", contact: c, inFolder: true });
+        out.push({ kind: "contact", contact: c });
       });
     }
 
     // `all` is paginated, so a contact can arrive twice if the underlying set
     // shifts between page fetches.
-    const rest = dedupById(
-      all.filter((c) => !seen.has(c.id) && !folderIds.has(c.id))
-    );
-    if (rest.length) {
-      out.push({ kind: "heading", label: "All Contacts" });
-      rest.forEach((c) =>
-        out.push({ kind: "contact", contact: c, inFolder: false })
-      );
+    const rest = dedupById(all.filter((c) => !seen.has(c.id)));
+
+    // A THIRD TIER, between "in this meeting" and everyone: the colleagues
+    // from the active organisation. They are the people a member assigns
+    // work to most often, and separating them makes a shared book of clients
+    // and teammates scannable instead of one long alphabet.
+    //
+    // Identified by workspace_role, which the server sets only for a live
+    // organisation member — so in a personal workspace this tier is simply
+    // empty and the list looks exactly as it did before.
+    const colleagues = rest.filter((c) => !!c.workspace_role);
+    const others = rest.filter((c) => !c.workspace_role);
+    if (colleagues.length) {
+      out.push({
+        kind: "heading", label: "Your organisation",
+        hint: "Synced from members",
+      });
+      colleagues.forEach((c) => out.push({ kind: "contact", contact: c }));
+    }
+    if (others.length) {
+      out.push({
+        kind: "heading",
+        // Only worth distinguishing from the tier above when there IS one.
+        label: colleagues.length ? "Other Contacts" : "All Contacts",
+      });
+      others.forEach((c) => out.push({ kind: "contact", contact: c }));
     }
     return out;
-  }, [all, meetingContacts, folderContacts, folderName, debounced]);
+  }, [all, meetingContacts, debounced]);
 
   const submitNew = useCallback(
     async (force: boolean) => {
@@ -316,7 +313,6 @@ export function ContactPicker({
           name,
           email: newEmail.trim() || undefined,
           phone: newPhone.trim() || undefined,
-          folder_id: folderId || undefined,
           force: force || undefined,
         });
         // `existing` means a strong identifier matched — the right outcome is
@@ -343,7 +339,7 @@ export function ContactPicker({
         setSaving(false);
       }
     },
-    [newName, newEmail, newPhone, folderId, onPick, onClose]
+    [newName, newEmail, newPhone, onPick, onClose]
   );
 
   /** Pick the signed-in user, creating their self-contact once if needed.
@@ -371,7 +367,6 @@ export function ContactPicker({
       const { contact } = await createContact({
         name: me.name,
         email: me.email,
-        folder_id: folderId || undefined,
         // Same-name collisions must not stop the user identifying THEMSELVES:
         // the email is an exact identifier, so an "is this a different
         // person?" prompt would be noise here.
@@ -386,7 +381,7 @@ export function ContactPicker({
     } finally {
       setSelfBusy(false);
     }
-  }, [me, folderId, onPick, onClose]);
+  }, [me, onPick, onClose]);
 
   // Ask for permission and load the device list. Kept out of the render path
   // so the address book is only read after a deliberate tap.
@@ -449,7 +444,6 @@ export function ContactPicker({
           email: pick.email || undefined,
           phone: pick.phone || undefined,
           avatar_url: avatarKey || undefined,
-          folder_id: folderId || undefined,
         });
         onPick(contact);
         onClose();
@@ -476,7 +470,7 @@ export function ContactPicker({
         setPhoneBusy(false);
       }
     },
-    [folderId, onPick, onClose]
+    [onPick, onClose]
   );
 
   const renderRow = (item: Section) => {
@@ -503,12 +497,27 @@ export function ContactPicker({
         <Avatar name={c.name} photoUri={c.avatar_view_url} size={36}
           fontSize={13} />
         <View style={{ flex: 1 }}>
-          <Text style={st.name} numberOfLines={1}>{c.name}</Text>
+          <View style={st.nameRow}>
+            <Text style={st.name} numberOfLines={1}>{c.name}</Text>
+            {/* THE ROLE TAG. Present only on an organisation colleague, and
+                resolved server-side from LIVE membership on every read — so
+                it cannot show a role somebody no longer holds. */}
+            {!!c.workspace_role && (
+              <View style={st.roleTag}>
+                <Text style={st.roleTagTxt}>
+                  {roleLabel(c.workspace_role)}
+                </Text>
+              </View>
+            )}
+          </View>
           {!!sub && <Text style={st.sub} numberOfLines={1}>{sub}</Text>}
         </View>
         {/* A contact with a MinuteX account can be notified in-app; one
-            without cannot, and pretending otherwise would be a lie. */}
-        {!!c.minutex_user_id && (
+            without cannot, and pretending otherwise would be a lie.
+            Redundant for a colleague — they are an account by definition and
+            already carry the role tag — so it is dropped there rather than
+            putting two badges on one row. */}
+        {!!c.minutex_user_id && !c.workspace_role && (
           <View style={st.badge}>
             <Icon name="checkmark" size={11} tintColor={C.success} />
             <Text style={st.badgeTxt}>App</Text>
@@ -832,6 +841,19 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     },
     name: { fontFamily: FONT.bold, fontSize: 14.5, color: C.text },
     sub: { fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 1 },
+    nameRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+    // The role tag sits ON the name line, not in the badge slot on the right:
+    // it qualifies WHO this person is, and the right-hand slot already means
+    // "notification-ready". Colour-coded by seniority so a long shared book
+    // can be scanned without reading every tag.
+    roleTag: {
+      paddingHorizontal: 6, paddingVertical: 2, borderRadius: R.sm,
+      backgroundColor: C.accentSoft,
+    },
+    roleTagTxt: {
+      fontFamily: FONT.bold, fontSize: 10, color: C.accent,
+      letterSpacing: 0.2,
+    },
     badge: {
       flexDirection: "row", alignItems: "center", gap: 3,
       paddingHorizontal: 7, paddingVertical: 3, borderRadius: R.pill,

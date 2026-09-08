@@ -119,14 +119,6 @@ describe("picking yourself produces a linkable contact", () => {
     assert.match(fn, /onPick\(contact\)/, "it must select the contact it made");
   });
 
-  it("files the contact into the folder when there is one", () => {
-    const fn = PICKER.slice(
-      PICKER.indexOf("const pickSelf"),
-      PICKER.indexOf("// Ask for permission and load the device list")
-    );
-    assert.match(fn, /folder_id: folderId \|\| undefined/);
-  });
-
   it("surfaces a failure instead of silently doing nothing", () => {
     const fn = PICKER.slice(
       PICKER.indexOf("const pickSelf"),

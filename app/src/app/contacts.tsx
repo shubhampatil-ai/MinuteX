@@ -1,10 +1,10 @@
 // src/app/contacts.tsx — the global contact list.
 //
-// One person, one row, account-wide. A contact is NOT owned by a folder: the
+// One person, one row, account-wide. A contact is account-wide: the
 // same Rahul Sharma appears in Client Alpha and Product without being
 // duplicated, so editing him here changes him everywhere. That is the whole
 // point of the model, and it is why this screen sits at the top level rather
-// than inside a folder.
+// than per meeting.
 //
 // Search is SERVER-side and paged (see getContacts) — never "download
 // everything and filter on the phone", which stops working the moment an
@@ -28,6 +28,7 @@ import {
   Avatar, Button, EmptyState, ErrorText, SearchBar, SkeletonCard,
 } from "../../lib/ui";
 import { ApiContact, ApiError, getContacts } from "../../lib/api";
+import { roleLabel } from "../../lib/workspace-context";
 import { ContactPicker } from "../../lib/contact-picker";
 
 const SEARCH_DEBOUNCE_MS = 300;
@@ -142,7 +143,19 @@ export default function ContactsScreen() {
               avatar_source on ApiContact. */}
           <Avatar name={item.name} photoUri={item.avatar_view_url} size={42} />
           <View style={{ flex: 1 }}>
-            <Text style={st.name} numberOfLines={1}>{item.name}</Text>
+            <View style={st.nameRow}>
+              <Text style={st.name} numberOfLines={1}>{item.name}</Text>
+              {/* Their LIVE role in this organisation, resolved server-side
+                  from membership on every read. Empty for an ordinary
+                  contact, so this renders nothing in a personal workspace. */}
+              {!!item.workspace_role && (
+                <View style={st.roleTag}>
+                  <Text style={st.roleTagTxt}>
+                    {roleLabel(item.workspace_role)}
+                  </Text>
+                </View>
+              )}
+            </View>
             {!!item.email && (
               <Text style={st.sub} numberOfLines={1}>{item.email}</Text>
             )}
@@ -150,8 +163,10 @@ export default function ContactsScreen() {
           </View>
           {/* Only a contact with a linked MinuteX account can be notified in
               the app. Showing this is the difference between a user expecting
-              a notification and knowing they have to message the person. */}
-          {!!item.minutex_user_id && (
+              a notification and knowing they have to message the person.
+              Dropped for a colleague, who is an account by definition and
+              already carries the role tag. */}
+          {!!item.minutex_user_id && !item.workspace_role && (
             <View style={st.badge}>
               <Icon name="checkmark" size={11} tintColor={C.success} />
               <Text style={st.badgeTxt}>App</Text>
@@ -168,7 +183,7 @@ export default function ContactsScreen() {
       <Stack.Screen options={{ title: "Contacts" }} />
       <Text style={st.intro}>
         The people you meet with. One entry per person, shared across every
-        folder and meeting.
+        meeting.
       </Text>
 
       <SearchBar
@@ -281,6 +296,19 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     name: { fontFamily: FONT.bold, fontSize: 15, color: C.text },
     sub: {
       fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 1,
+    },
+    nameRow: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: 6,
+    },
+    // On the NAME line rather than the right-hand badge slot: the tag says
+    // who this person is, while that slot means "notification-ready".
+    roleTag: {
+      paddingHorizontal: 6, paddingVertical: 2, borderRadius: R.sm,
+      backgroundColor: C.accentSoft,
+    },
+    roleTagTxt: {
+      fontFamily: FONT.bold, fontSize: 10, color: C.accent,
+      letterSpacing: 0.2,
     },
     badge: {
       flexDirection: "row" as const, alignItems: "center" as const, gap: 3,

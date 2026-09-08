@@ -90,8 +90,6 @@ const DELEGATES = new Map([
   // Same: a top-anchored search over a list. Nothing to cover.
   ["src/app/(tabs)/index.tsx", "top-anchored search over a list"],
   // The picker/sheet components own every input on these screens.
-  ["src/app/folders.tsx", "inputs live in FolderSheet"],
-  ["src/app/folder/[id].tsx", "inputs live in ContactPicker"],
   // Its search field is rendered by TaskSearchBar at the TOP of the list
   // header, so the keyboard opens below it and cannot cover it — the same
   // top-anchored-search-over-a-list case as contacts.tsx and the home tab.

@@ -43,7 +43,7 @@ export type ContactPickResult = {
 // actively harmful — a real Contacts service exists, and offering a user
 // fictional teammates while hiding their actual contacts is worse than an empty
 // list. The assign flow uses lib/contact-picker.tsx against the real /contacts
-// API instead (folder-first, then global, plus create-new and phone import).
+// API instead (meeting-first, then global, plus create-new and phone import).
 //
 // Kept only so nothing importing them breaks in a partial build. Do NOT wire
 // these into a screen; grep confirmed no screen references them any more.

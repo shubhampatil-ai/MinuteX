@@ -205,11 +205,6 @@ function statusChrome(state: string): { color: string; label: string } {
 
 export default function RecordPhoneScreen() {
   const router = useRouter();
-  // Set when Record was opened from inside a folder (see the folder detail
-  // screen's record button). Threaded to startUpload so the recording is filed
-  // at presign time rather than landing in General and being moved after.
-  const { folderId: folderParam } = useLocalSearchParams<{ folderId?: string }>();
-  const folderId = String(folderParam || "");
   // This screen is always ink (see INK above), so it takes no colours from
   // the theme — only the safe-area insets and the controller's snapshot.
   const insets = useSafeAreaInsets();
@@ -394,9 +389,6 @@ export default function RecordPhoneScreen() {
         duration: done.duration || undefined,
         size: done.size ?? undefined,
         sessionId: done.id,
-        // Set when the user hit Record from inside a folder — the recording is
-        // filed at presign time, so it never appears in General first.
-        folderId: folderId || undefined,
       }).catch(() => { /* surfaced by the Files-screen upload banner */ });
       reset();
       router.back();

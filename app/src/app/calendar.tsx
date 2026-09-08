@@ -35,11 +35,10 @@ import { Icon } from "../../lib/icons";
 import { S, R, ELEV, CAPS, FONT, useTheme, ColorScale } from "../../lib/theme";
 import { Button, EmptyState, ErrorText } from "../../lib/ui";
 import {
-  ApiError, ApiFolder, ApiTask, RecordingSummary, getAllTasks, getFolders,
+  ApiError, ApiTask, RecordingSummary, getAllTasks,
   getMeetingHighlights, getRecordings, patchTaskById,
 } from "../../lib/api";
 import { TaskCard, SectionHeader } from "../../lib/task-action-center";
-import { folderIcon, folderSwatch } from "../../lib/folder-appearance";
 import {
   AgendaEntry, CalendarCell, GRID_DAY_LABELS, MeetingDeadline, addDays,
   addMonths, agendaForDay, clockLabel, dayHeading, dayLoad, deadlinesFromHighlights,
@@ -88,7 +87,6 @@ export default function TaskCalendarScreen() {
   const [tasks, setTasks] = useState<ApiTask[]>([]);
   const [meetings, setMeetings] = useState<RecordingSummary[]>([]);
   const [deadlines, setDeadlines] = useState<MeetingDeadline[]>([]);
-  const [folders, setFolders] = useState<ApiFolder[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -157,7 +155,7 @@ export default function TaskCalendarScreen() {
     []
   );
 
-  // Meetings and folders are cheap, whole-list reads and are not month-scoped:
+  // Meetings are a cheap, whole-list read and not month-scoped:
   // the recordings list is the app's one meeting collection, filtered by day
   // here. Best-effort — a failure costs the meeting markers, and must never
   // take the task grid down with it.
@@ -202,9 +200,6 @@ export default function TaskCalendarScreen() {
         setMeetings([]);
         setDeadlines([]);
       });
-    getFolders()
-      .then((r) => setFolders(r.folders))
-      .catch(() => setFolders([]));
   }, []);
 
   useFocusEffect(
@@ -234,17 +229,7 @@ export default function TaskCalendarScreen() {
     [loads, selected]
   );
 
-  const folderById = useMemo(() => {
-    const m = new Map<string, ApiFolder>();
-    for (const f of folders) m.set(f.id, f);
-    return m;
-  }, [folders]);
 
-  const folderNames = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const f of folders) m.set(f.id, f.name);
-    return m;
-  }, [folders]);
 
   const monthTotals = useMemo(() => {
     let open = 0;
@@ -412,7 +397,6 @@ export default function TaskCalendarScreen() {
         <TaskCard
           task={item.task}
           now={now}
-          folderName={folderNames.get(String(item.task.folder_id || ""))}
           busy={busyId === item.task.id}
           onPress={openTask}
           onToggleComplete={toggleComplete}
@@ -452,14 +436,12 @@ export default function TaskCalendarScreen() {
     }
 
     const r = item.recording;
-    const folder = folderById.get(String(r.folder_id || ""));
-    const swatch = folderSwatch(folder?.color, mode === "dark");
     const when = clockLabel(String(r.recorded_at || r.created_at || ""));
     const dur = durationLabel(r.duration);
     // Only the facts we have. A meeting still processing says so, because
     // opening it would show an empty transcript.
     const processing = r.status !== "complete" && r.status !== "transcribed";
-    const meta = [when, dur, folder?.name].filter(Boolean).join("  ·  ");
+    const meta = [when, dur].filter(Boolean).join("  ·  ");
 
     return (
       <Pressable
@@ -470,13 +452,13 @@ export default function TaskCalendarScreen() {
       >
         {/* A colour spine, so a meeting reads as a different kind of thing
             from a task at a glance rather than by reading the label. */}
-        <View style={[st.spine, { backgroundColor: swatch.solid }]} />
+        <View style={[st.spine, { backgroundColor: C.primary }]} />
         <View style={st.meetingBody}>
           <View style={st.meetingHead}>
             <Icon
-              name={folder ? folderIcon(folder.icon) : "waveform"}
+              name="waveform"
               size={13}
-              tintColor={swatch.solid}
+              tintColor={C.primary}
             />
             <Text style={st.meetingTitle} numberOfLines={1}>
               {r.title || "Untitled meeting"}

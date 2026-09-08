@@ -159,15 +159,6 @@ export type RecSession = {
   size: number | null;
   segments: Segment[];
   interruptions: Interruption[];
-  /**
-   * The folder this recording should be filed into, when it was started from
-   * inside one. Persisted WITH the session on purpose: the presign is what
-   * files the recording, and a presign can happen minutes later (offline) or
-   * after a relaunch, by which point the screen that knew the folder is long
-   * gone. Keeping it here means the folder survives a retry, a crash, and a
-   * cold start. Absent = General.
-   */
-  folderId?: string;
   /** audio_s3_key, once the presign ticket is issued. */
   key?: string;
   /**
@@ -761,7 +752,7 @@ export function newSessionId(): string {
   ].join("-");
 }
 
-export function createSession(format = "m4a", folderId?: string): RecSession {
+export function createSession(format = "m4a"): RecSession {
   const s: RecSession = {
     id: newSessionId(),
     createdAt: Date.now(),
@@ -774,12 +765,9 @@ export function createSession(format = "m4a", folderId?: string): RecSession {
     segments: [],
     interruptions: [],
     attempts: 0,
-    // Only set when the recording began inside a folder. Left ABSENT rather
-    // than "" so "no folder" has one representation, matching the backend.
-    ...(folderId ? { folderId } : {}),
   };
   ensureDir();
   saveSession(s);
-  recLog("session.created", { format, folderId: folderId || undefined }, s.id);
+  recLog("session.created", { format }, s.id);
   return s;
 }

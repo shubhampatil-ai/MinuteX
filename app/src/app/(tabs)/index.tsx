@@ -10,8 +10,8 @@
 // written up.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert, Animated, Easing, Pressable, RefreshControl, SectionList, StyleSheet,
-  Text, View,
+  Alert, Animated, Easing, Pressable, RefreshControl, ScrollView, SectionList,
+  StyleSheet, Text, View,
   type LayoutChangeEvent, type NativeScrollEvent, type NativeSyntheticEvent,
 } from "react-native";
 import { useFocusEffect, useRouter } from "expo-router";
@@ -20,14 +20,17 @@ import { Icon, type IconName } from "../../../lib/icons";
 import { S, R, ELEV, CAPS, FONT, TABULAR, useTheme, ColorScale } from "../../../lib/theme";
 import { NotificationBell } from "../../../lib/notification-bell";
 import {
-  Button, Chip, EmptyState, ErrorText, IconCircle, SearchBar, SkeletonCard,
+  Avatar, Button, Chip, EmptyState, ErrorText, IconCircle, SearchBar,
+  SkeletonCard,
 } from "../../../lib/ui";
 import { Waveform } from "../../../lib/waveform";
 import { useDevice } from "../../../lib/device-context";
 import {
   getRecordings, clearToken, trashRecording, isStillUploading,
-  RecordingSummary, ApiError, getAllTasks,
+  RecordingSummary, ApiError, getAllTasks, getWorkspaceMembers, getMe,
+  ApiMember,
 } from "../../../lib/api";
+import { useWorkspace } from "../../../lib/workspace-context";
 import { fmtDuration, sourceMeta, statusMeta } from "../../../lib/sources";
 import {
   useUploads, dismissUpload, retryUpload, abandonUpload,
@@ -199,7 +202,6 @@ function workspaceTiles(openTasks: number | null): WorkspaceTile[] {
         : undefined,
     },
     { key: "calendar", label: "Calendar", icon: "calendar", path: "/calendar" },
-    { key: "folders", label: "Folders", icon: "folder", path: "/folders" },
     { key: "contacts", label: "People", icon: "person.2.fill", path: "/contacts" },
   ];
 }
@@ -475,6 +477,19 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     noticeTitle: { fontFamily: FONT.semibold, fontSize: 13.5, color: C.text },
     noticeSub: { ...T.caption, marginTop: 2 },
     filters: { flexDirection: "row" as const, gap: 7, marginTop: S.lg, marginBottom: 2 },
+    // The "whose meetings" row. Gap matches `filters` so the two read as one
+    // filter block; the padding is on the contentContainer because the row
+    // scrolls horizontally.
+    whoseRow: { flexDirection: "row" as const, gap: 7, marginTop: 9, paddingRight: S.lg },
+    // "Recorded by" on another person's brief. Sits under the headline, at
+    // caption weight — it is provenance, not the point of the card.
+    recordedBy: {
+      flexDirection: "row" as const, alignItems: "center" as const,
+      gap: 6, marginTop: 7,
+    },
+    recordedByText: {
+      fontFamily: FONT.medium, fontSize: 11.5, color: C.textDim, flexShrink: 1,
+    },
     // Day header. Sticky now (RN sticks all section headers or none), so it
     // keeps its opaque background and carries the gutter itself. marginTop
     // became paddingTop: a sticky header's margin sits outside the pinned
@@ -524,6 +539,27 @@ export default function DeskScreen() {
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
+  // WHOSE meetings — the "per user" filter, for OWNER and MANAGER only.
+  //
+  // WHY THOSE TWO AND NOBODY ELSE. A MEMBER cannot read a colleague's
+  // meetings in the first place (_can_read_meeting gates on
+  // CAP_VIEW_ALL_MEETINGS, which starts at MANAGER), so for them every
+  // person-chip except their own would return an empty list. That is not a
+  // filter, it is a row of dead ends that also advertises who else is in the
+  // organisation as if their meetings were one tap away.
+  //
+  // `view_all_meetings` is read from the server's own capability map rather
+  // than re-derived from the role here — one source of truth, and it stays
+  // correct if the capability's minimum role ever changes.
+  //
+  // This is PRESENTATION ONLY. The server applies ?user_id= after its own
+  // read check either way, so hiding the control is a UX decision, never the
+  // security boundary (see TestUserFilterCannotWiden).
+  const { isOrganisation, activeId, active } = useWorkspace();
+  const canSeeEveryones = !!active?.capabilities?.view_all_meetings;
+  const [whose, setWhose] = useState("");
+  const [members, setMembers] = useState<ApiMember[]>([]);
+  const [myUserId, setMyUserId] = useState("");
   // Open-task count for the Workspace row. A number is what makes that row
   // worth a place on MinuteX rather than being pure navigation chrome —
   // "3 open" is a reason to tap; a bare "Tasks" label is not.
@@ -565,7 +601,9 @@ export default function DeskScreen() {
   const load = useCallback(async () => {
     setError("");
     try {
-      setItems(await getRecordings());
+      // `whose` is only ever set on an organisation, and the server ignores
+      // it on a personal workspace, so this is safe to pass unconditionally.
+      setItems(await getRecordings({ userId: whose }));
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) { await clearToken(); router.replace("/login"); return; }
       setError(e instanceof ApiError ? e.message : "Could not load your briefs.");
@@ -573,9 +611,39 @@ export default function DeskScreen() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [router]);
+  }, [router, whose]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
+
+  // Who the caller IS — so their own meetings are not labelled with their own
+  // name on every row. One read, cached for the session by getMe's caller.
+  useEffect(() => {
+    let alive = true;
+    getMe()
+      .then((u) => { if (alive) setMyUserId(u.user_id); })
+      .catch(() => { /* attribution just shows on every row; not fatal */ });
+    return () => { alive = false; };
+  }, []);
+
+  // The people to offer in the "whose meetings" filter.
+  //
+  // Skipped entirely unless the caller may actually see everyone's meetings:
+  // fetching a roster to populate a control a MEMBER never sees would be a
+  // request per Desk visit for nothing. `whose` is cleared on the way out so
+  // a demotion (or a workspace switch) cannot leave a stale filter pinned to
+  // someone the caller can no longer query.
+  useEffect(() => {
+    if (!isOrganisation || !activeId || !canSeeEveryones) {
+      setMembers([]);
+      setWhose("");
+      return;
+    }
+    let alive = true;
+    getWorkspaceMembers(activeId)
+      .then((r) => { if (alive) setMembers(r.members); })
+      .catch(() => { if (alive) setMembers([]); });
+    return () => { alive = false; };
+  }, [isOrganisation, activeId, canSeeEveryones]);
 
   // The task count rides in its OWN request, deliberately not inside load():
   // MinuteX's job is to show briefs, and a task-service hiccup must not blank
@@ -898,6 +966,43 @@ export default function DeskScreen() {
         <Chip label="Filed" active={filter === "ready"} onPress={() => setFilter("ready")} />
         <Chip label="In the works" active={filter === "processing"} onPress={() => setFilter("processing")} />
       </View>
+
+      {/* WHOSE meetings. Organisation only, and only once there is more than
+          one person to choose between — a filter with a single option is
+          chrome, not a control. Horizontally scrollable because an
+          organisation can have more members than fit a row.
+
+          A MEMBER sees this too, deliberately: the server intersects the
+          filter with what they may already read, so for them it narrows
+          their own + shared meetings rather than exposing anyone. */}
+      {isOrganisation && canSeeEveryones && members.length > 1 ? (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          // This screen has a search field, so without persistTaps the first
+          // tap on a person chip while the keyboard is up would be swallowed
+          // dismissing it instead of applying the filter.
+          keyboardShouldPersistTaps="handled"
+          contentContainerStyle={st.whoseRow}
+        >
+          <Chip
+            label="Everyone"
+            active={whose === ""}
+            onPress={() => setWhose("")}
+          />
+          {members.map((m) => (
+            <Chip
+              key={m.user_id}
+              // Already a display name server-side (chosen -> derived ->
+              // email), so this is never a raw uuid.
+              label={m.user_id === myUserId ? "You" : (m.name || m.email || "")}
+              active={whose === m.user_id}
+              onPress={() => setWhose(
+                whose === m.user_id ? "" : m.user_id)}
+            />
+          ))}
+        </ScrollView>
+      ) : null}
     </View>
   );
 
@@ -1027,6 +1132,25 @@ export default function DeskScreen() {
                   <Text style={st.headline} numberOfLines={3}>
                     {item.title || "Untitled conversation"}
                   </Text>
+
+                  {/* WHO recorded it. Organisation only, and only for
+                      someone ELSE's meeting: the server omits these fields
+                      in a personal workspace, and "Recorded by you" on your
+                      own row is noise on every row you own. */}
+                  {item.recorded_by_name
+                    && item.recorded_by !== myUserId ? (
+                    <View style={st.recordedBy}>
+                      <Avatar
+                        name={item.recorded_by_name}
+                        photoUri={item.recorded_by_avatar}
+                        size={16}
+                        fontSize={8}
+                      />
+                      <Text style={st.recordedByText} numberOfLines={1}>
+                        {item.recorded_by_name}
+                      </Text>
+                    </View>
+                  ) : null}
                 </View>
                 {ready ? (
                   <Icon name="checkmark.circle.fill" tintColor={C.success} size={18} />

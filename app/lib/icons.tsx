@@ -113,9 +113,7 @@ const MAP = {
   "photo": "photo_library",
   "camera": "photo_camera",
   "folder": "folder_open",
-  // Folder category icons (lib/folder-appearance.tsx maps stored folder
-  // tokens onto these). Small, deliberate set — a folder icon is a
-  // glanceable category hint, not a sticker library.
+  // Category / accent icons used across the app. Small, deliberate set.
   "briefcase.fill": "work",
   "flag.fill": "flag",
   "star.fill": "star",

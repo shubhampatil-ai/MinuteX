@@ -259,16 +259,6 @@ export type StartUploadInput = {
    * the app's document directory, so there is nothing to import.
    */
   sessionId?: string;
-  /**
-   * File the recording into this folder. Passed to the presign, so the row is
-   * created already carrying its folder — the meeting is never briefly visible
-   * in General, and a crash mid-upload cannot leave it unfiled.
-   *
-   * For a session-backed upload the session's own `folderId` wins, because the
-   * session is what survives a relaunch; this field is for the import paths
-   * that have no session yet.
-   */
-  folderId?: string;
 };
 
 /** Map a session's persisted upload state onto the banner's phase. */
@@ -314,13 +304,6 @@ export async function startUpload(input: StartUploadInput): Promise<string> {
 
   if (!session) {
     session = await adoptFile(input);
-  } else if (input.folderId && !session.folderId) {
-    // A session created before the folder was known (or by an older build).
-    // Persist it NOW, while a caller with the answer is on the stack — the
-    // presign may not happen until after a relaunch, and by then `input` is
-    // gone and only the session survives.
-    session.folderId = input.folderId;
-    saveSession(session);
   }
 
   const job = jobForSession(session, input);
@@ -346,7 +329,7 @@ const inputs = new Map<string, StartUploadInput>();
  * independent of anything else deleting the original.
  */
 async function adoptFile(input: StartUploadInput): Promise<RecSession> {
-  const s = createSession(input.format, input.folderId);
+  const s = createSession(input.format);
   const src = new File(input.fileUri);
   let uri = input.fileUri;
   let size: number | null = input.size ?? null;
@@ -452,11 +435,6 @@ async function driveSession(sessionId: string): Promise<string> {
         title: input?.title,
         duration: s.duration || undefined,
         size: size || undefined,
-        // The SESSION's folder wins over the caller's: the session is what
-        // survives a relaunch, so on a retry hours later it is the only
-        // trustworthy source. `input` only matters on the very first attempt,
-        // and startUpload has already written it onto the session by then.
-        folder_id: s.folderId || input?.folderId || undefined,
         // The key from an earlier attempt, when this is a re-presign after
         // expiry. Sending it is what keeps one session to one row — without
         // it the backend mints a fresh identity and the first row is stranded

@@ -52,8 +52,6 @@ export default function ParticipantsScreen() {
 
   const [speakers, setSpeakers] = useState<string[]>([]);
   const [participants, setParticipants] = useState<ApiParticipant[]>([]);
-  const [folderContacts, setFolderContacts] = useState<ApiContact[]>([]);
-  const [folderId, setFolderId] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -76,8 +74,6 @@ export default function ParticipantsScreen() {
         const res = await getParticipants(recordingKey);
         setSpeakers(res.speakers);
         setParticipants(res.participants);
-        setFolderContacts(res.folder_contacts);
-        setFolderId(res.folder_id);
         setRecordingStatus(String(res.recording_status || ""));
       } catch (e) {
         setError(
@@ -406,16 +402,6 @@ export default function ParticipantsScreen() {
         />
       )}
 
-      {!folderId && (
-        <View style={st.hintBox}>
-          <Icon name="folder" size={14} tintColor={C.textFaint} />
-          <Text style={st.hintTxt}>
-            This meeting is not in a folder. Filing it lets that folder&apos;s
-            contacts be offered first here.
-          </Text>
-        </View>
-      )}
-
       <ContactPicker
         visible={pickerFor !== null}
         onClose={() => setPickerFor(null)}
@@ -429,8 +415,6 @@ export default function ParticipantsScreen() {
               }
             : undefined
         }
-        folderContacts={folderContacts}
-        folderId={folderId}
         // You are almost always IN your own meeting, and "Speaker 0" is very
         // often you. Without this the only way to say so was to type your own
         // name and email in by hand — and a typo in that email silently broke
@@ -450,8 +434,6 @@ export default function ParticipantsScreen() {
         visible={attendeePicker}
         onClose={() => setAttendeePicker(false)}
         onPick={addAttendee}
-        folderContacts={folderContacts}
-        folderId={folderId}
         allowSelf
         title="Who was in this meeting?"
       />

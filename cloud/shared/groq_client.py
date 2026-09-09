@@ -64,10 +64,25 @@ CHARS_PER_TOKEN = 3.5
 # to a model with a different window.
 GROQ_CONTEXT_TOKENS = int(os.environ.get("GROQ_CONTEXT_TOKENS", "131072"))
 
-# Reserve for the model's own reply. The single-pass analysis response is a
-# JSON object with a prose summary, a handful of highlights and a task list —
-# comfortably under this, but reserved generously since a response that gets
-# cut off mid-JSON is unparseable, not just short.
+# Reserve for the model's own reply, and — since the truncation fix — the
+# max_tokens actually SENT on the analysis call. One number for both, so the
+# budget arithmetic below and the request can never disagree about how much
+# output there is room for.
+#
+# It has to be sent explicitly. Groq's server-side default for
+# openai/gpt-oss-120b is 3072 completion tokens, and a multi-speaker analysis
+# runs out inside it: production logged finish_reason=length with
+# completion_tokens=3072, having written title + 6 overview sections and then
+# stopped — tasks [], every participant summary "", meeting_highlights absent.
+# Valid JSON, passes is_usable, silently missing most of the analysis. Fields
+# are generated in prompt order, so truncation always eats the same tail.
+#
+# 6000 is ~2x that default and comfortably inside the model's real ceiling
+# (verified against GET /openai/v1/models on 2026-09-09:
+# openai/gpt-oss-120b -> context_window=131072, max_completion_tokens=65536;
+# note 32768 is llama-3.3-70b-versatile's figure, not this model's). Raising
+# this raises the request cap and lowers the transcript budget together, which
+# is the correct coupling — do not split them.
 SINGLE_PASS_OUTPUT_RESERVE_TOKENS = 6000
 
 # Headroom below the hard ceiling. est_tokens()/CHARS_PER_TOKEN already err
@@ -146,6 +161,24 @@ def _is_transient_generation_failure(err):
         return False
     text = str(err).lower()
     return any(m in text for m in _GENERATION_FAILURE_MARKERS)
+
+
+# How many times the single-pass analysis call may be SENT before giving up on
+# it, counting the first attempt. Only a transient generation failure consumes
+# one of these — every other error still falls through on its first occurrence.
+#
+# 4, not 2. The fault is stochastic at a measured ~1-in-6 per attempt, so two
+# attempts still lose the whole analysis ~1 time in 36; four brings that to
+# ~1 in 1300. Each extra send costs one input-token bill and only happens on
+# the failing minority, which is far cheaper than the alternative — the row
+# persists as status="transcribed" with no analysis at all, and the only
+# recovery is a manual reprocess that pays the same tokens anyway.
+GENERATION_ATTEMPTS = int(os.environ.get("GROQ_GENERATION_ATTEMPTS", "4"))
+
+# How many times an UNUSABLE (but well-formed) result is re-requested. Kept at
+# 2 deliberately: a 200 the caller rejected is the model answering consistently,
+# not a bad sample, so extra rolls mostly spend the deadline.
+USABILITY_ATTEMPTS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +338,30 @@ def complete(system_prompt, user_content, label="groq", json_mode=True,
 #
 # The tool schema is OpenAI-compatible, which is what Groq's API speaks.
 # ---------------------------------------------------------------------------
+def _log_completion_meta(data, label):
+    """Log a 200's finish_reason and token usage — METADATA ONLY.
+
+    Diagnosing the json_validate_failed outages meant reading DynamoDB rows and
+    2000 log lines, because the response's own account of what happened was
+    read for `message` and then dropped on the floor. finish_reason separates
+    "the model stopped early" from "the model finished and we disliked it", and
+    usage is the only non-estimated token count this code ever sees
+    (est_tokens() is a chars/3.5 guess).
+
+    Never logs prompt or completion TEXT: these are meeting transcripts. Only
+    the reason string and integer counts.
+    """
+    try:
+        choice = (data.get("choices") or [{}])[0] or {}
+        usage = data.get("usage") or {}
+        print(f"[groq] {label}: finish_reason={choice.get('finish_reason')} "
+              f"prompt_tokens={usage.get('prompt_tokens')} "
+              f"completion_tokens={usage.get('completion_tokens')} "
+              f"total_tokens={usage.get('total_tokens')}")
+    except Exception:  # noqa: BLE001 — observability must never break a call
+        pass
+
+
 def _chat_once(payload, label, key=None, deadline=None):
     """POST one chat completion with the 429/backoff/deadline policy.
 
@@ -322,6 +379,7 @@ def _chat_once(payload, label, key=None, deadline=None):
             timeout = max(1.0, min(timeout, deadline - time.monotonic()))
         status, data = _post_json(GROQ_URL, headers, payload, timeout)
         if status == 200:
+            _log_completion_meta(data, label)
             return (data.get("choices") or [{}])[0].get("message", {}) or {}
         last = str(data)[:500]
         if status in (429, 0) or 500 <= status < 600:
@@ -371,12 +429,22 @@ def complete_with_tools(messages, tools, label="agent", key=None,
 
 
 def complete_json(system_prompt, user_content, label="groq", key=None,
-                  temperature=0.2, deadline=None):
+                  temperature=0.2, deadline=None, max_tokens=None):
     """complete() in JSON mode, parsed. A model that somehow answers non-JSON
     yields {"_raw": text} rather than an exception — the caller's coercer then
-    defaults every field, which beats losing the whole generation."""
+    defaults every field, which beats losing the whole generation.
+
+    `max_tokens` caps the REPLY. complete() has always accepted one; this
+    wrapper did not, so no JSON caller could set it and every analysis ran on
+    Groq's server-side default. For openai/gpt-oss-120b that default is 3072
+    completion tokens, which a multi-speaker analysis exhausts partway through:
+    production returned finish_reason=length with title and overview written
+    and tasks/participant summaries/meeting_highlights all empty — valid JSON,
+    silently incomplete. Left None the request is byte-identical to before.
+    """
     text = complete(system_prompt, user_content, label=label, json_mode=True,
-                    temperature=temperature, key=key, deadline=deadline)
+                    temperature=temperature, key=key, deadline=deadline,
+                    max_tokens=max_tokens)
     try:
         parsed = json.loads(text)
     except (ValueError, TypeError):
@@ -427,10 +495,21 @@ def analyze(text, map_prompt, reduce_prompt, merge, coerce,
 
     if fits:
         deadline = time.monotonic() + deadline_seconds
-        for attempt in range(2):
+        # TWO independent retry policies share this loop, and they are counted
+        # SEPARATELY because they answer different faults:
+        #   * a failed GENERATION (json_validate_failed) is a bad dice roll and
+        #     is worth several fresh samples — see GENERATION_ATTEMPTS.
+        #   * an UNUSABLE result is a 200 the caller rejected. That stays at
+        #     one retry: it is not a transport fault, and re-rolling it many
+        #     times spends the deadline on a model that answered consistently.
+        generation_failures = 0
+        usability_failures = 0
+        while True:
             try:
-                result = coerce(complete_json(map_prompt, text, label=label,
-                                              key=gkey, deadline=deadline))
+                result = coerce(complete_json(
+                    map_prompt, text, label=label, key=gkey,
+                    deadline=deadline,
+                    max_tokens=SINGLE_PASS_OUTPUT_RESERVE_TOKENS))
             except GroqError as err:
                 # A single-pass call can still legitimately fail (429 despite
                 # the higher quota, a transient 5xx, a deadline that was
@@ -450,19 +529,30 @@ def analyze(text, map_prompt, reduce_prompt, merge, coerce,
                 # exists to avoid (a reduce over partial JSONs, whose measured
                 # failure mode is an empty overview) in response to a fault a
                 # plain resend usually clears.
-                if _is_transient_generation_failure(err) and attempt == 0:
+                #
+                # ONE resend was not enough. At the measured ~1-in-6 rate, two
+                # attempts still both fail ~1 time in 36, and production saw
+                # exactly that on long code-switched transcripts: the analysis
+                # was lost outright and the row persisted status="transcribed"
+                # with no title, overview, tasks or participants.
+                generation_failures += 1
+                if (_is_transient_generation_failure(err)
+                        and generation_failures < GENERATION_ATTEMPTS):
                     print(f"[groq] {label}: single-pass generation failed "
-                          f"({err}) — resending once before falling back")
+                          f"({err}) — resend "
+                          f"{generation_failures}/{GENERATION_ATTEMPTS - 1}")
                     continue
                 reason = f"single-pass failed ({err})"
                 break
             if is_usable is None or is_usable(result):
                 return result, 1, 1
-            if attempt == 0:
+            usability_failures += 1
+            if usability_failures < USABILITY_ATTEMPTS:
                 print(f"[groq] {label}: single-pass result failed the "
                       f"usability check, retrying once before falling back")
                 continue
             reason = "retry also failed the usability check"
+            break
 
     # ONE fall-through for three distinct reasons (overflow, a failed call, a
     # failed usability check). It used to report the overflow arithmetic
@@ -571,9 +661,32 @@ def map_reduce(text, map_prompt, reduce_prompt, merge, coerce,
     deadline = time.monotonic() + deadline_seconds
 
     # Short input: one call, no chunking.
+    #
+    # This branch is reached far more often than "short input" suggests. On the
+    # 300K-TPM plan `budget` is ~128K tokens, so EVERY real meeting lands here —
+    # including one that arrived via analyze()'s fall-through after its own
+    # single-pass attempts failed. That made this an identical resend of the
+    # call that just failed, and with no try/except a json_validate_failed
+    # escaped map_reduce, escaped analyze, and cost the caller the whole
+    # analysis (the row persisted status="transcribed", nothing else). Give it
+    # the same transient-generation retry the single-pass path has; a genuinely
+    # malformed request still raises on its first occurrence.
     if total_tokens <= budget:
-        return coerce(complete_json(map_prompt, text, label=label, key=gkey,
-                                    deadline=deadline)), 1, 1
+        for attempt in range(GENERATION_ATTEMPTS):
+            try:
+                return coerce(complete_json(
+                    map_prompt, text, label=label, key=gkey,
+                    deadline=deadline,
+                    max_tokens=SINGLE_PASS_OUTPUT_RESERVE_TOKENS)), 1, 1
+            except GroqError as err:
+                if (_is_transient_generation_failure(err)
+                        and attempt < GENERATION_ATTEMPTS - 1
+                        and time.monotonic() < deadline):
+                    print(f"[groq] {label}: single-call generation failed "
+                          f"({err}) — resend "
+                          f"{attempt + 1}/{GENERATION_ATTEMPTS - 1}")
+                    continue
+                raise
 
     chunks = split_text(text, budget)
     print(f"[groq] {label}: ~{total_tokens} tokens > {budget} budget — "

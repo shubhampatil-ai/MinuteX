@@ -2234,17 +2234,21 @@ class TestSinglePassAnalysis(unittest.TestCase):
         self.assertEqual(got["overview"]["sections"][0]["content"],
                          "Recovered.")
 
-    def test_json_validate_failed_twice_still_falls_back(self):
-        """The resend is ONE extra chance, not a loop. A transcript whose
-        every single-pass attempt fails must still reach map_reduce rather
-        than raise - the long-meeting safety net is unchanged."""
+    def test_json_validate_failed_every_time_still_falls_back(self):
+        """The resend is a BOUNDED loop, not an infinite one. A transcript
+        whose every single-pass attempt fails must still reach map_reduce
+        rather than raise - the long-meeting safety net is unchanged.
+
+        The bound is GENERATION_ATTEMPTS (4, was 2): at the measured ~1-in-6
+        failure rate two attempts still lost the whole analysis ~1 time in 36,
+        which is what production hit on long code-switched transcripts."""
         text = "Speaker 0: " + ("word " * 3000)
         seen = []
 
         def _complete_json(prompt, content, **kw):
             single_pass = content == text
             seen.append((prompt, single_pass))
-            if single_pass:                 # BOTH single-pass attempts fail
+            if single_pass:                 # EVERY single-pass attempt fails
                 raise self._json_validate_failed()
             return self._ok("via map_reduce")
 
@@ -2258,11 +2262,42 @@ class TestSinglePassAnalysis(unittest.TestCase):
                 merge=ai_schema.merge_analyses,
                 coerce=ai_schema.coerce_analysis,
                 deadline_seconds=120, label="analyze", key="k")
-        # Two single-pass attempts, no more - the resend is not a loop.
-        self.assertEqual(sum(1 for _, sp in seen if sp), 2)
-        self.assertEqual([sp for _, sp in seen[:2]], [True, True])
-        self.assertGreater(len(seen), 2)      # it did go on to map_reduce
+        # Exactly GENERATION_ATTEMPTS single-pass sends, then the fallback.
+        self.assertEqual(sum(1 for _, sp in seen if sp),
+                         groq_client.GENERATION_ATTEMPTS)
+        self.assertGreater(len(seen), groq_client.GENERATION_ATTEMPTS)
         self.assertTrue(got["overview"]["sections"])
+
+    def test_json_validate_failed_recovers_on_a_later_attempt(self):
+        """The reason the bound was raised: a run that fails the first THREE
+        samples and succeeds on the fourth must return the single-pass result,
+        not a map_reduce one. Under the old 2-attempt bound this exact
+        sequence lost the analysis entirely."""
+        text = "Speaker 0: " + ("word " * 3000)
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            seen.append(prompt)
+            if len(seen) < 4:               # attempts 1, 2, 3 all fail
+                raise self._json_validate_failed()
+            return self._ok("Recovered on 4.")
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "GROQ_CONTEXT_TOKENS", 131_072), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            got, covered, total = groq_client.analyze(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k")
+        self.assertEqual(len(seen), 4)
+        self.assertEqual(seen, [prompts.SUMMARY_SYSTEM] * 4)
+        self.assertNotIn(prompts.SUMMARY_REDUCE_SYSTEM, seen)
+        self.assertEqual((covered, total), (1, 1))
+        self.assertEqual(got["overview"]["sections"][0]["content"],
+                         "Recovered on 4.")
 
     def test_a_non_generation_400_is_not_resent(self):
         """Only a failed GENERATION earns the resend. A genuinely malformed
@@ -2353,6 +2388,282 @@ class TestSinglePassAnalysis(unittest.TestCase):
         lines = [str(c.args[0]) for c in printed.call_args_list if c.args]
         self.assertTrue(any("single-pass budget" in ln and "chars >" in ln
                             for ln in lines), lines[:5])
+
+    # -- map_reduce's short-input branch -------------------------------------
+    #
+    # On the 300K-TPM plan chunk_budget is ~128K tokens, so every real meeting
+    # takes this branch. It used to have NO try/except, which made analyze()'s
+    # fall-through a third identical send whose failure escaped the whole
+    # analysis (the row persisted status="transcribed" and nothing else).
+
+    def test_map_reduce_short_input_retries_a_generation_failure(self):
+        """The branch every real meeting actually takes must survive a
+        stochastic generation failure instead of letting it escape."""
+        text = "Speaker 0: short enough to skip chunking."
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            seen.append(prompt)
+            if len(seen) == 1:
+                raise self._json_validate_failed()
+            return self._ok("recovered in map_reduce")
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            got, covered, total = groq_client.map_reduce(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual((covered, total), (1, 1))
+        self.assertEqual(got["overview"]["sections"][0]["content"],
+                         "recovered in map_reduce")
+
+    def test_map_reduce_short_input_propagates_after_the_retry_limit(self):
+        """Bounded, and still honest when it gives up: a permanently failing
+        generation raises GroqError rather than looping or returning a
+        silently-empty analysis."""
+        text = "Speaker 0: short enough to skip chunking."
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            seen.append(prompt)
+            raise self._json_validate_failed()
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            with self.assertRaises(groq_client.GroqError):
+                groq_client.map_reduce(
+                    text, prompts.SUMMARY_SYSTEM,
+                    prompts.SUMMARY_REDUCE_SYSTEM,
+                    merge=ai_schema.merge_analyses,
+                    coerce=ai_schema.coerce_analysis,
+                    deadline_seconds=120, label="analyze", key="k")
+        self.assertEqual(len(seen), groq_client.GENERATION_ATTEMPTS)
+
+    def test_map_reduce_short_input_does_not_retry_a_real_bad_request(self):
+        """Only a failed GENERATION earns the resend here too. A genuinely
+        malformed request must raise on its first occurrence."""
+        text = "Speaker 0: short enough to skip chunking."
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            seen.append(prompt)
+            raise groq_client.GroqError(
+                "Groq 400 on analyze: model `nope` does not exist",
+                status=400, retryable=False)
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            with self.assertRaises(groq_client.GroqError):
+                groq_client.map_reduce(
+                    text, prompts.SUMMARY_SYSTEM,
+                    prompts.SUMMARY_REDUCE_SYSTEM,
+                    merge=ai_schema.merge_analyses,
+                    coerce=ai_schema.coerce_analysis,
+                    deadline_seconds=120, label="analyze", key="k")
+        self.assertEqual(len(seen), 1)
+
+    def test_usability_retry_is_still_only_one(self):
+        """Raising the GENERATION bound must NOT raise the usability bound:
+        a 200 the caller rejected is the model answering consistently, not a
+        bad sample, so it keeps its single retry and then falls back.
+
+        Counted by the LOG line rather than by call count: this text is short,
+        so map_reduce's own single-call branch sends the same content again
+        and a raw call count cannot tell the two paths apart."""
+        text = "Speaker 0: short meeting content."
+
+        def _complete_json(prompt, content, **kw):
+            if prompt == prompts.SUMMARY_SYSTEM and content == text:
+                return {"title": "T", "tasks": [], "overview": {"sections": []}}
+            return self._ok("via map_reduce")
+
+        with mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"), \
+             mock.patch("builtins.print") as printed:
+            groq_client.analyze(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k",
+                is_usable=lambda a: not ai_schema.overview_empty(
+                    a.get("overview")))
+        lines = [str(c.args[0]) for c in printed.call_args_list if c.args]
+        retries = [ln for ln in lines if "failed the usability check" in ln
+                   and "retrying" in ln]
+        # Exactly ONE retry log, then the fall-through — not GENERATION_ATTEMPTS.
+        self.assertEqual(len(retries), groq_client.USABILITY_ATTEMPTS - 1)
+        self.assertTrue(any("retry also failed the usability check" in ln
+                            for ln in lines), lines)
+
+
+# ===========================================================================
+# Response metadata — finish_reason and token usage.
+#
+# _chat_once read the 200 body for `message` and dropped everything else, so
+# neither the model's own account of WHY it stopped nor a real (non-estimated)
+# token count ever reached CloudWatch. Diagnosing the json_validate_failed
+# outage needed a DynamoDB read and 2000 log lines because of it.
+# ===========================================================================
+class TestExplicitOutputTokenLimit(unittest.TestCase):
+    """The analysis request must CAP ITS OWN REPLY.
+
+    Groq's server-side default for openai/gpt-oss-120b is 3072 completion
+    tokens. Nothing sent one, so a multi-speaker analysis ran out inside it and
+    came back finish_reason=length: title and overview written, then tasks [],
+    every participant summary "" and meeting_highlights absent. That is valid
+    JSON which passes is_usable, so it was stored as a complete meeting.
+    """
+
+    REPLY = ('{"title": "T", "tasks": [], "participants": [], '
+             '"overview": {"sections": [{"title": "S", "content": "c"}]}}')
+
+    def _payload_of(self, run):
+        """The payload `run` actually puts on the wire."""
+        seen = {}
+
+        def fake_post(url, headers, payload, timeout):
+            seen.clear()
+            seen.update(payload)
+            return 200, {
+                "choices": [{"finish_reason": "stop",
+                             "message": {"content": self.REPLY}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2,
+                          "total_tokens": 3},
+            }
+
+        with mock.patch.object(groq_client, "_post_json",
+                               side_effect=fake_post):
+            run()
+        return seen
+
+    # -- complete_json ----------------------------------------------------
+    def test_complete_json_accepts_and_forwards_max_tokens(self):
+        got = self._payload_of(
+            lambda: groq_client.complete_json("SYS", "user", key="k",
+                                              max_tokens=1234))
+        self.assertEqual(got["max_tokens"], 1234)
+
+    def test_complete_json_omits_max_tokens_when_not_given(self):
+        """Every other JSON caller (documents, chat, reduce) must be
+        byte-identical to before this change."""
+        got = self._payload_of(
+            lambda: groq_client.complete_json("SYS", "user", key="k"))
+        self.assertNotIn("max_tokens", got)
+
+    # -- analyze ----------------------------------------------------------
+    def test_analyze_sends_the_configured_output_limit(self):
+        got = self._payload_of(lambda: groq_client.analyze(
+            "Speaker 0: hi.", "SYS", "RED",
+            merge=lambda p: p[0], coerce=lambda o: o,
+            deadline_seconds=60, label="analyze", key="k"))
+        self.assertEqual(got["max_tokens"],
+                         groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS)
+
+    def test_the_limit_is_above_groqs_truncating_default(self):
+        """The whole point: 3072 is what truncated production."""
+        self.assertGreater(groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS, 3072)
+
+    def test_the_limit_is_within_the_models_ceiling(self):
+        """openai/gpt-oss-120b reports max_completion_tokens=65536 (verified
+        against GET /openai/v1/models). Asking for more is a 400."""
+        self.assertLessEqual(groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS,
+                             65536)
+
+    def test_the_sent_limit_is_the_same_number_the_budget_reserves(self):
+        """The transcript budget subtracts this exact constant, so sending a
+        DIFFERENT number would silently overcommit the context window."""
+        got = self._payload_of(lambda: groq_client.analyze(
+            "Speaker 0: hi.", "SYS", "RED",
+            merge=lambda p: p[0], coerce=lambda o: o,
+            deadline_seconds=60, label="analyze", key="k"))
+        budget = groq_client.single_pass_budget_tokens("SYS")
+        self.assertEqual(
+            got["max_tokens"], groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS)
+        self.assertLess(
+            budget + got["max_tokens"], groq_client.GROQ_CONTEXT_TOKENS)
+
+    # -- map_reduce's single-call branch ----------------------------------
+    def test_map_reduce_short_input_also_caps_its_reply(self):
+        """The other path that sends the WHOLE analysis prompt — reached by
+        every real meeting, since chunk_budget is ~128K tokens."""
+        got = self._payload_of(lambda: groq_client.map_reduce(
+            "Speaker 0: hi.", "SYS", "RED",
+            merge=lambda p: p[0], coerce=lambda o: o,
+            deadline_seconds=60, label="analyze", key="k"))
+        self.assertEqual(got["max_tokens"],
+                         groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS)
+
+    # -- untouched paths ---------------------------------------------------
+    def test_prose_completions_are_unchanged(self):
+        """Documents and chat go through complete() directly and must not
+        acquire a cap they never had."""
+        got = self._payload_of(
+            lambda: groq_client.complete("SYS", "user", key="k",
+                                         json_mode=False))
+        self.assertNotIn("max_tokens", got)
+        self.assertNotIn("response_format", got)
+
+
+class TestCompletionMetadataLogging(unittest.TestCase):
+    BODY = {
+        "choices": [{"finish_reason": "stop",
+                     "message": {"content": '{"ok": true}'}}],
+        "usage": {"prompt_tokens": 21023, "completion_tokens": 1487,
+                  "total_tokens": 22510},
+    }
+
+    def _logged(self, body):
+        with mock.patch.object(groq_client, "_post_json",
+                               return_value=(200, body)), \
+             mock.patch("builtins.print") as printed:
+            groq_client._chat_once({"model": "m", "messages": []},
+                                   "analyze", key="k")
+        return [str(c.args[0]) for c in printed.call_args_list if c.args]
+
+    def test_finish_reason_and_usage_are_logged(self):
+        line = " ".join(self._logged(self.BODY))
+        self.assertIn("finish_reason=stop", line)
+        self.assertIn("prompt_tokens=21023", line)
+        self.assertIn("completion_tokens=1487", line)
+        self.assertIn("total_tokens=22510", line)
+
+    def test_no_transcript_or_completion_text_is_logged(self):
+        """These are meeting transcripts. Metadata only — never content."""
+        body = {
+            "choices": [{"finish_reason": "length",
+                         "message": {"content": "SECRET_MEETING_CONTENT"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2,
+                      "total_tokens": 3},
+        }
+        line = " ".join(self._logged(body))
+        self.assertNotIn("SECRET_MEETING_CONTENT", line)
+        self.assertIn("finish_reason=length", line)
+
+    def test_a_body_without_usage_still_returns_the_message(self):
+        """Observability must never break the call it is observing."""
+        body = {"choices": [{"message": {"content": "hi"}}]}
+        with mock.patch.object(groq_client, "_post_json",
+                               return_value=(200, body)):
+            msg = groq_client._chat_once({"model": "m", "messages": []},
+                                         "analyze", key="k")
+        self.assertEqual(msg["content"], "hi")
+
+    def test_return_value_is_unchanged_by_logging(self):
+        with mock.patch.object(groq_client, "_post_json",
+                               return_value=(200, self.BODY)):
+            msg = groq_client._chat_once({"model": "m", "messages": []},
+                                         "analyze", key="k")
+        self.assertEqual(msg, {"content": '{"ok": true}'})
 
 
 # ===========================================================================

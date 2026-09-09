@@ -569,7 +569,8 @@ def _note_partial_overview(overview, covered, total):
     return {**overview, "sections": [first] + list(sections[1:])}
 
 
-def analyze_meeting(transcript, valid_ids=None, roster_source=None):
+def analyze_meeting(transcript, valid_ids=None, roster_source=None,
+                    speaker_names=None):
     """THE analysis: title, the dynamic overview, tasks, participants and the
     structured meeting_highlights — in ONE Groq call.
 
@@ -643,8 +644,10 @@ def analyze_meeting(transcript, valid_ids=None, roster_source=None):
         # OVERFLOW ONLY — a transcript past the single-pass budget. Still built
         # on SUMMARY_REDUCE_SYSTEM, which is NOT retired.
         reduce_prompt=prompts.unified_reduce_system(),
-        merge=lambda partials: ai_schema.merge_unified(partials, roster),
-        coerce=lambda obj: ai_schema.coerce_unified(obj, roster, valid_ids),
+        merge=lambda partials: ai_schema.merge_unified(
+            partials, roster, speaker_names),
+        coerce=lambda obj: ai_schema.coerce_unified(
+            obj, roster, valid_ids, speaker_names),
         # The whole analysis is ONE call, so it gets the whole analysis budget
         # instead of the old summary-vs-highlights split.
         deadline_seconds=GROQ_DEADLINE_SECONDS,
@@ -1030,20 +1033,31 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # reference that validates at write time but resolves to nothing at read
     # time is the one failure the validation exists to prevent.
     _upsert(key, {"status": "generating_ai"})
+    # The row's rename map ({"0": "Yuvraj Sir", ...}), read BEFORE analysis so
+    # both the rendered transcript and the participant matcher can use it. A
+    # rename made after this point simply is not reflected in this analysis —
+    # same as any other row edit made mid-run.
+    speaker_names = (_table.get_item(Key={"audio_s3_key": key})
+                     .get("Item", {}).get("speaker_names")) or {}
     # The allow-list of real segment ids, and the transcript rendered WITH those
     # ids on each line. Both come from transcript_store so the input the model
     # reads and the validator's allow-list can never disagree about what a valid
     # reference is. Before this, the model was handed the plain prose transcript
     # — it had no ids to copy, so every extraction returned
     # evidence_segment_ids: [] however clearly the prompt asked for them.
+    # speaker_names renders the user's renames INTO the lines the model reads
+    # (see transcript_store.as_labelled_lines) — otherwise a renamed meeting
+    # answers "who said X" worse, not better, than an unrenamed one.
     valid_ids = transcript_store.valid_segment_ids(timestamps)
-    labelled = transcript_store.as_labelled_lines(transcript, timestamps)
+    labelled = transcript_store.as_labelled_lines(transcript, timestamps,
+                                                  speaker_names)
 
     analysis = ai_schema.empty_unified()
     status = "complete"
     try:
         analysis = analyze_meeting(labelled, valid_ids,
-                                   roster_source=transcript)
+                                   roster_source=transcript,
+                                   speaker_names=speaker_names)
         if ai_schema.overview_empty(analysis.get("overview")):
             # analyze_meeting() can return NORMALLY with an empty overview (e.g.
             # map_reduce's reduce step came back blank without Groq itself

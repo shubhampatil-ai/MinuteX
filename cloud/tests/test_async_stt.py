@@ -916,6 +916,71 @@ class UnifiedAnalysisTests(unittest.TestCase):
 
 
 # ===========================================================================
+# SPEAKER_NAMES WIRING — analyze_meeting() must actually forward the row's
+# rename map into coerce_unified/merge_unified, not just accept the kwarg.
+# ai_schema._roster_filtered's own matching is covered in
+# test_speaker_confidence.py; this proves the Lambda's entry point actually
+# reaches it end to end (the gap the audit found: the parameter existed on
+# ai_schema but nothing upstream ever passed it).
+# ===========================================================================
+NAMED_REPLY = {
+    "title": "Fit-out quotation review",
+    "overview": {"sections": []},
+    "tasks": [],
+    "participants": [
+        # The model answers with the HUMAN NAME it read off a renamed
+        # transcript line, exactly as it would for a real renamed meeting.
+        {"speaker": "Yuvraj Sir", "summary": "Presented the quotation"},
+        {"speaker": "Speaker 1", "summary": "Held the budget line"},
+    ],
+    "meeting_highlights": {"decisions": [], "action_items": [],
+                           "deadlines": [], "open_questions": []},
+}
+
+
+class SpeakerNamesWiringTests(unittest.TestCase):
+    def setUp(self):
+        def fake_complete(system_prompt, user_content, **kwargs):
+            return json.dumps(NAMED_REPLY)
+
+        mock.patch.object(groq_client, "complete",
+                          side_effect=fake_complete).start()
+        mock.patch.dict("os.environ", {"GROQ_API_KEY": "gsk_test"}).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_renamed_speaker_resolves_when_names_are_passed(self):
+        """The whole point of the wiring: analyze_meeting(speaker_names=...)
+        must let a human-name reply land on the right roster entry instead of
+        being dropped as an unmatched name."""
+        names = {"0": "Yuvraj Sir"}
+        out = transcribe.analyze_meeting(DIARIZED, speaker_names=names)
+        by_label = {p["speaker"]: p["summary"] for p in out["participants"]}
+        self.assertEqual(by_label["Speaker 0"], "Presented the quotation")
+        self.assertEqual(by_label["Speaker 1"], "Held the budget line")
+
+    def test_renamed_speaker_is_dropped_without_the_map(self):
+        """Without speaker_names, "Yuvraj Sir" cannot resolve to "Speaker 0" —
+        confirms the previous test is actually exercising the wiring, not a
+        default that would pass either way."""
+        out = transcribe.analyze_meeting(DIARIZED)
+        by_label = {p["speaker"]: p["summary"] for p in out["participants"]}
+        self.assertEqual(by_label["Speaker 0"], "")
+
+    def test_bare_and_underscored_labels_still_match_through_analyze_meeting(self):
+        """The normalized-matching half of the fix, exercised through the same
+        Lambda entry point (not just ai_schema directly)."""
+        reply = {**NAMED_REPLY,
+                 "participants": [{"speaker": "speaker_0", "summary": "Led."},
+                                  {"speaker": "1", "summary": "Asked."}]}
+        with mock.patch.object(groq_client, "complete",
+                               side_effect=lambda *a, **k: json.dumps(reply)):
+            out = transcribe.analyze_meeting(DIARIZED)
+        by_label = {p["speaker"]: p["summary"] for p in out["participants"]}
+        self.assertEqual(by_label["Speaker 0"], "Led.")
+        self.assertEqual(by_label["Speaker 1"], "Asked.")
+
+
+# ===========================================================================
 # PARTICIPANTS — completeness, and participants != assignees
 # ===========================================================================
 class ParticipantTests(unittest.TestCase):
@@ -1322,6 +1387,43 @@ class DegradationTests(unittest.TestCase):
         of regenerating on first open."""
         written = self._run(lambda *a, **k: ai_schema.empty_unified())
         self.assertNotIn("meeting_highlights", written)
+
+
+# ===========================================================================
+# analyze_and_persist READS speaker_names OFF THE ROW — the other half of the
+# wiring gap: analyze_meeting() accepting the kwarg is useless if the caller
+# never fetches it from DynamoDB. Proves the row's rename map actually reaches
+# analyze_meeting, not just that analyze_meeting can accept one.
+# ===========================================================================
+class SpeakerNamesRowWiringTests(unittest.TestCase):
+    def _run(self, item):
+        self.analyze_kwargs = None
+
+        def fake_analyze(transcript, valid_ids=None, roster_source=None,
+                         speaker_names=None):
+            self.analyze_kwargs = {"speaker_names": speaker_names}
+            return ai_schema.empty_unified()
+
+        mock.patch.object(transcribe, "_upsert",
+                          side_effect=lambda k, f, remove=(): None).start()
+        mock.patch.object(transcribe, "analyze_meeting",
+                          side_effect=fake_analyze).start()
+        table = mock.MagicMock()
+        table.get_item.return_value = {"Item": item}
+        mock.patch.object(transcribe, "_table", table).start()
+        mock.patch.object(transcribe, "_s3", mock.MagicMock()).start()
+        self.addCleanup(mock.patch.stopall)
+        transcribe.analyze_and_persist(BUCKET, KEY, DIARIZED, [], "en")
+
+    def test_speaker_names_on_the_row_reaches_analyze_meeting(self):
+        self._run({"audio_s3_key": KEY, "speaker_names": {"0": "Yuvraj Sir"}})
+        self.assertEqual(self.analyze_kwargs["speaker_names"],
+                         {"0": "Yuvraj Sir"})
+
+    def test_no_speaker_names_on_the_row_passes_an_empty_map(self):
+        """No renames yet — must not crash, and must not invent a mapping."""
+        self._run({"audio_s3_key": KEY})
+        self.assertEqual(self.analyze_kwargs["speaker_names"], {})
 
 
 if __name__ == "__main__":

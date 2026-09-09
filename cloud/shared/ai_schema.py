@@ -15,6 +15,7 @@ import hashlib
 import re
 
 import ai_sanitize
+import mom_schema
 
 from decimal import Decimal
 
@@ -156,26 +157,86 @@ def speaker_roster(transcript):
     return out
 
 
-def _roster_filtered(participants, roster):
+def _roster_filtered(participants, roster, speaker_names=None):
     """Keep only participants whose speaker is in `roster`, in ROSTER order.
 
     Roster order (not model order) so the list reads as the meeting's own
     speaker order, and every roster speaker appears even if the model omitted
     one — a speaker with turns in the transcript IS a participant whether or not
     the model bothered to describe them.
+
+    Matching is on the NORMALIZED label, not the raw string. The roster handed
+    to the prompt is authoritative about WHO spoke, but it is only guidance
+    about how to spell them back, and an exact-string lookup made that spelling
+    load-bearing: a model answering "0", "speaker_0" or "Speaker  0" for a
+    roster of "Speaker 0" missed on every entry, and each speaker silently took
+    the "" default. The visible symptom is a meeting where every speaker is
+    listed and every contribution blurb is blank, which is indistinguishable
+    from a model that wrote no blurbs at all. Observed in production on
+    code-switched (Hindi/Marathi) meetings, where label drift is common.
+
+    `speaker_names` (the row's rename map, {"0": "Yuvraj Sir"}) adds the second
+    miss: a model that answers with the HUMAN name it read off a renamed
+    transcript. Those names are resolved back to their label so the blurb lands
+    on the right speaker instead of being dropped.
+
+    Widening the MATCH does not widen the FILTER — the output is still exactly
+    the roster, in roster order, so a merely-mentioned name still cannot become
+    an attendee. That guarantee is the whole point of this function and is
+    unchanged; only the lookup that finds an existing blurb got more forgiving.
     """
     if not roster:
         return participants
-    by_label = {}
+
+    def _key(label):
+        return mom_schema.normalize_speaker_label(label).strip().casefold()
+
+    # Human name -> roster label, so a model answering "Yuvraj Sir" for
+    # "Speaker 1" still lands. Built only from the roster's own speakers: a
+    # name outside the roster must not resolve to anyone.
+    by_name = {}
+    for label in roster:
+        named = (speaker_names or {}).get(
+            mom_schema.normalize_speaker_label(label))
+        if named and str(named).strip():
+            by_name.setdefault(str(named).strip().casefold(), label)
+
+    by_label, unmatched = {}, []
     for p in participants:
-        k = " ".join((p.get("speaker") or "").split()).lower()
-        if k and k not in by_label:
+        raw = p.get("speaker") or ""
+        k = _key(raw)
+        if not k:
+            continue
+        # A human name resolves to that speaker's label; anything else is
+        # already a label (or a name nobody is mapped to, which stays unmatched
+        # and is reported below).
+        k = _key(by_name.get(k, k))
+        if k not in by_label:
             by_label[k] = p
+        else:
+            unmatched.append(raw)
+
     out = []
     for label in roster:
-        got = by_label.get(label.lower())
+        got = by_label.pop(_key(label), None)
         out.append({"speaker": label,
                     "summary": (got or {}).get("summary", "")})
+
+    # Anything left in by_label named someone outside the roster. Dropping it
+    # is correct (that is the anti-hallucination filter doing its job), but a
+    # DROP CARRYING A SUMMARY is also the signature of the label-drift bug
+    # above, so it is logged rather than silently discarded — the failure that
+    # needed a DynamoDB read to diagnose leaves a trace now.
+    dropped = [p.get("speaker") or "" for p in by_label.values()
+               if str(p.get("summary") or "").strip()]
+    dropped += [lbl for lbl in unmatched if lbl]
+    if dropped:
+        print(f"[ai_schema] roster: dropped {len(dropped)} participant "
+              f"summary/summaries not matching the roster {roster}: {dropped}")
+    blank = sum(1 for p in out if not str(p.get("summary") or "").strip())
+    if blank and participants:
+        print(f"[ai_schema] roster: {blank}/{len(out)} speaker(s) have no "
+              "contribution summary after matching")
     return out
 
 CONFIDENCE_HIGH = "high"
@@ -520,7 +581,7 @@ def empty_analysis():
     }
 
 
-def coerce_analysis(obj, roster=None, valid_ids=None):
+def coerce_analysis(obj, roster=None, valid_ids=None, speaker_names=None):
     """Strict coerce a parsed Groq object into the fixed analysis schema.
 
     Builds the result key-by-key from the four known fields, so a model that
@@ -547,7 +608,7 @@ def coerce_analysis(obj, roster=None, valid_ids=None):
     if not isinstance(obj, dict):
         return empty_analysis() if not roster else {
             **empty_analysis(),
-            "participants": _roster_filtered([], roster),
+            "participants": _roster_filtered([], roster, speaker_names),
         }
     tasks = obj_list(obj.get("tasks"), TASK_SPEC, required=("task",))
     if valid_ids is not None:
@@ -563,11 +624,12 @@ def coerce_analysis(obj, roster=None, valid_ids=None):
         "title": s(obj.get("title")),
         "overview": coerce_overview(obj.get("overview"), valid_ids),
         "tasks": _dedupe_tasks(tasks),
-        "participants": _roster_filtered(participants, roster or []),
+        "participants": _roster_filtered(participants, roster or [],
+                                         speaker_names),
     }
 
 
-def merge_analyses(partials, roster=None):
+def merge_analyses(partials, roster=None, speaker_names=None):
     """Fold per-chunk analyses into one, de-duplicated, order-preserving.
 
     Used as the reduce step's input, and as the final result if the reduce call
@@ -645,7 +707,7 @@ def merge_analyses(partials, roster=None):
     # Same structural guarantee as the single-pass path: a name that never had a
     # speaker turn is not a participant, however many segments volunteered it.
     merged["participants"] = _roster_filtered(merged["participants"],
-                                              roster or [])
+                                              roster or [], speaker_names)
     return merged
 
 
@@ -1140,18 +1202,19 @@ def empty_unified():
             "meeting_highlights": empty_highlights()}
 
 
-def coerce_unified(obj, roster=None, valid_ids=None):
+def coerce_unified(obj, roster=None, valid_ids=None, speaker_names=None):
     """Strict coerce ONE unified Groq reply into its sub-schemas."""
     if not isinstance(obj, dict):
         return {**empty_unified(),
-                "participants": _roster_filtered([], roster or [])}
+                "participants": _roster_filtered([], roster or [],
+                                                 speaker_names)}
 
-    out = coerce_analysis(obj, roster, valid_ids)
+    out = coerce_analysis(obj, roster, valid_ids, speaker_names)
     out["meeting_highlights"] = coerce_highlights(obj.get("meeting_highlights"))
     return out
 
 
-def merge_unified(partials, roster=None):
+def merge_unified(partials, roster=None, speaker_names=None):
     """Fold per-chunk unified analyses into one — the OVERFLOW path only.
 
     Reached only when a transcript exceeds the single-pass budget and
@@ -1161,7 +1224,7 @@ def merge_unified(partials, roster=None):
     correct and differ per section.
     """
     dicts = [p for p in partials if isinstance(p, dict)]
-    merged = merge_analyses(dicts, roster)
+    merged = merge_analyses(dicts, roster, speaker_names)
     merged["meeting_highlights"] = merge_highlights(
         [p.get("meeting_highlights") or {} for p in dicts])
     return merged

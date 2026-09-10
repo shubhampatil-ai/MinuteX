@@ -582,4 +582,21 @@ def build_tables():
         "meeting_access": FakeTable(
             "MeetingAccess", "meeting_id", "user_id",
             indexes={"user-index": ("user_id", "meeting_id")}),
+        # Organisation Salesforce connections (Phase 2D.1). Key schema
+        # mirrors scripts/60_create_org_crm_connections_table.sh exactly —
+        # PK workspace_id, SK provider, no GSI (same shape as CrmConnections,
+        # scoped to a workspace instead of a user).
+        "org_crm_connections": FakeTable(
+            "OrgCrmConnections", "workspace_id", "provider"),
+        # Internal-speaker -> Salesforce User links (Phase 2D.3). Key schema
+        # mirrors scripts/62_create_org_salesforce_user_links_table.sh.
+        "org_salesforce_user_links": FakeTable(
+            "OrgSalesforceUserLinks", "workspace_id", "user_id"),
+        # Durable CRM sync job state (Phase 2D.4). Key schema mirrors
+        # scripts/63_create_crm_sync_jobs_table.sh — PK job_id, GSI
+        # recording-index (recording_key, created_at) for "find the active/
+        # most-recent job for this meeting" without a table scan.
+        "crm_sync_jobs": FakeTable(
+            "CrmSyncJobs", "job_id",
+            indexes={"recording-index": ("recording_key", "created_at")}),
     }

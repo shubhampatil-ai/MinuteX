@@ -300,6 +300,14 @@ export type RecordingDetail = RecordingSummary & {
   // an ungrounded guess is discarded server-side), so the UI treats "nothing
   // here" as ordinary and simply renders no inputs.
   crm_records?: Record<string, CrmRecordValue> | null;
+  // WHOSE workspace this meeting belongs to (Phase 2D.3). Absent on a
+  // personal meeting (and on every recording made before workspaces
+  // existed) — present and equal to an ORGANISATION id only when the
+  // meeting was recorded/owned inside one. This is what the Overview
+  // screen reads to decide whether to show the organisation CRM Review/
+  // Push block instead of (never in addition to — see meeting-crm-records)
+  // the personal Salesforce mapping block.
+  workspace_id?: string;
 };
 
 // Where one mapping stands for one meeting. Object-neutral: the same states
@@ -516,11 +524,16 @@ export async function getToken(): Promise<string | null> {
 
 export async function clearToken(): Promise<void> {
   await store.deleteItemAsync(TOKEN_KEY);
-  // Signing out must not leave the next account pointed at the previous
-  // one's organisation. Harmless if it did — the server would 404 a
-  // workspace they are not in — but it would make the first screen after
-  // login render an error instead of their own data.
-  await clearActiveWorkspace();
+  // Drop the ACTIVE pointer, not the per-account memory. Signing out must
+  // not leave the next account pointed at the previous one's organisation
+  // (the server would 404 it, and the first screen after login would render
+  // an error instead of their own data) — but forgetting outright meant
+  // signing back in always dumped you in Personal, even as the same user.
+  //
+  // So the last workspace is remembered PER USER (see rememberWorkspaceFor /
+  // restoreWorkspaceFor). This clears only the live pointer; the owning
+  // account's memory survives and is restored on their next login.
+  await setActiveWorkspace(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +586,74 @@ export async function setActiveWorkspace(workspaceId: string | null): Promise<vo
 
 export async function clearActiveWorkspace(): Promise<void> {
   await setActiveWorkspace(null);
+}
+
+// ---------------------------------------------------------------------------
+// PER-ACCOUNT WORKSPACE MEMORY — "put me back where I was".
+//
+// WHY A SECOND KEY. WORKSPACE_KEY above is the LIVE pointer: what the app is
+// scoped to right now, and it has to be cleared on sign-out so the next
+// account does not inherit it. But clearing it also threw away the only
+// record of where the previous user had been, so signing back in always
+// landed them in Personal.
+//
+// These two functions keep that memory KEYED BY USER, which is what makes it
+// safe to survive a sign-out: user B's login can only ever read B's own
+// entry, so there is nothing to leak. Restoring is still a HINT, never a
+// grant — WorkspaceProvider re-validates it against a fresh /workspaces list
+// and falls back to Personal when the membership is gone.
+//
+// Personal is stored as "" rather than omitted, so "signed out from Personal"
+// stays distinguishable from "never chose" — the latter should follow the
+// server's current_workspace_id, the former should not be overridden by it.
+const LAST_WORKSPACE_PREFIX = "minutex.workspace.last.";
+
+/** Remember the workspace this user is in, so their next login restores it. */
+export async function rememberWorkspaceFor(
+  userId: string, workspaceId: string | null
+): Promise<void> {
+  const uid = (userId || "").trim();
+  if (!uid) return;
+  try {
+    await store.setItemAsync(LAST_WORKSPACE_PREFIX + uid, workspaceId || "");
+  } catch {
+    // Persistence is a convenience here (see lib/storage.ts). Losing it costs
+    // the user one workspace switch, never correctness.
+  }
+}
+
+/** The remembered workspace for this user WITHOUT touching the live pointer. */
+export async function peekWorkspaceFor(
+  userId: string
+): Promise<string | null> {
+  const uid = (userId || "").trim();
+  if (!uid) return null;
+  try {
+    return await store.getItemAsync(LAST_WORKSPACE_PREFIX + uid);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The workspace this user was last in: an id, "" for Personal, or null when
+ * they have no remembered choice. Makes the live pointer match, so the very
+ * first request after login is already correctly scoped.
+ */
+export async function restoreWorkspaceFor(
+  userId: string
+): Promise<string | null> {
+  const uid = (userId || "").trim();
+  if (!uid) return null;
+  let saved: string | null = null;
+  try {
+    saved = await store.getItemAsync(LAST_WORKSPACE_PREFIX + uid);
+  } catch {
+    return null;
+  }
+  if (saved === null) return null;
+  await setActiveWorkspace(saved || null);
+  return saved;
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,6 +1145,319 @@ export async function syncCrmRecord(
     method: "POST",
     body: { object },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Meeting identity -> Salesforce (Phase 2D.3) — ORGANISATION meetings only.
+//
+// The connection that performs the Salesforce API call is never the same
+// question as who owns the meeting's business content: an organisation
+// meeting's SM/Internal speaker resolves to a Salesforce User who becomes
+// the pushed Task's owner, and an external/Client speaker resolves to a
+// Salesforce Contact/Account — neither is ever the identity that happened
+// to run the Salesforce OAuth connect flow. See the CRM Review screen,
+// which is the one place all of this is surfaced together before a push.
+// ---------------------------------------------------------------------------
+
+export type SpeakerIdentityRole = "internal" | "external" | "";
+
+export type SalesforceContactCandidate = {
+  record_id: string; name: string; email: string; phone: string;
+  account_id: string; account_name: string;
+};
+
+export type SalesforceUserCandidate = {
+  record_id: string; name: string; username: string; email: string;
+};
+
+export async function searchSalesforceContacts(
+  workspaceId: string, q: string
+): Promise<{ records: SalesforceContactCandidate[]; truncated: boolean }> {
+  return request(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/search/contacts`
+    + `?q=${encodeURIComponent(q)}`
+  );
+}
+
+export async function searchSalesforceUsers(
+  workspaceId: string, q: string
+): Promise<{ records: SalesforceUserCandidate[]; truncated: boolean }> {
+  return request(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/search/users`
+    + `?q=${encodeURIComponent(q)}`
+  );
+}
+
+// Persists an EXPLICIT match only — never a search, never a guess. `recordId`
+// must come from searchSalesforceContacts (or be already known).
+export async function resolveContactCrmIdentity(
+  contactId: string, recordId: string, accountId?: string
+): Promise<{ contact: ApiContact }> {
+  return request(`/contacts/${encodeURIComponent(contactId)}/crm`, {
+    method: "PUT",
+    body: { record_id: recordId, account_id: accountId || undefined },
+  });
+}
+
+export type OrgSalesforceUserLink = {
+  user_id: string; sf_user_id: string; sf_username: string; resolved_at: string;
+};
+
+// Owner/Manager only (CAP_MANAGE_INTEGRATIONS) — an org member's Salesforce
+// User identity applies workspace-wide, not just to one meeting.
+export async function resolveMemberCrmIdentity(
+  workspaceId: string, userId: string, recordId: string, username?: string
+): Promise<{ link: OrgSalesforceUserLink }> {
+  const res = await request<{ link: OrgSalesforceUserLink }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/members/`
+    + encodeURIComponent(userId),
+    { method: "PUT", body: { record_id: recordId, username } }
+  );
+  return res;
+}
+
+export type SpeakerCrmState = {
+  speaker_id: string;
+  identity_role: SpeakerIdentityRole;
+  contact_id?: string;
+  status: "resolved" | "unresolved" | "not_linked";
+  reason?: string;
+  minutex_user_id?: string;
+  sf_user_id?: string;
+  sf_username?: string;
+  sf_contact_id?: string;
+  sf_account_id?: string;
+  contact_name?: string;
+};
+
+export type MeetingCrmIdentity = {
+  speakers: SpeakerCrmState[];
+  internal: SpeakerCrmState[];
+  external: SpeakerCrmState[];
+  unresolved: SpeakerCrmState[];
+  owner: SpeakerCrmState | null;
+  primary_client: SpeakerCrmState | null;
+};
+
+export type MeetingCrmReview = {
+  meeting: { title: string; audio_s3_key: string };
+  identity: MeetingCrmIdentity;
+  content: {
+    summary_ready: boolean; highlights_ready: boolean;
+    action_items_ready: boolean; action_item_count: number;
+  };
+  mappings: CrmMapping[];
+  ready: boolean;
+  blocking_reasons: string[];
+};
+
+export async function getMeetingCrmReview(key: string): Promise<MeetingCrmReview> {
+  return request(`/recordings/ai/crm-review/${encodeURIComponent(key)}`);
+}
+
+export type MeetingCrmPushResult = {
+  pushed: { object: string; crm_record: CrmRecordValue }[];
+  push_errors: { object: string; error: string; code: string }[];
+  tasks: {
+    created: { task_id: string; sf_task_id: string; assignee_resolved: boolean }[];
+    skipped: { task_id: string; reason: string }[];
+    failed: { task_id: string; error: string }[];
+  };
+  /** The meeting itself, pushed as ONE Salesforce Event (Phase 2D.3
+   *  completion) — OwnerId is the resolved SM, WhoId the resolved primary
+   *  client Contact, WhatId that Contact's own Account (never a guessed
+   *  one). Idempotent per meeting: a retried push reports
+   *  `created: false, skipped_reason: "already_synced"` rather than a
+   *  second Event. `code` mirrors push_errors[].code — a stable id like
+   *  "salesforce_reconnect_required", never just prose, present only on
+   *  a genuine failure (not on an ordinary skip). */
+  event: {
+    created: boolean;
+    sf_event_id: string;
+    skipped_reason: string;
+    error: string;
+    code: string;
+  };
+  identity: MeetingCrmIdentity;
+};
+
+// ---------------------------------------------------------------------------
+// CRM sync JOBS (Phase 2D.4) — the push itself is now ASYNCHRONOUS.
+//
+// pushMeetingCrm no longer waits for Salesforce: it returns {job_id, status}
+// immediately (HTTP 202), and the actual Event/Task/record-field work runs
+// in a queue-driven worker. The app must poll getCrmSyncJobStatus (or use
+// its own refresh mechanism) to learn the outcome — a successful POST here
+// means "queued", never "Salesforce received it".
+// ---------------------------------------------------------------------------
+export type CrmSyncJobStatus =
+  | "PENDING" | "SYNCING" | "SYNCED" | "RETRYING" | "FAILED" | "RECONNECT_REQUIRED";
+
+export type CrmSyncJob = {
+  job_id: string;
+  status: CrmSyncJobStatus;
+  attempt_count: number;
+  /** "transient" | "reauth" | "permission" | "validation" | "permanent" |
+   *  "" (none yet). Drives which action the UI offers — see
+   *  lib/meeting-crm-records.tsx's OrgCrmReviewBlock for the mapping. */
+  last_error_category: string;
+  last_error_code: string;
+  last_error_message: string;
+  /** The SAME shape pushMeetingCrm used to return synchronously in Phase
+   *  2D.3 — populated once the job has actually run at least once
+   *  (SYNCING or later); {} while still PENDING. */
+  result: Partial<MeetingCrmPushResult>;
+  created_at: string;
+  updated_at: string;
+  completed_at: string;
+};
+
+// Terminal statuses — a job in one of these will not progress further
+// without an explicit retryCrmSyncJob call.
+export const CRM_SYNC_JOB_TERMINAL_STATUSES: CrmSyncJobStatus[] =
+  ["SYNCED", "FAILED", "RECONNECT_REQUIRED"];
+
+export function isCrmSyncJobTerminal(status: CrmSyncJobStatus): boolean {
+  return CRM_SYNC_JOB_TERMINAL_STATUSES.includes(status);
+}
+
+// Enqueues the push and returns immediately — see the module note above.
+// Idempotent at the job level: a second call while a job for this meeting
+// is still non-terminal reuses the SAME job_id rather than creating a
+// second one (the backend's create_crm_sync_job).
+export async function pushMeetingCrm(
+  key: string, objects?: string[]
+): Promise<{ job_id: string; status: CrmSyncJobStatus }> {
+  return request(`/recordings/ai/crm-push/${encodeURIComponent(key)}`, {
+    method: "POST",
+    body: objects ? { objects } : undefined,
+  });
+}
+
+// The most recent CRM sync job for this meeting, or null if the meeting has
+// never been pushed. This is what the UI polls after pushMeetingCrm to learn
+// "queued -> syncing -> synced/failed/reconnect required".
+export async function getCrmSyncJobStatus(key: string): Promise<CrmSyncJob | null> {
+  const res = await request<{ job: CrmSyncJob | null }>(
+    `/recordings/ai/crm-sync-jobs/${encodeURIComponent(key)}`
+  );
+  return res.job;
+}
+
+// User-initiated retry for a job sitting in a TERMINAL state (FAILED —
+// recoverable, e.g. Salesforce was briefly down — or RECONNECT_REQUIRED,
+// after the user has reconnected Salesforce). Re-enqueues the SAME job
+// (attempt_count/history continues) rather than creating a new one; the
+// worker reads whatever identity/config is current AT RETRY TIME, never a
+// cached copy from the original push.
+export async function retryCrmSyncJob(
+  key: string
+): Promise<{ job_id: string; status: CrmSyncJobStatus }> {
+  return request(`/recordings/ai/crm-sync-jobs-retry/${encodeURIComponent(key)}`, {
+    method: "POST",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Organisation Salesforce (Phase 2D) — a SEPARATE connection from Personal
+// above, scoped to one workspace rather than one user.
+//
+// WHY THESE TAKE `workspaceId` EXPLICITLY, unlike every other call in this
+// file. `request()` auto-attaches whichever workspace is currently ACTIVE
+// (see WORKSPACE_HEADER above) — that is correct for resources that live
+// "in the active workspace" implicitly. Organisation Salesforce routes carry
+// `workspace_id` as an explicit PATH segment instead (see the backend's
+// Phase 2D.1/2D.2 routes), precisely so the Integrations screen can show the
+// Personal card and the Organisation card SIMULTANEOUSLY without switching
+// the active workspace back and forth to read each one — the active-header
+// mechanism can only ever address one workspace at a time.
+export type OrgSalesforceStatus = {
+  connected: boolean;
+  instance_url?: string;
+  sf_username?: string;
+  connected_by_user_id?: string;
+  connected_at?: string;
+  /** True once at least one object mapping is saved — the org connection
+   *  can be CONNECTED but not yet CONFIGURED (nothing to push to). */
+  configured?: boolean;
+  /** Present only right after a reconnect changed the underlying Salesforce
+   *  organisation (see the backend's org_salesforce_callback) — an
+   *  Owner/Manager must review and re-save the mapping. Cleared the next
+   *  time config is saved. */
+  config_cleared_reason?: string;
+  config_cleared_at?: string;
+};
+
+export async function getOrgSalesforceAuthorizeUrl(
+  workspaceId: string
+): Promise<string> {
+  const res = await request<{ authorize_url: string }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/connect`
+  );
+  return res.authorize_url;
+}
+
+export async function getOrgSalesforceStatus(
+  workspaceId: string
+): Promise<OrgSalesforceStatus> {
+  return request<OrgSalesforceStatus>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/status`
+  );
+}
+
+export async function disconnectOrgSalesforce(workspaceId: string): Promise<void> {
+  await request(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce`,
+    { method: "DELETE" }
+  );
+}
+
+export async function getOrgSalesforceObjects(
+  workspaceId: string
+): Promise<{ objects: SalesforceObject[]; suggested: string | null }> {
+  return request(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/objects`
+  );
+}
+
+export async function getOrgSalesforceFields(
+  workspaceId: string,
+  objectName: string
+): Promise<SalesforceFieldsResponse> {
+  return request(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/fields/`
+    + encodeURIComponent(objectName)
+  );
+}
+
+export async function getOrgSalesforceConfig(
+  workspaceId: string
+): Promise<SalesforceConfig> {
+  const res = await request<{ config: SalesforceConfig }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/config`
+  );
+  return res.config;
+}
+
+export async function saveOrgSalesforceConfig(
+  workspaceId: string,
+  config: SalesforceConfigInput
+): Promise<SalesforceConfig> {
+  const res = await request<{ config: SalesforceConfig }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/config`,
+    { method: "PUT", body: config }
+  );
+  return res.config;
+}
+
+// The backend's "no workspace has connected Salesforce yet" answer (HTTP 400
+// + this code) — distinct from SALESFORCE_RECONNECT_CODE, which means a
+// connection EXISTS but its credential died. One shows a Connect button, the
+// other shows Reconnect; collapsing them would lose that distinction.
+export const ORG_SALESFORCE_NOT_CONNECTED_CODE = "organisation_salesforce_not_connected";
+
+export function isOrgSalesforceNotConnected(e: unknown): boolean {
+  return e instanceof ApiError && e.code === ORG_SALESFORCE_NOT_CONNECTED_CODE;
 }
 
 // ---------------------------------------------------------------------------
@@ -2220,6 +2614,13 @@ export type ApiParticipant = {
   speaker_id: string;
   contact_id: string;
   participant_role: string;
+  /** CRM identity classification (Phase 2D.3) — "internal" (resolves through
+   * the organisation, ultimately to a Salesforce User) or "external"
+   * (resolves through this Contact, ultimately to a Salesforce Contact/
+   * Account). "" means not yet classified, the ordinary state for a meeting
+   * nobody intends to push to Salesforce. Independent of participant_role's
+   * free text. */
+  identity_role?: SpeakerIdentityRole;
   created_at: string;
   updated_at: string;
   contact?: ApiContact;
@@ -2289,11 +2690,39 @@ export type ApiContact = {
    *   ""        no photo
    */
   avatar_source: ContactAvatarSource;
+  /** WHERE this contact lives. An organisation id means the entry is part of
+   * the SHARED address book; a personal id means it is private to its owner.
+   * Presentation only — the backend enforces access in _owned_contact. */
+  workspace_id?: string;
+  /** True when this contact belongs to an organisation's shared book. */
+  shared?: boolean;
+  /** How the row came to exist. "member" is an organisation colleague synced
+   * from live membership; "manual" is somebody the user added. */
+  source?: ContactSource;
+  /** The person's LIVE role in the organisation being listed — "OWNER",
+   * "MANAGER" or "MEMBER". Empty means "not a colleague" (an ordinary client,
+   * or a personal contact), never "role unknown": the server resolves it from
+   * membership on every read, so it cannot be stale. Render it as the tag
+   * next to the name. */
+  workspace_role?: WorkspaceRole | "";
+  /** True when this entry IS an organisation member. Their name and photo
+   * come from their own MinuteX profile, so Edit and Delete must be hidden —
+   * the API answers 409 `contact_is_member` for both. */
+  is_member?: boolean;
+  /** CRM identity (Phase 2D.3) — present only once EXPLICITLY confirmed via
+   * resolveContactCrmIdentity. Never inferred from name/email; absent means
+   * "no Salesforce match confirmed yet", not "looked up and found none". */
+  crm_provider?: string;
+  crm_object_type?: string;
+  crm_external_id?: string;
+  crm_account_id?: string;
+  crm_resolved_at?: string;
   created_at: string;
   updated_at: string;
 };
 
 export type ContactAvatarSource = "" | "own" | "minutex";
+export type ContactSource = "manual" | "member" | string;
 
 // -- Contacts ---------------------------------------------------------------
 export async function getContacts(params?: {
@@ -2395,6 +2824,13 @@ export async function getParticipants(
     participants: res.participants ?? [],
     speakers: res.speakers ?? [],
     speaker_names: res.speaker_names ?? {},
+    // Passed through, not dropped. The screen reads this to decide whether a
+    // meeting with no speakers is still PROCESSING or genuinely finished;
+    // omitting it here pinned that check to "still processing" forever, so a
+    // finished recording with no diarized speakers promised a transcript that
+    // was never coming. Optional in the type, and the screen already treats a
+    // missing value as "still processing", so an older backend is unaffected.
+    recording_status: res.recording_status,
   };
 }
 
@@ -2405,7 +2841,8 @@ export async function setParticipant(
   key: string,
   speakerId: string,
   contactId: string | null,
-  participantRole?: string
+  participantRole?: string,
+  identityRole?: SpeakerIdentityRole
 ): Promise<{
   participant?: ApiParticipant;
   cleared?: boolean;
@@ -2417,6 +2854,11 @@ export async function setParticipant(
       speaker_id: speakerId,
       contact_id: contactId,
       participant_role: participantRole,
+      // Omitted (not sent as "") when not provided, so re-tagging a speaker
+      // for an unrelated reason (fixing participant_role, say) never
+      // overwrites a previously classified identity_role — the backend
+      // preserves it when the field is absent from the request body.
+      identity_role: identityRole || undefined,
     },
   });
 }

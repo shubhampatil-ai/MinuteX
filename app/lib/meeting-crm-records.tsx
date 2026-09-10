@@ -25,15 +25,19 @@
 //
 // Confirmation is load-bearing: nothing syncs without an explicit user action,
 // because notes written onto the wrong record are worse than no notes.
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator, Modal, Pressable,
   StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { FONT, R, S, useTheme, ColorScale } from "./theme";
-import { Button, Card, KeyboardAwareSheet, SectionRule, StatusPill } from "./ui";
+import { Button, Card, ErrorText, KeyboardAwareSheet, SectionRule, StatusPill } from "./ui";
 import { Icon, type IconName } from "./icons";
-import type { CrmCandidate, CrmMapping, CrmRecordValue, CrmSyncStatus } from "./api";
+import {
+  ApiError, CrmSyncJob, MeetingCrmReview, getCrmSyncJobStatus,
+  getMeetingCrmReview, isCrmSyncJobTerminal, pushMeetingCrm, retryCrmSyncJob,
+  type CrmCandidate, type CrmMapping, type CrmRecordValue, type CrmSyncStatus,
+} from "./api";
 
 const VALUE_MAX = 255;
 
@@ -459,6 +463,424 @@ export function CrmRecordsBlock({
             showDivider={i > 0}
           />
         ))}
+      </Card>
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ORGANISATION CRM REVIEW (Phase 2D.3) — the identity-resolution summary and
+// the push gate. A SEPARATE block from CrmRecordsBlock above, deliberately:
+// that one is the per-object field-mapping UI shared with Personal
+// Salesforce (untouched by this phase); this one is organisation-only and
+// concerns WHO the meeting's speakers resolve to, not which record fields
+// get written. Both can render on the same Overview screen — this one
+// ABOVE crm-records, since knowing who the meeting was with comes before
+// deciding what to write about it.
+// ---------------------------------------------------------------------------
+
+function speakerLine(label: string, state: {
+  identity_role?: string; status: string; sf_username?: string; contact_name?: string;
+} | null | undefined, C: ColorScale) {
+  if (!state) {
+    return { icon: "questionmark.circle" as IconName, color: C.textFaint,
+             text: `${label}: not tagged` };
+  }
+  if (state.status === "resolved") {
+    const who = state.identity_role === "internal"
+      ? state.sf_username : state.contact_name;
+    return { icon: "checkmark.circle.fill" as IconName, color: C.success,
+             text: `${label}: ${who || "resolved"}` };
+  }
+  return { icon: "exclamationmark.triangle.fill" as IconName, color: C.warn,
+           text: `${label}: unresolved` };
+}
+
+function buildReviewStyles(C: ColorScale) {
+  return StyleSheet.create({
+    row: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: S.sm,
+      paddingVertical: 8,
+    },
+    rowTxt: { fontFamily: FONT.medium, fontSize: 13.5, color: C.text, flex: 1 },
+    blurb: {
+      fontFamily: FONT.regular, fontSize: 12.5, color: C.textDim,
+      lineHeight: 18, marginTop: 2, marginBottom: 10,
+    },
+    divider: { height: 1, backgroundColor: C.border, marginVertical: S.sm },
+    resultRow: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: 8,
+      paddingVertical: 6,
+    },
+    resultTxt: { fontFamily: FONT.regular, fontSize: 12.5, color: C.textDim, flex: 1 },
+    actionsRow: {
+      flexDirection: "row" as const, gap: S.sm, marginTop: S.md, flexWrap: "wrap" as const,
+    },
+  });
+}
+
+// How often to poll while a job is non-terminal (Phase 2D.4). The push
+// itself answers in well under a second (it only writes a DynamoDB row and
+// sends one SQS message); the ACTUAL Salesforce work happens in the worker
+// on its own schedule, so the app has no way to know completion except by
+// asking again. 3s balances feeling responsive against hammering the API —
+// slower than a chat app's typing indicator, faster than a human would
+// notice as sluggish for something they just explicitly asked to run.
+const CRM_JOB_POLL_INTERVAL_MS = 3000;
+
+// The status line shown while a job is in flight — spec section 21's
+// "queued... syncing... synced/failed/reconnect required" progression.
+function jobStatusLabel(status: CrmSyncJob["status"] | "queuing"): string {
+  switch (status) {
+    case "queuing": return "CRM sync queued";
+    case "PENDING": return "CRM sync queued";
+    case "SYNCING": return "CRM syncing…";
+    case "RETRYING": return "CRM sync retrying…";
+    case "SYNCED": return "CRM synced";
+    case "FAILED": return "CRM sync failed";
+    case "RECONNECT_REQUIRED": return "Reconnect Salesforce required";
+    default: return "";
+  }
+}
+
+/** The Organisation CRM Review + Push block, rendered on the Overview screen
+ *  for an organisation meeting only. Fetches its own state (get_meeting_crm_
+ *  review, plus the CRM sync job for this meeting) rather than threading it
+ *  through meeting-context — this is a narrow, self-contained concern that
+ *  only this block needs, and the existing context already carries enough
+ *  for the Personal path. */
+export function OrgCrmReviewBlock({ meetingKey }: { meetingKey: string }) {
+  const { C } = useTheme();
+  const st = useMemo(() => buildReviewStyles(C), [C]);
+  const [review, setReview] = useState<MeetingCrmReview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [pushing, setPushing] = useState(false);
+  // "queuing" is a LOCAL transient state for the moment between tapping
+  // Push and the enqueue response landing — never confused with the
+  // server's own PENDING (which persists until the worker actually picks
+  // the job up), but rendered identically ("CRM sync queued") since the
+  // difference is not meaningful to a user watching this screen.
+  const [job, setJob] = useState<CrmSyncJob | "queuing" | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const load = useCallback(async () => {
+    setError("");
+    try {
+      setReview(await getMeetingCrmReview(meetingKey));
+    } catch (e) {
+      // A 400 here (not connected / not configured) is an ORDINARY state for
+      // most organisation meetings, not a failure worth alarming over — the
+      // blocking_reasons on a successful response already explain it. Only a
+      // genuinely unexpected error gets its own message.
+      if (!(e instanceof ApiError && e.status === 400)) {
+        setError(e instanceof ApiError ? e.message : "Could not load CRM review.");
+      }
+      setReview(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [meetingKey]);
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }, []);
+
+  const pollOnce = useCallback(async () => {
+    try {
+      const latest = await getCrmSyncJobStatus(meetingKey);
+      if (!latest) { stopPolling(); return; }
+      setJob(latest);
+      if (isCrmSyncJobTerminal(latest.status)) {
+        stopPolling();
+        await load(); // a push can change record states the review reads
+      }
+    } catch {
+      // A transient poll failure must not stop the block from rendering
+      // whatever it last knew — the NEXT tick tries again, and the
+      // interval itself is the retry.
+    }
+  }, [meetingKey, stopPolling, load]);
+
+  const startPolling = useCallback(() => {
+    stopPolling();
+    pollRef.current = setInterval(() => { void pollOnce(); }, CRM_JOB_POLL_INTERVAL_MS);
+  }, [stopPolling, pollOnce]);
+
+  // On mount: load the review AND check whether a job from an earlier visit
+  // (or another device) is still in flight — the UI must not assume
+  // "no local push state" means "nothing is happening", since the worker
+  // runs independently of this screen being open.
+  useEffect(() => {
+    void load();
+    (async () => {
+      try {
+        const existing = await getCrmSyncJobStatus(meetingKey);
+        if (existing) {
+          setJob(existing);
+          if (!isCrmSyncJobTerminal(existing.status)) startPolling();
+        }
+      } catch {
+        // No prior job, or a transient read failure — either way the Push
+        // button itself is the recovery path, so this stays silent.
+      }
+    })();
+    return stopPolling;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meetingKey]);
+
+  const push = async () => {
+    setPushing(true);
+    setError("");
+    setJob("queuing");
+    try {
+      await pushMeetingCrm(meetingKey);
+      // Read back the real row rather than trusting the enqueue response's
+      // bare {job_id, status} shape — the status route is the one source of
+      // job truth this component polls from here on.
+      const fresh = await getCrmSyncJobStatus(meetingKey);
+      setJob(fresh ?? "queuing");
+      if (!fresh || !isCrmSyncJobTerminal(fresh.status)) startPolling();
+    } catch (e) {
+      setJob(null);
+      setError(e instanceof ApiError ? e.message : "Could not queue the CRM push.");
+    } finally {
+      setPushing(false);
+    }
+  };
+
+  const retry = async () => {
+    setRetrying(true);
+    setError("");
+    try {
+      await retryCrmSyncJob(meetingKey);
+      const fresh = await getCrmSyncJobStatus(meetingKey);
+      setJob(fresh);
+      if (!fresh || !isCrmSyncJobTerminal(fresh.status)) startPolling();
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Could not retry the CRM push.");
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <View>
+        <SectionRule right={<Icon name="cloud.fill" tintColor={C.textFaint} size={15} />}>
+          CRM Review
+        </SectionRule>
+        <Card><ActivityIndicator color={C.textFaint} /></Card>
+      </View>
+    );
+  }
+
+  // No review at all (not connected / not configured) — say so briefly and
+  // point at the fix, rather than rendering an empty-looking block.
+  if (!review) {
+    return (
+      <View>
+        <SectionRule right={<Icon name="cloud.fill" tintColor={C.textFaint} size={15} />}>
+          CRM Review
+        </SectionRule>
+        <Card>
+          <Text style={st.blurb}>
+            Organisation Salesforce isn&apos;t connected or configured yet.
+            An owner or manager can set it up from Organisation → Integrations.
+          </Text>
+        </Card>
+      </View>
+    );
+  }
+
+  const { identity, content, ready, blocking_reasons } = review;
+
+  return (
+    <View>
+      <SectionRule right={<Icon name="cloud.fill" tintColor={C.textFaint} size={15} />}>
+        CRM Review
+      </SectionRule>
+      <Card>
+        {error ? <ErrorText>{error}</ErrorText> : null}
+
+        {(() => {
+          const owner = speakerLine("SM", identity.owner, C);
+          return (
+            <View style={st.row}>
+              <Icon name={owner.icon} tintColor={owner.color} size={16} />
+              <Text style={st.rowTxt}>{owner.text}</Text>
+            </View>
+          );
+        })()}
+        {(() => {
+          const client = speakerLine("Client", identity.primary_client, C);
+          return (
+            <View style={st.row}>
+              <Icon name={client.icon} tintColor={client.color} size={16} />
+              <Text style={st.rowTxt}>{client.text}</Text>
+            </View>
+          );
+        })()}
+        {identity.unresolved.map((s) => (
+          <View key={s.speaker_id} style={st.row}>
+            <Icon name="exclamationmark.triangle.fill" tintColor={C.warn} size={16} />
+            <Text style={st.rowTxt}>
+              Speaker {s.speaker_id}: {s.reason || "unresolved"}
+            </Text>
+          </View>
+        ))}
+
+        <View style={st.divider} />
+
+        <View style={st.row}>
+          <Icon
+            name={content.summary_ready ? "checkmark.circle.fill" : "info.circle"}
+            tintColor={content.summary_ready ? C.success : C.textFaint}
+            size={16}
+          />
+          <Text style={st.rowTxt}>Summary {content.summary_ready ? "ready" : "not ready"}</Text>
+        </View>
+        <View style={st.row}>
+          <Icon
+            name={content.action_items_ready ? "checkmark.circle.fill" : "info.circle"}
+            tintColor={content.action_items_ready ? C.success : C.textFaint}
+            size={16}
+          />
+          <Text style={st.rowTxt}>
+            Action items {content.action_items_ready ? `· ${content.action_item_count} ready` : "none"}
+          </Text>
+        </View>
+
+        {!ready && blocking_reasons.length ? (
+          <Text style={st.blurb}>
+            {blocking_reasons.includes("unresolved_speaker_identity")
+              ? "Resolve every tagged speaker's Salesforce identity before pushing."
+              : blocking_reasons.includes("no_salesforce_mapping_configured")
+                ? "No Salesforce mapping is configured for this organisation yet."
+                : "Organisation Salesforce isn't connected."}
+          </Text>
+        ) : null}
+
+        {job ? (
+          <>
+            <View style={st.divider} />
+            <View style={st.resultRow}>
+              {job === "queuing" || job.status === "PENDING" || job.status === "SYNCING"
+                || job.status === "RETRYING" ? (
+                <ActivityIndicator size="small" color={C.primary} />
+              ) : (
+                <Icon
+                  name={job.status === "SYNCED" ? "checkmark"
+                    : "exclamationmark.triangle"}
+                  tintColor={job.status === "SYNCED" ? C.success : C.danger}
+                  size={13}
+                />
+              )}
+              <Text style={st.resultTxt}>
+                {jobStatusLabel(job === "queuing" ? "queuing" : job.status)}
+              </Text>
+            </View>
+
+            {/* Per-operation detail — only once the worker has actually run
+                (job.result is populated from SYNCING onward). The UI must
+                not assume a successful ENQUEUE means Salesforce received
+                anything (spec section 21) — this section is exactly the
+                proof point that distinguishes "queued" from "done". */}
+            {job !== "queuing" && job.result?.pushed?.map((p) => (
+              <View key={p.object} style={st.resultRow}>
+                <Icon name="checkmark" tintColor={C.success} size={13} />
+                <Text style={st.resultTxt}>{p.object} synced</Text>
+              </View>
+            ))}
+            {job !== "queuing" && job.result?.push_errors?.map((e) => (
+              <View key={e.object} style={st.resultRow}>
+                <Icon name="exclamationmark.triangle" tintColor={C.danger} size={13} />
+                <Text style={st.resultTxt}>{e.object}: {e.error}</Text>
+              </View>
+            ))}
+            {job !== "queuing" && job.result?.tasks?.created?.length ? (
+              <View style={st.resultRow}>
+                <Icon name="checkmark" tintColor={C.success} size={13} />
+                <Text style={st.resultTxt}>
+                  {job.result.tasks.created.length} Salesforce Task
+                  {job.result.tasks.created.length === 1 ? "" : "s"} created
+                </Text>
+              </View>
+            ) : null}
+            {job !== "queuing" && job.result?.tasks?.failed?.length ? (
+              <View style={st.resultRow}>
+                <Icon name="exclamationmark.triangle" tintColor={C.danger} size={13} />
+                <Text style={st.resultTxt}>
+                  {job.result.tasks.failed.length} task{job.result.tasks.failed.length === 1 ? "" : "s"} failed
+                </Text>
+              </View>
+            ) : null}
+            {job !== "queuing" && job.result?.event?.created ? (
+              <View style={st.resultRow}>
+                <Icon name="checkmark" tintColor={C.success} size={13} />
+                <Text style={st.resultTxt}>Meeting Event created in Salesforce</Text>
+              </View>
+            ) : job !== "queuing" && job.result?.event?.error ? (
+              <View style={st.resultRow}>
+                <Icon name="exclamationmark.triangle" tintColor={C.danger} size={13} />
+                <Text style={st.resultTxt}>Event: {job.result.event.error}</Text>
+              </View>
+            ) : null}
+
+            {/* The job's OWN failure reason — distinct from per-operation
+                detail above, and what actually decides which action button
+                renders below (spec section 14: not a generic Retry for
+                every failure). */}
+            {job !== "queuing" && job.status === "FAILED" && job.last_error_message ? (
+              <Text style={st.blurb}>Reason: {job.last_error_message}</Text>
+            ) : null}
+            {job !== "queuing" && job.status === "RECONNECT_REQUIRED" ? (
+              <Text style={st.blurb}>
+                This organisation&apos;s Salesforce connection has expired. Reconnect it from
+                Organisation → Integrations, then retry.
+              </Text>
+            ) : null}
+          </>
+        ) : null}
+
+        <View style={st.actionsRow}>
+          {job !== "queuing" && job?.status === "RECONNECT_REQUIRED" ? (
+            // No generic Retry for a dead credential — the actual fix is
+            // reconnecting, not trying the same request again (spec
+            // section 14). Once reconnected, the SAME job can be retried;
+            // this screen does not itself navigate to Integrations (no
+            // existing cross-tab navigation convention for this file to
+            // reuse), so it names the fix rather than offering a dead-end
+            // button.
+            <Text style={st.blurb}>
+              Reconnect Salesforce for this organisation to continue.
+            </Text>
+          ) : job !== "queuing" && job?.status === "FAILED"
+              && job.last_error_category === "permanent" ? (
+            // A permanent failure (bad config, missing identity, deleted
+            // record) will fail again identically on retry — the fix is
+            // reviewing configuration/identity, not repeating the request.
+            <Text style={st.blurb}>
+              Review the CRM configuration or speaker identity above, then push again.
+            </Text>
+          ) : job !== "queuing" && job?.status === "FAILED" ? (
+            <Button
+              label={retrying ? "Retrying…" : "Retry"}
+              loading={retrying}
+              disabled={retrying}
+              onPress={retry}
+            />
+          ) : (
+            <Button
+              label={pushing || job === "queuing" ? "Queuing…" : "Push to Salesforce"}
+              loading={pushing}
+              disabled={!ready || pushing
+                || (job !== null && job !== "queuing" && !isCrmSyncJobTerminal(job.status))}
+              onPress={push}
+            />
+          )}
+        </View>
       </Card>
     </View>
   );

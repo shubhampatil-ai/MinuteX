@@ -213,7 +213,7 @@ def public_status(provider: str, row=None) -> dict:
 
 
 def salesforce_row(crm_row) -> dict:
-    """A CrmConnections row in this module's row shape.
+    """A CrmConnections (PERSONAL) row in this module's row shape.
 
     Salesforce predates the Integrations table and stores different attribute
     names (`sf_username`, no `status`, no `scopes`). Translating here — rather
@@ -244,6 +244,60 @@ def salesforce_row(crm_row) -> dict:
         "connected_at": crm_row.get("connected_at", ""),
         "updated_at": crm_row.get("updated_at", ""),
     }
+
+
+def org_salesforce_row(org_crm_row) -> dict:
+    """An OrgCrmConnections (ORGANISATION, Phase 2D.1/2D.2) row in this
+    module's row shape — the workspace-scoped twin of salesforce_row above.
+
+    Same translation, same inference limits (see salesforce_row's docstring
+    for why only CONNECTED/NOT_CONNECTED are reachable from a cheap read).
+    Kept as a SEPARATE function rather than a `scope` parameter on
+    salesforce_row: the two source rows have different shapes
+    (`connected_by_user_id` here, no such concept for Personal) and different
+    tables, and a shared function would have to branch on scope internally
+    for no real reuse gained — the translation logic itself is three lines.
+    """
+    if not org_crm_row:
+        return None
+    return {
+        "status": STATUS_CONNECTED,
+        "status_message": "",
+        "refresh_token_enc": org_crm_row.get("refresh_token_enc", ""),
+        "account_identifier": org_crm_row.get("sf_username", ""),
+        "account_name": org_crm_row.get("instance_url", ""),
+        "scopes": [],
+        "connected_at": org_crm_row.get("connected_at", ""),
+        "updated_at": org_crm_row.get("updated_at", ""),
+    }
+
+
+def public_org_salesforce_status(org_crm_row=None) -> dict:
+    """The ORGANISATION Salesforce card, in the SAME shape public_status()
+    returns for every other provider — so the frontend renders the
+    Personal-Salesforce card and the Organisation-Salesforce card with one
+    component, never two.
+
+    Deliberately its own function rather than a `workspace_id` parameter
+    threaded through public_status()/catalog(): those two stay exactly what
+    they already are — the per-USER catalog, unaware that workspaces exist.
+    An organisation's Salesforce connection is not a row in that catalog and
+    must never be merged into it (see the module docstring's table-separation
+    rationale) — it is a second, independent status the workspace-aware
+    screen fetches and renders alongside the personal one.
+    """
+    out = public_status(PROVIDER_SALESFORCE, org_salesforce_row(org_crm_row))
+    out["scope"] = "organisation"
+    # configured / config_cleared_reason are ORGANISATION-CONFIG concepts
+    # (Phase 2D.2) with no Personal equivalent surfaced here — added only
+    # when present so a Personal-shaped consumer of public_status() (which
+    # never sees this function) is not required to know about them.
+    if org_crm_row:
+        out["configured"] = bool(org_crm_row.get("config", {}).get("mappings")) \
+            if isinstance(org_crm_row.get("config"), dict) else False
+        if org_crm_row.get("config_cleared_reason"):
+            out["config_cleared_reason"] = org_crm_row["config_cleared_reason"]
+    return out
 
 
 def catalog(rows_by_provider=None) -> list:

@@ -26,13 +26,17 @@
 //   longer appears the app falls back to Personal instead of showing a
 //   screen full of 404s.
 import React, {
-  createContext, useCallback, useContext, useEffect, useMemo, useState,
+  createContext, useCallback, useContext, useEffect, useMemo, useRef, useState,
 } from "react";
 import {
   ApiWorkspace,
   WorkspaceRole,
+  getMe,
+  getToken,
   getWorkspaces,
   getActiveWorkspaceId,
+  peekWorkspaceFor,
+  rememberWorkspaceFor,
   setActiveWorkspace as persistActiveWorkspace,
 } from "./api";
 
@@ -47,6 +51,13 @@ type Ctx = {
   isOrganisation: boolean;
   /** The caller's role in the active workspace. Display gating ONLY. */
   role: WorkspaceRole | "";
+  /** Display gating ONLY, exactly like `role` above — reads the
+   *  `capabilities` map the backend already computes from the role
+   *  (workspace_schema.capabilities_for) and sends on every workspace, so
+   *  a capability name change on the server needs no matching change here.
+   *  The backend re-checks the same capability on every mutating request;
+   *  this only decides whether a button renders as usable. */
+  can: (capability: string) => boolean;
   loading: boolean;
   /** Non-fatal: the last load error, for screens that want to show it. */
   error: string;
@@ -61,16 +72,64 @@ const WorkspaceContext = createContext<Ctx | null>(null);
 export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
   const [workspaces, setWorkspaces] = useState<ApiWorkspace[]>([]);
   const [activeId, setActiveId] = useState<string>("");
+  // WHOSE workspaces these are. Needed only so a switch can be remembered
+  // under the right account (see rememberWorkspaceFor) — never for
+  // authorization, which the server does on every request regardless.
+  const userIdRef = useRef<string>("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
     setError("");
+    // NO TOKEN, NO REQUEST. This provider is mounted ABOVE the auth gate, so
+    // it also mounts on /login — where a fetch is guaranteed to 401 with
+    // "missing bearer token". That 401 used to land in the catch below and
+    // leave `workspaces` empty for the whole session, which is exactly how an
+    // owner's organisation "disappeared" after signing back in: nothing
+    // re-fetched once the token existed.
+    //
+    // Signed out is a STATE, not an error: clear the list so the next
+    // account never sees the previous one's workspaces, and leave `error`
+    // empty so /login does not render a failure the user cannot act on.
+    if (!(await getToken())) {
+      setWorkspaces([]);
+      setActiveId("");
+      userIdRef.current = "";
+      setLoading(false);
+      return;
+    }
     try {
-      const stored = await getActiveWorkspaceId();
       const { workspaces: list, current_workspace_id } = await getWorkspaces();
       setWorkspaces(list);
 
+      // WHOSE list this is, resolved BEFORE the workspace is chosen, because
+      // the per-account memory below is keyed on it. Awaited deliberately:
+      // the earlier fire-and-forget version made this whole feature a race —
+      // it worked when /me happened to win and silently fell back to Personal
+      // when it did not, which is exactly the "works once, then doesn't"
+      // behaviour.
+      if (!userIdRef.current) {
+        try {
+          userIdRef.current = (await getMe()).user_id || "";
+        } catch {
+          /* fall through: the live pointer below still scopes this session */
+        }
+      }
+
+      // WHERE TO LAND. The live pointer is the first choice, but it is
+      // module-level state that a sign-out sets to null, so after a
+      // sign-out/sign-in cycle within one app run it can legitimately be
+      // empty even though this account HAS a remembered workspace. Falling
+      // back to that per-account memory is what makes the restore reliable
+      // rather than dependent on which async path finished first.
+      //
+      // "" is a real answer meaning Personal (see rememberWorkspaceFor), so
+      // it is distinguished from null, which means "nothing remembered".
+      let stored = await getActiveWorkspaceId();
+      if (!stored) {
+        const remembered = await peekWorkspaceFor(userIdRef.current);
+        if (remembered) stored = remembered;
+      }
       // RE-VALIDATE the stored id against what the server just returned.
       // If the user was removed from an organisation while the app was
       // closed, the id is gone from the list and we must not keep sending
@@ -85,8 +144,28 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
       if (!stillValid && stored) {
         // Clear the dead hint so the next cold start does not retry it.
         await persistActiveWorkspace(null);
+      } else if (stillValid) {
+        // SYNC THE LIVE POINTER. `stored` may have come from the per-account
+        // memory rather than the pointer, and the pointer is what request()
+        // reads to attach the workspace header. Without this the UI would
+        // show the organisation while every call was still scoped personal.
+        // setActiveWorkspace maps a personal id to null on its own.
+        await persistActiveWorkspace(next);
       }
       setActiveId(next);
+
+      // RECORD WHERE THIS SESSION ACTUALLY LANDED, not just explicit
+      // switches. A user who is already in their organisation may never tap
+      // the switcher at all, and remembering only on switchTo would leave
+      // them with nothing stored and drop them into Personal on their next
+      // sign-in — the very bug this is meant to fix. Written in the
+      // background so it never delays first paint.
+      if (next && userIdRef.current) {
+        const isPersonal = !!list.find(
+          (w) => w.workspace_id === next && w.is_personal);
+        await rememberWorkspaceFor(
+          userIdRef.current, isPersonal ? null : next);
+      }
     } catch (e: any) {
       // Leave whatever we had. A failed workspace list must not lock the
       // user out of the app — the personal path works with no header at all,
@@ -106,7 +185,27 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
     const target = workspaces.find((w) => w.workspace_id === workspaceId);
     if (!target) return;
     setActiveId(workspaceId);
-    await persistActiveWorkspace(target.is_personal ? null : workspaceId);
+    const value = target.is_personal ? null : workspaceId;
+    await persistActiveWorkspace(value);
+    // Remember it against the ACCOUNT too, so signing out and back in lands
+    // here again instead of defaulting to Personal.
+    //
+    // RESOLVED ON DEMAND when the background /me above has not landed yet.
+    // Without this the id is still "" for the first seconds after launch,
+    // rememberWorkspaceFor no-ops on the empty id, and the switch is silently
+    // forgotten — which is precisely the case that matters, since switching
+    // workspace is one of the first things a user does after opening the app.
+    let uid = userIdRef.current;
+    if (!uid) {
+      try {
+        uid = (await getMe()).user_id || "";
+        userIdRef.current = uid;
+      } catch {
+        // Genuinely offline: the live pointer is already persisted above, so
+        // this session is correct; only the cross-sign-in memory is lost.
+      }
+    }
+    await rememberWorkspaceFor(uid, value);
   }, [workspaces]);
 
   const value = useMemo<Ctx>(() => {
@@ -114,12 +213,14 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
       workspaces.find((w) => w.workspace_id === activeId)
       ?? workspaces.find((w) => w.is_personal)
       ?? null;
+    const capabilities = active?.capabilities;
     return {
       workspaces,
       active,
       activeId: active?.workspace_id ?? "",
       isOrganisation: !!active && !active.is_personal,
       role: (active?.role ?? "") as WorkspaceRole | "",
+      can: (capability: string) => !!capabilities?.[capability],
       loading,
       error,
       switchTo,

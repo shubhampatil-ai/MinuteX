@@ -116,6 +116,32 @@ function GoogleTasksLogo({ size = 28 }: LogoProps) {
 }
 
 // ---------------------------------------------------------------------------
+// Outlook — the blue "O" badge with the envelope. Not currently offered as
+// an integration (no Outlook provider exists in the backend registry yet),
+// but present for the same forward-provisioning reason as Google Drive
+// below: the catalog is server-driven, so the day it ships the card renders
+// correctly with no app update, and the fallback link icon never has to
+// stand in for a real vendor.
+// ---------------------------------------------------------------------------
+function OutlookLogo({ size = 28 }: LogoProps) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 48 48">
+      <Rect x="22" y="6" width="20" height="30" rx="2" fill="#0364B8" />
+      <Path fill="#0A2767" d="M22 6 4 12v24l18 6V6Z" />
+      <Path fill="#28A8EA" d="M22 12.5 8 16v16l14 3.5V12.5Z" />
+      <Path fill="#0078D4" d="M42 12H26v9h16v-9Z" />
+      <Path fill="#0364B8" d="M42 21H26v9h16v-9Z" opacity={0.85} />
+      <Path fill="#14447D" d="M26 30h16v6H26z" />
+      <Circle cx="15" cy="24" r="6" fill="#FFFFFF" />
+      <Path
+        fill="#0078D4"
+        d="M15 19.5a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9Zm0 7.2a2.7 2.7 0 1 1 0-5.4 2.7 2.7 0 0 1 0 5.4Z"
+      />
+    </Svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Google Drive — the tri-colour triangle. Not currently offered as an
 // integration, but the mark is here because Drive is the most likely next
 // Google provider and the registry is server-driven: the day the backend adds
@@ -142,6 +168,7 @@ const LOGOS: Record<string, (p: LogoProps) => React.ReactElement> = {
   google_calendar: GoogleCalendarLogo,
   google_tasks: GoogleTasksLogo,
   google_drive: GoogleDriveLogo,
+  outlook: OutlookLogo,
 };
 
 /** True when a real brand mark exists for this provider. Lets a caller choose

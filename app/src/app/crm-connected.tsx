@@ -22,20 +22,32 @@
 // this redirect, and `connected=1` here is only a report of that. It reads the
 // query param, tells the user, and sends them somewhere real — the Salesforce
 // settings screen, which re-fetches the authoritative status from the backend.
+//
+// PERSONAL VS ORGANISATION (Phase 2D.1+). Both salesforce_callback (Personal)
+// and org_salesforce_callback (Organisation) redirect here — same deep link,
+// same app route, because a single OAuth landing page is simpler than two.
+// The org callback additionally sets `scope=organisation` on the redirect, so
+// this screen sends the user back to the CORRECT settings screen (/salesforce
+// vs /org-salesforce) instead of always assuming Personal.
 import { useEffect } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { FONT, S, useTheme, ColorScale } from "../../lib/theme";
 import { Loading } from "../../lib/ui";
 
-// Mirrors REASON_COPY in lib/salesforce.ts — the same backend ?reason= codes.
-// Kept in sync deliberately rather than shared, because that module owns the
-// in-session browser flow and this one owns the cold-start fallback.
+// Mirrors REASON_COPY in lib/salesforce.ts and src/app/org-salesforce.tsx —
+// the same backend ?reason= codes (Personal and Organisation together, since
+// both flows land on this one screen). Kept in sync deliberately rather than
+// shared, because those modules own the in-session browser flow and this one
+// owns the cold-start fallback.
 const REASON_COPY: Record<string, string> = {
   denied: "Salesforce access was declined.",
   missing_params: "Salesforce didn’t return a valid response.",
   exchange_failed: "Couldn’t complete the Salesforce connection.",
   pkce_missing: "That Salesforce sign-in link expired.",
+  // Organisation-only reasons (org_salesforce_callback).
+  not_authorized: "You no longer have permission to connect Salesforce for this workspace.",
+  expired: "That Salesforce sign-in link expired.",
 };
 
 function buildStyles(C: ColorScale) {
@@ -58,19 +70,21 @@ function buildStyles(C: ColorScale) {
 export default function CrmConnectedScreen() {
   const router = useRouter();
   const { C } = useTheme();
-  const params = useLocalSearchParams<{ connected?: string; reason?: string }>();
+  const params = useLocalSearchParams<{ connected?: string; reason?: string; scope?: string }>();
   const st = buildStyles(C);
 
   const ok = params.connected === "1";
   const reason = typeof params.reason === "string" ? params.reason : "";
+  const isOrg = params.scope === "organisation";
+  const destination = isOrg ? "/org-salesforce" : "/salesforce";
 
-  // Hand the user back to the Salesforce screen, which reads the real
+  // Hand the user back to the right Salesforce screen, which reads the real
   // connection status from the backend rather than trusting this query param.
   // replace(), not push(), so the deep link doesn't sit in the back stack.
   useEffect(() => {
-    const t = setTimeout(() => router.replace("/salesforce"), ok ? 700 : 1600);
+    const t = setTimeout(() => router.replace(destination as any), ok ? 700 : 1600);
     return () => clearTimeout(t);
-  }, [router, ok]);
+  }, [router, ok, destination]);
 
   return (
     <View style={st.container}>

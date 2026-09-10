@@ -25,6 +25,7 @@ import {
   ScrollView, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import Animated, { FadeInDown, LinearTransition } from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
   ApiError, deleteMom, generateMom, getMom, isNotReady, isRetryable, saveMom,
   type AiDocument, type Mom, type MomSection, type MomSectionKind,
@@ -173,6 +174,13 @@ export function MomEditorScreen({
 }) {
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
+  // The editor renders as a full-screen Modal, which draws UNDER the Android
+  // status bar — so the bar's fixed paddingTop put the back chevron on top of
+  // the clock and Save/Preview under the network icons, where taps land on the
+  // system bar instead of the buttons. Every other full-screen view in the app
+  // offsets by the inset (see (tabs)/index.tsx, record-phone.tsx); this one
+  // was missed because it is a Modal rather than a route.
+  const insets = useSafeAreaInsets();
 
   const [mom, setMom] = useState<Mom | null>(null);
   const [loading, setLoading] = useState(true);
@@ -414,7 +422,7 @@ export function MomEditorScreen({
 
   return (
     <View style={st.wrap}>
-      <View style={st.bar}>
+      <View style={[st.bar, { paddingTop: insets.top + 14 }]}>
         <Pressable onPress={closeWithGuard} hitSlop={8} accessibilityLabel="Back">
           <Icon name="chevron.left" tintColor={C.text} size={20} />
         </Pressable>
@@ -538,7 +546,7 @@ export function MomEditorScreen({
       {previewOpen && mom ? (
         <Modal visible animationType="slide" onRequestClose={() => setPreviewOpen(false)}>
           <View style={st.wrap}>
-            <View style={st.bar}>
+            <View style={[st.bar, { paddingTop: insets.top + 14 }]}>
               <Pressable onPress={() => setPreviewOpen(false)} hitSlop={8}
                          accessibilityLabel="Close preview">
                 <Icon name="xmark" tintColor={C.text} size={20} />
@@ -777,6 +785,9 @@ function SectionEditor({ section, onClose, onChange }: {
 }) {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
+  // Same status-bar overlap as the editor's own bar — this is a full-screen
+  // Modal too, so its back/rename controls need the inset as well.
+  const insets = useSafeAreaInsets();
   const [renaming, setRenaming] = useState(false);
   const [draftTitle, setDraftTitle] = useState(section.title);
   const [editingRow, setEditingRow] = useState<string | null>(null);
@@ -790,7 +801,7 @@ function SectionEditor({ section, onClose, onChange }: {
           than a bottom sheet — but "padding" is right on both platforms here
           for the Android 15 reason in lib/ui.tsx, not because it is a screen. */}
       <KeyboardAvoidingView style={st.wrap} behavior="padding">
-        <View style={st.bar}>
+        <View style={[st.bar, { paddingTop: insets.top + 14 }]}>
           <Pressable onPress={onClose} hitSlop={8} accessibilityLabel="Back">
             <Icon name="chevron.left" tintColor={C.text} size={20} />
           </Pressable>

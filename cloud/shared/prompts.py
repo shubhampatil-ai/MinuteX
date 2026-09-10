@@ -20,6 +20,14 @@ Two contracts callers rely on:
 import json
 import re
 
+# The ONE definition of speaker identity. Safe to import here despite this
+# module's "no imports beyond re" convention (see _overview_context): that
+# rule exists to keep the prompt layer from depending on the COERCION layer,
+# and speaker_identity is a stdlib-only leaf that imports nothing from this
+# package. Rebuilding the id rules locally is exactly the duplication that
+# let "Speaker 0" and "0" drift apart in the first place.
+import speaker_identity
+
 # ---------------------------------------------------------------------------
 # The shared foundation. Every prompt below opens with this.
 #
@@ -293,6 +301,21 @@ SUMMARY_SYSTEM = _json_system(
     "into \"title\", \"content\" or \"items\", and never expose any other "
     "internal identifier there. Those fields are read as prose: to point "
     "at a moment, name the SPEAKER or the TOPIC.\n"
+    "  ATTRIBUTION: WRITE THE SUBJECT, NOT THE SPEAKER, BY DEFAULT. The "
+    "overview explains WHAT the meeting was about, so lead with the subject "
+    'and attribute only when the identity is part of the point. Write "The '
+    'meeting focused on India\'s trade strategy", NOT "Speaker 0 discussed '
+    'India\'s trade strategy" and NOT "Rahul discussed India\'s trade '
+    'strategy". Attribute for a specific PROPOSAL, a COMMITMENT, a DECISION '
+    "and who made it, an explicit OPINION or disagreement, or OWNERSHIP of "
+    'work — "Rahul proposed moving the launch to October", "Amit committed '
+    'to sharing the revised proposal". Do NOT attribute a general topic '
+    "summary, synthesized discussion, a restated point, or background and "
+    "context — those read better as the team, the meeting, or no subject at "
+    "all. When attribution is genuinely required but the speaker has no name "
+    'on the roster, write "An unidentified participant proposed…" rather '
+    'than "Speaker 0 proposed…". Never drop a decision, a commitment or an '
+    "owner just to avoid naming someone.\n"
     '- "tasks": array of objects, each EXACTLY {"task": string, "assignee": '
     'string, "assignee_speaker_id": string, "due_date": string, '
     '"priority": string, "confidence": string, "evidence": string, '
@@ -522,6 +545,52 @@ SUMMARY_SYSTEM = _json_system(
     "explaining that there was nothing to analyze."
 )
 
+def speaker_roster_block(roster=(), speaker_names=None):
+    """The explicit speaker_id -> display-name table for the model.
+
+    WHY THIS IS NEEDED. transcript_store.as_labelled_lines renders the user's
+    names INTO the transcript lines ("Rahul: I'll send it"), which is what
+    makes "what did Rahul say?" answerable. But the schema asks for a
+    canonical speaker id in `assignee_speaker_id`, and a model that can only
+    see "Rahul:" answers "Rahul" — a name in an id field, which no join can
+    use and no later rename can repair.
+
+    So the mapping is stated OUTRIGHT, in both directions, instead of being
+    left implicit in the transcript's own labels:
+
+        SPEAKER ROSTER (speaker_id -> who they are):
+          speaker_id "0" = Rahul
+          speaker_id "1" = Speaker 1 (not yet named)
+
+    Returns "" when there is no roster, so a non-diarized transcript adds no
+    tokens and the prompt is unchanged for that case.
+
+    Coercion is still the guarantee (ai_schema._resolve_task_speakers repairs
+    a name that slips through); this is the guidance that stops it happening.
+    """
+    labels = [str(r).strip() for r in (roster or []) if str(r).strip()]
+    if not labels:
+        return ""
+    names = speaker_names if isinstance(speaker_names, dict) else {}
+    lines = []
+    for label in labels:
+        sid = speaker_identity.normalize_speaker_id(label)
+        named = speaker_identity.resolve_speaker_name(sid, names)
+        lines.append(f'  speaker_id "{sid}" = '
+                     + (named if named
+                        else f"{speaker_identity.fallback_display_name(sid)} "
+                             "(not yet named)"))
+    return (
+        "\n\nSPEAKER ROSTER (speaker_id -> who they are):\n"
+        + "\n".join(lines)
+        + "\n\nThe transcript may address these people BY NAME. When a field "
+          'asks for a speaker id (for example "assignee_speaker_id"), answer '
+          'with the speaker_id EXACTLY as written above — "0", not "Rahul" '
+          'and not "Speaker 0". When no specific speaker owns the value, use '
+          '"". Never invent a speaker_id that is not on this list.'
+    )
+
+
 def summary_system(roster=()):
     """SUMMARY_SYSTEM, optionally naming the transcript's ACTUAL speakers.
 
@@ -635,10 +704,16 @@ SUMMARY_REDUCE_SYSTEM = _json_system(
 # user reads, so nothing here should be tuned for how it looks in the app.
 _HIGHLIGHTS_FIELDS = (
     '- "decisions": array of objects, each EXACTLY {"decision": string, '
-    '"context": string}. Only what was actually AGREED (e.g. "Approved the '
-    'quotation", "Budget finalized at 4.2 lakh", "Site visit confirmed for '
-    'Friday"). context is a short why/where-from, "" if none. Never include '
-    "proposals, options or questions. [] if none.\n"
+    '"context": string, "speaker_id": string}. Only what was actually AGREED '
+    '(e.g. "Approved the quotation", "Budget finalized at 4.2 lakh", "Site '
+    'visit confirmed for Friday"). context is a short why/where-from, "" if '
+    "none. Never include proposals, options or questions. [] if none.\n"
+    '  "speaker_id" is WHO MADE the decision, as a speaker id from the '
+    'roster ("0"), never a name and never "Speaker 0". Use "" when the '
+    "decision was collective or no single speaker owns it — \"\" is correct "
+    "and expected. Keep the identity in this field, not in the decision "
+    "text: the app renders the current name from it, so a decision that "
+    "spells out a name goes stale the moment that person is renamed.\n"
     # "action_items" was REMOVED here. It asked the model to extract the same
     # commitments a second time, in a weaker shape: measured on a real meeting,
     # ai_tasks and action_items came back with identical task text, identical
@@ -746,8 +821,13 @@ _IDENTIFIER_HINTS = {
 }
 
 
-def unified_analysis_system(roster=()):
+def unified_analysis_system(roster=(), speaker_names=None):
     """The ONE analysis prompt: everything the pipeline needs in a single call.
+
+    `speaker_names` is the recording's rename map. When given, an explicit
+    speaker_id -> name roster is appended (see speaker_roster_block) so the
+    model can return canonical ids for a transcript whose lines it reads as
+    names. Optional and defaulted, so an existing caller is unaffected.
 
     Replaces the separate summary and meeting_highlights calls with one request
     over one copy of the transcript. On a normal meeting that is 2+ transcript
@@ -783,6 +863,9 @@ def unified_analysis_system(roster=()):
     they never went through this prompt.
     """
     body = summary_system(roster)
+    # The id -> name table. Placed with the roster it explains, before the
+    # field specs that ask for an id.
+    body += speaker_roster_block(roster, speaker_names)
 
     # The structured extraction sections. Nested under one key so the four
     # sections keep their existing shapes (ai_schema.coerce_highlights parses

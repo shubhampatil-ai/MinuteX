@@ -640,7 +640,12 @@ def analyze_meeting(transcript, valid_ids=None, roster_source=None,
         # model who the speakers are beats asking it to work that out from prose,
         # and it means the contribution blurbs land on the right speakers rather
         # than being dropped by the filter for naming someone else.
-        map_prompt=prompts.unified_analysis_system(roster),
+        # speaker_names too, so the prompt can state the id -> name mapping
+        # explicitly. The transcript the model reads has already had those
+        # names substituted into its lines, so without this table it has no
+        # way to know that "Rahul:" is the speaker whose id is "0" — and it
+        # answers "Rahul" in `assignee_speaker_id`.
+        map_prompt=prompts.unified_analysis_system(roster, speaker_names),
         # OVERFLOW ONLY — a transcript past the single-pass budget. Still built
         # on SUMMARY_REDUCE_SYSTEM, which is NOT retired.
         reduce_prompt=prompts.unified_reduce_system(),

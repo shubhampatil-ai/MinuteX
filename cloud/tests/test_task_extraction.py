@@ -130,6 +130,12 @@ class TestTaskContract(unittest.TestCase):
 
         The speaker owes the work, so the transcript label is the join key
         that later resolves to a real person.
+
+        The label is now stored CANONICALLY ("0", not "Speaker 0"). It is the
+        same identity written the one way every join already keys on —
+        participant rows, speaker_names, _resolve_tasks_for_speaker — so the
+        resolution this test is about happens without each reader having to
+        re-normalize. See ai_schema._resolve_task_speakers.
         """
         got = self.coerce_one({
             "task": "Send the proposal",
@@ -140,7 +146,7 @@ class TestTaskContract(unittest.TestCase):
             "confidence": "high",
             "evidence": "I'll send the proposal tomorrow.",
         })
-        self.assertEqual(got["assignee_speaker_id"], "Speaker 0")
+        self.assertEqual(got["assignee_speaker_id"], "0")
         self.assertEqual(got["confidence"], "high")
         self.assertEqual(got["evidence"], "I'll send the proposal tomorrow.")
         self.assertEqual(got["due_date"], "tomorrow")
@@ -280,7 +286,9 @@ class TestTaskContract(unittest.TestCase):
              "confidence": "high", "evidence": "I'll send the proposal."},
         ]})
         self.assertEqual(len(out["tasks"]), 1)
-        self.assertEqual(out["tasks"][0]["assignee_speaker_id"], "Speaker 0")
+        # Canonical, per ai_schema._resolve_task_speakers — same identity,
+        # written the one way every join keys on.
+        self.assertEqual(out["tasks"][0]["assignee_speaker_id"], "0")
         self.assertEqual(out["tasks"][0]["confidence"], "high")
         self.assertEqual(out["tasks"][0]["evidence"],
                          "I'll send the proposal.")

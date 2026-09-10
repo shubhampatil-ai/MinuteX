@@ -15,6 +15,7 @@ import { ELEV, FONT, R, S, useTheme, ColorScale } from "../../../../lib/theme";
 import { RawGradient } from "../../../../lib/ui";
 import { Icon } from "../../../../lib/icons";
 import { Markdown } from "../../../../lib/document-renderer";
+import { speakerName } from "../../../../lib/sources";
 import { useMeeting } from "../../../../lib/meeting-context";
 import { Tasks } from "../../../../lib/meeting-tasks";
 import { CreateDocumentSheet, type GeneratedDoc } from "../../../../lib/meeting-documents";
@@ -221,9 +222,11 @@ function useThinkingLabel(sending: boolean, willRetrieve: boolean) {
  * stored turn and an older backend all produce that case, and it is ordinary
  * rather than an error worth reporting to the user.
  */
-function Sources({ sources, recordingKey, C, st }: {
+function Sources({ sources, recordingKey, speakerNames, C, st }: {
   sources?: ChatSource[];
   recordingKey: string;
+  /** The meeting's speaker_id -> name map, for attributing each source. */
+  speakerNames?: Record<string, string> | null;
   C: ColorScale;
   st: ReturnType<typeof buildStyles>;
 }) {
@@ -232,24 +235,36 @@ function Sources({ sources, recordingKey, C, st }: {
   return (
     <View style={st.sourcesWrap}>
       <Text style={st.sourcesLabel}>Sources</Text>
-      {sources.map((src) => (
-        <Pressable
-          key={src.segment_id}
-          onPress={() =>
-            router.push({
-              pathname: "/recording/[key]/transcript",
-              params: { key: recordingKey, evidence: src.segment_id },
-            } as never)
-          }
-          hitSlop={6}
-          style={({ pressed }) => [st.sourceRow, pressed && { opacity: 0.6 }]}
-          accessibilityRole="button"
-          accessibilityLabel={`View this source in the transcript at ${clock(src.start_time)}`}
-        >
-          <Icon name="waveform" size={12} tintColor={C.primary} />
-          <Text style={st.sourceTxt}>Transcript — {clock(src.start_time)}</Text>
-        </Pressable>
-      ))}
+      {sources.map((src) => {
+        // WHO said it, resolved live from the speaker map — the API already
+        // sends `speaker_id` on every source and it was being discarded, so
+        // a row could only say when, never who. Resolving (rather than
+        // storing) means a rename retitles every past answer's sources too.
+        const who = src.speaker_id
+          ? speakerName(src.speaker_id, speakerNames)
+          : "";
+        const label = who
+          ? `${who} — ${clock(src.start_time)}`
+          : `Transcript — ${clock(src.start_time)}`;
+        return (
+          <Pressable
+            key={src.segment_id}
+            onPress={() =>
+              router.push({
+                pathname: "/recording/[key]/transcript",
+                params: { key: recordingKey, evidence: src.segment_id },
+              } as never)
+            }
+            hitSlop={6}
+            style={({ pressed }) => [st.sourceRow, pressed && { opacity: 0.6 }]}
+            accessibilityRole="button"
+            accessibilityLabel={`View this source in the transcript at ${clock(src.start_time)}`}
+          >
+            <Icon name="waveform" size={12} tintColor={C.primary} />
+            <Text style={st.sourceTxt}>{label}</Text>
+          </Pressable>
+        );
+      })}
     </View>
   );
 }
@@ -445,7 +460,8 @@ export default function AssistantScreen() {
                 </RawGradient>
                 <View style={st.bubbleAi}>
                   <Markdown text={t.content} />
-                  <Sources sources={t.sources} recordingKey={key} C={C} st={st} />
+                  <Sources sources={t.sources} recordingKey={key}
+                    speakerNames={rec?.speaker_names} C={C} st={st} />
                 </View>
               </View>
             )

@@ -16,6 +16,7 @@ import { Splash } from "../../lib/splash";
 import { getMe, getToken } from "../../lib/api";
 import { DeviceProvider } from "../../lib/device-context";
 import { WorkspaceProvider } from "../../lib/workspace-context";
+import { onProfileNameSaved } from "../../lib/profile-gate";
 import { IntegrationsProvider } from "../../lib/integrations";
 import { NotificationsProvider } from "../../lib/notification-center";
 import { recoverUploads } from "../../lib/uploads";
@@ -161,6 +162,14 @@ function RootContent() {
   // without re-running this effect, which is what keeps a single /me call a
   // single /me call.
   const nameChecked = useRef(false);
+  // The gate is ONE-WAY once satisfied. The /me read below is async and can
+  // still be in flight while the user is already filling in the onboarding
+  // form, so its response carries the PRE-SAVE profile. Without this latch
+  // that stale answer lands after the save and flips needsName back to true,
+  // and the gate bounces the user straight back to the screen they just
+  // completed — the exact "Continue does nothing until I restart the app"
+  // symptom, and the reason the notify-only fix was not enough on its own.
+  const nameSatisfied = useRef(false);
   useEffect(() => {
     if (!authed) {
       // Signed out: reset the latch so the NEXT sign-in re-asks. Guarded on
@@ -169,6 +178,7 @@ function RootContent() {
       // it again on every pass.
       if (nameChecked.current) {
         nameChecked.current = false;
+        nameSatisfied.current = false;   // next sign-in re-asks from scratch
         setNeedsName(null);
       }
       return;
@@ -179,7 +189,7 @@ function RootContent() {
     (async () => {
       try {
         const me = await getMe();
-        if (cancelled) return;
+        if (cancelled || nameSatisfied.current) return;
         // name_set is authoritative: `name` on /me is the RAW stored value, so
         // an older server that predates the flag still resolves correctly via
         // the name fallback rather than gating everyone.
@@ -191,11 +201,29 @@ function RootContent() {
         // that would make a transient network error look like a lockout.
         // Fail OPEN: the worst case is a derived name shown for one session.
         // The latch stays set, so this does not retry in a loop.
-        if (!cancelled) setNeedsName(false);
+        if (!cancelled && !nameSatisfied.current) setNeedsName(false);
       }
     })();
     return () => { cancelled = true; };
   }, [authed]);
+
+  // The one thing that OPENS the gate, wired to the screen that does it.
+  //
+  // The /me read above is one-shot per sign-in, so saving a name cannot be
+  // observed by re-reading it — and `needsName` is private to this component,
+  // so the onboarding screen could not flip it either. The result was a gate
+  // that stayed shut after being satisfied: Continue saved the name, then the
+  // effect below bounced the user back to the gate, and only a full app
+  // restart (a fresh /me) let them in.
+  //
+  // Trusting this ping is safe because it can only ever OPEN the gate, and
+  // only for a session that already authenticated. A cold start still asks
+  // the server.
+  useEffect(() => onProfileNameSaved(() => {
+    // Latch FIRST: an in-flight /me that resolves after this must not undo it.
+    nameSatisfied.current = true;
+    setNeedsName(false);
+  }), []);
 
   // Gate: once we know auth state FOR THIS ROUTE, keep the user on the right side.
   useEffect(() => {

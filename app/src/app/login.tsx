@@ -16,7 +16,8 @@ import { Icon } from "../../lib/icons";
 import { useRouter } from "expo-router";
 import { APP_NAME, COMPANY, TAGLINE, R, S, CAPS, FONT, ELEV, useTheme, ColorScale } from "../../lib/theme";
 import { Button, ErrorText, GoogleButton } from "../../lib/ui";
-import { login, signup, ApiError } from "../../lib/api";
+import { login, signup, restoreWorkspaceFor, ApiError } from "../../lib/api";
+import { useWorkspace } from "../../lib/workspace-context";
 import { store } from "../../lib/storage";
 
 type Mode = "login" | "signup";
@@ -126,6 +127,12 @@ function AuthField({
 }
 
 export default function LoginScreen() {
+  // WorkspaceProvider sits ABOVE the auth gate, so its one-shot mount
+  // fetch already ran while this screen was signed out and found no
+  // token. Nothing re-runs it on its own, so the list has to be pulled
+  // again HERE, once the token exists — otherwise the user lands on the
+  // tabs with an empty workspace list and their organisation missing.
+  const { refresh: refreshWorkspaces } = useWorkspace();
   const router = useRouter();
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C, T), [C, T]);
@@ -179,10 +186,22 @@ export default function LoginScreen() {
     const em = email.trim().toLowerCase();
     setBusy(true);
     try {
-      if (mode === "login") await login(em, password);
-      else await signup(em, password);
+      const res = mode === "login"
+        ? await login(em, password)
+        : await signup(em, password);
       if (remember) await store.setItemAsync(REMEMBER_KEY, em);
       else await store.deleteItemAsync(REMEMBER_KEY);
+      // Put them back in the workspace they signed out of. Done BEFORE the
+      // list is fetched so the very first request is already scoped there,
+      // and it is only a hint — the provider re-validates it against the
+      // fresh list and falls back to Personal if the membership is gone.
+      await restoreWorkspaceFor(res.user_id);
+      // Load the workspaces for the account that just authenticated, BEFORE
+      // navigating: the tabs render against this list, and arriving with a
+      // stale empty one is what made an owner's organisation disappear.
+      // Deliberately awaited but non-fatal — refresh() swallows its own
+      // errors into context state, and a slow list must not block login.
+      await refreshWorkspaces();
       // Replace so the back button doesn't return to login. Land on the tabs.
       router.replace("/");
     } catch (e) {

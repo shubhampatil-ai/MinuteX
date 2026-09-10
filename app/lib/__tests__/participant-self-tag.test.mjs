@@ -156,7 +156,11 @@ describe("mapping a speaker syncs every surface that shows the name", () => {
 
   it("the participants screen calls it after a mapping change", () => {
     assert.match(
-      SCREEN, /const \{ syncSpeakerNames \} = useMeeting\(\)/,
+      // Destructuring may pull in other fields alongside it (e.g. `rec`,
+      // added in Phase 2D.3 for organisation-meeting detection) — the
+      // invariant this pins is that syncSpeakerNames comes FROM the
+      // context, not the exact shape of the destructure.
+      SCREEN, /const \{[^}]*\bsyncSpeakerNames\b[^}]*\} = useMeeting\(\)/,
       "the screen must take the resync from the context"
     );
     assert.match(

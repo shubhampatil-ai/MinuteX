@@ -726,13 +726,27 @@ export function ComingSoonRow({
 
 // ---- ListRow -----------------------------------------------------------------
 export function ListRow({
-  icon, label, sub, right, onPress, tint, destructive,
+  icon, label, sub, right, onPress, tint, destructive, photoUri, photoName,
 }: {
   icon: string; label: string; sub?: string; right?: React.ReactNode;
   onPress?: () => void; tint?: string; destructive?: boolean;
+  /** A PERSON's photo, when this row is about a person. Presigned
+   * `avatar_view_url` from the API — never the stored S3 key, which renders
+   * nothing. Falls back to `icon` when absent, so every existing caller is
+   * unaffected. */
+  photoUri?: string;
+  /** The name the initials fall back to when `photoUri` is empty or fails to
+   * load. Passing it (even with no photo) is what turns a generic glyph into
+   * a recognisable person. */
+  photoName?: string;
 }) {
   const { C, T } = useTheme();
   const color = destructive ? C.danger : C.text;
+  // A person gets an Avatar (photo, else coloured initials); everything else
+  // keeps the icon disc. Avatar already handles a failed/expired image URL by
+  // falling back to initials, so a stale presigned link degrades rather than
+  // leaving a hole.
+  const isPerson = !destructive && (!!photoUri || !!photoName);
   return (
     <Pressable
       onPress={onPress}
@@ -742,7 +756,11 @@ export function ListRow({
         paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: C.border,
       }, pressed && { opacity: 0.6 }]}
     >
-      <IconCircle name={icon} tint={destructive ? C.danger : (tint ?? C.primary)} bg={destructive ? C.dangerSoft : C.primarySoft} size={34} />
+      {isPerson ? (
+        <Avatar name={photoName || label} photoUri={photoUri} size={34} />
+      ) : (
+        <IconCircle name={icon} tint={destructive ? C.danger : (tint ?? C.primary)} bg={destructive ? C.dangerSoft : C.primarySoft} size={34} />
+      )}
       <View style={{ flex: 1 }}>
         <Text style={{ fontFamily: FONT.semibold, fontSize: 14.5, color }}>{label}</Text>
         {sub ? <Text style={[T.caption, { marginTop: 3 }]}>{sub}</Text> : null}

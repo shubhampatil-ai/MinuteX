@@ -233,7 +233,7 @@ echo ">> Running the offline unit tests..."
 # quietly undo a plan upgrade.
 GROQ_TPM_LIMIT_ERR="GROQ_TPM_LIMIT not set. Export the account's current tokens-per-minute limit (check the x-ratelimit-limit-tokens response header on a live Groq call, or the Groq console) before deploying. This is deliberately not defaulted, since silently falling back to the free-tier number would downgrade an upgraded plan."
 : "${GROQ_TPM_LIMIT:?$GROQ_TPM_LIMIT_ERR}"
-GROQ_CONTEXT_TOKENS="${GROQ_CONTEXT_TOKENS:-131072}"  # llama-3.3-70b-versatile
+GROQ_CONTEXT_TOKENS="${GROQ_CONTEXT_TOKENS:-131072}"  # openai/gpt-oss-120b
 
 # -------------------------------------------------------------
 # 1. transcribeRecording: the staged summary + highlights.
@@ -247,7 +247,7 @@ GROQ_CONTEXT_TOKENS="${GROQ_CONTEXT_TOKENS:-131072}"  # llama-3.3-70b-versatile
 echo
 echo ">> === transcribeRecording (staged summary + highlights) ==="
 merge_env "$TRANSCRIBE_LAMBDA_NAME" \
-  "GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}" \
+  "GROQ_MODEL=${GROQ_MODEL:-openai/gpt-oss-120b}" \
   "GROQ_TPM_LIMIT=$GROQ_TPM_LIMIT" \
   "GROQ_CONTEXT_TOKENS=$GROQ_CONTEXT_TOKENS"
 deploy_py_with_shared "$TRANSCRIBE_LAMBDA_NAME" "functions/transcribe"
@@ -263,7 +263,7 @@ echo
 echo ">> === userApi (on-demand documents / Quick AI / chat) ==="
 merge_env "$USERAPI_LAMBDA_NAME" \
   "GROQ_API_KEY=$GROQ_API_KEY" \
-  "GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}" \
+  "GROQ_MODEL=${GROQ_MODEL:-openai/gpt-oss-120b}" \
   "GROQ_TPM_LIMIT=$GROQ_TPM_LIMIT" \
   "GROQ_CONTEXT_TOKENS=$GROQ_CONTEXT_TOKENS" \
   "ONDEMAND_DEADLINE_SECONDS=$ONDEMAND_DEADLINE_SECONDS"

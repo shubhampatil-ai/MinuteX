@@ -44,7 +44,8 @@ import { sourceMeta, statusMeta, speakerName, normalizeSpeakerLabel, fmtDuration
 import { MeetingSummary, Highlights, Participants } from "../../../../lib/meeting-summary";
 import { MeetingOverviewView, hasOverview } from "../../../../lib/meeting-overview";
 import { buildSpeakerBlocks, buildSpeakerColors } from "../../../../lib/transcript-view";
-import { CrmRecordsBlock } from "../../../../lib/meeting-crm-records";
+import { CrmRecordsBlock, OrgCrmReviewBlock } from "../../../../lib/meeting-crm-records";
+import { useWorkspace } from "../../../../lib/workspace-context";
 import { Tasks } from "../../../../lib/meeting-tasks";
 import { AddTaskSheet } from "../../../../lib/add-task-sheet";
 import { DocumentsList, CreateDocumentSheet } from "../../../../lib/meeting-documents";
@@ -230,6 +231,15 @@ export default function MeetingDetailScreen() {
     confirmCrmRecord, syncCrmRecordNow, crmMappings, crmAmbiguity, tasks,
     documentsNeedingUpdate, updateAllDocuments, addTask,
   } = useMeeting();
+  // Phase 2D.3: an organisation meeting gets the CRM Review/Push block
+  // ABOVE the ordinary field-mapping block (CrmRecordsBlock, unchanged,
+  // Personal-and-Organisation-shared) — never instead of it, since the
+  // review is about WHO the meeting resolves to and the mapping block is
+  // about WHICH record fields get written; a personal meeting shows only
+  // the mapping block, exactly as before this phase.
+  const { workspaces } = useWorkspace();
+  const isOrgMeeting = !!rec?.workspace_id
+    && workspaces.some((w) => w.workspace_id === rec.workspace_id && !w.is_personal);
   const [tab, setTab] = useState<Tab>("overview");
 
   const [renaming, setRenaming] = useState(false);
@@ -675,6 +685,7 @@ export default function MeetingDetailScreen() {
                     />
                   </>
                 )}
+                {isOrgMeeting ? <OrgCrmReviewBlock meetingKey={key} /> : null}
                 <CrmRecordsBlock
                   mappings={crmMappings}
                   records={rec.crm_records}
@@ -722,6 +733,7 @@ export default function MeetingDetailScreen() {
                     identifier is independent of it, and the user may well want
                     to link this meeting to Salesforce anyway. Renders nothing
                     when no mappings are configured. */}
+                {isOrgMeeting ? <OrgCrmReviewBlock meetingKey={key} /> : null}
                 <CrmRecordsBlock
                   mappings={crmMappings}
                   records={rec.crm_records}

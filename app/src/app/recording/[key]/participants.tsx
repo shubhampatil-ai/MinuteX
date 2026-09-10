@@ -30,11 +30,13 @@ import {
   Button, EmptyState, ErrorText, Loading, SectionTitle, Toast,
 } from "../../../../lib/ui";
 import {
-  ApiContact, ApiError, ApiParticipant, getParticipants, setParticipant,
-  tagAttendee,
+  ApiContact, ApiError, ApiParticipant, SpeakerIdentityRole, getParticipants,
+  setParticipant, tagAttendee,
 } from "../../../../lib/api";
 import { ContactPicker } from "../../../../lib/contact-picker";
+import { speakerName } from "../../../../lib/sources";
 import { useMeeting } from "../../../../lib/meeting-context";
+import { useWorkspace } from "../../../../lib/workspace-context";
 import { avatarColorFor, initialsOf } from "../../../../lib/task-model";
 
 export default function ParticipantsScreen() {
@@ -48,7 +50,16 @@ export default function ParticipantsScreen() {
   // participants API rather than the context, so without telling it, those
   // surfaces keep showing the old name until the provider remounts — which is
   // why the change only appeared after navigating away and back.
-  const { syncSpeakerNames } = useMeeting();
+  const { syncSpeakerNames, rec } = useMeeting();
+  // CRM identity tagging (Phase 2D.3) only makes sense for an ORGANISATION
+  // meeting — a personal meeting has no Salesforce Contact/User resolution
+  // to feed, and showing the control there would be a control with nothing
+  // behind it. `workspaces` carries `is_personal` per entry; a meeting's
+  // workspace_id resolves against it rather than against a guessed prefix,
+  // so this stays correct even if the id format ever changes server-side.
+  const { workspaces } = useWorkspace();
+  const isOrgMeeting = !!rec?.workspace_id
+    && workspaces.some((w) => w.workspace_id === rec.workspace_id && !w.is_personal);
 
   const [speakers, setSpeakers] = useState<string[]>([]);
   const [participants, setParticipants] = useState<ApiParticipant[]>([]);
@@ -64,6 +75,12 @@ export default function ParticipantsScreen() {
   const [attendeePicker, setAttendeePicker] = useState(false);
   const [attendeeBusy, setAttendeeBusy] = useState(false);
   const [recordingStatus, setRecordingStatus] = useState("");
+  // The meeting's speaker_id -> name map, straight from the participants API.
+  // This screen used to render the raw "Speaker 0" for every voice, so a
+  // speaker the user had already named on the Transcript tab still read
+  // "Not yet identified" here — the one screen whose whole job is identity.
+  const [speakerNames, setSpeakerNames] =
+    useState<Record<string, string>>({});
 
   const load = useCallback(
     async (isRefresh = false) => {
@@ -74,6 +91,7 @@ export default function ParticipantsScreen() {
         const res = await getParticipants(recordingKey);
         setSpeakers(res.speakers);
         setParticipants(res.participants);
+        setSpeakerNames(res.speaker_names ?? {});
         setRecordingStatus(String(res.recording_status || ""));
       } catch (e) {
         setError(
@@ -165,13 +183,16 @@ export default function ParticipantsScreen() {
   );
 
   const assign = useCallback(
-    async (speakerId: string, contact: ApiContact | null) => {
+    async (speakerId: string, contact: ApiContact | null,
+          identityRole?: SpeakerIdentityRole) => {
       setBusySpeaker(speakerId);
       try {
         const res = await setParticipant(
           recordingKey,
           speakerId,
-          contact ? contact.id : null
+          contact ? contact.id : null,
+          undefined,
+          identityRole
         );
         await load();
         // The write changed speaker_names; pull it into the context so the
@@ -278,12 +299,24 @@ export default function ParticipantsScreen() {
                     <Text style={st.speakerBadgeTxt}>{sid}</Text>
                   </View>
                   <View style={{ flex: 1 }}>
-                    <Text style={st.speakerLabel}>Speaker {sid}</Text>
+                    {/* The CURRENT display name, resolved through the shared
+                        helper the transcript uses, so both screens agree.
+                        Falls back to "Speaker 0" when nobody has named this
+                        voice — which is also what marks it unidentified. */}
+                    <Text style={st.speakerLabel}>
+                      {speakerName(sid, speakerNames)}
+                    </Text>
                     {contact ? (
                       <Text style={st.mappedTo} numberOfLines={1}>
                         {contact.name}
                         {contact.email ? ` · ${contact.email}` : ""}
                       </Text>
+                    ) : speakerName(sid, speakerNames) !== `Speaker ${sid}` ? (
+                      // Named, but not yet tied to a Contact. Saying "Not yet
+                      // identified" under their own name reads as a
+                      // contradiction; what is actually missing is the CRM
+                      // link, so say that instead.
+                      <Text style={st.unmapped}>Speaker {sid} · not linked to a contact</Text>
                     ) : (
                       <Text style={st.unmapped}>Not yet identified</Text>
                     )}
@@ -342,6 +375,66 @@ export default function ParticipantsScreen() {
                     </Pressable>
                   )}
                 </View>
+
+                {/* CRM identity (Phase 2D.3) — organisation meetings only,
+                    and only once a Contact is attached: classifying WHO a
+                    voice is comes first, classifying WHAT they are to the
+                    CRM comes second. Re-tagging Internal/External never
+                    disturbs the contact mapping above (setParticipant keeps
+                    contact_id unless the caller changes it). */}
+                {isOrgMeeting && !!contact && (
+                  <View style={st.identityRow}>
+                    <Text style={st.identityLabel}>CRM identity</Text>
+                    <View style={st.identityToggle}>
+                      <Pressable
+                        style={[
+                          st.identityOption,
+                          mapped?.identity_role === "internal" && {
+                            backgroundColor: C.primarySoft,
+                          },
+                        ]}
+                        disabled={busy}
+                        onPress={() => assign(sid, contact, "internal")}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Tag speaker ${sid} as Internal / SM`}
+                      >
+                        <Text
+                          style={[
+                            st.identityOptionTxt,
+                            mapped?.identity_role === "internal" && {
+                              color: C.primary,
+                            },
+                          ]}
+                        >
+                          Internal / SM
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        style={[
+                          st.identityOption,
+                          mapped?.identity_role === "external" && {
+                            backgroundColor: C.primarySoft,
+                          },
+                        ]}
+                        disabled={busy}
+                        onPress={() => assign(sid, contact, "external")}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Tag speaker ${sid} as Client / External`}
+                      >
+                        <Text
+                          style={[
+                            st.identityOptionTxt,
+                            mapped?.identity_role === "external" && {
+                              color: C.primary,
+                            },
+                          ]}
+                        >
+                          Client / External
+                        </Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                )}
               </View>
             );
           })}
@@ -421,7 +514,9 @@ export default function ParticipantsScreen() {
         // the link to your account, which is what every task notification
         // depends on.
         allowSelf
-        title={pickerFor ? `Who is Speaker ${pickerFor}?` : "Select Contact"}
+        title={pickerFor
+          ? `Who is ${speakerName(pickerFor, speakerNames)}?`
+          : "Select Contact"}
       />
 
       {/* A SECOND picker instance, for attendance rather than speaker mapping.
@@ -508,6 +603,21 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
       paddingVertical: 7, paddingHorizontal: 12, borderRadius: R.pill,
     },
     actionTxt: { fontFamily: FONT.bold, fontSize: 12.5 },
+    identityRow: {
+      marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.border,
+    },
+    identityLabel: {
+      ...CAPS, fontFamily: FONT.bold, fontSize: 9.5, letterSpacing: 1,
+      color: C.textFaint, marginBottom: 8,
+    },
+    identityToggle: {
+      flexDirection: "row" as const, gap: S.sm,
+    },
+    identityOption: {
+      flex: 1, paddingVertical: 8, borderRadius: R.pill,
+      borderWidth: 1, borderColor: C.border, alignItems: "center" as const,
+    },
+    identityOptionTxt: { fontFamily: FONT.bold, fontSize: 12, color: C.textDim },
     hintBox: {
       flexDirection: "row" as const, alignItems: "flex-start" as const,
       gap: S.sm, padding: S.md, borderRadius: R.md,

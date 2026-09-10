@@ -130,7 +130,12 @@ if "_can_write_meeting" not in ai:
 # INVARIANT 4 (Phase 2C) — the CONTACT gate must also check membership
 # before the owner test, or a member removed from an organisation would keep
 # access to shared contacts they created. Same bug class as the Phase 2B P0.
-oc = code_of("_owned_contact", 2400)
+# The span must cover the WHOLE function. Phase 2D inserted the projected-
+# member branch (the `if not item:` block) AHEAD of both markers, and a
+# window that stops short finds neither - which reads as "cannot verify"
+# even though the order is correct. Widened, not relaxed: the gate<owner
+# assertion below is unchanged and still fails loudly on a real inversion.
+oc = code_of("_owned_contact", 4000)
 gate = oc.find("is_organisation_workspace_id")
 owner = oc.find('item.get("owner_user_id") != user_id')
 if gate < 0 or owner < 0:

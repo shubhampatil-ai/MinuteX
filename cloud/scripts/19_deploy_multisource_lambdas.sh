@@ -54,7 +54,7 @@ cat > "$POLICY_FILE" <<EOF
       "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
       "Resource": "arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:*" },
     { "Sid": "Users", "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"],
+      "Action": ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"],
       "Resource": [
         "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/Users",
         "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/Users/index/*" ] },
@@ -90,21 +90,56 @@ aws iam put-role-policy \
 echo ">> userApi-inline policy extended (Devices, Recordings writes, UserDevices delete)."
 
 # -------------------------------------------------------------
-# 2. Deploy userApi (single-file zip, stdlib only).
+# 2. Deploy userApi (lambda_function.py + the shared AI core).
+#
+# THIS ZIP IS NOT SINGLE-FILE, WHATEVER THIS COMMENT USED TO SAY. It once
+# was — both handlers were stdlib-only — and the packager kept writing just
+# lambda_function.py long after that stopped being true. Both handlers now
+# import the shared modules at TOP LEVEL (userApi 15 of them, transcribe 7),
+# so a zip without them does not fail on the route that uses them: it fails
+# in Runtime.ImportModuleError during init, and EVERY request 500s.
+#
+#   [ERROR] Runtime.ImportModuleError: Unable to import module
+#   'lambda_function': No module named 'ai_sanitize'
+#
+# It was invisible because this script is not the only deployer. Script 21
+# (deploy_py_with_shared) packages the same two functions CORRECTLY, so
+# whichever ran last won — the outage arrived whenever someone ran 19.
+#
+# Zipped FLAT (ai_schema.py at the archive root, not shared/ai_schema.py):
+# the handler's directory is on sys.path, subdirectories are not, so that is
+# how `import ai_schema` resolves in the runtime. Kept deliberately
+# identical to script 21's packager so the two cannot drift apart again.
 # -------------------------------------------------------------
 deploy_py() {
   local fn="$1" src_dir="$2"
   local zip="$PROJECT_ROOT/$src_dir/function.zip"
   rm -f "$zip"
-  (cd "$PROJECT_ROOT/$src_dir" && "$AWS_BIN" --version >/dev/null && \
-     python -c "import zipfile; z = zipfile.ZipFile('function.zip', 'w', zipfile.ZIP_DEFLATED); z.write('lambda_function.py'); z.close()")
+  ( cd "$PROJECT_ROOT" && "$AWS_BIN" --version >/dev/null && python - "$src_dir" <<'PY'
+import sys, zipfile
+from pathlib import Path
+
+src_dir = sys.argv[1]
+root = Path.cwd()
+out = root / src_dir / "function.zip"
+shared = root / "shared"
+
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    z.write(root / src_dir / "lambda_function.py", "lambda_function.py")
+    for mod in sorted(shared.glob("*.py")):
+        # Flat at the archive root — see the note above.
+        z.write(mod, mod.name)
+        print(f"   + {mod.name}")
+print(f">> packaged {out.relative_to(root)}")
+PY
+  )
   aws lambda update-function-code \
     --function-name "$fn" \
     --zip-file "fileb://$(winpath "$zip")" \
     --publish \
     --query "[FunctionName,CodeSize,LastModified]" --output text
   aws lambda wait function-updated-v2 --function-name "$fn"
-  echo ">> $fn deployed from $src_dir/lambda_function.py"
+  echo ">> $fn deployed from $src_dir/ + shared/"
 }
 
 deploy_py "$USERAPI_LAMBDA_NAME" "functions/userapi"

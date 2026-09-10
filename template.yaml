@@ -1,0 +1,2252 @@
+# =============================================================================
+# IMPORTANT:
+# This template is an architecture capture of an existing manually deployed
+# MinuteX AWS environment.
+#
+# It has NOT been validated for deployment and must NOT be deployed against
+# the production AWS account without a separate migration/import plan.
+#
+# Every resource below ALREADY EXISTS in account 624734879550 (ap-south-1),
+# created by the numbered shell scripts in cloud/scripts/. Running create-stack
+# with this template would attempt to create DUPLICATES and fail on the names
+# that must be globally or regionally unique (the S3 bucket, the DynamoDB
+# tables, the IAM roles). Adopting it requires CloudFormation resource IMPORT,
+# not a deploy. See AWS_ARCHITECTURE.md.
+#
+# NO SECRET VALUES APPEAR IN THIS FILE. Lambda environment variables are
+# represented by NAME only; every value is a REDACTED placeholder or a
+# CloudFormation parameter. The four Secrets Manager secrets are referenced
+# by ARN and their contents are never read.
+# =============================================================================
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  MinuteX production architecture captured from AWS account 624734879550 in ap-south-1. This template is for architecture visualization (AWS Infrastructure Composer) and IaC migration planning. It must not be deployed directly.
+
+# -----------------------------------------------------------------------------
+# EXTERNAL (NON-AWS) SERVICES  --  documented here, deliberately NOT modelled
+# as CloudFormation resources because they are third-party HTTP APIs.
+#
+#   transcribeRecording --> ElevenLabs Scribe   api.elevenlabs.io
+#                             POST /v1/speech-to-text, model scribe_v2,
+#                             source_url + webhook=true, diarize=true
+#   ElevenLabs          --> userApi             POST /webhooks/elevenlabs/stt
+#                             inbound callback, HMAC-SHA256 verified
+#   transcribeRecording --> Groq                api.groq.com (staged analysis)
+#   userApi             --> Groq                api.groq.com (on-demand AI, chat)
+#   userApi             --> Google OAuth+Gmail  accounts.google.com,
+#                             oauth2.googleapis.com, gmail.googleapis.com
+#   userApi             --> Salesforce REST     login.salesforce.com + instance
+#
+# NOTE: Google OAuth here is the GMAIL INTEGRATION only. There is no Google
+# Sign-In backend; the app's Google button is UI-only (coming soon).
+# -----------------------------------------------------------------------------
+Metadata:
+  Capture:
+    Account: '624734879550'
+    Region: ap-south-1
+    Method: read-only AWS CLI describe/get calls
+    Purpose: architecture visualization and IaC migration planning
+    Deployed: false
+    ExternalServices:
+      - ElevenLabs Scribe (STT)
+      - Groq (LLM)
+      - Google OAuth + Gmail API (integration only, NOT sign-in)
+      - Salesforce REST API (CRM)
+
+Parameters:
+
+  # Every Lambda environment variable is represented by this single placeholder
+  # parameter. The deployed values were never read during capture.
+  RedactedPlaceholder:
+    Type: String
+    Default: REDACTED
+    Description: |
+      Placeholder standing in for a redacted environment-variable value. The real values live only in the deployed Lambda configurations.
+
+Resources:
+
+  # ===========================================================================
+  # IAM  --  Lambda execution roles
+  #
+  # Reproduced EXACTLY as deployed. Overly broad grants are PRESERVED and
+  # annotated; they are not corrected here, because the purpose of this file
+  # is to represent the current system, not to redesign its security model.
+  # ===========================================================================
+
+  UserApiRole:
+    Type: AWS::IAM::Role
+    # Existing deployed role. Retained on stack delete so an import can
+    # never destroy the live role.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RoleName: userApi-aps1
+      Description: Execution role for the userApi Lambda function
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # No managed policies attached in the deployed account.
+      # Existing deployed permission. Not changed during architecture capture.
+      # 13 inline policies and NO managed policies -- not even
+      # AWSLambdaBasicExecutionRole; CloudWatch Logs access is granted by the
+      # 'Logs' statement inside userApi-inline instead.
+      Policies:
+        - PolicyName: MinuteXChatSessionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/ChatSessions
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/ChatSessions/index/*
+        - PolicyName: lambda-notifications
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: NotificationsTable
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Notifications
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Notifications/index/*
+              - Sid: NotificationDedupeClaims
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/NotificationDedupe
+        - PolicyName: userApi-avatars
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AvatarObjects
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/avatars/*
+        - PolicyName: userApi-crm-salesforce
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CrmConnections
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/CrmConnections
+              - Sid: SalesforceTokenKms
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                Resource: arn:aws:kms:ap-south-1:624734879550:key/b5a78676-4c51-4ba4-8f2a-bb0a77bfcec4
+              - Sid: SalesforceClientSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/salesforceClientSecret-vUDtk6
+        - PolicyName: userApi-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:ap-south-1:624734879550:*
+              - Sid: Users
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  # BatchGetItem is what the members list and meeting
+                  # attribution read profiles with (_users_by_ids). Without
+                  # it those reads fail AccessDenied, get swallowed by a
+                  # defensive except, and every name renders as a raw uuid.
+                  - dynamodb:BatchGetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Users
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Users/index/*
+              - Sid: UserDevices
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:DeleteItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/UserDevices
+              - Sid: DeviceKeysRead
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/DeviceKeys
+              - Sid: Devices
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Devices
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Devices/index/*
+              - Sid: Recordings
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Recordings
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Recordings/index/*
+              - Sid: JwtSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/jwtSecret-fxK2Iv
+              - Sid: GetAudio
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/*
+        - PolicyName: userApi-integrations-gmail
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: IntegrationsTable
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/Integrations
+              - Sid: IntegrationTokenKms
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                Resource: arn:aws:kms:ap-south-1:624734879550:key/33f5f31c-5c64-4826-9e64-588b70a12645
+              - Sid: GoogleClientSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/googleClientSecret-r13TXA
+        - PolicyName: userApi-invoke-transcribe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeTranscribeForReprocess
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - arn:aws:lambda:ap-south-1:624734879550:function:transcribeRecording
+                  - arn:aws:lambda:ap-south-1:624734879550:function:transcribeRecording:*
+        - PolicyName: userApi-pageindex
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PageIndexReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/pageindex/*
+        - PolicyName: userApi-permanent-delete
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PermanentDeleteObjects
+                Effect: Allow
+                Action: s3:DeleteObject
+                Resource:
+                  - arn:aws:s3:::meeting-recorder-shubham-aps1/recordings/*
+                  - arn:aws:s3:::meeting-recorder-shubham-aps1/transcripts/*
+                  - arn:aws:s3:::meeting-recorder-shubham-aps1/pageindex/*
+              - Sid: PermanentDeleteRow
+                Effect: Allow
+                Action: dynamodb:DeleteItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/Recordings
+        - PolicyName: userApi-shares
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Shares
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Shares/index/*
+        - PolicyName: userApi-stt-webhook
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteDeliveredTranscripts
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/transcripts/*
+              - Sid: ReadWebhookSigningSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/elevenlabsWebhookSecret-pnuv3j
+        - PolicyName: userApi-upload-presign
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PresignedUserUploads
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/recordings/*
+        - PolicyName: userApi-workspace-org
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WorkspaceOrgTables
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:BatchGetItem
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Contacts
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Folders
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/FolderContacts
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/MeetingParticipants
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Tasks
+              - Sid: WorkspaceOrgIndexes
+                Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Contacts/index/*
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Folders/index/*
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/FolderContacts/index/*
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/MeetingParticipants/index/*
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Tasks/index/*
+
+  GetUploadUrlRole:
+    Type: AWS::IAM::Role
+    # Existing deployed role. Retained on stack delete so an import can
+    # never destroy the live role.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RoleName: getUploadUrl-aps1
+      Description: Execution role for the getUploadUrl Lambda function
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      # Existing deployed permission. Not changed during architecture capture.
+      # This role carries THREE overlapping inline policies that each grant
+      # s3:PutObject on the WHOLE bucket (.../*) rather than recordings/*.
+      # Because a presigned URL inherits the signer's permissions, this is
+      # broader than the function needs. Preserved verbatim.
+      Policies:
+        - PolicyName: device-presign-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:ap-south-1:624734879550:*
+              - Sid: DeviceKeysRead
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/DeviceKeys
+              - Sid: DevicesReadTouch
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/Devices
+              - Sid: PutRecordings
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/*
+        - PolicyName: get-upload-url-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PresignPutRecordings
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/*
+              - Sid: ReadDeviceKeys
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/DeviceKeys
+        - PolicyName: getUploadUrl-inline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PutAudioObjects
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/*
+              - Sid: ReadDeviceKeys
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/DeviceKeys
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:ap-south-1:624734879550:*
+
+  TranscribeRecordingRole:
+    Type: AWS::IAM::Role
+    # Existing deployed role. Retained on stack delete so an import can
+    # never destroy the live role.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RoleName: transcribeRecording-aps1
+      Description: Execution role for the transcribeRecording Lambda function
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      # Existing deployed permission. Not changed during architecture capture.
+      Policies:
+        - PolicyName: lambda-notifications
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: NotificationsTable
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Notifications
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Notifications/index/*
+              - Sid: NotificationDedupeClaims
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/NotificationDedupe
+        - PolicyName: transcribe-crm-config-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CrmConnectionsRead
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/CrmConnections
+        - PolicyName: transcribe-invoke-userapi
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeUserApiForTaskSeeding
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - arn:aws:lambda:ap-south-1:624734879550:function:userApi
+                  - arn:aws:lambda:ap-south-1:624734879550:function:userApi:*
+        - PolicyName: transcribe-pageindex
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PageIndexWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/pageindex/*
+        - PolicyName: transcribe-recording-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PresignAndReadAudioObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/*
+              - Sid: WriteOffloadedTranscripts
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/transcripts/*
+              - Sid: UpsertAndReadRecordings
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Recordings
+                  - arn:aws:dynamodb:ap-south-1:624734879550:table/Recordings/index/*
+
+  # ===========================================================================
+  # KMS  --  two customer-managed symmetric CMKs
+  #
+  # Used at the APPLICATION layer by userApi to envelope-encrypt per-user OAuth
+  # refresh tokens before they are written to DynamoDB. Automatic key rotation
+  # is DISABLED on both (existing state, not changed).
+  #
+  # The KeyPolicy below is a MINIMAL REPRESENTATION, not a byte-for-byte copy:
+  # kms:GetKeyPolicy was not called during capture. Treat the policy body as
+  # UNVERIFIED and re-read it before any import. See AWS_ARCHITECTURE.md.
+  # ===========================================================================
+
+  CrmSalesforceKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Deployed key id: b5a78676-4c51-4ba4-8f2a-bb0a77bfcec4
+    Properties:
+      Description: Envelope-encrypts per-user CRM OAuth refresh tokens (MinuteX)
+      KeyUsage: ENCRYPT_DECRYPT
+      KeySpec: SYMMETRIC_DEFAULT
+      Enabled: true
+      EnableKeyRotation: false # existing deployed state
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+  CrmSalesforceKeyAlias:
+    Type: AWS::KMS::Alias
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AliasName: alias/crm-salesforce
+      TargetKeyId: !Ref CrmSalesforceKey
+
+  IntegrationsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Deployed key id: 33f5f31c-5c64-4826-9e64-588b70a12645
+    Properties:
+      Description: Envelope-encrypts per-user integration OAuth refresh tokens (MinuteX)
+      KeyUsage: ENCRYPT_DECRYPT
+      KeySpec: SYMMETRIC_DEFAULT
+      Enabled: true
+      EnableKeyRotation: false # existing deployed state
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+  IntegrationsKeyAlias:
+    Type: AWS::KMS::Alias
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AliasName: alias/minutex-integrations
+      TargetKeyId: !Ref IntegrationsKey
+
+  # ===========================================================================
+  # SECRETS MANAGER  --  four secrets, all read by userApi only
+  #
+  # NO SecretString AND NO GenerateSecretString IS DECLARED, DELIBERATELY.
+  # Declaring either would embed a real secret in version control, or
+  # OVERWRITE the live secret with a generated value on a future update.
+  # Only the name and description are captured; the values were never read.
+  #
+  # The Lambda reads these at runtime with secretsmanager:GetSecretValue,
+  # using the *_ARN environment variables -- NOT with a
+  # {{resolve:secretsmanager:...}} template reference. Adding a resolve here
+  # would misrepresent the deployed mechanism, so none is used.
+  #
+  # Rotation is not configured on any of the four (existing state).
+  # ===========================================================================
+
+  JwtSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Deployed ARN: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/jwtSecret-fxK2Iv
+    Properties:
+      Name: userApi/jwtSecret
+      Description: HS256 signing key for MinuteX JWTs. Read by userApi via JWT_SECRET_ARN.
+      # SecretString intentionally omitted -- see the section note above.
+
+  GoogleClientSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Deployed ARN: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/googleClientSecret-r13TXA
+    Properties:
+      Name: userApi/googleClientSecret
+      Description: Google OAuth client secret (MinuteX Gmail integration)
+      # SecretString intentionally omitted -- see the section note above.
+
+  SalesforceClientSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Deployed ARN: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/salesforceClientSecret-vUDtk6
+    Properties:
+      Name: userApi/salesforceClientSecret
+      Description: Salesforce Connected App consumer secret (MinuteX CRM OAuth)
+      # SecretString intentionally omitted -- see the section note above.
+
+  ElevenLabsWebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Deployed ARN: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/elevenlabsWebhookSecret-pnuv3j
+    Properties:
+      Name: userApi/elevenlabsWebhookSecret
+      Description: ElevenLabs STT webhook HMAC signing secret
+      # SecretString intentionally omitted -- see the section note above.
+
+      # ===========================================================================
+      # S3  --  the single bucket in the account
+      #
+      # Holds all audio, transcripts, PageIndex trees and avatars. No Lambda ever
+      # moves audio bytes: clients PUT and GET directly via presigned URLs.
+      #
+      # Prefixes in use (S3 has no prefix resource; documented for Composer):
+      #   recordings/{user_id}/{device_id|mobile|uploads}/{recording_id}.{ext}
+      #   transcripts/<recording key>.transcript.json.gz
+      #   pageindex/<recording key>.pageindex.json.gz
+      #   avatars/{user_id}/{user|contact}/<file>
+      #   esp32-001/  (LEGACY, pre-user-ownership layout)
+      #
+      # EXISTING STATE PRESERVED: versioning is NOT enabled, there is NO lifecycle
+      # rule, NO CORS configuration and NO bucket policy. Encryption is SSE-S3
+      # (AES256) with a bucket key; object ownership is BucketOwnerEnforced; all
+      # four public-access blocks are on. No bucket tags.
+      # ===========================================================================
+
+  RecordingsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: TranscribeRecordingS3InvokePermission
+    Properties:
+      BucketName: meeting-recorder-shubham-aps1
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # S3 -> Lambda trigger, as deployed (notification id transcribe-on-audio).
+      # NO prefix and NO suffix filter are configured in AWS: EVERY ObjectCreated
+      # event on this bucket -- including avatar, transcript and pageindex writes
+      # -- invokes transcribeRecording, which then filters by audio extension in
+      # code. Existing state, preserved.
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt TranscribeRecordingFunction.Arn
+
+  # ===========================================================================
+  # DYNAMODB  --  16 tables
+  #
+  # EXISTING STATE PRESERVED ACROSS ALL 16:
+  #   BillingMode                  PAY_PER_REQUEST
+  #   PointInTimeRecovery          DISABLED
+  #   DeletionProtection           DISABLED
+  #   Streams                      none
+  #   SSESpecification             omitted -> AWS-owned default key
+  #                                (no table reported an SSEDescription)
+  #   Local secondary indexes      none
+  #   Tags                         none
+  #   TTL                          only NotificationDedupe (expires_at)
+  #
+  # Every GSI projects ALL attributes, as deployed.
+  # ===========================================================================
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # User accounts. Password hashes are scrypt (stdlib); login goes through the email-index GSI.
+    Properties:
+      TableName: Users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  RecordingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # One item per meeting: status lifecycle, AI output, and POINTERS to the S3 transcript / PageIndex objects (the transcript itself is offloaded to S3 to stay under the 400 KB item limit).
+    Properties:
+      TableName: Recordings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: audio_s3_key
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: device_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: audio_s3_key
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: device-index
+          KeySchema:
+            - AttributeName: device_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # AI-extracted and manually created tasks. Six GSIs serve owner, assignee (contact and user), folder, source meeting, and fingerprint dedupe.
+    Properties:
+      TableName: Tasks
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: assignee_contact_id
+          AttributeType: S
+        - AttributeName: assignee_user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: fingerprint
+          AttributeType: S
+        - AttributeName: folder_id
+          AttributeType: S
+        - AttributeName: owner_user_id
+          AttributeType: S
+        - AttributeName: source_recording_id
+          AttributeType: S
+        - AttributeName: task_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: task_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: assignee-index
+          KeySchema:
+            - AttributeName: assignee_contact_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: assignee-user-index
+          KeySchema:
+            - AttributeName: assignee_user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: dedupe-index
+          KeySchema:
+            - AttributeName: owner_user_id
+              KeyType: HASH
+            - AttributeName: fingerprint
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: folder-index
+          KeySchema:
+            - AttributeName: folder_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: meeting-index
+          KeySchema:
+            - AttributeName: source_recording_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: owner-index
+          KeySchema:
+            - AttributeName: owner_user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  ContactsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Per-user contact book, scoped by owner_user_id.
+    Properties:
+      TableName: Contacts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: contact_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: email_lc
+          AttributeType: S
+        - AttributeName: owner_user_id
+          AttributeType: S
+        - AttributeName: phone_e164
+          AttributeType: S
+      KeySchema:
+        - AttributeName: contact_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: owner-phone-index
+          KeySchema:
+            - AttributeName: owner_user_id
+              KeyType: HASH
+            - AttributeName: phone_e164
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: owner-email-index
+          KeySchema:
+            - AttributeName: owner_user_id
+              KeyType: HASH
+            - AttributeName: email_lc
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: owner-index
+          KeySchema:
+            - AttributeName: owner_user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  FoldersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Projects / folders that group recordings and contacts.
+    Properties:
+      TableName: Folders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: folder_id
+          AttributeType: S
+        - AttributeName: name_lc
+          AttributeType: S
+        - AttributeName: owner_user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: folder_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: owner-index
+          KeySchema:
+            - AttributeName: owner_user_id
+              KeyType: HASH
+            - AttributeName: name_lc
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  FolderContactsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Folder-to-contact membership edge table.
+    Properties:
+      TableName: FolderContacts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: contact_id
+          AttributeType: S
+        - AttributeName: folder_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: folder_id
+          KeyType: HASH
+        - AttributeName: contact_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: contact-index
+          KeySchema:
+            - AttributeName: contact_id
+              KeyType: HASH
+            - AttributeName: folder_id
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  MeetingParticipantsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Speaker-label to contact mapping, keyed by the recording's S3 key.
+    Properties:
+      TableName: MeetingParticipants
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: audio_s3_key
+          AttributeType: S
+        - AttributeName: contact_id
+          AttributeType: S
+        - AttributeName: speaker_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: audio_s3_key
+          KeyType: HASH
+        - AttributeName: speaker_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: contact-index
+          KeySchema:
+            - AttributeName: contact_id
+              KeyType: HASH
+            - AttributeName: audio_s3_key
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  DevicesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Source of truth for device OWNERSHIP and pairing state.
+    Properties:
+      TableName: Devices
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+        - AttributeName: paired_user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: paired-user-index
+          KeySchema:
+            - AttributeName: paired_user_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  DeviceKeysTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Device AUTHENTICATION only (apiKey -> deviceId). Never ownership.
+    Properties:
+      TableName: DeviceKeys
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: apiKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: apiKey
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  UserDevicesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # LEGACY claim link, retained so recordings predating user-ownership stay visible.
+    Properties:
+      TableName: UserDevices
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: device_id
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  ChatSessionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Workspace assistant conversations. One item per session holding a bounded turns[] list.
+    Properties:
+      TableName: ChatSessions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: updated_at
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: updated_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  SharesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Public share links. Stores only the sha256 of the token, never the token itself.
+    Properties:
+      TableName: Shares
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: recording_key
+          AttributeType: S
+        - AttributeName: share_id
+          AttributeType: S
+        - AttributeName: token_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: share_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: token-index
+          KeySchema:
+            - AttributeName: token_hash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: recording-index
+          KeySchema:
+            - AttributeName: recording_key
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  IntegrationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Per-user integration OAuth tokens (Gmail), envelope-encrypted with the minutex-integrations CMK.
+    Properties:
+      TableName: Integrations
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: provider
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: provider
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  CrmConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Per-user Salesforce OAuth tokens and field mappings, envelope-encrypted with the crm-salesforce CMK.
+    Properties:
+      TableName: CrmConnections
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: provider
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: provider
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # In-app notification centre rows.
+    Properties:
+      TableName: Notifications
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: notification_id
+          AttributeType: S
+        - AttributeName: unread_marker
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: notification_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: user-unread-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: unread_marker
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  NotificationDedupeTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Idempotency claims for notification delivery. The ONLY table with TTL enabled (expires_at).
+    Properties:
+      TableName: NotificationDedupe
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: dedupe_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: dedupe_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false # existing deployed state
+      DeletionProtectionEnabled: false # existing deployed state
+
+  # ===========================================================================
+  # CLOUDWATCH LOGS  --  three Lambda log groups
+  #
+  # EXISTING STATE PRESERVED: RetentionInDays is intentionally OMITTED on all
+  # three, because retention is NOT SET in the deployed account (logs never
+  # expire). No KMS key is configured on any group; log class is STANDARD.
+  # Setting a retention here would be a CHANGE, not a capture.
+  # ===========================================================================
+
+  UserApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /aws/lambda/userApi
+      # RetentionInDays omitted -- never expires in the deployed account.
+
+  GetUploadUrlLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /aws/lambda/getUploadUrl
+      # RetentionInDays omitted -- never expires in the deployed account.
+
+  TranscribeRecordingLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /aws/lambda/transcribeRecording
+      # RetentionInDays omitted -- never expires in the deployed account.
+
+      # ===========================================================================
+      # API GATEWAY  --  HTTP API (v2) 'iot-audio-api', deployed id q87zfn5vyj
+      #
+      # 105 routes, ONE stage ($default) with AutoDeploy enabled.
+      #   102 routes -> userApi
+      #     3 routes -> getUploadUrl
+      #
+      # AUTHORIZATION: every one of the 105 routes has AuthorizationType NONE and
+      # ApiKeyRequired false. There are NO API Gateway authorizers in the account.
+      # All authentication and authorization happens INSIDE the Lambda code (JWT
+      # via _require_auth, x-api-key for device routes, HMAC-SHA256 for the STT
+      # webhook, sha256 token for share links). Existing state, preserved.
+      #
+      # CORS: no CorsConfiguration is set on the API and the Lambdas return no
+      # Access-Control-* headers. The clients are a native app and the ESP32
+      # firmware, so no browser preflight is involved. Preserved as-is.
+      #
+      # THROTTLING: no route settings and no explicit stage throttle are
+      # configured; DetailedMetricsEnabled is false; no stage access logging.
+      #
+      # The routes are declared below as SAM function Events (HttpApi), which is
+      # what makes the API-to-Lambda wiring render in Infrastructure Composer.
+      # ===========================================================================
+
+  MinuteXHttpApi:
+    Type: AWS::Serverless::HttpApi
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: iot-audio-api
+      Description: MinuteX public HTTP API. Deployed API id q87zfn5vyj.
+      StageName: $default
+      # AutoDeploy is true on the deployed $default stage.
+      # No Auth block: no authorizer exists in the account.
+      # No CorsConfiguration: none is set on the deployed API.
+
+      # ===========================================================================
+      # LAMBDA  --  three functions, all python3.12 / x86_64 / 256 MB
+      #
+      # EXISTING STATE PRESERVED ON ALL THREE:
+      #   Layers                    none
+      #   VpcConfig                 none (no function is VPC-attached)
+      #   DeadLetterConfig          none
+      #   EventInvokeConfig         none (no OnSuccess/OnFailure destinations)
+      #   ReservedConcurrency       not set
+      #   ProvisionedConcurrency    not set
+      #   Tracing                   PassThrough (X-Ray not enabled)
+      #   FunctionUrlConfig         none
+      #   SnapStart                 None
+      #   EphemeralStorage          512 MB (default)
+      #   Tags                      none
+      #   LoggingConfig             Text format, default log group
+      #
+      # CodeUri points at the real source directory in this repo, but the DEPLOYED
+      # zips also vendor the cloud/shared/*.py modules (groq_client, prompts,
+      # ai_schema, transcript_store, pageindex, pageindex_store, ...) at the
+      # package root. That vendoring is done by cloud/scripts/_package_lambda.py,
+      # NOT by SAM, so `sam build` against this template would NOT reproduce the
+      # deployed artifact. Documented, not worked around.
+      # ===========================================================================
+
+  UserApiFunction:
+    Type: AWS::Serverless::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # The main application API. Serves 102 of the 105 HTTP API routes: auth, recordings, AI workspace, per-meeting and workspace chat, tasks, CRM, Gmail, shares, notifications, and the ElevenLabs STT webhook. Also handles an internal asynchronous tasks.seed invoke from transcribeRecording.
+    Properties:
+      FunctionName: userApi
+      Description: Main application API - 102 HTTP routes plus the ElevenLabs STT
+        webhook and an internal task-seeding invoke.
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Architectures:
+        - x86_64
+      MemorySize: 256
+      Timeout: 29
+      # Existing deployed role, referenced by ARN rather than generated by
+      # SAM, so no new policy is ever synthesised for these functions.
+      Role: !GetAtt UserApiRole.Arn
+      CodeUri: cloud/functions/userapi/
+      Tracing: PassThrough # X-Ray not enabled in the deployed account
+      # ---------------------------------------------------------------
+      # ENVIRONMENT VARIABLES -- 53 variables, NAMES ONLY.
+      # Every value below is a REDACTED placeholder. The real values were
+      # never read during capture and MUST NOT be committed here.
+      #
+      # SECURITY NOTE (existing deployed state, not changed):
+      # GROQ_API_KEY and ELEVENLABS_API_KEY are stored as PLAINTEXT Lambda
+      # environment variables, while the other four secrets correctly use
+      # Secrets Manager. Captured as-is; see AWS_ARCHITECTURE.md risks.
+      # ---------------------------------------------------------------
+      Environment:
+        Variables:
+          AI_CONTEXT_DEADLINE_SECONDS: !Ref RedactedPlaceholder # [REDACTED]
+          AI_CONTEXT_MAX_CHARS: !Ref RedactedPlaceholder # [REDACTED]
+          AI_INTEL_MAX_TASKS: !Ref RedactedPlaceholder # [REDACTED]
+          AI_MAX_TOOL_HOPS: !Ref RedactedPlaceholder # [REDACTED]
+          AI_TOOL_ROW_LIMIT: !Ref RedactedPlaceholder # [REDACTED]
+          AVATAR_URL_EXPIRY: !Ref RedactedPlaceholder # [REDACTED]
+          BUCKET_NAME: !Ref RedactedPlaceholder # [REDACTED]
+          CHAT_SESSIONS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          CHAT_SESSIONS_USER_INDEX: !Ref RedactedPlaceholder # [REDACTED]
+          CONTACTS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          CRM_CONNECTIONS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          ELEVENLABS_API_KEY: !Ref RedactedPlaceholder # [REDACTED - plaintext secret in deployed env]
+          ELEVENLABS_WEBHOOK_SECRET_ARN: !Ref RedactedPlaceholder # [REDACTED]
+          FOLDERS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          FOLDER_CONTACTS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          GOOGLE_CLIENT_ID: !Ref RedactedPlaceholder # [REDACTED]
+          GOOGLE_CLIENT_SECRET_ARN: !Ref RedactedPlaceholder # [REDACTED]
+          GOOGLE_REDIRECT_URI: !Ref RedactedPlaceholder # [REDACTED]
+          GROQ_API_KEY: !Ref RedactedPlaceholder # [REDACTED - plaintext secret in deployed env]
+          GROQ_CONTEXT_TOKENS: !Ref RedactedPlaceholder # [REDACTED]
+          GROQ_MODEL: !Ref RedactedPlaceholder # [REDACTED]
+          GROQ_TPM_LIMIT: !Ref RedactedPlaceholder # [REDACTED]
+          INTEGRATIONS_KMS_KEY_ID: !Ref RedactedPlaceholder # [REDACTED]
+          INTEGRATIONS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          INTEGRATION_RETURN_URL: !Ref RedactedPlaceholder # [REDACTED]
+          JWT_SECRET_ARN: !Ref RedactedPlaceholder # [REDACTED]
+          JWT_TTL: !Ref RedactedPlaceholder # [REDACTED]
+          MAX_AVATAR_BYTES: !Ref RedactedPlaceholder # [REDACTED]
+          MAX_DURATION_SECONDS: !Ref RedactedPlaceholder # [REDACTED]
+          MAX_SESSION_TURNS: !Ref RedactedPlaceholder # [REDACTED]
+          MAX_UPLOAD_BYTES: !Ref RedactedPlaceholder # [REDACTED]
+          MEETING_PARTICIPANTS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          NOTIFICATIONS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          NOTIFICATION_DEDUPE_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          ONDEMAND_DEADLINE_SECONDS: !Ref RedactedPlaceholder # [REDACTED]
+          PAGEINDEX_LLM_SUMMARY: !Ref RedactedPlaceholder # [REDACTED]
+          PAGEINDEX_LOCK_TTL: !Ref RedactedPlaceholder # [REDACTED]
+          PAGEINDEX_PREFIX: !Ref RedactedPlaceholder # [REDACTED]
+          PAGEINDEX_RETRIEVAL_DEADLINE: !Ref RedactedPlaceholder # [REDACTED]
+          REPROCESS_COOLDOWN_SECONDS: !Ref RedactedPlaceholder # [REDACTED]
+          SALESFORCE_API_VERSION: !Ref RedactedPlaceholder # [REDACTED]
+          SALESFORCE_CLIENT_ID: !Ref RedactedPlaceholder # [REDACTED]
+          SALESFORCE_CLIENT_SECRET_ARN: !Ref RedactedPlaceholder # [REDACTED]
+          SALESFORCE_KMS_KEY_ID: !Ref RedactedPlaceholder # [REDACTED]
+          SALESFORCE_LOGIN_URL: !Ref RedactedPlaceholder # [REDACTED]
+          SALESFORCE_REDIRECT_URI: !Ref RedactedPlaceholder # [REDACTED]
+          SALESFORCE_RETURN_URL: !Ref RedactedPlaceholder # [REDACTED]
+          SHARES_RECORDING_INDEX: !Ref RedactedPlaceholder # [REDACTED]
+          SHARES_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          SHARES_TOKEN_INDEX: !Ref RedactedPlaceholder # [REDACTED]
+          SHARE_BASE_URL: !Ref RedactedPlaceholder # [REDACTED]
+          TASKS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          TRANSCRIBE_LAMBDA_NAME: !Ref RedactedPlaceholder # [REDACTED]
+      # ---------------------------------------------------------------
+      # API GATEWAY ROUTES -- 102 routes, all AuthorizationType NONE.
+      # ---------------------------------------------------------------
+      Events:
+        Route001:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /ai/chat/sessions/{session_id}
+        Route002:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /contacts/{contact_id}
+        Route003:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /crm/salesforce
+        Route004:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /devices/{device_id}
+        Route005:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /folders/{folder_id}
+        Route006:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /folders/{folder_id}/contacts/{contact_id}
+        Route007:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /integrations/{provider}
+        Route008:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /recordings/ai/chat/{key+}
+        Route009:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /recordings/ai/documents/{key+}
+        Route010:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /recordings/ai/mom/{key+}
+        Route011:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /recordings/ai/tasks/{key+}
+        Route012:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /recordings/permanent/{key+}
+        Route013:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /recordings/{key+}
+        Route014:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: delete
+            Path: /shares/{share_id}
+        Route015:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /ai/chat/sessions
+        Route016:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /ai/chat/sessions/{session_id}
+        Route017:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /ai/suggestions
+        Route018:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /contacts
+        Route019:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /contacts/{contact_id}
+        Route020:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /crm/salesforce/callback
+        Route021:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /crm/salesforce/config
+        Route022:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /crm/salesforce/connect
+        Route023:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /crm/salesforce/fields/{object_name}
+        Route024:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /crm/salesforce/objects
+        Route025:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /crm/salesforce/status
+        Route026:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /devices
+        Route027:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /devices/{device_id}
+        Route028:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /folders
+        Route029:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /folders/{folder_id}
+        Route030:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /folders/{folder_id}/contacts
+        Route031:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /integrations
+        Route032:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /integrations/gmail/recipients/{key+}
+        Route033:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /integrations/{provider}
+        Route034:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /integrations/{provider}/callback
+        Route035:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /me
+        Route036:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /notifications
+        Route037:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /notifications/unread-count
+        Route038:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /recordings
+        Route039:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /recordings/ai/chat/{key+}
+        Route040:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /recordings/ai/documents/{key+}
+        Route041:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /recordings/ai/mom/{key+}
+        Route042:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /recordings/ai/tasks/{key+}
+        Route043:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /recordings/participants/{key+}
+        Route044:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /recordings/shared-with-me/{key+}
+        Route045:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /recordings/shares/{key+}
+        Route046:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /recordings/{key+}
+        Route047:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /share/{token}
+        Route048:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /share/{token}/audio
+        Route049:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /tasks
+        Route050:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /tasks/{task_id}
+        Route051:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /tasks/{task_id}/assignee-candidates
+        Route052:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /trash
+        Route053:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /contacts/{contact_id}
+        Route054:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /devices/{device_id}
+        Route055:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /folders/{folder_id}
+        Route056:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /me
+        Route057:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /recordings/ai/documents/{key+}
+        Route058:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /recordings/ai/tasks/{key+}
+        Route059:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /recordings/folder/{key+}
+        Route060:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /recordings/{key+}
+        Route061:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /shares/{share_id}
+        Route062:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: patch
+            Path: /tasks/{task_id}
+        Route063:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /ai/chat
+        Route064:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /ai/task-intelligence
+        Route065:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /avatars/upload-request
+        Route066:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /contacts
+        Route067:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /crm/salesforce/lookup
+        Route068:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /crm/salesforce/sync/{key+}
+        Route069:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /devices/claim
+        Route070:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /devices/pair
+        Route071:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /devices/pair-request
+        Route072:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /devices/{device_id}/factory-reset
+        Route073:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /folders
+        Route074:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /folders/{folder_id}/contacts/{contact_id}
+        Route075:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /integrations/gmail/send
+        Route076:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /integrations/gmail/send/meeting/{key+}
+        Route077:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /integrations/gmail/send/task/{task_id}
+        Route078:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /integrations/{provider}/connect
+        Route079:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /login
+        Route080:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /me/password
+        Route081:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /notifications/read-all
+        Route082:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /notifications/{notification_id}/read
+        Route083:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/chat/{key+}
+        Route084:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/custom-document/{key+}
+        Route085:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/documents/{key+}
+        Route086:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/highlights/{key+}
+        Route087:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/mom/{key+}
+        Route088:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/quick/{key+}
+        Route089:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/reprocess/{key+}
+        Route090:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/stt-reconcile/{key+}
+        Route091:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/tasks/{key+}
+        Route092:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/ai/update-documents/{key+}
+        Route093:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/restore/{key+}
+        Route094:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/share/{key+}
+        Route095:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/upload-complete
+        Route096:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /recordings/upload-request
+        Route097:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /signup
+        Route098:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /tasks/{task_id}/resolve
+        Route099:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /webhooks/elevenlabs/stt
+        Route100:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: put
+            Path: /crm/salesforce/config
+        Route101:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: put
+            Path: /recordings/ai/mom/{key+}
+        Route102:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: put
+            Path: /recordings/participants/{key+}
+
+  GetUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Device-facing API (3 routes). Authenticates the ESP32-S3 by x-api-key, requires the device to be PAIRED, and returns a presigned S3 PUT. Also handles heartbeat and upload-complete.
+    Properties:
+      FunctionName: getUploadUrl
+      Description: Device-facing API - presign, heartbeat and upload-complete for the
+        ESP32-S3, authenticated by x-api-key.
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Architectures:
+        - x86_64
+      MemorySize: 256
+      Timeout: 10
+      # Existing deployed role, referenced by ARN rather than generated by
+      # SAM, so no new policy is ever synthesised for these functions.
+      Role: !GetAtt GetUploadUrlRole.Arn
+      CodeUri: cloud/functions/device-presign/
+      Tracing: PassThrough # X-Ray not enabled in the deployed account
+      # ---------------------------------------------------------------
+      # ENVIRONMENT VARIABLES -- 4 variables, NAMES ONLY.
+      # Every value below is a REDACTED placeholder. The real values were
+      # never read during capture and MUST NOT be committed here.
+      # ---------------------------------------------------------------
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref RedactedPlaceholder # [REDACTED]
+          DEVICES_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          TABLE_NAME: !Ref RedactedPlaceholder # [REDACTED]
+          URL_EXPIRY: !Ref RedactedPlaceholder # [REDACTED]
+      # ---------------------------------------------------------------
+      # API GATEWAY ROUTES -- 3 routes, all AuthorizationType NONE.
+      # ---------------------------------------------------------------
+      Events:
+        Route001:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: get
+            Path: /get-upload-url
+        Route002:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /device/heartbeat
+        Route003:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MinuteXHttpApi
+            Method: post
+            Path: /device/upload-complete
+
+  TranscribeRecordingFunction:
+    Type: AWS::Serverless::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Transcription + AI analysis. Two entry points: (A) an S3 ObjectCreated event STARTS an asynchronous ElevenLabs job and exits in ~2s; (B) an asynchronous stt.completed invoke from userApi runs the Groq analysis and persistence path.
+    Properties:
+      FunctionName: transcribeRecording
+      Description: Transcription and AI analysis - S3-triggered async STT start, plus
+        the stt.completed analysis path.
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Architectures:
+        - x86_64
+      MemorySize: 256
+      Timeout: 300
+      # Existing deployed role, referenced by ARN rather than generated by
+      # SAM, so no new policy is ever synthesised for these functions.
+      Role: !GetAtt TranscribeRecordingRole.Arn
+      CodeUri: cloud/functions/transcribe/
+      Tracing: PassThrough # X-Ray not enabled in the deployed account
+      # ---------------------------------------------------------------
+      # ENVIRONMENT VARIABLES -- 19 variables, NAMES ONLY.
+      # Every value below is a REDACTED placeholder. The real values were
+      # never read during capture and MUST NOT be committed here.
+      #
+      # SECURITY NOTE (existing deployed state, not changed):
+      # GROQ_API_KEY and ELEVENLABS_API_KEY are stored as PLAINTEXT Lambda
+      # environment variables, while the other four secrets correctly use
+      # Secrets Manager. Captured as-is; see AWS_ARCHITECTURE.md risks.
+      # ---------------------------------------------------------------
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref RedactedPlaceholder # [REDACTED]
+          CRM_CONNECTIONS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          ELEVENLABS_API_KEY: !Ref RedactedPlaceholder # [REDACTED - plaintext secret in deployed env]
+          ELEVENLABS_MODEL: !Ref RedactedPlaceholder # [REDACTED]
+          GROQ_API_KEY: !Ref RedactedPlaceholder # [REDACTED - plaintext secret in deployed env]
+          GROQ_CONTEXT_TOKENS: !Ref RedactedPlaceholder # [REDACTED]
+          GROQ_MODEL: !Ref RedactedPlaceholder # [REDACTED]
+          GROQ_TPM_LIMIT: !Ref RedactedPlaceholder # [REDACTED]
+          NOTIFICATIONS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          NOTIFICATION_DEDUPE_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          PAGEINDEX_LLM_SUMMARY: !Ref RedactedPlaceholder # [REDACTED]
+          PAGEINDEX_LOCK_TTL: !Ref RedactedPlaceholder # [REDACTED]
+          PAGEINDEX_PREFIX: !Ref RedactedPlaceholder # [REDACTED]
+          PAGEINDEX_RETRIEVAL_DEADLINE: !Ref RedactedPlaceholder # [REDACTED]
+          RECORDINGS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
+          STT_START_TIMEOUT: !Ref RedactedPlaceholder # [REDACTED]
+          STT_URL_EXPIRY: !Ref RedactedPlaceholder # [REDACTED]
+          URL_EXPIRY: !Ref RedactedPlaceholder # [REDACTED]
+          USERAPI_LAMBDA_NAME: !Ref RedactedPlaceholder # [REDACTED]
+      # ---------------------------------------------------------------
+      # TRIGGERS
+      # This function is NOT wired to API Gateway. It is invoked by:
+      #   1. S3 ObjectCreated on meeting-recorder-shubham-aps1,
+      #      declared on the bucket's NotificationConfiguration above
+      #      plus TranscribeRecordingS3InvokePermission below. It is
+      #      NOT declared as a SAM S3 event, because a SAM S3 event
+      #      requires SAM to own (create) the bucket, and this bucket
+      #      already exists.
+      #   2. An ASYNCHRONOUS lambda:InvokeFunction from userApi carrying
+      #      a stt.completed payload (InvocationType=Event).
+      # ---------------------------------------------------------------
+
+      # ===========================================================================
+      # LAMBDA RESOURCE POLICIES  --  who may invoke what
+      #
+      # The API-Gateway permissions below mirror the statements found on the
+      # deployed functions. NOTE: the deployed userApi policy actually carries
+      # THREE apigateway statements (sids apigw-invoke-userapi,
+      # apigw-q87zfn5vyj-invoke, apigw-stt-webhook), two of which have identical
+      # SourceArn conditions -- deploy-script accretion. Represented here as the
+      # single distinct grant they collectively express.
+      #
+      # SAM also auto-generates its own invoke permissions from the HttpApi events
+      # above; these explicit resources document what actually exists in AWS.
+      #
+      # There is NO resource-policy statement for the Lambda-to-Lambda invokes:
+      # those are authorised by the CALLER's IAM role (userApi-invoke-transcribe
+      # and transcribe-invoke-userapi inline policies above), which is the correct
+      # and sufficient mechanism for same-account invocation.
+      #
+      # LAMBDA -> LAMBDA (both directions, both ASYNCHRONOUS, InvocationType=Event
+      # confirmed at all four call sites in source):
+      #   userApi --> transcribeRecording   reprocess, and stt.completed after the
+      #                                     ElevenLabs webhook is verified
+      #   transcribeRecording --> userApi   tasks.seed once a meeting completes
+      # ===========================================================================
+
+  UserApiApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    # Deployed statement sid: apigw-invoke-userapi
+    Properties:
+      FunctionName: !Ref UserApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MinuteXHttpApi}/*/*
+
+  GetUploadUrlApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    # Deployed statement sid: apigw-invoke-getuploadurl
+    Properties:
+      FunctionName: !Ref GetUploadUrlFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MinuteXHttpApi}/*/*
+
+  TranscribeRecordingS3InvokePermission:
+    Type: AWS::Lambda::Permission
+    # Deployed statement sid: s3-invoke-transcribe
+    # This is what allows the bucket notification to fire the function.
+    Properties:
+      FunctionName: !Ref TranscribeRecordingFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: arn:aws:s3:::meeting-recorder-shubham-aps1
+
+Outputs:
+
+  ApiEndpoint:
+    Description: Deployed HTTP API endpoint, hardcoded in app/lib/api.ts and
+      device/src/Config.h
+    Value: https://q87zfn5vyj.execute-api.ap-south-1.amazonaws.com
+
+  DeployedApiId:
+    Description: The real API Gateway id of the deployed HTTP API
+    Value: q87zfn5vyj
+
+  BucketName:
+    Description: The single S3 bucket holding audio, transcripts, PageIndex trees
+      and avatars
+    Value: meeting-recorder-shubham-aps1
+
+  LambdaFunctionCount:
+    Description: Number of Lambda functions in the deployed MinuteX system
+    Value: '3'
+
+  DynamoDbTableCount:
+    Description: Number of DynamoDB tables in the deployed MinuteX system
+    Value: '16'
+
+  RouteCount:
+    Description: Total HTTP API routes (102 to userApi, 3 to getUploadUrl)
+    Value: '105'
+
+  CaptureNotice:
+    Description: Deployment status of this template
+    Value: ARCHITECTURE CAPTURE ONLY. This template has never been deployed and no
+      AWS resources were created or modified to produce it.

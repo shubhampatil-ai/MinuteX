@@ -19,7 +19,7 @@ import { Icon } from "../../../lib/icons";
 import {
   S, R, ELEV, CAPS, FONT, useTheme, ColorScale,
 } from "../../../lib/theme";
-import { useWorkspace } from "../../../lib/workspace-context";
+import { roleLabel, useWorkspace } from "../../../lib/workspace-context";
 import {
   Avatar, Button, Card, ErrorText, KeyboardAware, Loading, SectionTitle,
   TextField, scrollFormProps,
@@ -38,7 +38,7 @@ export default function ContactDetailScreen() {
   // needs the manage_contacts capability, which the server supplies alongside
   // the role so the UI and the backend cannot disagree about the rule.
   const { active: activeWorkspace, isOrganisation } = useWorkspace();
-  const canManageContact = !isOrganisation
+  const canManageWorkspaceContacts = !isOrganisation
     || !!activeWorkspace?.capabilities?.manage_contacts;
   const st = useMemo(() => buildStyles(C, T), [C, T]);
   const router = useRouter();
@@ -50,6 +50,16 @@ export default function ContactDetailScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
+
+  // AN ORGANISATION MEMBER'S ENTRY IS NOT EDITABLE, whatever the caller's
+  // role. It mirrors that person's own MinuteX profile, so an edit here would
+  // be replaced by the live projection on the next read and the name shown
+  // would depend on which copy won; deleting would unassign their tasks and
+  // unlink every meeting they were tagged in, then project them straight
+  // back. The API answers 409 `contact_is_member` for both — this only saves
+  // the round trip.
+  const isMemberContact = !!contact?.is_member;
+  const canManageContact = canManageWorkspaceContacts && !isMemberContact;
 
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState("");
@@ -353,9 +363,20 @@ export default function ContactDetailScreen() {
           {!!contact.notes && (
             <DetailRow label="Notes" value={contact.notes} C={C} st={st} />
           )}
-          <View style={{ marginTop: S.md }}>
-            <Button label="Edit" variant="secondary" onPress={beginEdit} />
-          </View>
+          {canManageContact ? (
+            <View style={{ marginTop: S.md }}>
+              <Button label="Edit" variant="secondary" onPress={beginEdit} />
+            </View>
+          ) : isMemberContact ? (
+            <Text style={[T.caption, { marginTop: S.md }]}>
+              {contact.name.split(" ")[0]} is
+              {contact.workspace_role
+                ? ` ${roleLabel(contact.workspace_role).toLowerCase()} of`
+                : " a member of"}{" "}
+              your organisation. Their name and photo come from their own
+              MinuteX profile.
+            </Text>
+          ) : null}
         </Card>
       )}
 
@@ -404,6 +425,11 @@ export default function ContactDetailScreen() {
             onPress={confirmDelete}
           />
         </View>
+      ) : isMemberContact ? (
+        <Text style={[T.caption, { marginTop: S.xl, textAlign: "center" }]}>
+          Organisation members stay in Contacts automatically. To remove them,
+          remove them from the organisation.
+        </Text>
       ) : (
         <Text style={[T.caption, { marginTop: S.xl, textAlign: "center" }]}>
           Shared organisation contact. Ask an owner or manager to change it.

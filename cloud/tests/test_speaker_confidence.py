@@ -560,5 +560,112 @@ class LivePromptContractTests(unittest.TestCase):
         self.assertIn('"high" | "medium" | "low"', live)
 
 
+# ---------------------------------------------------------------------------
+# PART 3 — the ROSTER MATCH, and why blank contribution summaries happened.
+#
+# Same class of bug as PART 1, one layer along. The roster handed to the prompt
+# is authoritative about WHO spoke, but only guidance about how to SPELL them
+# back. _roster_filtered used an exact-string lookup, so a model answering "0"
+# or the speaker's human name for a roster of "Speaker 0" missed on every entry
+# and each speaker took the "" default.
+#
+# The production symptom (a real 40-minute Hindi meeting): six speakers listed,
+# every `summary` empty, while the title, overview and tasks were all fine. It
+# is indistinguishable on the row from "the model wrote no blurbs", which is
+# why it needed a DynamoDB read to diagnose and why these tests exist.
+#
+# The filter must stay a FILTER: widening the match must not let a merely
+# MENTIONED name become an attendee. That is asserted last, and is the property
+# the whole function exists for.
+# ---------------------------------------------------------------------------
+ROSTER = ["Speaker 1", "Speaker 0", "Speaker 2"]
+NAMES = {"0": "Ashish Goel Ganga", "1": "Yuvraj Sir", "2": "Pooja ma'am"}
+
+
+class RosterMatching(unittest.TestCase):
+    def _by_speaker(self, out):
+        return {p["speaker"]: p["summary"] for p in out}
+
+    def test_bare_numeric_labels_still_match(self):
+        """"0" is the same speaker as "Speaker 0". The model drifts to the
+        compact form on code-switched transcripts; before the fix every blurb
+        was dropped."""
+        got = ai_schema._roster_filtered(
+            [{"speaker": "0", "summary": "Led the demo."},
+             {"speaker": "1", "summary": "Asked about tagging."}], ROSTER)
+        self.assertEqual(self._by_speaker(got)["Speaker 0"], "Led the demo.")
+        self.assertEqual(self._by_speaker(got)["Speaker 1"],
+                         "Asked about tagging.")
+
+    def test_underscore_and_double_space_labels_match(self):
+        """The other two spellings seen in the wild."""
+        got = ai_schema._roster_filtered(
+            [{"speaker": "speaker_2", "summary": "Explained upload."},
+             {"speaker": "Speaker  1", "summary": "Drove requirements."}],
+            ROSTER)
+        self.assertEqual(self._by_speaker(got)["Speaker 2"],
+                         "Explained upload.")
+        self.assertEqual(self._by_speaker(got)["Speaker 1"],
+                         "Drove requirements.")
+
+    def test_human_names_resolve_through_speaker_names(self):
+        """A renamed transcript reads "Yuvraj Sir:", so the model answers with
+        the NAME. Without the rename map that blurb has nowhere to land."""
+        got = ai_schema._roster_filtered(
+            [{"speaker": "Yuvraj Sir", "summary": "Drove requirements."},
+             {"speaker": "Pooja ma'am", "summary": "Explained upload."}],
+            ROSTER, NAMES)
+        self.assertEqual(self._by_speaker(got)["Speaker 1"],
+                         "Drove requirements.")
+        self.assertEqual(self._by_speaker(got)["Speaker 2"],
+                         "Explained upload.")
+
+    def test_exact_labels_are_unchanged(self):
+        """The path that always worked must keep working."""
+        got = ai_schema._roster_filtered(
+            [{"speaker": "Speaker 0", "summary": "Kept."}], ROSTER, NAMES)
+        self.assertEqual(self._by_speaker(got)["Speaker 0"], "Kept.")
+
+    def test_the_production_row_is_reproduced_and_fixed(self):
+        """The real failure: every speaker present, every summary blank."""
+        drifted = [{"speaker": str(i), "summary": f"Contribution {i}."}
+                   for i in range(3)]
+        got = ai_schema._roster_filtered(drifted, ROSTER)
+        self.assertEqual([p["speaker"] for p in got], ROSTER,
+                         "roster order and membership are unchanged")
+        self.assertTrue(all(p["summary"] for p in got),
+                        "no speaker may be left with a blank summary")
+
+    def test_a_mentioned_name_is_still_dropped(self):
+        """THE guarantee. A task owner who never spoke must not become an
+        attendee just because the match got more forgiving."""
+        got = ai_schema._roster_filtered(
+            [{"speaker": "Rahul", "summary": "Invented attendee."},
+             {"speaker": "Speaker 0", "summary": "Real."}], ROSTER, NAMES)
+        self.assertEqual([p["speaker"] for p in got], ROSTER)
+        self.assertNotIn("Rahul", self._by_speaker(got))
+
+    def test_an_unnamed_speaker_keeps_a_blank_summary(self):
+        """A roster speaker the model genuinely skipped is still listed — a
+        speaker with turns IS a participant whether or not it described them."""
+        got = ai_schema._roster_filtered(
+            [{"speaker": "0", "summary": "Only this one."}], ROSTER)
+        self.assertEqual(self._by_speaker(got)["Speaker 2"], "")
+        self.assertEqual([p["speaker"] for p in got], ROSTER)
+
+    def test_no_roster_leaves_the_model_list_alone(self):
+        """A non-diarized transcript has no structural evidence to enforce."""
+        model = [{"speaker": "Alice", "summary": "Spoke."}]
+        self.assertEqual(ai_schema._roster_filtered(model, []), model)
+
+    def test_coerce_unified_threads_speaker_names(self):
+        """The public entry point, not just the private helper."""
+        out = ai_schema.coerce_unified(
+            {"participants": [{"speaker": "Yuvraj Sir", "summary": "Led."}]},
+            ROSTER, None, NAMES)
+        got = {p["speaker"]: p["summary"] for p in out["participants"]}
+        self.assertEqual(got["Speaker 1"], "Led.")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

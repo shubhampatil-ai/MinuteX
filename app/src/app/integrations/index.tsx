@@ -1,9 +1,43 @@
-// src/app/integrations.tsx — Settings -> Integrations.
+// src/app/integrations/index.tsx — Settings -> Connected Apps, AND
+// Organisation -> Organisation Integrations. One screen, two entry points
+// (settings.tsx and organisation/index.tsx both router.push("/integrations")
+// — see those files), rendering two DELIBERATELY DIFFERENT views depending
+// on the active workspace, so the same route never reads as "the same
+// screen twice" no matter which way the user arrived:
 //
-// The central place a user connects MinuteX to other applications. Gmail is
-// the only one that can be connected in this phase; the rest are honest
-// "Coming Soon" cards, which is the same convention settings.tsx already uses
-// for planned features (ComingSoonRow / SoonBadge).
+//   PERSONAL (useWorkspace().isOrganisation === false): unchanged from
+//   before this file gained organisation-awareness — the full personal
+//   catalog (Gmail, Salesforce, and every server-listed provider), because
+//   this IS "my personal/user-level connected applications."
+//
+//   ORGANISATION: shows ONLY what is relevant to the active organisation —
+//   the Organisation Salesforce connection (workspace-owned, see
+//   OrgSalesforceCard) and Gmail (the SAME per-user connection Personal
+//   already shows, re-labelled here as "Your Gmail account" / "used for
+//   organisation actions" — never a second OAuth connection, never a
+//   shared organisation mailbox). Every other personal-only provider
+//   (Google Calendar, Google Tasks, WhatsApp, Outlook, ...) is hidden here:
+//   an organisation member switching into a workspace should see what THIS
+//   organisation uses, not their own unrelated personal connections mixed
+//   in — that mixing is exactly the confusion this split exists to remove.
+//
+// GMAIL IS USER-OWNED, NOT ORGANISATION-OWNED. There is exactly one Gmail
+// connection per MinuteX user (Integrations table, keyed by user_id only —
+// see cloud/shared/integrations.py). Showing it here is the SAME
+// useIntegrations() catalog Personal reads, not a second fetch and not a
+// second connection — switching workspace changes what this screen shows,
+// never what is connected. Sending email from an organisation meeting/task
+// already only ever used the sending user's own Gmail token (see
+// gmail_send_meeting/gmail_send_task in lambda_function.py) — this screen
+// now just says that honestly instead of leaving it unlabelled.
+//
+// SALESFORCE IS ORGANISATION-OWNED. OrgCrmConnections is keyed by
+// workspace_id, entirely separate from CrmConnections (Personal, keyed by
+// user_id) — see org-salesforce.tsx and shared/integrations.py. The
+// Personal Salesforce card is never shown in Organisation mode, and the
+// Organisation Salesforce card is never shown in Personal mode: showing
+// both together (as this screen briefly did) was itself the source of the
+// "which Salesforce is this" confusion.
 //
 // THE CARD LIST COMES FROM THE SERVER. It is not a constant in this file. The
 // backend's PROVIDERS registry decides which integrations exist and which are
@@ -30,10 +64,11 @@ import {
 import { useFocusEffect, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { S, R, CAPS, FONT, useTheme, ColorScale } from "../../../lib/theme";
-import { ErrorText, Masthead, SoonBadge } from "../../../lib/ui";
+import { ErrorText, Masthead, SectionRule, SoonBadge } from "../../../lib/ui";
 import { IntegrationLogo } from "../../../lib/integration-logos";
-import { Integration } from "../../../lib/api";
-import { useIntegrations } from "../../../lib/integrations";
+import { Integration, OrgSalesforceStatus, getOrgSalesforceStatus } from "../../../lib/api";
+import { useGmail, useIntegrations } from "../../../lib/integrations";
+import { useWorkspace, workspaceLabel } from "../../../lib/workspace-context";
 
 // The logo tile sits on a neutral surface rather than a per-brand tinted one.
 // With real multi-colour marks a tinted backdrop fights the artwork — Gmail's
@@ -88,8 +123,23 @@ function buildStyles(C: ColorScale) {
       fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint,
       lineHeight: 17, marginTop: 6, marginBottom: 30,
     },
+    scopeBadge: {
+      ...CAPS, fontFamily: FONT.bold, fontSize: 9, letterSpacing: 1,
+      color: C.textFaint, marginTop: 2,
+    },
   });
 }
+
+// Category -> section title, in the order sections render. Mirrors
+// shared/integrations.py's PROVIDERS categories ("crm", "communication",
+// "productivity") — a new category the backend introduces falls into
+// OTHER_CATEGORY below rather than disappearing.
+const SECTIONS: { category: string; title: string }[] = [
+  { category: "crm", title: "CRM" },
+  { category: "communication", title: "Email" },
+  { category: "productivity", title: "Calendar" },
+];
+const OTHER_CATEGORY = "Other";
 
 export default function IntegrationsScreen() {
   const router = useRouter();
@@ -98,18 +148,43 @@ export default function IntegrationsScreen() {
   const st = useMemo(() => buildStyles(C), [C]);
 
   const { integrations, loading, error, refresh, connect } = useIntegrations();
+  const { active, isOrganisation, loading: wsLoading } = useWorkspace();
   const [busy, setBusy] = useState("");
   const [connectError, setConnectError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
 
+  // The ORGANISATION Salesforce card — a second, independent status fetched
+  // alongside the personal catalog above rather than merged into it (see the
+  // module note in shared/integrations.py's public_org_salesforce_status).
+  // Only fetched when the active workspace IS an organisation: a personal
+  // workspace has no organisation connection to show, and calling the route
+  // for one would only ever answer "not connected" for a card this screen
+  // should not render at all.
+  const [orgSalesforce, setOrgSalesforce] = useState<OrgSalesforceStatus | null>(null);
+  const [orgSalesforceLoading, setOrgSalesforceLoading] = useState(false);
+
+  const loadOrgSalesforce = useCallback(async () => {
+    if (!isOrganisation || !active) { setOrgSalesforce(null); return; }
+    setOrgSalesforceLoading(true);
+    try {
+      setOrgSalesforce(await getOrgSalesforceStatus(active.workspace_id));
+    } catch {
+      // Degrade to "not shown" rather than breaking the whole screen — the
+      // Personal cards above must still render.
+      setOrgSalesforce(null);
+    } finally {
+      setOrgSalesforceLoading(false);
+    }
+  }, [isOrganisation, active]);
+
   // Re-read on every return to this screen — coming back from the Gmail
-  // Manage screen must show the new state, and a connection can also change
-  // on another device.
-  useFocusEffect(useCallback(() => { refresh(); }, [refresh]));
+  // Manage screen (or org-salesforce.tsx) must show the new state, and a
+  // connection can also change on another device.
+  useFocusEffect(useCallback(() => { refresh(); void loadOrgSalesforce(); }, [refresh, loadOrgSalesforce]));
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await refresh();
+    await Promise.all([refresh(), loadOrgSalesforce()]);
     setRefreshing(false);
   };
 
@@ -130,6 +205,23 @@ export default function IntegrationsScreen() {
     if (provider === "salesforce") { router.push("/salesforce"); return; }
   };
 
+  const grouped = useMemo(() => {
+    const byCategory = new Map<string, Integration[]>();
+    for (const it of integrations) {
+      const list = byCategory.get(it.category) ?? [];
+      list.push(it);
+      byCategory.set(it.category, list);
+    }
+    return byCategory;
+  }, [integrations]);
+
+  const knownCategories = new Set(SECTIONS.map((s) => s.category));
+  const other = integrations.filter((it) => !knownCategories.has(it.category));
+
+  const gmail = useGmail();
+
+  const loadingBody = (loading && !integrations.length) || wsLoading;
+
   return (
     <ScrollView
       style={st.container}
@@ -139,36 +231,257 @@ export default function IntegrationsScreen() {
         <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={C.textFaint} />
       }
     >
-      <Masthead kicker="Settings" title="Integrations" />
-      <Text style={st.blurb}>
-        Connect MinuteX with your favourite applications.
+      {isOrganisation ? (
+        <>
+          <Masthead kicker={workspaceLabel(active)} title="Organisation Integrations" />
+          <Text style={st.blurb}>Apps and services used with this organisation.</Text>
+
+          {connectError ? <ErrorText>{connectError}</ErrorText> : null}
+          {error && !integrations.length ? <ErrorText>{error}</ErrorText> : null}
+
+          {loadingBody ? (
+            <View style={{ paddingVertical: 40, alignItems: "center" }}>
+              <ActivityIndicator color={C.textFaint} />
+            </View>
+          ) : (
+            <>
+              <SectionRule>CRM</SectionRule>
+              <OrgSalesforceCard
+                workspaceName={workspaceLabel(active)}
+                status={orgSalesforce}
+                loading={orgSalesforceLoading}
+                onPress={() => router.push("/org-salesforce")}
+              />
+
+              <SectionRule>Communication</SectionRule>
+              <OrgGmailCard
+                integration={gmail.integration}
+                loading={gmail.loading}
+                busy={busy === "gmail"}
+                onConnect={() => onConnect("gmail")}
+                onManage={() => openManage("gmail")}
+              />
+            </>
+          )}
+
+          <Text style={st.footnote}>
+            Salesforce here is this organisation&apos;s own connection, managed by an
+            owner or manager. Gmail uses your own personal connection — the same one
+            shown in Settings — so email always sends from your address, never a
+            shared organisation mailbox.
+          </Text>
+        </>
+      ) : (
+        <>
+          <Masthead kicker="Personal" title="Connected Apps" />
+          <Text style={st.blurb}>
+            Apps connected to your personal MinuteX account.
+          </Text>
+
+          {connectError ? <ErrorText>{connectError}</ErrorText> : null}
+          {error && !integrations.length ? <ErrorText>{error}</ErrorText> : null}
+
+          {loadingBody ? (
+            <View style={{ paddingVertical: 40, alignItems: "center" }}>
+              <ActivityIndicator color={C.textFaint} />
+            </View>
+          ) : (
+            <>
+              {SECTIONS.map(({ category, title }) => {
+                const items = grouped.get(category) ?? [];
+                if (!items.length) return null;
+                return (
+                  <View key={category}>
+                    <SectionRule>{title}</SectionRule>
+                    {items.map((it) => (
+                      <IntegrationCard
+                        key={it.provider}
+                        integration={it}
+                        busy={busy === it.provider}
+                        onConnect={() => onConnect(it.provider)}
+                        onManage={() => openManage(it.provider)}
+                      />
+                    ))}
+                  </View>
+                );
+              })}
+
+              {other.length ? (
+                <View>
+                  <SectionRule>{OTHER_CATEGORY}</SectionRule>
+                  {other.map((it) => (
+                    <IntegrationCard
+                      key={it.provider}
+                      integration={it}
+                      busy={busy === it.provider}
+                      onConnect={() => onConnect(it.provider)}
+                      onManage={() => openManage(it.provider)}
+                    />
+                  ))}
+                </View>
+              ) : null}
+            </>
+          )}
+
+          <Text style={st.footnote}>
+            MinuteX never stores your password for a connected application, and
+            your recordings, contacts and tasks stay in your account whether an
+            integration is connected or not.
+          </Text>
+        </>
+      )}
+    </ScrollView>
+  );
+}
+
+/** The Organisation Salesforce card — same visual language as
+ *  IntegrationCard below, but reading OrgSalesforceStatus (a second,
+ *  independent connection) rather than the personal Integration catalog.
+ *  Kept as its own small component rather than forcing OrgSalesforceStatus
+ *  into the Integration shape: the two have genuinely different fields
+ *  (`configured`, `config_cleared_reason`, `connected_by_user_id` have no
+ *  Personal equivalent), and coercing one into the other would be the kind
+ *  of union-type nobody can reason about that shared/integrations.py's own
+ *  docstring warns against. */
+function OrgSalesforceCard({
+  workspaceName, status, loading, onPress,
+}: {
+  workspaceName: string;
+  status: OrgSalesforceStatus | null;
+  loading: boolean;
+  onPress: () => void;
+}) {
+  const { C } = useTheme();
+  const st = useMemo(() => buildStyles(C), [C]);
+  const connected = status?.connected === true;
+  const label = loading ? "Checking…" : connected ? "Connected" : "Not connected";
+  const color = loading ? C.textFaint : connected ? C.success : C.textFaint;
+
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [st.card, pressed && { opacity: 0.85 }]}
+    >
+      <View style={st.cardHead}>
+        <View style={st.logoTile}>
+          <IntegrationLogo provider="salesforce" size={26} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text style={st.name}>Salesforce</Text>
+          <Text style={st.scopeBadge}>Organisation connection</Text>
+          <Text style={[st.statusCaps, { color, marginTop: 5 }]}>{label}</Text>
+        </View>
+      </View>
+
+      <Text style={st.desc}>
+        Push {workspaceName}&apos;s meeting notes onto your organisation&apos;s CRM records.
       </Text>
 
-      {connectError ? <ErrorText>{connectError}</ErrorText> : null}
-      {error && !integrations.length ? <ErrorText>{error}</ErrorText> : null}
-
-      {loading && !integrations.length ? (
-        <View style={{ paddingVertical: 40, alignItems: "center" }}>
-          <ActivityIndicator color={C.textFaint} />
-        </View>
+      {connected && status?.sf_username ? (
+        <Text style={st.account}>{status.sf_username}</Text>
       ) : null}
 
-      {integrations.map((it) => (
-        <IntegrationCard
-          key={it.provider}
-          integration={it}
-          busy={busy === it.provider}
-          onConnect={() => onConnect(it.provider)}
-          onManage={() => openManage(it.provider)}
-        />
-      ))}
+      {/* "Managed by organisation" — always true for this card (an
+          Owner/Manager connects/configures/disconnects it, never a
+          per-member action), so it is shown regardless of who is looking,
+          the same way the label on the card itself never changes by role. */}
+      {connected ? <Text style={st.scopeBadge}>Managed by organisation</Text> : null}
 
-      <Text style={st.footnote}>
-        MinuteX never stores your password for a connected application, and
-        your recordings, contacts and tasks stay in your account whether an
-        integration is connected or not.
+      {connected && status?.config_cleared_reason ? (
+        <Text style={st.warnNote}>{status.config_cleared_reason}</Text>
+      ) : null}
+
+      <View style={st.statusRow}>
+        <View />
+        <View style={[st.action, connected ? st.actionQuiet : st.actionPrimary]}>
+          <Text style={connected ? st.actionTxtQuiet : st.actionTxtPrimary}>
+            {connected ? "Manage" : "Connect Salesforce"}
+          </Text>
+        </View>
+      </View>
+    </Pressable>
+  );
+}
+
+/** The Organisation Integrations screen's Gmail card. Reads the SAME
+ *  useGmail()/Integration status Personal's IntegrationCard reads — this is
+ *  not a second connection or a second fetch, only different copy, because
+ *  Gmail is user-owned even when the context is an organisation (see the
+ *  module docstring). Tapping it goes to the exact same Manage screen
+ *  Personal uses (/integrations/gmail) — there is nothing organisation-
+ *  specific to configure, since there is no organisation-level Gmail
+ *  connection to configure. */
+function OrgGmailCard({
+  integration, loading, busy, onConnect, onManage,
+}: {
+  integration: Integration | null;
+  loading: boolean;
+  busy: boolean;
+  onConnect: () => void;
+  onManage: () => void;
+}) {
+  const { C } = useTheme();
+  const st = useMemo(() => buildStyles(C), [C]);
+  const connected = integration?.status === "CONNECTED";
+  const needsReauth = integration?.status === "REAUTH_REQUIRED"
+    || integration?.status === "ERROR";
+  const label = loading ? "Checking…"
+    : connected ? "Connected"
+      : needsReauth ? "Reconnect required" : "Not connected";
+  const color = loading ? C.textFaint
+    : connected ? C.success
+      : needsReauth ? C.warn : C.textFaint;
+
+  return (
+    <View style={st.card}>
+      <View style={st.cardHead}>
+        <View style={st.logoTile}>
+          <IntegrationLogo provider="gmail" size={26} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text style={st.name}>Gmail</Text>
+          <Text style={st.scopeBadge}>Your Gmail account</Text>
+          <Text style={[st.statusCaps, { color, marginTop: 5 }]}>{label}</Text>
+        </View>
+      </View>
+
+      <Text style={st.desc}>
+        Used for sending from your own account — never a shared organisation
+        mailbox. Only you can manage this connection.
       </Text>
-    </ScrollView>
+
+      {connected && integration?.account_identifier ? (
+        <Text style={st.account}>Sending as {integration.account_identifier}</Text>
+      ) : null}
+
+      {needsReauth ? (
+        <Text style={st.warnNote}>
+          {integration?.message || "Reconnect Gmail to keep sending from your account."}
+        </Text>
+      ) : null}
+
+      <View style={st.statusRow}>
+        <View />
+        <Pressable
+          onPress={connected ? onManage : onConnect}
+          disabled={busy}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: busy }}
+          style={({ pressed }) => [
+            st.action, connected ? st.actionQuiet : st.actionPrimary,
+            (pressed || busy) && { opacity: 0.7 },
+          ]}
+        >
+          {busy
+            ? <ActivityIndicator size="small" color={connected ? C.text : C.textOnPrimary} />
+            : (
+              <Text style={connected ? st.actionTxtQuiet : st.actionTxtPrimary}>
+                {connected ? "Manage" : needsReauth ? "Reconnect Gmail" : "Connect Gmail"}
+              </Text>
+            )}
+        </Pressable>
+      </View>
+    </View>
   );
 }
 

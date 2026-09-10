@@ -9,9 +9,17 @@
 // of these destinations calls an API that re-resolves membership and role
 // server-side, so a member who navigated here by hand still gets 403/404.
 //
-// Sections that belong to later phases (Integrations) are shown with the
-// existing Coming Soon treatment rather than hidden, so the shape of the
-// product is honest — the same choice the profile screen already makes.
+// Organisation Integrations (Phase 2D) is a real destination, not a
+// placeholder: it routes to the SAME /integrations route Settings ->
+// Connected apps links to, but that screen renders a deliberately
+// different, organisation-scoped view once the active workspace is an
+// organisation (see src/app/integrations/index.tsx's own module comment) —
+// only the Organisation Salesforce connection and the current user's Gmail,
+// never the rest of the personal catalog. This hub row only needs to get
+// the user to that screen, not duplicate its logic. Sections that
+// genuinely belong to a later phase (Settings) still use the existing
+// Coming Soon treatment, so the shape of the product stays honest — the
+// same choice the profile screen already makes.
 import { useMemo } from "react";
 import { ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
@@ -145,15 +153,12 @@ export default function OrganisationScreen() {
               onPress={() => router.push("/organisation/members")}
             />
           )}
-          {canManageSettings ? (
-            // Integrations and organisation settings are Phase 2D/2E. Shown
-            // honestly rather than hidden, matching the profile screen.
-            <ComingSoonRow
-              icon="puzzlepiece.extension.fill"
-              label="Integrations"
-              sub="Organisation CRM and email"
-            />
-          ) : null}
+          <ListRow
+            icon="puzzlepiece.extension.fill"
+            label="Organisation Integrations"
+            sub="Apps and services used with this organisation"
+            onPress={() => router.push("/integrations")}
+          />
           {canManageSettings ? (
             <ComingSoonRow
               icon="gearshape.fill"

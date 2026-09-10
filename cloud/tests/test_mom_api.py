@@ -212,10 +212,12 @@ class TestGenerate(MomRouteTestCase):
 
     def test_generate_refuses_when_there_is_nothing_to_write(self):
         # Meeting Details alone IS a usable MoM, so the title and date have to
-        # go as well for the document to be genuinely empty.
+        # go as well for the document to be genuinely empty. `ai_tasks` counts
+        # too: Action Items now renders from it when no first-class Tasks have
+        # been seeded yet, so leaving it populated would be a real document.
         self.item.update(summary="", highlights=[], participants=[],
                          meeting_highlights=None, title="", started_at="",
-                         created_at="")
+                         created_at="", ai_tasks=[])
         status, body = parse(call(api.generate_mom, mom_event("POST", {})))
         self.assertEqual(status, 409)
         self.assertIn("enough", body["error"])
@@ -480,6 +482,172 @@ class TestDelete(MomRouteTestCase):
         after = self.generate()["mom"]
         self.assertNotEqual(
             self.section(after, mom_schema.ROLE_SUMMARY)["text"], "MY SUMMARY")
+
+
+class TestTaskBackedRoutes(MomRouteTestCase):
+    """The AUTHORITATIVE path: real Tasks, not the legacy highlights fallback.
+
+    Every other test in this file stubs _tasks_for_recording to [] so the
+    builder falls through to meeting_highlights.action_items. That kept those
+    tests focused, but it also meant the source the product actually uses was
+    never exercised at the route level. These re-point the stub at real task
+    rows in the shape _tasks_for_recording returns them.
+    """
+
+    def task_row(self, task_id, title, owner="", due="", normalized=""):
+        """A Tasks-table ROW (not the public payload) — _public_task_v2 turns
+        this into what the MoM builder sees, so the whole chain is covered."""
+        return {
+            "task_id": task_id,
+            "owner_user_id": "u-1",
+            "recording_key": KEY,
+            "title": title,
+            "status": "open",
+            "priority": "Medium",
+            "due_date": due,
+            "due_date_normalized": normalized,
+            "assignee_name": owner,
+            "assignee_speaker_id": "",
+            "created_at": f"2026-09-10T00:00:0{task_id[-1]}Z",
+            "source_type": "AI",
+        }
+
+    def use_tasks(self, rows):
+        """Re-point the task fetch. The base class stubs it to [] so the
+        builder uses the legacy fallback; these tests want the real tier."""
+        self.p_tasks.stop()
+        self.p_tasks = mock.patch.object(api, "_tasks_for_recording",
+                                         return_value=rows)
+        self.p_tasks.start()
+        self.addCleanup(self.p_tasks.stop)
+
+    def action_section(self, payload):
+        return next(s for s in payload["mom"]["sections"]
+                    if s["role"] == mom_schema.ROLE_ACTIONS)
+
+    def cell(self, section, row, label):
+        col = next(c["id"] for c in section["columns"]
+                   if c["label"] == label)
+        return row["cells"][col]
+
+    def test_generated_rows_carry_the_task_id(self):
+        self.use_tasks([self.task_row("t-a", "Confirm the rate card", "Amit")])
+        body = self.generate()
+        row = self.action_section(body)["rows"][0]
+        self.assertEqual(row[mom_schema.TASK_REF], "t-a")
+
+    def test_the_task_id_is_not_rendered_into_the_document(self):
+        """It is internal identity — the mirror must not leak it."""
+        self.use_tasks([self.task_row("t-a", "Confirm the rate card", "Amit")])
+        body = self.generate()
+        self.assertNotIn("t-a", body["document"]["content"])
+        self.assertNotIn(mom_schema.TASK_REF, body["document"]["content"])
+
+    def test_normalized_due_date_is_shown_not_the_spoken_phrase(self):
+        self.use_tasks([self.task_row("t-a", "Ship the build", "Amit",
+                                      due="tomorrow",
+                                      normalized="2026-09-11")])
+        body = self.generate()
+        section = self.action_section(body)
+        self.assertEqual(self.cell(section, section["rows"][0], "Deadline"),
+                         "2026-09-11")
+        self.assertIn("2026-09-11", body["document"]["content"])
+
+    def test_unresolvable_due_date_falls_back_to_the_phrase(self):
+        self.use_tasks([self.task_row("t-a", "Ship the build", "Amit",
+                                      due="Next Meeting", normalized="")])
+        section = self.action_section(self.generate())
+        self.assertEqual(self.cell(section, section["rows"][0], "Deadline"),
+                         "Next Meeting")
+
+    def test_deleting_a_task_removes_its_row_on_regeneration(self):
+        rows = [self.task_row("t-a", "Task A", "Amit"),
+                self.task_row("t-b", "Task B", "Neha")]
+        self.use_tasks(rows)
+        self.generate()
+        # The user deletes Task A in the Tasks screen.
+        self.use_tasks(rows[1:])
+        section = self.action_section(self.generate())
+        self.assertEqual([r[mom_schema.TASK_REF] for r in section["rows"]],
+                         ["t-b"])
+
+    def test_a_user_edit_survives_deletion_of_an_earlier_task(self):
+        rows = [self.task_row("t-a", "Task A", "Amit"),
+                self.task_row("t-b", "Task B", "Neha"),
+                self.task_row("t-c", "Task C", "Ravi")]
+        self.use_tasks(rows)
+        body = self.generate()
+        doc = body["mom"]
+        section = next(s for s in doc["sections"]
+                       if s["role"] == mom_schema.ROLE_ACTIONS)
+        owner = next(c["id"] for c in section["columns"]
+                     if c["label"] == "Owner")
+        target = next(r for r in section["rows"]
+                      if r[mom_schema.TASK_REF] == "t-b")
+        target["cells"][owner] = "Priya"
+        target["source"] = mom_schema.SOURCE_USER_EDITED
+        self.save(doc)
+
+        self.use_tasks(rows[1:])          # Task A deleted
+        after = self.action_section(self.generate())
+        self.assertEqual([r[mom_schema.TASK_REF] for r in after["rows"]],
+                         ["t-b", "t-c"])
+        kept = next(r for r in after["rows"]
+                    if r[mom_schema.TASK_REF] == "t-b")
+        self.assertEqual(self.cell(after, kept, "Owner"), "Priya")
+
+    def test_a_new_mom_is_stamped_with_the_current_version(self):
+        self.use_tasks([self.task_row("t-a", "Task A", "Amit")])
+        body = self.generate()
+        self.assertEqual(body["mom"]["mom_version"], mom_schema.MOM_VERSION)
+
+
+class TestMomIsStructuredOnly(MomRouteTestCase):
+    """The generic document routes must not author a second MoM."""
+
+    def doc_event(self, body):
+        return event(key=KEY, body=body, method="POST",
+                     route="/recordings/ai/documents/{key+}")
+
+    def generate_doc(self, body):
+        return parse(call(api.generate_document, self.doc_event(body)))
+
+    def test_generate_document_refuses_minutes_of_meeting(self):
+        status, body = self.generate_doc({"type": "minutes_of_meeting",
+                                          "regenerate": True})
+        self.assertEqual(status, 409, body)
+        self.assertIn("structured", body["error"].lower())
+
+    def test_quick_action_refuses_minutes_of_meeting(self):
+        """Quick AI aliases the same document key, so it is a second door."""
+        ev = event(key=KEY, body={"action": "minutes_of_meeting",
+                                  "regenerate": True},
+                   method="POST", route="/recordings/ai/quick/{key+}")
+        status, body = parse(call(api.quick_action, ev))
+        self.assertEqual(status, 409, body)
+
+    def test_other_document_types_are_unaffected(self):
+        """The guard must be scoped to the MoM, not to the route."""
+        with mock.patch.object(
+                api, "_generate_document",
+                return_value={"content": "x", "format": "markdown",
+                              "edited": False}) as gen:
+            status, body = self.generate_doc({"type": "action_items",
+                                              "regenerate": True})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(gen.called)
+
+    def test_a_stored_legacy_markdown_mom_is_still_readable(self):
+        """Path A documents already in production must keep working: the
+        guard sits AFTER the cache check so a read still serves them."""
+        self.item["documents"] = {"minutes_of_meeting": {
+            "content": "## Minutes\n\nLegacy Path A body.",
+            "format": "markdown",
+            "edited": True,
+        }}
+        status, body = self.generate_doc({"type": "minutes_of_meeting"})
+        self.assertEqual(status, 200, body)
+        self.assertIn("Legacy Path A body.", body["document"]["content"])
 
 
 if __name__ == "__main__":

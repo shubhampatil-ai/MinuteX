@@ -19,7 +19,7 @@ bundle beyond this file. Secrets come from the environment, never hardcoded.
 
 Rate limits (see MEMORY / the transcribe Lambda's own notes): the free
 `on_demand` tier allows 12k TOKENS PER MINUTE. That is a quota, not a context
-window — llama-3.3-70b has 131k of context but a single 45-minute transcript
+window — gpt-oss-120b has 131k of context but a single 45-minute transcript
 (~20k tokens) still 429s. Everything about chunking here exists for the TPM
 quota. Raise GROQ_TPM_LIMIT after a plan upgrade and long inputs get faster
 with no code change.
@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # Account tokens-per-minute quota, NOT the model context window. See above.
 GROQ_TPM_LIMIT = int(os.environ.get("GROQ_TPM_LIMIT", "12000"))
@@ -54,20 +54,34 @@ CHARS_PER_TOKEN = 3.5
 #           this with no code change (see GROQ_TPM_LIMIT above).
 #   CONTEXT is the model's fixed input+output token ceiling. No plan upgrade
 #           changes this — only switching models does.
-# On the Developer plan (300K TPM) for llama-3.3-70b-versatile, the context
+# On the Developer plan (300K TPM) for openai/gpt-oss-120b, the context
 # window (131,072 tokens) is now the SMALLER of the two, so it — not TPM — is
 # what actually bounds how large a transcript can be analyzed in one call.
-# Verified against Groq's published model table (2026-08-10):
-#   llama-3.3-70b-versatile: context_window=131072, max_completion_tokens=32768
+# Verified against GET /openai/v1/models (2026-09-09):
+#   openai/gpt-oss-120b: context_window=131072, max_completion_tokens=65536
 # GROQ_CONTEXT_TOKENS is model-specific and deliberately NOT derived from
 # GROQ_MODEL by name matching (fragile) — set it via env if GROQ_MODEL changes
 # to a model with a different window.
 GROQ_CONTEXT_TOKENS = int(os.environ.get("GROQ_CONTEXT_TOKENS", "131072"))
 
-# Reserve for the model's own reply, and — since the truncation fix — the
-# max_tokens actually SENT on the analysis call. One number for both, so the
-# budget arithmetic below and the request can never disagree about how much
-# output there is room for.
+# INPUT SIZING. How much room to leave for the model's reply when deciding how
+# much TEXT fits one call — see single_pass_budget_tokens() below, and note
+# userApi's Task Intelligence sizes its task batch off the same budget.
+#
+# This is NOT the max_tokens sent on the request; that is
+# ANALYSIS_MAX_OUTPUT_TOKENS. The two were briefly one constant and it coupled
+# unrelated features: raising it for output headroom shrank the task batch.
+SINGLE_PASS_OUTPUT_RESERVE_TOKENS = 6000
+
+# The max_tokens actually SENT on the meeting-analysis call.
+#
+# Deliberately SEPARATE from the reserve above, which is an INPUT-sizing
+# number: single_pass_budget_chars() subtracts it to decide how much text fits
+# one call, and userApi's Task Intelligence uses that same budget to decide how
+# many tasks to batch. Raising the reserve to buy output headroom therefore
+# shrank an unrelated feature's input batch (measured: 14,248 -> 1,750 chars at
+# the default 12k TPM, and one fewer task analyzed). Two different questions,
+# two constants.
 #
 # It has to be sent explicitly. Groq's server-side default for
 # openai/gpt-oss-120b is 3072 completion tokens, and a multi-speaker analysis
@@ -77,13 +91,20 @@ GROQ_CONTEXT_TOKENS = int(os.environ.get("GROQ_CONTEXT_TOKENS", "131072"))
 # Valid JSON, passes is_usable, silently missing most of the analysis. Fields
 # are generated in prompt order, so truncation always eats the same tail.
 #
-# 6000 is ~2x that default and comfortably inside the model's real ceiling
-# (verified against GET /openai/v1/models on 2026-09-09:
-# openai/gpt-oss-120b -> context_window=131072, max_completion_tokens=65536;
-# note 32768 is llama-3.3-70b-versatile's figure, not this model's). Raising
-# this raises the request cap and lowers the transcript budget together, which
-# is the correct coupling — do not split them.
-SINGLE_PASS_OUTPUT_RESERVE_TOKENS = 6000
+# SIZING. The model's ceiling is 65536 (verified against GET /openai/v1/models
+# on 2026-09-09: openai/gpt-oss-120b -> context_window=131072,
+# max_completion_tokens=65536; 32768 is llama-3.3-70b-versatile's figure, not
+# this model's). We sit well under it because the binding constraint is TIME:
+#   * a 16-speaker meeting measured 4921 completion tokens in ~14s (~350 tok/s)
+#   * GROQ_DEADLINE_SECONDS is 180s for the WHOLE analysis, retries included
+#   * 65536 tokens alone would be ~190s of generation — past the deadline
+# 16000 is ~3x the largest real reply observed and ~45s worst case, leaving the
+# retry path room inside the deadline. It costs nothing per call (billing is on
+# tokens GENERATED, not on the cap); it only spends wall-clock if a reply
+# actually grows into it. Still inside the reply reserve's own headroom, so the
+# input budget above stays honest.
+ANALYSIS_MAX_OUTPUT_TOKENS = int(
+    os.environ.get("GROQ_ANALYSIS_MAX_OUTPUT_TOKENS", "16000"))
 
 # Headroom below the hard ceiling. est_tokens()/CHARS_PER_TOKEN already err
 # high, but a second, explicit margin here means a future prompt tweak (a few
@@ -509,7 +530,7 @@ def analyze(text, map_prompt, reduce_prompt, merge, coerce,
                 result = coerce(complete_json(
                     map_prompt, text, label=label, key=gkey,
                     deadline=deadline,
-                    max_tokens=SINGLE_PASS_OUTPUT_RESERVE_TOKENS))
+                    max_tokens=ANALYSIS_MAX_OUTPUT_TOKENS))
             except GroqError as err:
                 # A single-pass call can still legitimately fail (429 despite
                 # the higher quota, a transient 5xx, a deadline that was
@@ -677,7 +698,7 @@ def map_reduce(text, map_prompt, reduce_prompt, merge, coerce,
                 return coerce(complete_json(
                     map_prompt, text, label=label, key=gkey,
                     deadline=deadline,
-                    max_tokens=SINGLE_PASS_OUTPUT_RESERVE_TOKENS)), 1, 1
+                    max_tokens=ANALYSIS_MAX_OUTPUT_TOKENS)), 1, 1
             except GroqError as err:
                 if (_is_transient_generation_failure(err)
                         and attempt < GENERATION_ATTEMPTS - 1

@@ -44,6 +44,8 @@ valid structure.
 """
 import hashlib
 
+import speaker_identity
+
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -51,7 +53,26 @@ from decimal import Decimal
 # structure stale. Mirrors ai_schema.AI_VERSION's role and is stamped on the
 # document the same way, so a revision invalidates lazily on next read rather
 # than needing a migration.
-MOM_VERSION = "1"
+#
+# "2" introduced TASK-BACKED ACTION ROW IDENTITY. Under "1" an Action Items row
+# id was _ident("r", role, position) — pure position, carrying nothing about
+# which Task it projected. Two consequences, both reproduced against the real
+# merge: deleting a Task shifted every later Task up one slot so a user's edit
+# stayed on the slot and attached to the WRONG Task, and a vanished Task left
+# its stale row behind forever because _merge_rows keeps a stored row whose id
+# the generation no longer produces.
+#
+# The version is load-bearing, not decorative: a stored "1" row id and a "2"
+# row id are both opaque strings, so without the stamp the merge cannot tell a
+# positional id from a task-derived one and would treat every migrated row as
+# brand new. See migrate_action_identity() for how a "1" MoM is carried over.
+MOM_VERSION = "2"
+MOM_VERSION_POSITIONAL = "1"
+
+# Where an action row records the Task it projects. Kept OUT of `cells` (which
+# is the rendered grid and would show it to the user) and off the column list
+# entirely — it is identity, not content. render_markdown never reads it.
+TASK_REF = "task_ref"
 
 # Provenance values. `ai` is the only one a generation may write; the other two
 # are only ever set by a user edit, which is what makes the merge rule in
@@ -212,13 +233,23 @@ def _coerce_row(raw, columns, index):
     raw_cells = raw.get("cells")
     raw_cells = raw_cells if isinstance(raw_cells, dict) else {}
     cells = {c["id"]: _s(raw_cells.get(c["id"])) for c in columns}
-    return {
+    out = {
         "id": _s(raw.get("id"), 64)
             or _ident("r", index, *[cells[c["id"]] for c in columns]),
         "cells": cells,
         "visible": _bool(raw.get("visible")),
         "source": _source(raw.get("source")),
     }
+    # Carried through explicitly. This function returns a FIXED dict, so any
+    # key not named here is destroyed on the next coerce_mom — which is what
+    # keeps a client from smuggling extra state onto a row, and is also why
+    # the task ref has to be listed. Without this line the ref would survive
+    # exactly one request and every later regeneration would see a row with no
+    # ref and fall back to positional matching.
+    ref = _s(raw.get(TASK_REF), 200)
+    if ref:
+        out[TASK_REF] = ref
+    return out
 
 
 def _coerce_section(raw, index):
@@ -382,26 +413,25 @@ def coerce_mom(raw):
 # ---------------------------------------------------------------------------
 def normalize_speaker_label(label):
     """"Speaker 0" / "speaker_0" / "0" -> "0". The raw diarization label,
-    which is what the speaker_names map is keyed by."""
-    raw = str(label or "").strip()
-    lowered = raw.lower()
-    for prefix in ("speaker ", "speaker_", "speaker-", "speaker"):
-        if lowered.startswith(prefix):
-            stripped = raw[len(prefix):].strip()
-            # "speaker" alone is a name, not a prefix with an empty label.
-            return stripped or raw
-    return raw
+    which is what the speaker_names map is keyed by.
+
+    Now delegates to speaker_identity, the single definition. One BEHAVIOUR
+    CHANGE comes with that: a label whose prefix does not leave a plain number
+    ("Speaker Two") keeps its whole identity instead of being truncated to
+    "Two". Truncating it could collide with a different speaker, and the
+    stricter reading is what every join in the system already used.
+    """
+    return speaker_identity.normalize_speaker_id(label)
 
 
 def speaker_display_name(label, speaker_names=None):
-    """The human-facing name for a speaker label."""
-    key = normalize_speaker_label(label)
-    if not key:
-        return ""
-    named = (speaker_names or {}).get(key)
-    if named and str(named).strip():
-        return str(named).strip()
-    return f"Speaker {key}" if key.isdigit() else key
+    """The human-facing name for a speaker label.
+
+    Resolves through the shared identity layer, so MoM, the API and the
+    transcript can never disagree — and a map stored under a legacy
+    display-form key ({"Speaker 0": ...}) resolves here too.
+    """
+    return speaker_identity.resolve_speaker_display(label, speaker_names)
 
 
 # ---------------------------------------------------------------------------
@@ -486,25 +516,47 @@ def _columns(role, labels):
              "source": SOURCE_AI} for label in labels]
 
 
-def _rows(role, columns, values_list):
-    """[[cell, ...]] -> row dicts keyed by column id, with POSITIONAL ids.
+def _rows(role, columns, values_list, refs=None):
+    """[[cell, ...]] -> row dicts keyed by column id.
 
-    Same reasoning as _items: the row id is derived from (role, position) and
-    never from cell contents. A regeneration that rewords an Action Item must
-    match it to the stored row so the merge can decide whether the user
-    edited it — a content-derived id would make every reworded row look like
-    a brand-new one, duplicating it against the stale copy.
+    Ids are POSITIONAL — derived from (role, position), never from cell
+    contents. A regeneration that rewords a row must still match it to the
+    stored one so the merge can decide whether the user edited it; a
+    content-derived id would make every reworded row look brand new and
+    duplicate it against the stale copy.
+
+    `refs` OPTS A TABLE OUT of positional identity. Pass one external key per
+    row — a Task id, for Action Items — and the row id becomes a function of
+    that key instead of the index, with the key recorded under TASK_REF so the
+    merge can tell a task-backed row from a user-added one. Position is the
+    right identity for a table whose rows have no independent existence
+    (Attendees follows the speaker roster, and roster slot N *is* the
+    identity); it is the wrong identity for a projection of a mutable external
+    collection, where deleting the first Task shifts every later one into a
+    slot that already carries someone else's edit.
+
+    A ref that is empty falls back to the positional id for that row alone, so
+    a task with no id degrades to the old behaviour rather than colliding with
+    every other id-less row on a shared hash of "".
     """
     out = []
     for i, values in enumerate(values_list):
         cells = {c["id"]: _s(values[j]) if j < len(values) else ""
                  for j, c in enumerate(columns)}
-        out.append({
-            "id": _ident("r", role, i),
+        ref = _s(refs[i], 200) if refs and i < len(refs) else ""
+        row = {
+            # Namespaced on the ref, not the raw ref: an id must stay
+            # recognisably a row id, and "r_" + hash keeps every id in the
+            # document the same shape whatever minted it.
+            "id": _ident("r", role, "ref", ref) if ref
+                  else _ident("r", role, i),
             "cells": cells,
             "visible": True,
             "source": SOURCE_AI,
-        })
+        }
+        if ref:
+            row[TASK_REF] = ref
+        out.append(row)
     return out
 
 
@@ -741,38 +793,16 @@ def _owner_display(owner, speaker_names):
     return text
 
 
-def _build_points(item, speaker_names):
-    """Meeting Points — the reference design's central table.
+def _build_decisions(item, speaker_names=None):
+    """The Decisions list.
 
-    Built from meeting_highlights.action_items, the only extraction that pairs
-    a discussion point with an owner. There is no attempt to synthesise a
-    Topic column the extraction never produced: an invented topic heading
-    would read as fact.
+    A decision may carry `speaker_id` — WHO decided, as a canonical id. It is
+    resolved to the CURRENT display name here, at render time, so renaming
+    that speaker changes what the MoM says on its next render without the
+    decision text being rewritten. A decision with no `speaker_id` (every row
+    written before the field existed, and every collective decision) renders
+    exactly as it always did.
     """
-    highlights = item.get("meeting_highlights")
-    if not isinstance(highlights, dict):
-        return None
-    actions = highlights.get("action_items")
-    if not isinstance(actions, list) or not actions:
-        return None
-    columns = _columns(ROLE_POINTS,
-                       ["Sr. No", "Discussion Point", "Action Item", "Owner"])
-    values = []
-    for a in actions:
-        if not isinstance(a, dict):
-            continue
-        task = _s(a.get("task"))
-        if not task:
-            continue
-        values.append([str(len(values) + 1), task, task,
-                       _owner_display(a.get("owner"), speaker_names)])
-    if not values:
-        return None
-    return _section(ROLE_POINTS, KIND_TABLE, "Meeting Points",
-                    columns=columns, rows=_rows(ROLE_POINTS, columns, values))
-
-
-def _build_decisions(item):
     highlights = item.get("meeting_highlights")
     if not isinstance(highlights, dict):
         return None
@@ -784,6 +814,14 @@ def _build_decisions(item):
         if not decision:
             continue
         context = _s(d.get("context"))
+        # The speaker's CURRENT name, never a stored one. Only shown when the
+        # id resolves to a real name — an unnamed speaker adds "Speaker 0",
+        # which tells a reader nothing a decision needs.
+        who = speaker_identity.resolve_speaker_name(
+            d.get("speaker_id"), speaker_names)
+        if who:
+            context = f"{context} — decided by {who}" if context \
+                else f"decided by {who}"
         texts.append(f"{decision} ({context})" if context else decision)
     items = _items(ROLE_DECISIONS, texts)
     if not items:
@@ -791,17 +829,49 @@ def _build_decisions(item):
     return _section(ROLE_DECISIONS, KIND_LIST, "Decisions", items=items)
 
 
+def _task_deadline(task):
+    """The Deadline cell for one Task: resolved date if there is one, else the
+    phrase as spoken.
+
+    A Task carries both. `due_date` is what was SAID ("tomorrow", "Friday",
+    "कल") and `due_date_normalized` is that resolved against the meeting's own
+    day. The spoken phrase is the honest record of the transcript but it is not
+    a date: a MoM read six months later still says "tomorrow", and production
+    rows show exactly that. So the resolved value wins for display wherever it
+    exists.
+
+    Normalization legitimately fails — "Next Meeting", "2 to 3 days",
+    "weekend", and every non-English phrase resolve to "" — and in that case
+    the spoken phrase is strictly better than a blank cell and infinitely
+    better than a guessed date. Nothing here invents a date.
+    """
+    if not isinstance(task, dict):
+        return ""
+    normalized = _s(task.get("due_date_normalized")
+                    or task.get("due_normalized"))
+    return normalized or _s(task.get("due") or task.get("due_date"))
+
+
 def _build_actions(item, tasks, speaker_names):
     """Action Items — from the first-class Tasks the pipeline seeded.
 
-    Prefers `tasks` (the real, assignable, status-tracked records) over
-    meeting_highlights.action_items, so the MoM states the same owners and due
-    dates the user sees on the Tasks screen. Falls back to the highlights
-    extraction only for a recording old enough to predate task seeding.
+    Source order, most authoritative first:
+      1. `tasks`     — the real, assignable, status-tracked records, so the MoM
+                       states the same owners and due dates the Tasks screen
+                       shows (including any the user edited).
+      2. `ai_tasks`  — the analysis's extraction, for a row analyzed but not
+                       yet seeded (seeding runs on first read of Tasks).
+      3. `meeting_highlights.action_items` — LEGACY. No longer generated; kept
+                       so rows written before its removal still render.
     """
     columns = _columns(ROLE_ACTIONS,
                        ["Sr. No", "Action Item", "Owner", "Deadline"])
     values = []
+    # One external identity per row, positionally aligned with `values`. Only
+    # the `tasks` tier can fill these — the other two tiers project extractions
+    # that have no independent record to point at — so a row built from
+    # ai_tasks or the legacy highlights keeps the positional id it always had.
+    refs = []
 
     for t in tasks or []:
         if not isinstance(t, dict):
@@ -816,9 +886,31 @@ def _build_actions(item, tasks, speaker_names):
         if not owner:
             owner = speaker_display_name(
                 t.get("assignee_speaker_id"), speaker_names)
-        values.append([str(len(values) + 1), text, owner,
-                       _s(t.get("due") or t.get("due_date"))])
+        values.append([str(len(values) + 1), text, owner, _task_deadline(t)])
+        # The Task's own id, falling back to its content fingerprint. The
+        # fingerprint is stable for the same (meeting, title, owner) and is
+        # what the seeder already uses for idempotency, so it is the right
+        # second choice; "" then degrades this row to positional identity.
+        refs.append(_s(t.get("id") or t.get("task_id")
+                       or t.get("fingerprint"), 200))
 
+    # The analysis's own extraction, for a row analyzed but not yet seeded into
+    # first-class Tasks (seeding happens on first read of the Tasks screen).
+    if not values:
+        for a in item.get("ai_tasks") or []:
+            if not isinstance(a, dict):
+                continue
+            text = _s(a.get("task"))
+            if not text:
+                continue
+            owner = _s(a.get("assignee")) or speaker_display_name(
+                a.get("assignee_speaker_id"), speaker_names)
+            values.append([str(len(values) + 1), text, owner,
+                           _s(a.get("due_date"))])
+
+    # LEGACY ONLY. meeting_highlights.action_items is no longer generated — it
+    # duplicated `tasks` field-for-field — but rows written before its removal
+    # still carry one, and this is what keeps their MoM rendering.
     if not values:
         highlights = item.get("meeting_highlights")
         actions = (highlights or {}).get("action_items") \
@@ -835,8 +927,11 @@ def _build_actions(item, tasks, speaker_names):
 
     if not values:
         return None
+    # refs is shorter than values whenever a lower tier supplied the rows; the
+    # missing entries simply read as "" and those rows stay positional.
     return _section(ROLE_ACTIONS, KIND_TABLE, "Action Items",
-                    columns=columns, rows=_rows(ROLE_ACTIONS, columns, values))
+                    columns=columns,
+                    rows=_rows(ROLE_ACTIONS, columns, values, refs=refs))
 
 
 def _build_followups(item):
@@ -894,8 +989,7 @@ def build_sections(item, tasks=None, speaker_names=None, meta=None,
         _build_details(item, meta),
         _build_attendees(item, speaker_names, attendees),
         *prose,
-        _build_points(item, speaker_names),
-        _build_decisions(item),
+        _build_decisions(item, speaker_names),
         _build_actions(item, tasks, speaker_names),
         _build_followups(item),
     ]
@@ -960,6 +1054,21 @@ def _merge_rows(stored_rows, fresh_rows, columns, deleted):
     destroy a user-typed one.
     """
     fresh_by_id = {r["id"]: r for r in fresh_rows}
+    # A table is a PROJECTION when the generation identifies its rows by an
+    # external key. Then "the generation stopped producing this row" means the
+    # underlying record is gone, and keeping the row would leave an orphan
+    # claiming a Task that no longer exists. For every other table the stored
+    # row is kept, because a missing row there only means the AI said less
+    # this time — see the module note on never blanking a section.
+    #
+    # A ref on EITHER side marks the table. Reading only the fresh rows would
+    # miss the case that matters most: when the last Task is deleted the
+    # generation returns no rows at all, and a table judged "not a projection"
+    # would then keep every stale row forever — the exact orphan this rule
+    # exists to prevent. A stored "1" MoM has no refs on either side, so it
+    # still can never be misread as a projection.
+    projection = any(r.get(TASK_REF) for r in fresh_rows) or \
+        any(r.get(TASK_REF) for r in stored_rows)
     out = []
     for row in stored_rows:
         if row["id"] in deleted:
@@ -968,9 +1077,24 @@ def _merge_rows(stored_rows, fresh_rows, columns, deleted):
         if fresh and not _keep_user_text(row):
             cells = {c["id"]: fresh["cells"].get(c["id"], "") for c in columns}
             out.append(dict(row, cells=cells))
+        elif fresh:
+            # User-touched and still present: keep every stored cell.
+            cells = {c["id"]: row["cells"].get(c["id"], "") for c in columns}
+            out.append(dict(row, cells=cells))
+        elif projection and row.get(TASK_REF):
+            # DROPPED. The row names a Task the generation no longer returns,
+            # so the Task is deleted. This is the one place a regeneration
+            # removes content, and it is deliberately narrow: the row must
+            # itself carry a ref (so a user_added row is never touched) AND
+            # this generation must be a projection (so a legacy positional MoM
+            # is never pruned). A user_edited row goes too — its Task is gone,
+            # and a MoM asserting work nobody owns is worse than a MoM missing
+            # a line the user can re-add.
+            continue
         else:
-            # Columns added since this row was written need a blank cell, or
-            # the renderer would emit a short row.
+            # No fresh counterpart and no ref: the pre-existing behaviour.
+            # user_added rows land here and survive, as do every row of a
+            # non-projection table.
             cells = {c["id"]: row["cells"].get(c["id"], "") for c in columns}
             out.append(dict(row, cells=cells))
     seen = {r["id"] for r in out}
@@ -1019,8 +1143,21 @@ def _merge_section(stored, fresh, deleted):
     nothing for this role this time — e.g. no decisions were made in the new
     transcript), in which case the stored section is kept as-is rather than
     emptied: a user looking at their MoM should not find a section silently
-    blanked by a regeneration."""
+    blanked by a regeneration.
+
+    ONE EXCEPTION: a PROJECTION table (its rows carry an external key — see
+    _merge_rows) whose generation vanished entirely. That happens when the
+    last Task is deleted, because _build_actions then returns None and the
+    section never reaches the merge at all. Keeping it would leave the MoM
+    asserting every deleted Task forever, so the projection's own rows are
+    pruned instead. A user_added row has no key and survives, which is why
+    the section can still come back non-empty."""
     if fresh is None:
+        rows = stored.get("rows") or []
+        if stored.get("kind") == KIND_TABLE and \
+                any(r.get(TASK_REF) for r in rows):
+            kept = [r for r in rows if not r.get(TASK_REF)]
+            return dict(stored, rows=kept)
         return stored
     # A retitled section keeps the user's title. `title` is content too.
     title = stored["title"] if _keep_user_text(stored) or \
@@ -1053,13 +1190,120 @@ def _merge_section(stored, fresh, deleted):
     return merged
 
 
+RETIRED_ROLES = ("meeting_points",)
+
+
+def migrate_action_identity(stored_mom, fresh_sections):
+    """Re-key a version-"1" MoM's Action Items onto task-backed identity.
+
+    WHY THIS IS NEEDED. Under "1" an action row's id was a hash of (role,
+    position). Under "2" it is a hash of (role, "ref", task id). Nothing
+    connects the two, so a straight merge would match nothing: every stored
+    row would look deleted-then-recreated, and any user edit on it would be
+    silently replaced by fresh AI text. This runs first and hands the merge a
+    stored MoM already speaking "2", so the ordinary merge rule then applies
+    unchanged.
+
+    MATCHING IS BY ACTION TEXT, and only when it is UNAMBIGUOUS. The Action
+    Item cell is the one value a stored row and a fresh row share, since the
+    fresh row's owner and deadline may legitimately have changed since. A
+    stored row whose text matches exactly one fresh row takes that row's id
+    and ref. Anything else — no match, or two fresh rows with the same text —
+    is LEFT ALONE at its positional id: it then has no ref, so the projection
+    rule below never prunes it, and the worst case is one stale row the user
+    can delete rather than an edit attached to the wrong Task. Guessing here
+    would mean asserting the wrong owner against the wrong commitment.
+
+    Production makes this safe to ship: at the time of writing all 11 stored
+    action rows across 4 MoMs are `source: "ai"`, with zero deleted_ids and
+    zero user_edited rows, so a mismatch cannot currently lose user work.
+
+    RETIRED_ROLES are dropped in the same pass. `meeting_points` was a
+    generated-only table (its builder produced Discussion Point/Action Item
+    from the same extraction) and it was removed from the catalogue; two live
+    MoMs still carry one. Since no builder emits the role, the merge would
+    keep it forever as a section the AI "stopped producing". It is only
+    dropped when the whole section is untouched AI content — a user edit
+    anywhere in it means the user has adopted that table and it stays.
+    """
+    stored = coerce_mom(stored_mom)
+    if stored.get("mom_version") != MOM_VERSION_POSITIONAL:
+        return stored
+
+    fresh_actions = next((s for s in fresh_sections
+                          if s.get("role") == ROLE_ACTIONS), None)
+    sections = []
+    for section in stored["sections"]:
+        if section.get("role") in RETIRED_ROLES and _section_is_pure_ai(section):
+            continue
+        if section.get("role") == ROLE_ACTIONS and fresh_actions:
+            section = _rekey_action_rows(section, fresh_actions)
+        sections.append(section)
+
+    stored["sections"] = sections
+    stored["mom_version"] = MOM_VERSION
+    return stored
+
+
+def _section_is_pure_ai(section):
+    """True when nothing in this section carries a user's mark."""
+    if _source(section.get("source")) != SOURCE_AI:
+        return False
+    for key in ("fields", "rows", "items", "columns"):
+        for child in section.get(key) or []:
+            if isinstance(child, dict) and \
+                    _source(child.get("source")) != SOURCE_AI:
+                return False
+    return True
+
+
+def _action_text(row, columns):
+    """The Action Item cell, by column LABEL rather than by index.
+
+    The label is what survives a column reorder, and a stored "1" MoM's column
+    ids were minted from the same (role, label) pair, so they match the fresh
+    ones — but reading the label keeps this correct even if they did not.
+    """
+    for col in columns or []:
+        if str(col.get("label") or "").strip().casefold() == "action item":
+            return _s((row.get("cells") or {}).get(col.get("id"))).casefold()
+    return ""
+
+
+def _rekey_action_rows(stored_section, fresh_section):
+    stored_cols = stored_section.get("columns") or []
+    fresh_cols = fresh_section.get("columns") or []
+    fresh_rows = [r for r in fresh_section.get("rows") or [] if r.get(TASK_REF)]
+
+    by_text = {}
+    for row in fresh_rows:
+        text = _action_text(row, fresh_cols)
+        if text:
+            by_text.setdefault(text, []).append(row)
+
+    rows = []
+    for row in stored_section.get("rows") or []:
+        matches = by_text.get(_action_text(row, stored_cols)) or []
+        # Exactly one candidate, or leave it positional. Two fresh rows with
+        # the same action text carry no information about which Task this
+        # stored row meant.
+        if len(matches) == 1:
+            row = dict(row, id=matches[0]["id"],
+                       **{TASK_REF: matches[0][TASK_REF]})
+        rows.append(row)
+    return dict(stored_section, rows=rows)
+
+
 def merge_generated(stored_mom, fresh_sections):
     """Fold a fresh generation into the stored MoM, preserving user work.
 
     Returns a NEW mom dict; neither argument is mutated. The caller stamps
     generated_at/fingerprint afterwards.
     """
-    stored = coerce_mom(stored_mom)
+    # Re-key a legacy positional MoM BEFORE matching anything. A no-op for a
+    # MoM already at the current version, so this costs one version compare on
+    # the normal path.
+    stored = migrate_action_identity(stored_mom, fresh_sections)
     deleted = set(stored.get("deleted_ids") or [])
 
     # Match on `role` first (stable across a title rename), falling back to id

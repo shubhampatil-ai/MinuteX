@@ -2822,7 +2822,7 @@ class TestOwnership(AiTestCase):
         with mock.patch.object(api, "_owned_devices", return_value=["esp32-001"]):
             self.stub_groq()
             status, _ = parse(call(api.generate_document, 
-                event(body={"type": "minutes_of_meeting"})))
+                event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
 
     def test_missing_key_is_400(self):
@@ -2835,7 +2835,7 @@ class TestOwnership(AiTestCase):
         self.stub_groq()
         encoded = "recordings%2Fu-1%2Fmobile%2Fmobile-abc_1754300000.m4a"
         status, _ = parse(call(api.generate_document, 
-            event(key=encoded, body={"type": "minutes_of_meeting"})))
+            event(key=encoded, body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         called_key = self.table.get_item.call_args[1]["Key"]["audio_s3_key"]
         self.assertEqual(called_key, RECORDING["audio_s3_key"])
@@ -2844,7 +2844,7 @@ class TestOwnership(AiTestCase):
         self.stub_groq()
         status, _ = parse(call(api.generate_document, 
             event(key="recordings%252Fu-1%252Fmobile%252Fmobile-abc_1754300000.m4a",
-                  body={"type": "minutes_of_meeting"})))
+                  body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
 
 
@@ -2856,7 +2856,7 @@ class TestTranscriptGating(AiTestCase):
         self.item["transcript"] = ""
         self.item["status"] = "transcribing"
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 409)
         self.assertIn("transcribing", body["error"])
 
@@ -2873,11 +2873,11 @@ class TestDocuments(AiTestCase):
     def test_generate_and_store(self):
         groq = self.stub_groq("## Minutes\n\nApproved.")
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         self.assertFalse(body["cached"])
-        self.assertEqual(body["document"]["type"], "minutes_of_meeting")
-        self.assertEqual(body["document"]["label"], "Minutes of Meeting")
+        self.assertEqual(body["document"]["type"], "executive_summary")
+        self.assertEqual(body["document"]["label"], "Executive Summary")
         self.assertIn("Approved", body["document"]["content"])
         self.assertEqual(body["document"]["format"], "markdown")
         # Persisted with cache provenance.
@@ -2887,7 +2887,7 @@ class TestDocuments(AiTestCase):
         self.assertEqual(saved["ai_version"], ai_schema.AI_VERSION)
         # The prompt actually used was the template's.
         self.assertEqual(groq.call_args[0][0],
-                         prompts.DOCUMENTS["minutes_of_meeting"]["system"])
+                         prompts.DOCUMENTS["executive_summary"]["system"])
 
     def test_unknown_type_is_400_and_lists_the_valid_ones(self):
         status, body = parse(call(api.generate_document, event(body={"type": "poem"})))
@@ -2897,36 +2897,36 @@ class TestDocuments(AiTestCase):
     def test_cache_hit_makes_no_groq_call(self):
         """The core caching requirement: transcript unchanged + document exists
         -> serve the stored copy."""
-        self.item["documents"] = {"minutes_of_meeting": {
+        self.item["documents"] = {"executive_summary": {
             "content": "cached minutes", "format": "markdown",
             "transcript_fingerprint": ai_schema.fingerprint(TRANSCRIPT),
             "ai_version": ai_schema.AI_VERSION, "generated_at": "2026-08-04"}}
         groq = self.stub_groq()
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         self.assertTrue(body["cached"])
         self.assertEqual(body["document"]["content"], "cached minutes")
         groq.assert_not_called()
 
     def test_changed_transcript_invalidates_the_cache(self):
-        self.item["documents"] = {"minutes_of_meeting": {
+        self.item["documents"] = {"executive_summary": {
             "content": "old minutes", "transcript_fingerprint": "staleprint00000",
             "ai_version": ai_schema.AI_VERSION}}
         groq = self.stub_groq("## Fresh minutes")
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertFalse(body["cached"])
         self.assertIn("Fresh", body["document"]["content"])
         groq.assert_called_once()
 
     def test_regenerate_forces_a_fresh_call(self):
-        self.item["documents"] = {"minutes_of_meeting": {
+        self.item["documents"] = {"executive_summary": {
             "content": "cached", "transcript_fingerprint":
             ai_schema.fingerprint(TRANSCRIPT), "ai_version": ai_schema.AI_VERSION}}
         groq = self.stub_groq("## Regenerated")
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting", "regenerate": True})))
+            event(body={"type": "executive_summary", "regenerate": True})))
         self.assertFalse(body["cached"])
         groq.assert_called_once()
 
@@ -2935,7 +2935,7 @@ class TestDocuments(AiTestCase):
         with mock.patch.object(groq_client, "complete",
                                side_effect=groq_client.GroqError("429", 429, True)):
             status, body = parse(call(api.generate_document, 
-                event(body={"type": "minutes_of_meeting"})))
+                event(body={"type": "executive_summary"})))
         self.assertEqual(status, 502)
         self.assertIn("retry", body["error"].lower())
         self.assertTrue(self.item["transcript"])   # untouched
@@ -2947,20 +2947,20 @@ class TestDocuments(AiTestCase):
                 groq_client, "complete",
                 side_effect=groq_client.GroqError("no key", 0, False)):
             status, _ = parse(call(api.generate_document, 
-                event(body={"type": "minutes_of_meeting"})))
+                event(body={"type": "executive_summary"})))
         self.assertEqual(status, 500)
 
     def test_empty_generation_is_502_not_a_stored_blank(self):
         self.stub_groq("   ")
         status, _ = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 502)
         self.table.update_item.assert_not_called()
 
     def test_runaway_output_is_truncated(self):
         self.stub_groq("x" * 100_000)
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         self.assertLessEqual(len(body["document"]["content"]),
                              api.MAX_DOCUMENT_CHARS + 50)
@@ -3849,13 +3849,13 @@ class TestDocumentPersistence(AiTestCase):
         """End to end: a generation reaches _save_document's nested SET."""
         self.stub_groq("## Minutes")
         status, _ = parse(call(api.generate_document,
-                              event(body={"type": "minutes_of_meeting"})))
+                              event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         expr = self.table.update_item.call_args[1]["UpdateExpression"]
         self.assertIn("#docs.#t = :doc", expr)
         self.assertEqual(
             self.table.update_item.call_args[1]["ExpressionAttributeNames"]["#t"],
-            "minutes_of_meeting")
+            "executive_summary")
 
 
 class TestQuickActions(AiTestCase):
@@ -3897,13 +3897,23 @@ class TestQuickActions(AiTestCase):
                          "whatsapp_summary")
 
     def test_every_advertised_action_actually_runs(self):
-        """No action can be listed but broken."""
+        """No action can be listed but broken.
+
+        minutes_of_meeting is the ONE deliberate exception: it aliases the
+        minutes_of_meeting document key, and that slot is now owned by the
+        structured MoM (the `mom` attribute, mirrored by _mirror_document).
+        Generating a prompt-authored MoM through this route would write a
+        second, differently-shaped MoM over that mirror, so the route refuses
+        with a 409 and the app routes Minutes of Meeting to the editor
+        instead. See test_mom_api.TestMomIsStructuredOnly.
+        """
         for action in prompts.QUICK_ACTION_KEYS:
             with self.subTest(action=action):
                 self.setUp()
                 self.stub_groq("output")
                 status, _ = parse(call(api.quick_action, event(body={"action": action})))
-                self.assertEqual(status, 200)
+                expected = 409 if action == "minutes_of_meeting" else 200
+                self.assertEqual(status, expected)
 
 
 class TestHighlights(AiTestCase):

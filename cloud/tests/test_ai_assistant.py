@@ -124,8 +124,6 @@ class AIBase(unittest.TestCase):
         self.patches = [
             mock.patch.object(api, "_recordings", self.t["recordings"]),
             mock.patch.object(api, "_contacts", self.t["contacts"]),
-            mock.patch.object(api, "_folders", self.t["folders"]),
-            mock.patch.object(api, "_folder_contacts", self.t["folder_contacts"]),
             mock.patch.object(api, "_meeting_participants", self.t["participants"]),
             mock.patch.object(api, "_tasks", self.t["tasks"]),
             mock.patch.object(api, "_users", self.t["users"]),

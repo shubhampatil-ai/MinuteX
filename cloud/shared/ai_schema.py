@@ -16,6 +16,7 @@ import re
 
 import ai_sanitize
 import mom_schema
+import speaker_identity
 
 from decimal import Decimal
 
@@ -239,6 +240,51 @@ def _roster_filtered(participants, roster, speaker_names=None):
               "contribution summary after matching")
     return out
 
+def _resolve_task_speakers(tasks, roster=None, speaker_names=None):
+    """Force every `assignee_speaker_id` to a canonical id, or to "".
+
+    THE BUG THIS CLOSES. transcript_store.as_labelled_lines renders the user's
+    names INTO the lines the model reads ("Rahul: I'll send it"), while the
+    prompt asks it to copy a "Speaker 0" label that is no longer on the page.
+    So on a RENAMED meeting the model answers with the name, and `s` stored it
+    verbatim — a name sitting in an id field. That value matches no
+    participant row (normalize("Rahul") is "Rahul", not "0"), so the task
+    never resolves to a contact, never fires TASK_ASSIGNED, and can never be
+    corrected by a later rename, because nothing records that it ever meant
+    speaker "0". Renaming a meeting therefore made task ownership WORSE.
+
+    `participants` already survives this — _roster_filtered resolves a
+    human name back to its label. This gives tasks the same treatment, at the
+    one place a task's speaker enters the system.
+
+    UNRESOLVABLE BECOMES "", WHICH IS A SUPPORTED VALUE. The prompt already
+    documents "" as correct and expected whenever the owner is not a specific
+    speaker, and _seed_ai_tasks treats a task with no speaker as unresolved —
+    a visible, fixable gap. A wrong id is invisible and assigns real work to
+    the wrong person, so an ambiguous name resolves to nothing (see
+    speaker_identity.resolve_legacy_speaker_reference's ambiguity rule).
+
+    `assignee` (the spoken NAME) is untouched: it is legitimately a name, it
+    is what the confidence gate and the fingerprint read, and rewriting it
+    would change task identity for every already-seeded row.
+    """
+    roster_ids = [speaker_identity.normalize_speaker_id(r)
+                  for r in (roster or [])]
+    roster_ids = [r for r in roster_ids if r] or None
+    for t in tasks:
+        raw = t.get("assignee_speaker_id")
+        if not str(raw or "").strip():
+            t["assignee_speaker_id"] = ""
+            continue
+        resolved = speaker_identity.resolve_legacy_speaker_reference(
+            raw, roster_ids, speaker_names)
+        if not resolved and str(raw or "").strip():
+            print("[ai_schema] task: dropped unresolvable "
+                  f"assignee_speaker_id {raw!r} (roster {roster_ids})")
+        t["assignee_speaker_id"] = resolved
+    return tasks
+
+
 CONFIDENCE_HIGH = "high"
 CONFIDENCE_MEDIUM = "medium"
 CONFIDENCE_LOW = "low"
@@ -280,6 +326,9 @@ def coerce_confidence(value):
 TASK_SPEC = {
     "task": ("task", s),
     "assignee": ("assignee", s),
+    # Shape-coerced only here; the ROSTER-aware pass is _resolve_task_speakers
+    # below, which is the one that can tell a real speaker from a name. Same
+    # split as evidence_segment_ids: obj_list cannot see the meeting.
     "assignee_speaker_id": ("assignee_speaker_id", s),
     "due_date": ("due_date", s),
     "priority": ("priority", lambda x: clamp(
@@ -618,6 +667,7 @@ def coerce_analysis(obj, roster=None, valid_ids=None, speaker_names=None):
         for t in tasks:
             t["evidence_segment_ids"] = _evidence_ids(
                 t.get("evidence_segment_ids"), valid_ids)
+    _resolve_task_speakers(tasks, roster, speaker_names)
     participants = obj_list(obj.get("participants"), PARTICIPANT_SPEC,
                             required=("speaker",))
     return {
@@ -717,11 +767,16 @@ def merge_analyses(partials, roster=None, speaker_names=None):
 HL_DECISION_SPEC = {
     "decision": ("decision", s),
     "context": ("context", s),
-}
-HL_ACTION_SPEC = {
-    "task": ("task", s),
-    "owner": ("owner", s),
-    "deadline": ("deadline", s),
+    # WHO decided, as a canonical speaker id — the structured half of
+    # attribution, so a rename moves the displayed name without the decision
+    # TEXT having to be rewritten. Shape-coerced here; resolved against the
+    # roster by coerce_highlights, which is where the meeting is known.
+    #
+    # OPTIONAL BY CONSTRUCTION. Not in `required`, so a decision without one
+    # is kept exactly as before, and every stored decision written before
+    # this field existed still coerces and still renders. "" is the ordinary
+    # value for a collective decision.
+    "speaker_id": ("speaker_id", s),
 }
 HL_DEADLINE_SPEC = {
     "what": ("what", s),
@@ -736,10 +791,21 @@ HL_DEADLINE_SPEC = {
 # remaining section is kept because something reads it:
 #
 #   decisions      -> mom_schema._build_decisions      (MoM "Decisions")
-#   action_items   -> mom_schema._build_points         (MoM "Meeting Points")
 #   deadlines      -> mom_schema._build_followups      (MoM "Follow-ups") AND
 #                     app calendar.tsx (deadline markers on the month grid)
 #   open_questions -> mom_schema._build_followups      (MoM "Follow-ups")
+#
+# `action_items` was REMOVED because it DUPLICATED `tasks`. Measured on a real
+# meeting, the two came back with identical task text, owners and deadlines,
+# three for three — the model was extracting the same commitments twice, in one
+# already-truncating reply, and the copies were free to disagree. `tasks` is
+# the survivor: it alone carries evidence, confidence and assignee_speaker_id,
+# and it is what the Tasks screen, notifications and the Salesforce push read.
+# Its MoM consumer (_build_points, the "Meeting Points" table) went with it —
+# that table printed the same string in both its "Discussion Point" and
+# "Action Item" columns, so it was a duplicate of the Action Items table.
+# mom_schema._build_actions still FALLS BACK to a stored action_items list for
+# a row older than task seeding, which is why old rows keep rendering.
 #
 # `important_numbers` and `risks` were REMOVED: nothing consumed them in rows.
 # Their content is not lost — a meeting's figures and risks now land in the
@@ -751,28 +817,37 @@ HL_DEADLINE_SPEC = {
 # both iterate it, and old rows carrying the two removed keys stay readable
 # because coercion builds the result key-by-key and simply never looks at them.
 # ---------------------------------------------------------------------------
-HIGHLIGHT_SECTIONS = ("decisions", "action_items", "deadlines",
-                      "open_questions")
+HIGHLIGHT_SECTIONS = ("decisions", "deadlines", "open_questions")
 
 
 def empty_highlights():
     return {k: [] for k in HIGHLIGHT_SECTIONS}
 
 
-def coerce_highlights(obj):
+def coerce_highlights(obj, roster=None, speaker_names=None):
     """Strict coerce a parsed Groq object into the meeting_highlights schema.
 
     Elements missing their load-bearing field are dropped: a deadline with no
     "what" or a number with no "value" carries no information, and keeping it
     would render as an empty row in the workspace.
+
+    `roster`/`speaker_names` resolve each decision's `speaker_id` the same way
+    tasks are resolved — a name or a display label becomes a canonical id, and
+    anything ambiguous becomes "". Both default to None so every existing
+    caller keeps working; without them the field is shape-checked only.
     """
     if not isinstance(obj, dict):
         return empty_highlights()
+    decisions = obj_list(obj.get("decisions"), HL_DECISION_SPEC,
+                         required=("decision",))
+    roster_ids = [speaker_identity.normalize_speaker_id(r)
+                  for r in (roster or [])]
+    roster_ids = [r for r in roster_ids if r] or None
+    for d in decisions:
+        d["speaker_id"] = speaker_identity.resolve_legacy_speaker_reference(
+            d.get("speaker_id"), roster_ids, speaker_names)
     return {
-        "decisions": obj_list(obj.get("decisions"), HL_DECISION_SPEC,
-                              required=("decision",)),
-        "action_items": obj_list(obj.get("action_items"), HL_ACTION_SPEC,
-                                 required=("task",)),
+        "decisions": decisions,
         "deadlines": obj_list(obj.get("deadlines"), HL_DEADLINE_SPEC,
                               required=("what",)),
         "open_questions": slist(obj.get("open_questions")),
@@ -793,8 +868,6 @@ def merge_highlights(partials):
     def _key(section, item):
         if section == "decisions":
             return (item.get("decision") or "").strip().lower()
-        if section == "action_items":
-            return (item.get("task") or "").strip().lower()
         if section == "deadlines":
             return (item.get("what") or "").strip().lower()
         return str(item).strip().lower()
@@ -808,7 +881,7 @@ def merge_highlights(partials):
                 if norm and norm not in seen[section]:
                     seen[section][norm] = True
                     merged[section].append(item)
-        for section in ("decisions", "action_items", "deadlines"):
+        for section in ("decisions", "deadlines"):
             for item in p.get(section, []):
                 if not isinstance(item, dict):
                     continue
@@ -1210,7 +1283,10 @@ def coerce_unified(obj, roster=None, valid_ids=None, speaker_names=None):
                                                  speaker_names)}
 
     out = coerce_analysis(obj, roster, valid_ids, speaker_names)
-    out["meeting_highlights"] = coerce_highlights(obj.get("meeting_highlights"))
+    # Roster-aware, so a decision's speaker_id lands as a canonical id for the
+    # same reason a task's does.
+    out["meeting_highlights"] = coerce_highlights(
+        obj.get("meeting_highlights"), roster, speaker_names)
     return out
 
 

@@ -300,6 +300,39 @@ SUMMARY_SYSTEM = _json_system(
     "never a discussion, suggestion, recommendation, possibility or question. "
     "Only create a task when the transcript indicates actual responsibility or "
     "commitment.\n"
+    # OWNERSHIP IS NOT PART OF QUALIFICATION. Stated HERE, adjacent to the
+    # qualification bar, and not only in TASK ASSIGNMENT RULE ~110 lines below.
+    # Production evidence (finish_reason=stop, 3878/16000 completion tokens, so
+    # not truncation): a 59-minute process-definition meeting returned 6
+    # overview sections, 3 decisions, 2 deadlines and 4 open_questions but
+    # 0 tasks. Every commitment in it was a process obligation with no named
+    # owner ("every document shared with a customer must include the logo").
+    # Reading "requires actual responsibility or commitment" next to the field
+    # and "an empty assignee is correct" far away, the model collapsed "no
+    # owner" into "not a task" — exactly the inference TASK ASSIGNMENT RULE
+    # forbids. The two tests must be adjacent because they are independent:
+    # qualification asks WHETHER work was committed, ownership asks WHO holds
+    # it. Keep the positive example: "General discussion -> no task" was the
+    # nearest worked case to an unowned commitment and it taught rejection.
+    "  QUALIFICATION AND OWNERSHIP ARE SEPARATE TESTS. The question \"was "
+    "this work actually committed to?\" is decided WITHOUT reference to "
+    "whether anyone was named. A task that was clearly agreed, committed or "
+    "planned MUST be extracted even when NO owner is identifiable anywhere in "
+    "the transcript — set assignee \"\" and assignee_speaker_id \"\" and emit "
+    "the task. Never drop a genuine commitment because you could not "
+    "attribute it; an unowned task is a normal, expected result, and omitting "
+    "it loses work the meeting actually agreed to.\n"
+    '  - Committed, no owner named: "Every document shared with a customer '
+    'must include the company logo." -> task "Include the company logo on '
+    'every document shared with a customer", assignee "", '
+    'assignee_speaker_id "". A collective or process obligation with no '
+    "named owner is still a task.\n"
+    "  This does NOT lower the qualification bar. A question, suggestion, "
+    "recommendation, possibility, option under consideration, general "
+    "discussion or a standing fact stated for information is STILL not a "
+    'task, with or without an owner: "Should someone check the API limit?" '
+    'and "We should probably send the proposal" remain no task. What changes '
+    "is only that a real commitment no longer needs an owner to be recorded.\n"
     # The four fields below were MISSING from this contract while ai_schema's
     # TASK_SPEC, the Tasks table and the assignment gate all expected them.
     # The prompt said EXACTLY {task, assignee, due_date, priority}, so the
@@ -606,10 +639,18 @@ _HIGHLIGHTS_FIELDS = (
     'quotation", "Budget finalized at 4.2 lakh", "Site visit confirmed for '
     'Friday"). context is a short why/where-from, "" if none. Never include '
     "proposals, options or questions. [] if none.\n"
-    '- "action_items": array of objects, each EXACTLY {"task": string, '
-    '"owner": string, "deadline": string}. owner is the person who agreed to '
-    "do it — a speaker label or a name actually said. deadline is only what "
-    'was stated. Use "" (never a guess) when not mentioned. [] if none.\n'
+    # "action_items" was REMOVED here. It asked the model to extract the same
+    # commitments a second time, in a weaker shape: measured on a real meeting,
+    # ai_tasks and action_items came back with identical task text, identical
+    # owners and identical deadlines, three for three. The duplicate cost
+    # output tokens on a reply that was already truncating (see
+    # groq_client.ANALYSIS_MAX_OUTPUT_TOKENS) and gave the two lists licence to
+    # disagree about the same meeting. "tasks" is the survivor: it is the only
+    # one carrying evidence, confidence and assignee_speaker_id, and the only
+    # one the Tasks screen, notifications and the Salesforce push read.
+    # Stored action_items on existing rows are still READ (mom_schema falls
+    # back to them for a recording older than task seeding); nothing new is
+    # generated.
     '- "deadlines": array of objects, each EXACTLY {"what": string, "when": '
     'string}. Every date, time or milestone mentioned — "when" EXACTLY as '
     'spoken ("next Tuesday", "end of Q3", "15th March"). Do not resolve '
@@ -659,8 +700,8 @@ HIGHLIGHTS_REDUCE_SYSTEM = _json_system(
     "- Never invent anything absent from the segments.\n"
     "\n"
     'Return EXACTLY these fields with the same shapes: "decisions" '
-    '({"decision","context"}), "action_items" ({"task","owner","deadline"}), '
-    '"deadlines" ({"what","when"}), "open_questions" (strings).'
+    '({"decision","context"}), "deadlines" ({"what","when"}), '
+    '"open_questions" (strings).'
 )
 
 # ===========================================================================
@@ -755,7 +796,7 @@ def unified_analysis_system(roster=()):
     body += (
         "\n\n"
         "ADDITIONALLY, include a \"meeting_highlights\" object with EXACTLY "
-        "these four fields:\n"
+        "these three fields:\n"
         + _HIGHLIGHTS_FIELDS
         + "Every array is [] when the meeting contains nothing of that kind. An "
         "empty array is CORRECT and expected — never pad a section to look "
@@ -806,9 +847,8 @@ def unified_reduce_system():
     return SUMMARY_REDUCE_SYSTEM + (
         "\n\n"
         "The segment analyses ALSO carry a \"meeting_highlights\" object with "
-        "the four sections decisions / action_items / deadlines / "
-        "open_questions. Merge it too, into one \"meeting_highlights\" object "
-        "of the same shape:\n"
+        "the three sections decisions / deadlines / open_questions. Merge it "
+        "too, into one \"meeting_highlights\" object of the same shape:\n"
         "- Merge duplicates: the same commitment or deadline often recurs "
         "across segments. Keep it once, with the most complete owner/deadline "
         "available.\n"

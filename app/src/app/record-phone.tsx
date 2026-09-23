@@ -144,7 +144,15 @@ function buildStyles() {
       flexDirection: "row" as const, alignItems: "center" as const,
       justifyContent: "center" as const, gap: 6,
     },
-    routeTxt: { fontFamily: FONT.regular, fontSize: 11.5, color: INK.faint },
+    // flexShrink so a long OS-supplied route name ("Jabra Evolve2 65
+    // Hands-Free AG Audio") yields instead of pushing the chevron off the
+    // row. The chevron is the ONLY thing advertising that this row switches
+    // microphone — and switching away from a failing Bluetooth mic mid-
+    // recording is exactly when that affordance has to be visible.
+    routeTxt: {
+      fontFamily: FONT.regular, fontSize: 11.5, color: INK.faint,
+      flexShrink: 1,
+    },
 
     controls: { alignItems: "center" as const, gap: 12 },
     controlsRow: {
@@ -487,7 +495,7 @@ export default function RecordPhoneScreen() {
             accessibilityLabel="Change microphone"
           >
             <Icon name="mic.fill" tintColor={INK.faint} size={12} />
-            <Text style={st.routeTxt}>{rec.inputName}</Text>
+            <Text style={st.routeTxt} numberOfLines={1}>{rec.inputName}</Text>
             {inputs.length > 1 ? (
               <Icon name="chevron.right" tintColor={INK.faint} size={12} />
             ) : null}

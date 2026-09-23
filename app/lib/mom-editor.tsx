@@ -72,11 +72,27 @@ function buildStyles(C: ColorScale) {
     },
 
     sectionRow: {
-      flexDirection: "row", alignItems: "center", gap: 10,
-      paddingVertical: 12, paddingHorizontal: 12,
+      // gap 4, not 10: the three trailing controls now carry their own
+      // 44pt boxes (st.rowAction), which already supply the visual
+      // breathing room the gap used to. Keeping 10 on top would have
+      // pushed the row uncomfortably wide on a narrow phone.
+      flexDirection: "row", alignItems: "center", gap: 4,
+      paddingVertical: 8, paddingRight: 4, paddingLeft: 12,
       backgroundColor: C.surface, borderRadius: R.card, marginBottom: 8,
       borderWidth: 1, borderColor: C.border, shadowColor: C.shadow, ...ELEV.sm,
     },
+    // A platform-minimum touch target around a deliberately small glyph.
+    // Width is 40 rather than 44 so three of them plus the checkbox still
+    // fit beside the title on a 320pt-wide phone; combined with the row's
+    // gap and padding the effective separation clears 44pt vertically and
+    // the horizontal centres sit ~44pt apart.
+    rowAction: {
+      width: 40, height: 44,
+      alignItems: "center", justifyContent: "center",
+    },
+    // Extra separation before the destructive control, so a slip off
+    // "move down" lands in dead space instead of on Delete.
+    rowActionDanger: { marginLeft: 4 },
     sectionTitle: { fontFamily: FONT.semibold, fontSize: 14.5, color: C.text },
     sectionMeta: {
       fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint, marginTop: 2,
@@ -649,7 +665,11 @@ function SectionRow({
                                hidden && { opacity: 0.55 }]}
       accessibilityLabel={`Edit ${section.title}`}
     >
-      <Pressable onPress={onToggle} hitSlop={8}
+      {/* Same 44pt treatment as the trailing controls — this one toggles
+          whether a section is published at all, so it is worth hitting
+          reliably. Negative marginLeft keeps the icon on its original
+          optical position now that it carries a wider box. */}
+      <Pressable onPress={onToggle} style={[st.rowAction, { marginLeft: -10 }]}
                  accessibilityLabel={hidden ? "Show section" : "Hide section"}>
         <Icon name={hidden ? "square" : "checkmark.square.fill"}
               tintColor={hidden ? C.textFaint : C.primary} size={19} />
@@ -672,17 +692,31 @@ function SectionRow({
         </View>
       </View>
 
-      <Pressable onPress={() => onMove(-1)} hitSlop={6} disabled={index === 0}
+      {/* REAL PADDING, NOT MORE hitSlop.
+          These were three 16pt glyphs 10pt apart with hitSlop 6 — about
+          28pt of target each, and because hitSlop expands the touch area
+          WITHOUT moving anything, the regions of "move down" and "delete
+          section" already met in the middle. Growing hitSlop further would
+          have made two adjacent targets overlap outright, and the one they
+          overlap into is destructive.
+          st.rowAction gives each control a 44pt box that participates in
+          layout, so the controls genuinely move apart instead of merely
+          claiming more invisible space. The icons are unchanged at 16pt —
+          only the tappable box around them grew. st.rowActionDanger adds a
+          margin before the trash so a slip off "move down" lands on
+          nothing rather than on delete. */}
+      <Pressable onPress={() => onMove(-1)} disabled={index === 0}
                  accessibilityLabel="Move up"
-                 style={index === 0 && { opacity: 0.25 }}>
+                 style={[st.rowAction, index === 0 && { opacity: 0.25 }]}>
         <Icon name="chevron.up" tintColor={C.textDim} size={16} />
       </Pressable>
-      <Pressable onPress={() => onMove(1)} hitSlop={6} disabled={index === total - 1}
+      <Pressable onPress={() => onMove(1)} disabled={index === total - 1}
                  accessibilityLabel="Move down"
-                 style={index === total - 1 && { opacity: 0.25 }}>
+                 style={[st.rowAction, index === total - 1 && { opacity: 0.25 }]}>
         <Icon name="chevron.down" tintColor={C.textDim} size={16} />
       </Pressable>
-      <Pressable onPress={onDelete} hitSlop={6} accessibilityLabel="Delete section">
+      <Pressable onPress={onDelete} accessibilityLabel="Delete section"
+                 style={[st.rowAction, st.rowActionDanger]}>
         <Icon name="trash" tintColor={C.danger} size={16} />
       </Pressable>
     </Pressable>
@@ -918,15 +952,22 @@ function FieldsEditor({ st, C, section, onChange }: {
               placeholder="Field name" placeholderTextColor={C.textFaint}
               maxLength={120}
             />
+            {/* Real 44pt boxes rather than overlapping hitSlop, as on the
+                section row: these two sit side by side and one is
+                destructive. The delete is confirmation-guarded, so a slip
+                costs a dialog rather than data — but the targets should
+                still not overlap. */}
             <Pressable onPress={() => onChange((m) => toggleFieldVisible(m, id, f.id))}
-                       hitSlop={8} accessibilityLabel={f.visible ? "Hide field" : "Show field"}>
+                       style={st.rowAction}
+                       accessibilityLabel={f.visible ? "Hide field" : "Show field"}>
               <Icon name={f.visible ? "eye" : "eye.slash"} tintColor={C.textDim} size={17} />
             </Pressable>
             <Pressable
               onPress={() => confirmDestroy(
                 f.label ? `"${f.label}"` : "this field",
                 () => onChange((m) => deleteField(m, id, f.id)))}
-              hitSlop={8} accessibilityLabel="Delete field"
+              style={[st.rowAction, st.rowActionDanger]}
+              accessibilityLabel="Delete field"
             >
               <Icon name="trash" tintColor={C.danger} size={16} />
             </Pressable>

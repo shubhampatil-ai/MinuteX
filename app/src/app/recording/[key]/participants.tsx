@@ -463,8 +463,8 @@ export default function ParticipantsScreen() {
                   {initialsOf(p.contact?.name || "?")}
                 </Text>
               </View>
-              <View style={{ flex: 1 }}>
-                <Text style={st.attendeeName}>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={st.attendeeName} numberOfLines={1}>
                   {p.contact?.name || "Unknown"}
                 </Text>
                 <Text style={st.attendeeSub}>Attended — did not speak</Text>
@@ -560,7 +560,9 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     attendeeInitials: {
       fontFamily: FONT.bold, fontSize: 12, color: "#FFFFFF",
     },
-    attendeeName: { fontFamily: FONT.semibold, fontSize: 14.5, color: C.text },
+    attendeeName: {
+      fontFamily: FONT.semibold, fontSize: 14.5, color: C.text, flexShrink: 1,
+    },
     attendeeSub: {
       fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 2,
     },

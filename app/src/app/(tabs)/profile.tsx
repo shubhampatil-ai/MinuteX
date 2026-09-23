@@ -13,7 +13,7 @@ import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { S, R, ELEV, CAPS, FONT, TABULAR, useTheme, ColorScale } from "../../../lib/theme";
 import {
-  Avatar, Button, ComingSoonRow, ErrorText, ListRow, Loading, Masthead,
+  Avatar, Button, ComingSoonRow, ErrorBlock, ListRow, Loading, Masthead,
   SectionRule, SoonBadge, SwitchRow, TextField, Toast, KeyboardAware,
   scrollFormProps,
 } from "../../../lib/ui";
@@ -199,7 +199,11 @@ export default function ProfileScreen() {
   return (
     <KeyboardAware>
       <ScrollView style={[st.container, { paddingTop: insets.top + S.lg }]}
-        contentContainerStyle={{ paddingBottom: 100 }} {...scrollFormProps}>
+        // Derived from the real tab-bar height (60 + max(inset, 8)) plus the
+        // record FAB's overhang, rather than a flat 100 that came up short
+        // on a large-inset phone.
+        contentContainerStyle={{ paddingBottom: 60 + Math.max(insets.bottom, 8) + 40 }}
+        {...scrollFormProps}>
         <Masthead
           kicker={me?.email}
           title={me?.name || "Add your name"}
@@ -236,7 +240,10 @@ export default function ProfileScreen() {
             </Pressable>
           }
         />
-        {error ? <ErrorText>{error}</ErrorText> : null}
+        {/* A failed profile load used to state the problem and stop —
+            on a primary tab, with no retry and no pull-to-refresh, so the
+            only way out was to switch tabs and come back. */}
+        {error ? <ErrorBlock message={error} onRetry={load} /> : null}
 
         {editing ? (
           <View style={{ marginTop: S.lg }}>

@@ -233,7 +233,10 @@ export default function ContactDetailScreen() {
       }
       {...scrollFormProps}
     >
-      <Stack.Screen options={{ title: contact.name || "Contact" }} />
+      {/* Constant, for the same reason as the meeting screen: a long
+          contact name centre-elides to a stub in the native header, and
+          the name is already displayed in full in the hero below. */}
+      <Stack.Screen options={{ title: "Contact" }} />
 
       <View style={st.hero}>
         <Pressable

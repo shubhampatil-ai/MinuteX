@@ -68,20 +68,33 @@ function buildStyles(C: ColorScale) {
       flexDirection: "row" as const, alignItems: "center" as const, gap: S.sm,
       paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: C.border,
     },
-    mapTitle: { flex: 1, fontFamily: FONT.extrabold, fontSize: 15.5, color: C.text },
-    mapApi: { fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint, marginTop: 2 },
+    mapTitle: { flexShrink: 1, fontFamily: FONT.extrabold, fontSize: 15.5, color: C.text },
+    // The raw SObject API name. Namespaced managed-package objects run
+    // long ("acme_partner__Site_Visit_Inspection__c"), so it shrinks and
+    // ellipsizes rather than unbalancing the row against Remove.
+    mapApi: {
+      fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint,
+      marginTop: 2, flexShrink: 1,
+    },
     pickRow: {
       flexDirection: "row" as const, alignItems: "center" as const, gap: S.md,
       paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.border,
     },
-    pickBody: { flex: 1 },
+    pickBody: { flex: 1, minWidth: 0 },
     pickLabel: { fontFamily: FONT.semibold, fontSize: 13.5, color: C.text },
-    pickValue: { fontFamily: FONT.regular, fontSize: 12.5, color: C.textDim, marginTop: 3 },
+    // fieldLabel() renders "Label (API_Name__c)", routinely 60+ chars.
+    pickValue: {
+      fontFamily: FONT.regular, fontSize: 12.5, color: C.textDim, marginTop: 3,
+    },
     pickEmpty: {
       fontFamily: FONT.regular, fontSize: 12.5, color: C.textFaint, marginTop: 3,
       fontStyle: "italic" as const,
     },
-    required: { fontFamily: FONT.bold, fontSize: 9.5, letterSpacing: 1, color: C.textFaint },
+    // Never shrinks: a half-rendered "REQUIRED" is worse than none.
+    required: {
+      fontFamily: FONT.bold, fontSize: 9.5, letterSpacing: 1, color: C.textFaint,
+      flexShrink: 0,
+    },
     empty: {
       fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 20, color: C.textFaint,
       paddingVertical: 6,
@@ -114,7 +127,10 @@ function buildStyles(C: ColorScale) {
       alignItems: "center" as const, gap: 10,
     },
     optLabel: { fontFamily: FONT.semibold, fontSize: 14.5, color: C.text },
-    optMeta: { fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint, marginTop: 2 },
+    // "Field_Name__c · Long text · 131,072 chars" — long by construction.
+    optMeta: {
+      fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint, marginTop: 2,
+    },
     optNone: { fontFamily: FONT.semibold, fontSize: 14.5, color: C.textDim },
     emptyList: {
       fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 20, color: C.textFaint,
@@ -446,8 +462,8 @@ export default function OrgSalesforceConfigScreen() {
             <Card>
               <View style={st.mapHead}>
                 <View style={{ flex: 1 }}>
-                  <Text style={st.mapTitle}>{d.objectLabel}</Text>
-                  <Text style={st.mapApi}>{d.object}</Text>
+                  <Text style={st.mapTitle} numberOfLines={2}>{d.objectLabel}</Text>
+                  <Text style={st.mapApi} numberOfLines={1}>{d.object}</Text>
                 </View>
                 <Pressable onPress={() => removeMapping(index)} hitSlop={8}>
                   <Text style={st.removeTxt}>Remove</Text>
@@ -463,7 +479,7 @@ export default function OrgSalesforceConfigScreen() {
                   {describing === index && !d.schema ? (
                     <Text style={st.pickEmpty}>Loading fields…</Text>
                   ) : d.lookupField ? (
-                    <Text style={st.pickValue}>
+                    <Text style={st.pickValue} numberOfLines={2}>
                       {fieldLabel(index, d.lookupField, "lookup")}
                     </Text>
                   ) : (
@@ -487,7 +503,7 @@ export default function OrgSalesforceConfigScreen() {
                   <View style={st.pickBody}>
                     <Text style={st.pickLabel}>{t.label}</Text>
                     {d.targets[t.key] ? (
-                      <Text style={st.pickValue}>
+                      <Text style={st.pickValue} numberOfLines={2}>
                         {fieldLabel(index, d.targets[t.key], "long")}
                       </Text>
                     ) : (
@@ -592,8 +608,8 @@ export default function OrgSalesforceConfigScreen() {
                   return (
                     <Pressable key={o.value} style={st.optRow} onPress={() => choose(o.value)}>
                       <View style={{ flex: 1 }}>
-                        <Text style={st.optLabel}>{o.label}</Text>
-                        <Text style={st.optMeta}>{o.meta}</Text>
+                        <Text style={st.optLabel} numberOfLines={2}>{o.label}</Text>
+                        <Text style={st.optMeta} numberOfLines={2}>{o.meta}</Text>
                       </View>
                       {selected ? <Icon name="checkmark" tintColor={C.primary} size={16} /> : null}
                     </Pressable>

@@ -632,7 +632,7 @@ export default function AssistantScreen() {
         <View style={{ flex: 1, backgroundColor: C.bg }}>
           <View style={{
             flexDirection: "row", alignItems: "center", gap: S.md,
-            paddingHorizontal: 20, paddingTop: 60, paddingBottom: 14,
+            paddingHorizontal: 20, paddingTop: insets.top + 14, paddingBottom: 14,
             borderBottomWidth: 1, borderBottomColor: C.border,
           }}>
             <Pressable onPress={() => setHistoryOpen(false)} hitSlop={8} accessibilityLabel="Close">
@@ -678,6 +678,10 @@ function AssistantDocSheet({
   onDelete: () => void;
 }) {
   const { C, T } = useTheme();
+  // This overlay is absolutely positioned from top: 0, so it draws under
+  // the status bar. The 60 it used to hard-code happened to clear a
+  // notch-less iPhone and nothing else.
+  const insets = useSafeAreaInsets();
   const [busy, setBusy] = useState<"pdf" | "docx" | "copy" | null>(null);
   const [toast, setToast] = useState("");
 
@@ -721,7 +725,7 @@ function AssistantDocSheet({
     }}>
       <View style={{
         flexDirection: "row", alignItems: "center", gap: S.md,
-        paddingHorizontal: 20, paddingTop: 60, paddingBottom: 14,
+        paddingHorizontal: 20, paddingTop: insets.top + 14, paddingBottom: 14,
         borderBottomWidth: 1, borderBottomColor: C.border,
       }}>
         <Pressable onPress={onClose} hitSlop={8} accessibilityLabel="Close">

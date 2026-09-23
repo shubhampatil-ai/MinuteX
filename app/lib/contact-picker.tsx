@@ -677,13 +677,17 @@ export function ContactPicker({
                   >
                     <Avatar name={c.name} photoUri={c.avatar_view_url}
                       size={36} fontSize={13} />
-                    <View style={{ flex: 1 }}>
-                      <Text style={st.name}>{c.name}</Text>
+                    {/* Matches the two sibling rows in this file, which
+                        already truncate — this one was the odd one out. */}
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={st.name} numberOfLines={1}>{c.name}</Text>
                       {!!(c.email || c.company) && (
-                        <Text style={st.sub}>{c.email || c.company}</Text>
+                        <Text style={st.sub} numberOfLines={1}>
+                          {c.email || c.company}
+                        </Text>
                       )}
                     </View>
-                    <Text style={st.useTxt}>Use this</Text>
+                    <Text style={[st.useTxt, { flexShrink: 0 }]}>Use this</Text>
                   </Pressable>
                 ))}
 
@@ -839,7 +843,11 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
       flexDirection: "row", alignItems: "center", gap: S.md,
       paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: C.border,
     },
-    name: { fontFamily: FONT.bold, fontSize: 14.5, color: C.text },
+    // flexShrink so a long name yields to the role tag / badges beside it
+    // rather than pushing them off the sheet (numberOfLines alone does not
+    // constrain width in RN). Mirrors src/app/contacts.tsx, which renders
+    // the same row.
+    name: { fontFamily: FONT.bold, fontSize: 14.5, color: C.text, flexShrink: 1 },
     sub: { fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 1 },
     nameRow: { flexDirection: "row", alignItems: "center", gap: 6 },
     // The role tag sits ON the name line, not in the badge slot on the right:
@@ -848,7 +856,7 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     // can be scanned without reading every tag.
     roleTag: {
       paddingHorizontal: 6, paddingVertical: 2, borderRadius: R.sm,
-      backgroundColor: C.accentSoft,
+      backgroundColor: C.accentSoft, flexShrink: 0,
     },
     roleTagTxt: {
       fontFamily: FONT.bold, fontSize: 10, color: C.accent,
@@ -857,7 +865,7 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     badge: {
       flexDirection: "row", alignItems: "center", gap: 3,
       paddingHorizontal: 7, paddingVertical: 3, borderRadius: R.pill,
-      backgroundColor: C.successSoft,
+      backgroundColor: C.successSoft, flexShrink: 0,
     },
     badgeTxt: { fontFamily: FONT.bold, fontSize: 10, color: C.success },
     actions: { gap: S.sm, marginTop: S.md },

@@ -17,6 +17,7 @@ import {
   ScrollView, Share, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import Animated, { FadeInDown, LinearTransition } from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ELEV, FONT, R, S, useTheme } from "./theme";
 import { Button, Card, KeyboardAwareSheet, SectionRule } from "./ui";
 import { Icon } from "./icons";
@@ -150,6 +151,9 @@ export function CreateDocumentSheet({
 }) {
   const { C, T } = useTheme();
   const st = buildStyles(C);
+  // These sheets are full-screen Modals (no `transparent`), so they draw
+  // edge to edge and own the status bar themselves.
+  const insets = useSafeAreaInsets();
   const [busyTemplate, setBusyTemplate] = useState<string | null>(null);
   const [customPrompt, setCustomPrompt] = useState("");
   const [customBusy, setCustomBusy] = useState(false);
@@ -220,7 +224,7 @@ export function CreateDocumentSheet({
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
       <View style={st.sheetWrap}>
-        <View style={st.sheetBar}>
+        <View style={[st.sheetBar, { paddingTop: insets.top + 14 }]}>
           <Pressable onPress={onClose} hitSlop={8} accessibilityLabel="Close">
             <Icon name="xmark" tintColor={C.text} size={20} />
           </Pressable>
@@ -464,6 +468,9 @@ function DocumentSheet({
 }) {
   const { C, T } = useTheme();
   const st = buildStyles(C);
+  // These sheets are full-screen Modals (no `transparent`), so they draw
+  // edge to edge and own the status bar themselves.
+  const insets = useSafeAreaInsets();
   const [mode, setMode] = useState<"view" | "edit" | "rename">("view");
   const [draftContent, setDraftContent] = useState(doc.content);
   const [draftLabel, setDraftLabel] = useState(doc.label);
@@ -600,7 +607,7 @@ function DocumentSheet({
   return (
     <Modal visible animationType="slide" onRequestClose={onClose}>
       <KeyboardAvoidingView style={st.sheetWrap} behavior={Platform.OS === "ios" ? "padding" : "height"}>
-        <View style={st.sheetBar}>
+        <View style={[st.sheetBar, { paddingTop: insets.top + 14 }]}>
           <Pressable onPress={onClose} hitSlop={8} accessibilityLabel="Close">
             <Icon name="xmark" tintColor={C.text} size={20} />
           </Pressable>

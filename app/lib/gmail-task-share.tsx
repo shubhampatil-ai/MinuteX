@@ -19,6 +19,7 @@ import {
   Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "./icons";
 import { R, FONT, useTheme, ColorScale } from "./theme";
 import {
@@ -76,6 +77,8 @@ export function GmailTaskSheet({
 }: GmailTaskSheetProps) {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
+  // Send sits at the foot of this sheet, so it must clear the home indicator.
+  const insets = useSafeAreaInsets();
 
   const [subject, setSubject] = useState(`Action item — ${taskTitle}`);
   // Empty by default, NOT pre-filled with the task's own fields. The backend
@@ -114,7 +117,7 @@ export function GmailTaskSheet({
       <KeyboardAwareSheet>
       <View style={st.backdrop}>
         <Pressable style={{ flex: 1 }} onPress={onClose} accessibilityLabel="Close" />
-        <View style={st.sheet}>
+        <View style={[st.sheet, { paddingBottom: Math.max(insets.bottom, 12) + 14 }]}>
           <View style={st.head}>
             <View style={{ flex: 1 }}>
               <Text style={st.title}>Email this task</Text>
@@ -129,7 +132,11 @@ export function GmailTaskSheet({
             </Pressable>
           </View>
 
-          <ScrollView {...scrollFormProps} style={{ maxHeight: 340 }}>
+          {/* flexShrink, not a fixed maxHeight — same reasoning as the
+              meeting Gmail sheet: the sheet is bounded at 85% and Send sits
+              below this list, so the list is what must yield on a short
+              phone. */}
+          <ScrollView {...scrollFormProps} style={{ flexShrink: 1 }}>
             <Text style={st.label}>Subject</Text>
             <TextInput
               style={st.input}

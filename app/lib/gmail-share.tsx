@@ -36,6 +36,7 @@ import {
   TextInput, View,
 } from "react-native";
 import { useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "./icons";
 import { R, FONT, useTheme, ColorScale } from "./theme";
 import {
@@ -131,7 +132,9 @@ function buildStyles(C: ColorScale) {
       lineHeight: 19, paddingVertical: 8,
     },
     link: { fontFamily: FONT.bold, fontSize: 13, color: C.primary },
-    footer: { paddingTop: 18, paddingBottom: 26, gap: 10 },
+    // flexShrink: 0 — the action row must never be the thing that gives
+    // way. The ScrollView above it is the designated flexible child.
+    footer: { paddingTop: 18, paddingBottom: 26, gap: 10, flexShrink: 0 },
     progress: {
       fontFamily: FONT.regular, fontSize: 12.5, color: C.textDim,
       textAlign: "center" as const,
@@ -144,6 +147,9 @@ export function GmailShareSheet({
 }: GmailShareSheetProps) {
   const { C } = useTheme();
   const router = useRouter();
+  // The home indicator / gesture bar. The footer holds Send, so it must
+  // clear it; the fixed paddingBottom below assumed no inset at all.
+  const insets = useSafeAreaInsets();
   const st = useMemo(() => buildStyles(C), [C]);
 
   const [loading, setLoading] = useState(true);
@@ -353,7 +359,16 @@ export function GmailShareSheet({
               <ActivityIndicator color={C.textFaint} />
             </View>
           ) : (
-            <ScrollView {...scrollFormProps} style={{ maxHeight: 430 }}>
+            // flexShrink, not a fixed maxHeight. The sheet is already
+            // bounded (maxHeight "90%") and the header/footer lay out at
+            // their natural size. A hard 430 made this list refuse to give
+            // any height back, so on a short phone head + 430 + footer
+            // exceeded the sheet and Send — the only way to finish — fell
+            // below the fold. flexShrink lets the LIST absorb the
+            // shortfall, which is right because it already scrolls. On a
+            // tall phone nothing changes: flexShrink only bites when there
+            // is a shortfall to absorb.
+            <ScrollView {...scrollFormProps} style={{ flexShrink: 1 }}>
               {/* ---- Documents ---- */}
               <Text style={st.sectionTitle}>Documents</Text>
               {!outputs.length ? (
@@ -486,7 +501,7 @@ export function GmailShareSheet({
             </ScrollView>
           )}
 
-          <View style={st.footer}>
+          <View style={[st.footer, { paddingBottom: Math.max(insets.bottom, 12) + 14 }]}>
             {error ? <ErrorText>{error}</ErrorText> : null}
             {sending && progress ? <Text style={st.progress}>{progress}</Text> : null}
             <Button

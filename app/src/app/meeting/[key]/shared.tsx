@@ -92,8 +92,15 @@ function buildStyles(C: ColorScale) {
       flexDirection: "row" as const, gap: S.md, paddingVertical: 6,
       alignItems: "flex-start" as const,
     },
+    // A RANGE, not a hard width. `f.label` is a server-supplied MoM field
+    // label: at a fixed 110 a long one wrapped to four or five lines inside
+    // its box while the value beside it stayed on one, so the row's height
+    // was driven by the label rather than the content. The range keeps the
+    // labels optically aligned in the common case and lets an unusual one
+    // take the room it needs.
     fieldLabel: {
-      fontFamily: FONT.semibold, fontSize: 13.5, color: C.textDim, width: 110,
+      fontFamily: FONT.semibold, fontSize: 13.5, color: C.textDim,
+      minWidth: 96, maxWidth: 140, flexShrink: 1,
     },
     fieldValue: {
       fontFamily: FONT.medium, fontSize: 14, lineHeight: 20, color: C.text,

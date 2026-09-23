@@ -235,8 +235,15 @@ export default function MeetingDetailScreen() {
   // ABOVE the ordinary field-mapping block (CrmRecordsBlock, unchanged,
   // Personal-and-Organisation-shared) — never instead of it, since the
   // review is about WHO the meeting resolves to and the mapping block is
-  // about WHICH record fields get written; a personal meeting shows only
-  // the mapping block, exactly as before this phase.
+  // about WHICH record fields get written.
+  //
+  // A PERSONAL meeting now renders the same block in `personal` mode,
+  // where it shows ONLY when that user has generic delivery turned on and
+  // returns null otherwise (including while loading, so nothing flashes).
+  // That is what gives a personal meeting a Push button at all — generic
+  // delivery is its only push path, since the mapping push was always
+  // organisation-only. A personal user without delivery sees exactly what
+  // they saw before: the mapping block and nothing else.
   const { workspaces } = useWorkspace();
   const isOrgMeeting = !!rec?.workspace_id
     && workspaces.some((w) => w.workspace_id === rec.workspace_id && !w.is_personal);
@@ -548,9 +555,17 @@ export default function MeetingDetailScreen() {
   return (
     <AudioPlayerProvider url={rec.audio_url}>
       <View style={{ flex: 1, backgroundColor: C.bg }}>
+        {/* A CONSTANT header title, not the meeting's own.
+            An AI-written title runs long ("Quarterly Business Review with
+            ACME Corporation — Renewal Discussion") and the native header
+            has to fit it between the back chevron and the ellipsis: iOS
+            centre-elides it to an unreadable stub, Android collides with
+            the back arrow. It also duplicated the headline rendered a few
+            points below, so the risk bought nothing. The page keeps the
+            real title where it has room to wrap. */}
         <Stack.Screen
           options={{
-            title: rec.title || "Meeting",
+            title: "Meeting",
             headerRight: () => (
               <Pressable onPress={() => setMenuOpen(true)} hitSlop={10} accessibilityLabel="More">
                 <Icon name="ellipsis" tintColor={C.text} size={20} />
@@ -569,7 +584,12 @@ export default function MeetingDetailScreen() {
           {/* ---- Shared masthead: title (tap to rename), dateline, player ---- */}
           <View>
             <Pressable onPress={openRenameTitle} style={st.titleRow} accessibilityLabel="Rename meeting">
-              <Text style={st.headline}>{rec.title || "Untitled meeting"}</Text>
+              {/* Four lines is generous enough for any real AI title while
+                  still guaranteeing the player and tabs stay above the
+                  fold on a small phone. */}
+              <Text style={st.headline} numberOfLines={4}>
+                {rec.title || "Untitled meeting"}
+              </Text>
             </Pressable>
             <Text style={st.dateline}>{datelineParts.join(" · ")}</Text>
 
@@ -675,7 +695,10 @@ export default function MeetingDetailScreen() {
             hasAnalysis ? (
               <View style={st.section}>
                 {hasOverview(rec.overview) ? (
-                  <MeetingOverviewView overview={rec.overview} />
+                  <MeetingOverviewView
+                    overview={rec.overview}
+                    speakerNames={rec.speaker_names}
+                  />
                 ) : (
                   <>
                     <MeetingSummary summary={rec.summary} />
@@ -685,7 +708,9 @@ export default function MeetingDetailScreen() {
                     />
                   </>
                 )}
-                {isOrgMeeting ? <OrgCrmReviewBlock meetingKey={key} /> : null}
+                {isOrgMeeting
+                  ? <OrgCrmReviewBlock meetingKey={key} />
+                  : <OrgCrmReviewBlock meetingKey={key} personal />}
                 <CrmRecordsBlock
                   mappings={crmMappings}
                   records={rec.crm_records}
@@ -733,7 +758,9 @@ export default function MeetingDetailScreen() {
                     identifier is independent of it, and the user may well want
                     to link this meeting to Salesforce anyway. Renders nothing
                     when no mappings are configured. */}
-                {isOrgMeeting ? <OrgCrmReviewBlock meetingKey={key} /> : null}
+                {isOrgMeeting
+                  ? <OrgCrmReviewBlock meetingKey={key} />
+                  : <OrgCrmReviewBlock meetingKey={key} personal />}
                 <CrmRecordsBlock
                   mappings={crmMappings}
                   records={rec.crm_records}

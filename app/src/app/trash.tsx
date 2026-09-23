@@ -243,7 +243,7 @@ export default function TrashScreen() {
                       {duration ? <Text style={st.meta}>{duration}</Text> : null}
                     </View>
                     <Text style={st.headline} numberOfLines={2}>
-                      {item.title || "Untitled conversation"}
+                      {item.title || "Untitled meeting"}
                     </Text>
                     <Text style={st.deletedAt}>{fmtAgo(item.deleted_at)}</Text>
                   </View>

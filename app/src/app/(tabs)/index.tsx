@@ -511,9 +511,25 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
       marginBottom: S.md, shadowColor: C.shadow, ...ELEV.sm,
     },
     briefTop: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: S.md },
-    kicker: { ...CAPS, fontFamily: FONT.bold, fontSize: 10, letterSpacing: 1.4 },
+    // The kicker line wraps rather than overflowing. Source labels are
+    // translated/variable ("UPLOADED FILE", "MINUTEX DEVICE") and the
+    // timecode beside them is a fixed-width run, so on a narrow phone the
+    // two genuinely cannot share one line — `wrap` lets the timecode drop
+    // to its own line instead of being pushed out of the card.
+    kickerRow: {
+      flexDirection: "row" as const, alignItems: "center" as const,
+      flexWrap: "wrap" as const, columnGap: 8, rowGap: 2,
+    },
+    // flexShrink so a long source label yields before it can push the
+    // timecode off the card; the label still ellipsizes rather than clip.
+    kicker: {
+      ...CAPS, fontFamily: FONT.bold, fontSize: 10, letterSpacing: 1.4,
+      flexShrink: 1,
+    },
     // Time + duration is a timecode — mono, per the type system's third job.
-    briefMeta: { ...TABULAR, fontSize: 11, color: C.textFaint },
+    // flexShrink: 0 — a timecode that ellipsizes tells you nothing, so the
+    // label above yields first and this stays whole (or wraps to its own row).
+    briefMeta: { ...TABULAR, fontSize: 11, color: C.textFaint, flexShrink: 0 },
     headline: { ...T.headlineSm, marginTop: 5 },
     summary: { ...T.bodyDim, marginTop: 7 },
     metaRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 14, marginTop: 11 },
@@ -674,7 +690,7 @@ export default function DeskScreen() {
       failed ? "Move this failed brief to Trash?" : "Move this brief to Trash?",
       failed
         ? "Nothing was written up for this one. You can restore it later from Trash."
-        : `“${item.title || "Untitled conversation"}” moves to Trash with its `
+        : `“${item.title || "Untitled meeting"}” moves to Trash with its `
         + "transcript and everything written from it. You can restore it later.",
       [
         { text: "Cancel", style: "cancel" },
@@ -1044,7 +1060,14 @@ export default function DeskScreen() {
         ListHeaderComponent={dashboard}
         // paddingBottom clears the absolutely-positioned tab bar and the
         // floating record button, exactly as before.
-        contentContainerStyle={{ paddingTop: S.lg, paddingBottom: 100 }}
+        // Clearance derived from the real tab bar rather than guessed:
+        // (tabs)/_layout sizes it 60 + max(inset, 8), and the extra 40
+        // clears the raised record FAB, which overhangs the bar by 26. A
+        // flat 100 fell short on a large-inset phone, cutting the last card.
+        contentContainerStyle={{
+          paddingTop: S.lg,
+          paddingBottom: 60 + Math.max(insets.bottom, 8) + 40,
+        }}
         refreshControl={
           <RefreshControl refreshing={refreshing}
             onRefresh={() => { setRefreshing(true); load(); }} tintColor={C.primary} />
@@ -1117,20 +1140,28 @@ export default function DeskScreen() {
                   bg={failed ? C.dangerSoft : C.primarySoft}
                   size={40}
                 />
-                <View style={{ flex: 1 }}>
-                  {/* Kicker line: what kind of conversation, when, how long. */}
-                  <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
-                    <Text style={[st.kicker, { color: kickerColor }]}>
+                {/* minWidth: 0 is what actually lets the children ellipsize.
+                    A flex child's default minWidth is auto, which means "at
+                    least my content" — so without this a long title widens
+                    the column and pushes the status icon off the card no
+                    matter what numberOfLines says. */}
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  {/* Kicker line: what kind of meeting, when, how long. */}
+                  <View style={st.kickerRow}>
+                    <Text
+                      style={[st.kicker, { color: kickerColor }]}
+                      numberOfLines={1}
+                    >
                       {failed ? "Couldn't finish" : source.label}
                     </Text>
-                    <Text style={st.briefMeta}>
+                    <Text style={st.briefMeta} numberOfLines={1}>
                       {fmtWhen(item.created_at)}{duration ? ` · ${duration}` : ""}
                     </Text>
                   </View>
 
                   {/* The headline is what the AI wrote */}
                   <Text style={st.headline} numberOfLines={3}>
-                    {item.title || "Untitled conversation"}
+                    {item.title || "Untitled meeting"}
                   </Text>
 
                   {/* WHO recorded it. Organisation only, and only for
@@ -1152,8 +1183,14 @@ export default function DeskScreen() {
                     </View>
                   ) : null}
                 </View>
+                {/* The status tick never shrinks and never wraps — it is
+                    18px of fixed intent. marginTop nudges it onto the
+                    kicker's optical line rather than the title's, so it
+                    reads as status for the row, not for the headline. */}
                 {ready ? (
-                  <Icon name="checkmark.circle.fill" tintColor={C.success} size={18} />
+                  <View style={{ flexShrink: 0, marginTop: 2 }}>
+                    <Icon name="checkmark.circle.fill" tintColor={C.success} size={18} />
+                  </View>
                 ) : null}
               </View>
 
@@ -1167,9 +1204,14 @@ export default function DeskScreen() {
                       avatars live on the brief screen, not here. */}
                   <View style={st.metaRow}>
                     {item.language ? (
-                      <Text style={{ ...T.caption }}>{item.language.toUpperCase()}</Text>
+                      <Text style={{ ...T.caption, flexShrink: 0 }} numberOfLines={1}>
+                        {item.language.toUpperCase()}
+                      </Text>
                     ) : null}
-                    <View style={{ flex: 1, alignItems: "flex-end" }}>
+                    {/* The waveform is decoration, so it yields the space:
+                        minWidth 0 lets it compress on a narrow phone rather
+                        than forcing the row wider than the card. */}
+                    <View style={{ flex: 1, minWidth: 0, alignItems: "flex-end" }}>
                       <Waveform seed={item.audio_s3_key} bars={28} height={16}
                         color={C.border} dimColor={C.border} />
                     </View>

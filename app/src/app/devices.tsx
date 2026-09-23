@@ -10,7 +10,7 @@ import { useFocusEffect, useRouter } from "expo-router";
 import { Icon } from "../../lib/icons";
 import { S, R, ELEV, CAPS, FONT, TABULAR, useTheme, ColorScale } from "../../lib/theme";
 import {
-  Button, Card, ComingSoonRow, EmptyState, ErrorText, Masthead, Row,
+  Button, Card, ComingSoonRow, EmptyState, ErrorBlock, Masthead, Row,
   SectionRule,
 } from "../../lib/ui";
 import { DeviceArt } from "../../lib/device-art";
@@ -112,7 +112,7 @@ export default function DevicesScreen() {
         }
         title="Your device"
       />
-      {error ? <ErrorText>{error}</ErrorText> : null}
+      {error ? <ErrorBlock message={error} onRetry={load} /> : null}
 
       {/* Live connected device */}
       {device ? (

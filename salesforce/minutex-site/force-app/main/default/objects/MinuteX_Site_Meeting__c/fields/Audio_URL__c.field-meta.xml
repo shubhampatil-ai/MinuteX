@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Audio_URL__c</fullName>
+    <description>A MinuteX audio link. MinuteX checks access on every request and redirects to a short-lived download, so the link stops working if Site delivery is turned off or the meeting is deleted.</description>
+    <label>Audio Link</label>
+    <length>4000</length>
+    <required>false</required>
+    <type>LongTextArea</type>
+    <visibleLines>2</visibleLines>
+</CustomField>

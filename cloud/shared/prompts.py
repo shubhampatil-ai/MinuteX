@@ -312,10 +312,13 @@ SUMMARY_SYSTEM = _json_system(
     'to sharing the revised proposal". Do NOT attribute a general topic '
     "summary, synthesized discussion, a restated point, or background and "
     "context — those read better as the team, the meeting, or no subject at "
-    "all. When attribution is genuinely required but the speaker has no name "
-    'on the roster, write "An unidentified participant proposed…" rather '
-    'than "Speaker 0 proposed…". Never drop a decision, a commitment or an '
-    "owner just to avoid naming someone.\n"
+    "all. When attribution is genuinely required, use the name on the roster "
+    "above. When that speaker has NO name on the roster, write \"An "
+    "unidentified participant proposed…\" — NEVER \"Speaker 0 proposed…\". "
+    "A bare \"Speaker N\" is a raw diarization label, the same class of "
+    "internal identifier as a segment id, and it must never appear in "
+    "\"title\", \"content\" or \"items\". Never drop a decision, a commitment "
+    "or an owner just to avoid naming someone.\n"
     '- "tasks": array of objects, each EXACTLY {"task": string, "assignee": '
     'string, "assignee_speaker_id": string, "due_date": string, '
     '"priority": string, "confidence": string, "evidence": string, '
@@ -722,7 +725,7 @@ _HIGHLIGHTS_FIELDS = (
     # groq_client.ANALYSIS_MAX_OUTPUT_TOKENS) and gave the two lists licence to
     # disagree about the same meeting. "tasks" is the survivor: it is the only
     # one carrying evidence, confidence and assignee_speaker_id, and the only
-    # one the Tasks screen, notifications and the Salesforce push read.
+    # one the Tasks screen, notifications and Salesforce delivery read.
     # Stored action_items on existing rows are still READ (mom_schema falls
     # back to them for a recording older than task seeding); nothing new is
     # generated.
@@ -779,48 +782,6 @@ HIGHLIGHTS_REDUCE_SYSTEM = _json_system(
     '"open_questions" (strings).'
 )
 
-# ===========================================================================
-# STAGE 2b — CRM record identifier extraction.
-#
-# A SEPARATE, deliberately tiny call rather than another field on
-# SUMMARY_SYSTEM or HIGHLIGHTS_SYSTEM. Same reasoning that split highlights
-# from the summary, but the stakes here are higher: this value decides WHICH
-# Salesforce record a meeting gets pushed onto, so a hallucinated one is worse
-# than no value at all — it writes real meeting notes onto a stranger's record.
-# Bundling it into a prompt that is simultaneously being asked to write prose is
-# exactly the condition under which models pattern-complete a plausible id.
-#
-# GENERIC BY CONSTRUCTION. The prompt is BUILT from the customer's own
-# configured mapping (object label + the field they identify records by), so the
-# same code extracts a site visit number, a lead email or an opportunity number
-# without knowing what any of those are. Nothing here names a specific object.
-#
-# The rules are stricter than BASE_SYSTEM's general "never invent": the model
-# must return null unless the value was SPOKEN, and must quote the sentence it
-# came from. `evidence` is not decoration — it is what makes a wrong extraction
-# auditable before anything is pushed, and requiring a verbatim quote measurably
-# suppresses invention because the model has to produce a source it cannot
-# fabricate from the transcript.
-#
-# Confidence is asked for as a coarse 3-way label, NOT a float: models are
-# badly calibrated at "0.87" but reasonably reliable at "did they say it
-# outright, or am I inferring it". The caller maps the label to a number.
-# ===========================================================================
-
-# Kinds of value we can give the model a useful hint about, chosen from the
-# Salesforce field type so the wording matches what it is looking for. Falls
-# back to neutral wording for anything else — a new field type degrades to
-# "find this identifier", never to a wrong instruction.
-_IDENTIFIER_HINTS = {
-    "email": 'an email address (e.g. "priya@example.com")',
-    "phone": 'a phone number',
-    "url": "a web address",
-    "double": "a number",
-    "int": "a number",
-    "currency": "an amount",
-}
-
-
 def unified_analysis_system(roster=(), speaker_names=None):
     """The ONE analysis prompt: everything the pipeline needs in a single call.
 
@@ -847,20 +808,6 @@ def unified_analysis_system(roster=(), speaker_names=None):
     what is genuinely new: the envelope that says these fields arrive together,
     and the reminder that the extraction fields must not degrade just because
     prose is being written in the same breath.
-
-    CRM identifier extraction was REMOVED from this prompt. It made every
-    analysis carry per-mapping extraction rules for a feature not yet built
-    out, and it is the one output whose failure mode is attaching a real
-    customer's meeting to a stranger's Salesforce record.
-
-    crm_identifier_system() below is now UNCALLED — no Lambda reaches it. It is
-    kept, with ai_schema's coerce/normalize/grounding helpers, because those
-    four pieces are where the anti-hallucination work for record identifiers
-    lives (the grounding check that refuses a value the model cannot quote, and
-    the spoken-digit normalizer). Re-deriving them when integration extraction
-    is designed properly would mean re-earning them; they are still covered by
-    tests. Manual identifier entry and the Salesforce push are unaffected —
-    they never went through this prompt.
     """
     body = summary_system(roster)
     # The id -> name table. Placed with the roster it explains, before the
@@ -943,52 +890,6 @@ def unified_reduce_system():
         "- Never invent anything absent from the segments.\n"
     )
 
-
-def crm_identifier_system(label, object_label="", field_type=""):
-    """Build the extraction prompt for ONE configured mapping.
-
-    `label` is what the customer's own configuration calls this identifier
-    ("Site Visit Number", "Lead Email"); `object_label` is the object's label in
-    their org ("Site Visit", "Lead"). Both come from Salesforce's Describe
-    output, so the prompt speaks the user's vocabulary rather than ours.
-    """
-    what = (label or "record identifier").strip()
-    of_object = f" for the {object_label.strip()}" if object_label.strip() else ""
-    hint = _IDENTIFIER_HINTS.get((field_type or "").lower(), "")
-    hint_line = f" It is usually {hint}." if hint else ""
-    return _json_system(
-        f'Your ONLY job is to find the "{what}"{of_object} if the meeting '
-        f"mentions one.{hint_line} Output ONLY a single valid JSON object with "
-        "EXACTLY these fields:\n"
-        f'- "value": string. The {what} EXACTLY as stated, including any '
-        "prefix, separators and letter case. Use null when the transcript does "
-        "not mention one.\n"
-        '- "confidence": string. One of "explicit" | "probable" | "none".\n'
-        f'    "explicit" — someone stated it as the {what} outright.\n'
-        f'    "probable" — clearly this meeting\'s {what}, but said less '
-        "directly or without naming it as such.\n"
-        f'    "none" — no {what} in the transcript.\n'
-        '- "evidence": string. The VERBATIM sentence (or shortest phrase) from '
-        "the transcript containing it. Copy it exactly — do not paraphrase, do "
-        'not clean it up. Use "" when there is nothing to quote.\n'
-        "\n"
-        "CRITICAL RULES — a wrong value is far worse than no value:\n"
-        "- Extract ONLY a value that is actually IN the transcript. NEVER "
-        "invent, complete, correct or guess one, even partially.\n"
-        f'- If no {what} is mentioned, you MUST return {{"value": null, '
-        '"confidence": "none", "evidence": ""}}. Returning null is the CORRECT '
-        "answer for most meetings — the majority of meetings do not mention "
-        "one, and that is expected.\n"
-        "- Do NOT confuse it with other values in the meeting: phone numbers, "
-        "flat/unit numbers, invoice or quotation numbers, budget amounts, "
-        f"areas, dates, PIN codes and measurements are NOT the {what} unless "
-        "explicitly identified as such.\n"
-        f"- If several candidates are mentioned, return the one identified as "
-        "THIS meeting's; if that is genuinely ambiguous, return the first and "
-        'set "confidence" to "probable".\n'
-        "- Never output a value that does not appear character-for-character in "
-        'your own "evidence" quote.'
-    )
 
 # ===========================================================================
 # STAGE 3 — AI Documents. One entry per document type. Data, not code.

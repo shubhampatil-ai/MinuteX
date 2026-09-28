@@ -98,7 +98,7 @@ DLQ_ARN="arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:${CRM_SYNC_DLQ_NAME}"
 #
 # --attributes is built as ONE JSON OBJECT (via python -c json.dumps, the
 # same pattern this repo already uses for Lambda --environment payloads —
-# see e.g. 23_deploy_salesforce_oauth.sh) rather than the CLI's comma-
+# see e.g. 65_deploy_crm_sync_worker.sh) rather than the CLI's comma-
 # separated shorthand form. Shorthand splits on top-level "," and "=" with
 # no awareness that RedrivePolicy's OWN value is a JSON object containing
 # both — it fails to parse (ParamValidationError) the moment it reaches

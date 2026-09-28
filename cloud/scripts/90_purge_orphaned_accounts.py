@@ -78,7 +78,6 @@ WORKSPACES_TABLE = os.environ.get("WORKSPACES_TABLE", "Workspaces")
 MEMBERSHIPS_TABLE = os.environ.get("WORKSPACE_MEMBERSHIPS_TABLE",
                                    "WorkspaceMemberships")
 INTEGRATIONS_TABLE = os.environ.get("INTEGRATIONS_TABLE", "Integrations")
-CRM_TABLE = os.environ.get("CRM_CONNECTIONS_TABLE", "CrmConnections")
 
 TRANSCRIPT_PREFIX = os.environ.get("TRANSCRIPT_PREFIX", "transcripts")
 PAGEINDEX_PREFIX = os.environ.get("PAGEINDEX_PREFIX", "pageindex")
@@ -221,8 +220,7 @@ def collect(ddb, user_id):
         [wrow] if wrow else [])
 
     # Per-user OAuth tokens (KMS-encrypted). PK is user_id + provider.
-    for label, tname in (("integrations", INTEGRATIONS_TABLE),
-                         ("crm_connections", CRM_TABLE)):
+    for label, tname in (("integrations", INTEGRATIONS_TABLE),):
         try:
             t = ddb.Table(tname)
             add(label, tname, ["user_id", "provider"],

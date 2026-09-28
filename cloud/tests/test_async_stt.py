@@ -1359,8 +1359,6 @@ class DegradationTests(unittest.TestCase):
                           ).start()
         mock.patch.object(transcribe, "analyze_meeting",
                           side_effect=analyze_side_effect).start()
-        mock.patch.object(transcribe, "_crm_mappings_for_user",
-                          return_value=[]).start()
         table = mock.MagicMock()
         table.get_item.return_value = {"Item": {}}
         mock.patch.object(transcribe, "_table", table).start()

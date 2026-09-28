@@ -1,78 +1,38 @@
 #!/usr/bin/env bash
 # =============================================================
-# 65_deploy_crm_sync_worker.sh — create/update the CRM sync worker Lambda
-# and wire it to the CRM sync SQS queue (Phase 2D.4).
+# 65_deploy_crm_sync_worker.sh — create/update the job worker Lambda
+# (crmSyncWorker) and wire it to the CrmSyncQueue SQS queue.
 #
-# THIS IS THE FIRST SCRIPT IN THIS CODEBASE THAT CREATES A NEW LAMBDA
-# FUNCTION AND A NEW IAM ROLE FROM SCRATCH. Verified before writing this:
-# every existing NN_deploy_*.sh script only UPDATES a pre-existing function
-# (aws lambda update-function-code/update-function-configuration) and only
-# EXTENDS an existing role's inline policy (aws iam put-role-policy) — there
-# is no create-function/create-role precedent anywhere in cloud/scripts/.
-# This script establishes that pattern, following the same aws.sh/winpath/
-# idempotency style everything else uses; it deliberately does NOT touch
-# any other Lambda's role, matching the least-privilege requirement (spec
-# section 20) — this worker gets its OWN role with ONLY what it needs.
+# The worker runs the Salesforce Site flow's CrmSyncJobs jobs (meeting
+# delivery, people sync, discovery, Salesforce Task create/update); see
+# functions/crm-sync-worker/lambda_function.py.
 #
-# Resources created:
-#   1. IAM role `crmSyncWorkerRole` — Lambda service trust policy (mirrors
-#      the shape in scripts/iam/trust-policy.json, the one static reference
-#      this repo already had for it) + an inline policy scoped to EXACTLY:
+# Resources:
+#   1. IAM role `crmSyncWorkerRole` + inline policy crmSyncWorker-least-privilege:
 #        - CrmSyncJobs: Get/Put/Update/Query (job state)
-#        - Recordings: Get/Update (meeting content, crm_records/
-#          crm_tasks_synced/crm_event_synced) — Update only on the
-#          Recordings table, never Delete
-#        - Contacts, Tasks, WorkspaceMemberships, Workspaces,
-#          OrgCrmConnections, OrgSalesforceUserLinks: Get/Query (read-only —
-#          the worker CONSUMES resolved identity, it never writes it; see
-#          the "must not re-resolve identity" requirement)
-#        - KMS Decrypt (SAME key Personal/Organisation Salesforce already
-#          use — SALESFORCE_KMS_KEY_ID) — needed by _sf_call_org to decrypt
-#          the stored refresh token; no Encrypt permission is granted here
-#          because the worker's OWN token-rotation path re-encrypts through
-#          the same _kms_encrypt used everywhere else, which DOES need
-#          Encrypt too — see the policy below, it is included, but scoped
-#          to the one key, matching every existing Salesforce-touching role
-#        - Secrets Manager GetSecretValue on the Salesforce Connected App
-#          client secret (same secret Personal/Organisation already read)
-#        - SQS ReceiveMessage/DeleteMessage/GetQueueAttributes/
-#          ChangeMessageVisibility on the CRM sync queue ONLY (not the DLQ —
-#          nothing in this Lambda's own code sends to or reads from the DLQ
-#          directly; SQS's redrive policy moves messages there on Lambda's
-#          behalf). ChangeMessageVisibility lets a retried message's actual
-#          redelivery delay match the job's own computed backoff instead of
-#          always falling back to the queue's fixed VisibilityTimeout — see
-#          docs/WORKSPACE_PHASE2D.md's Phase 2D.4 retry-timing section.
-#        - CloudWatch Logs (the standard Lambda execution logging grant)
-#      Explicitly NOT granted: any OTHER DynamoDB table, S3 (the worker
-#      never touches audio/transcript objects), any other Secrets Manager
-#      secret, iam:PassRole, or write access to Contacts/Tasks/
-#      WorkspaceMemberships/OrgCrmConnections/OrgSalesforceUserLinks.
-#   2. Lambda function `crmSyncWorker` — packaged from
-#      functions/crm-sync-worker/lambda_function.py, with a COPY of
-#      functions/userapi/lambda_function.py (renamed to userapi_worker.py to
-#      make explicit in code that this is a packaged copy, not a live
-#      cross-Lambda import — see that file's own module docstring for why
-#      importing it directly, rather than duplicating or extracting its
-#      logic, is the deliberate choice here) plus every shared/*.py module,
-#      all flattened to the archive root (same packaging convention every
-#      other Lambda in this repo already uses — the runtime only puts the
-#      handler's own directory on sys.path).
-#   3. SQS event source mapping, CRM sync queue -> crmSyncWorker, with
-#      `ReportBatchItemFailures` enabled (see the worker's own module
-#      docstring for why partial-batch-failure reporting matters here).
+#        - Recordings: Get/Update
+#        - Contacts, Tasks, Workspaces, WorkspaceMemberships,
+#          MeetingParticipants: Get/Query (read-only)
+#        - SQS Receive/Delete/GetQueueAttributes/ChangeMessageVisibility on
+#          the queue ONLY (ChangeMessageVisibility applies the job's own
+#          backoff to a retried message)
+#        - CloudWatch Logs
+#      The Site-specific grants (Site tables, endpoint-credential KMS
+#      decrypt, transcript S3 read) are separate inline policies owned by
+#      scripts/78, 79 and 74.
+#   2. Lambda `crmSyncWorker` — functions/crm-sync-worker/lambda_function.py
+#      plus a COPY of functions/userapi/lambda_function.py (renamed
+#      userapi_worker.py) and every shared/*.py, flat at the archive root.
+#   3. SQS event source mapping with `ReportBatchItemFailures`.
 #
-# Idempotent: creates what is missing, updates what already exists.
+# Idempotent. On an existing function the environment is MERGED into the
+# live one (so variables set by scripts/74, 78 and 79 survive), and the
+# retired Salesforce OAuth variables are removed.
 #
 # Prerequisites:
 #   - scripts/63_create_crm_sync_jobs_table.sh (CrmSyncJobs table)
 #   - scripts/64_create_crm_sync_queue.sh (queue + DLQ; CRM_SYNC_QUEUE_URL/
 #     CRM_SYNC_QUEUE_ARN in .env)
-#   - scripts/23_deploy_salesforce_oauth.sh (SALESFORCE_KMS_KEY_ID,
-#     SALESFORCE_CLIENT_SECRET_ARN already provisioned — reused, not
-#     recreated)
-#   - scripts/60/61/62 (OrgCrmConnections, org OAuth routes,
-#     OrgSalesforceUserLinks already deployed)
 # =============================================================
 set -euo pipefail
 
@@ -89,34 +49,10 @@ CONTACTS_TABLE="${CONTACTS_TABLE:-Contacts}"
 TASKS_TABLE="${TASKS_TABLE:-Tasks}"
 WORKSPACES_TABLE="${WORKSPACES_TABLE:-Workspaces}"
 WORKSPACE_MEMBERSHIPS_TABLE="${WORKSPACE_MEMBERSHIPS_TABLE:-WorkspaceMemberships}"
-ORG_CRM_CONNECTIONS_TABLE="${ORG_CRM_CONNECTIONS_TABLE:-OrgCrmConnections}"
-ORG_SALESFORCE_USER_LINKS_TABLE="${ORG_SALESFORCE_USER_LINKS_TABLE:-OrgSalesforceUserLinks}"
+# Read when a meeting is delivered (participants); see scripts/72.
+MEETING_PARTICIPANTS_TABLE="${MEETING_PARTICIPANTS_TABLE:-MeetingParticipants}"
 : "${CRM_SYNC_QUEUE_ARN:?CRM_SYNC_QUEUE_ARN not set — run scripts/64_create_crm_sync_queue.sh first and add it to .env}"
 : "${CRM_SYNC_QUEUE_URL:?CRM_SYNC_QUEUE_URL not set — run scripts/64_create_crm_sync_queue.sh first and add it to .env}"
-: "${SALESFORCE_KMS_KEY_ID:?SALESFORCE_KMS_KEY_ID not set — run scripts/23_deploy_salesforce_oauth.sh first}"
-
-# SALESFORCE_CLIENT_SECRET_ARN is deliberately never written to .env (see
-# script 23/61 — only the SECRET's ARN is ever an env var, never its
-# plaintext contents, and it lives in the already-deployed userApi
-# Lambda's own configuration, not in local config). Reuse it from there
-# when not already supplied locally, the same read-only
-# get-function-configuration pattern script 61 already uses — never call
-# secretsmanager:GetSecretValue here, this script only ever needs the ARN.
-if [[ -z "${SALESFORCE_CLIENT_SECRET_ARN:-}" ]]; then
-  echo ">> SALESFORCE_CLIENT_SECRET_ARN not set locally — reading it from" \
-       "the deployed $USERAPI_LAMBDA_NAME Lambda's configuration (read-only)."
-  SALESFORCE_CLIENT_SECRET_ARN="$(aws lambda get-function-configuration \
-      --function-name "$USERAPI_LAMBDA_NAME" \
-      --query 'Environment.Variables.SALESFORCE_CLIENT_SECRET_ARN' \
-      --output text 2>/dev/null || true)"
-  if [[ -z "$SALESFORCE_CLIENT_SECRET_ARN" || "$SALESFORCE_CLIENT_SECRET_ARN" == "None" ]]; then
-    echo "ERROR: SALESFORCE_CLIENT_SECRET_ARN not set and not found on the" \
-         "deployed $USERAPI_LAMBDA_NAME Lambda — run" \
-         "scripts/23_deploy_salesforce_oauth.sh first." >&2
-    exit 1
-  fi
-  echo ">> Found SALESFORCE_CLIENT_SECRET_ARN on $USERAPI_LAMBDA_NAME: $SALESFORCE_CLIENT_SECRET_ARN"
-fi
 CRM_SYNC_WORKER_TIMEOUT="${CRM_SYNC_WORKER_TIMEOUT:-120}"
 CRM_SYNC_WORKER_MEMORY="${CRM_SYNC_WORKER_MEMORY:-256}"
 # Must be LESS than the queue's VisibilityTimeout (300s, scripts/64) —
@@ -129,7 +65,6 @@ echo ">> Region: $AWS_REGION"
 echo ">> Worker: $CRM_SYNC_WORKER_LAMBDA_NAME"
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-KMS_KEY_ARN="arn:aws:kms:${AWS_REGION}:${ACCOUNT_ID}:key/${SALESFORCE_KMS_KEY_ID}"
 
 # -------------------------------------------------------------
 # 1. IAM role — create if absent, then set/overwrite its inline policy
@@ -147,7 +82,7 @@ else
   aws iam create-role \
     --role-name "$CRM_SYNC_WORKER_ROLE_NAME" \
     --assume-role-policy-document "file://$(winpath "$TRUST_POLICY_FILE")" \
-    --description "Execution role for crmSyncWorker (Phase 2D.4) - least-privilege, scoped to CRM sync only" \
+    --description "Execution role for crmSyncWorker - least-privilege, scoped to CrmSyncJobs jobs" \
     >/dev/null
   echo ">> Created role: $CRM_SYNC_WORKER_ROLE_NAME"
   echo ">> Waiting for IAM role propagation ..."
@@ -183,18 +118,8 @@ cat > "$POLICY_FILE" <<EOF
         "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${TASKS_TABLE}/index/*",
         "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${WORKSPACES_TABLE}",
         "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${WORKSPACE_MEMBERSHIPS_TABLE}",
-        "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${ORG_CRM_CONNECTIONS_TABLE}",
-        "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${ORG_SALESFORCE_USER_LINKS_TABLE}"
+        "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${MEETING_PARTICIPANTS_TABLE}"
       ] },
-    { "Sid": "OrgCrmConnectionsTokenRotation", "Effect": "Allow",
-      "Action": ["dynamodb:UpdateItem"],
-      "Resource": "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${ORG_CRM_CONNECTIONS_TABLE}" },
-    { "Sid": "SalesforceTokenKms", "Effect": "Allow",
-      "Action": ["kms:Encrypt", "kms:Decrypt"],
-      "Resource": "${KMS_KEY_ARN}" },
-    { "Sid": "SalesforceClientSecret", "Effect": "Allow",
-      "Action": "secretsmanager:GetSecretValue",
-      "Resource": "${SALESFORCE_CLIENT_SECRET_ARN}" },
     { "Sid": "CrmSyncQueueConsume", "Effect": "Allow",
       "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes",
                  "sqs:ChangeMessageVisibility"],
@@ -237,37 +162,37 @@ PY
 # -------------------------------------------------------------
 # 3. Create or update the Lambda function.
 # -------------------------------------------------------------
-# Environment: the SAME table/queue names userApi already uses (so the
-# worker reads/writes the identical rows), plus the Salesforce Connected
-# App config userApi's org routes already rely on. No secret VALUE is ever
-# an env var — only ARNs, matching userApi's own SALESFORCE_CLIENT_SECRET_ARN
-# convention.
-ENV_JSON="$(python - "$CRM_SYNC_JOBS_TABLE" "$RECORDINGS_TABLE" "$CONTACTS_TABLE" \
-    "$TASKS_TABLE" "$WORKSPACES_TABLE" "$WORKSPACE_MEMBERSHIPS_TABLE" \
-    "$ORG_CRM_CONNECTIONS_TABLE" "$ORG_SALESFORCE_USER_LINKS_TABLE" \
-    "$SALESFORCE_KMS_KEY_ID" "$SALESFORCE_CLIENT_SECRET_ARN" \
-    "${SALESFORCE_CLIENT_ID:-}" "${SALESFORCE_LOGIN_URL:-https://login.salesforce.com}" \
-    "${SALESFORCE_API_VERSION:-v62.0}" "$CRM_SYNC_QUEUE_URL" <<'PY'
+# Environment: the SAME table/queue names userApi uses, MERGED into the live
+# environment when the function exists (scripts/74, 78 and 79 add their own
+# variables), minus the retired Salesforce OAuth variables.
+CURRENT_ENV="$(aws lambda get-function-configuration \
+    --function-name "$CRM_SYNC_WORKER_LAMBDA_NAME" \
+    --query 'Environment.Variables' --output json 2>/dev/null || echo null)"
+ENV_JSON="$(python - "$CURRENT_ENV" "$CRM_SYNC_JOBS_TABLE" "$RECORDINGS_TABLE" \
+    "$CONTACTS_TABLE" "$TASKS_TABLE" "$WORKSPACES_TABLE" \
+    "$WORKSPACE_MEMBERSHIPS_TABLE" "$CRM_SYNC_QUEUE_URL" <<'PY'
 import json, sys
-(jobs, recordings, contacts, tasks, workspaces, memberships, org_crm,
- org_sf_links, kms_key, secret_arn, client_id, login_url, api_version,
- queue_url) = sys.argv[1:15]
-env = {
+current_raw, jobs, recordings, contacts, tasks, workspaces, memberships, queue_url = sys.argv[1:9]
+try:
+    env = json.loads(current_raw) or {}
+except ValueError:
+    env = {}
+RETIRED = ("ORG_CRM_CONNECTIONS_TABLE", "ORG_SALESFORCE_USER_LINKS_TABLE",
+           "CRM_CONNECTIONS_TABLE", "SALESFORCE_KMS_KEY_ID",
+           "SALESFORCE_CLIENT_SECRET_ARN", "SALESFORCE_CLIENT_ID",
+           "SALESFORCE_LOGIN_URL", "SALESFORCE_API_VERSION",
+           "SF_MEETING_OBJECT", "SF_MEETING_EXTERNAL_ID", "SF_PACKAGE_INSTALL_URL")
+for key in RETIRED:
+    env.pop(key, None)
+env.update({
     "CRM_SYNC_JOBS_TABLE": jobs,
     "RECORDINGS_TABLE": recordings,
     "CONTACTS_TABLE": contacts,
     "TASKS_TABLE": tasks,
     "WORKSPACES_TABLE": workspaces,
     "WORKSPACE_MEMBERSHIPS_TABLE": memberships,
-    "ORG_CRM_CONNECTIONS_TABLE": org_crm,
-    "ORG_SALESFORCE_USER_LINKS_TABLE": org_sf_links,
-    "SALESFORCE_KMS_KEY_ID": kms_key,
-    "SALESFORCE_CLIENT_SECRET_ARN": secret_arn,
-    "SALESFORCE_CLIENT_ID": client_id,
-    "SALESFORCE_LOGIN_URL": login_url,
-    "SALESFORCE_API_VERSION": api_version,
     "CRM_SYNC_QUEUE_URL": queue_url,
-}
+})
 print(json.dumps({"Variables": env}))
 PY
 )"

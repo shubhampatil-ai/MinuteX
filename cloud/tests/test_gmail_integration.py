@@ -19,9 +19,9 @@ WHY EACH GROUP EXISTS — every one is a real failure mode, not a box-tick:
                 must refuse on the server when Gmail is not usable — with 409
                 and a stable `code`, never 401, because 401 on this API makes
                 the app clear the JWT and sign the user out of MinuteX over a
-                dead Google token. That bug already happened once with
-                Salesforce (see SF_RECONNECT_STATUS); these tests exist so it
-                cannot happen again through a new door.
+                dead Google token. That bug already happened once with an
+                earlier integration; these tests exist so it cannot happen
+                again through a new door.
 
   ISOLATION     One user's connection must be invisible and unusable to
                 another. Since every route keys the connection off the JWT's
@@ -168,12 +168,6 @@ class IntegrationTestCase(unittest.TestCase):
         self.participants = fdb.FakeTable(
             "MeetingParticipants", "audio_s3_key", "speaker_id")
         self.tasks = fdb.FakeTable("Tasks", "task_id")
-        # Salesforce lives in its OWN table and is merged into the catalog by
-        # _integration_rows. A real fake table (rather than leaving the
-        # Lambda's module-level handle in place) is what lets these tests
-        # assert the merge — and stops an unstubbed handle answering with
-        # whatever another suite left behind.
-        self.crm = fdb.FakeTable("CrmConnections", "user_id", "provider")
 
         self.recordings.items[(KEY,)] = self.item
         self.contacts.items[(CONTACT_RAHUL,)] = {
@@ -196,7 +190,6 @@ class IntegrationTestCase(unittest.TestCase):
         patches = [
             mock.patch.object(api, "Key", fdb.Key),
             mock.patch.object(api, "_integrations", self.integrations),
-            mock.patch.object(api, "_crm_connections", self.crm),
             mock.patch.object(api, "_contacts", self.contacts),
             mock.patch.object(api, "_recordings", self.recordings),
             mock.patch.object(api, "_meeting_participants", self.participants),
@@ -252,19 +245,6 @@ class IntegrationTestCase(unittest.TestCase):
         self.integrations.items[(OWNER, GMAIL)] = row
         return row
 
-    def connect_salesforce(self, user_id=OWNER):
-        """A CrmConnections row, in that table's OWN shape — deliberately not
-        the Integrations shape, because translating between them is what
-        integrations.salesforce_row() is for and what these tests check."""
-        row = {"user_id": user_id, "provider": "salesforce",
-               "instance_url": "https://acme.my.salesforce.com",
-               "refresh_token_enc": "enc-sf-token",
-               "sf_username": "admin@acme.com",
-               "connected_at": "2026-07-01T00:00:00Z",
-               "updated_at": "2026-07-01T00:00:00Z"}
-        self.crm.items[(user_id, "salesforce")] = row
-        return row
-
     def add_participant(self, speaker_id, contact_id):
         self.participants.items[(KEY, speaker_id)] = {
             "audio_s3_key": KEY, "speaker_id": speaker_id,
@@ -301,15 +281,16 @@ class StatusTests(IntegrationTestCase):
     def test_catalog_lists_every_provider_when_nothing_is_connected(self):
         """The Coming Soon cards come from the server, not from the app.
 
-        Covers BOTH sources: no Integrations row and no CrmConnections row
-        must read as NOT_CONNECTED for every card, including Salesforce."""
+        No Integrations row must read as NOT_CONNECTED for every card.
+        Salesforce is not an integration card (it is the workspace's
+        Salesforce Site connection)."""
         status, data = parse(call(api.list_integrations, event("GET", "/integrations")))
         self.assertEqual(status, 200)
         providers = [i["provider"] for i in data["integrations"]]
         self.assertIn(GMAIL, providers)
-        for expected in ("whatsapp", "salesforce", "google_calendar",
-                         "google_tasks"):
+        for expected in ("whatsapp", "google_calendar", "google_tasks"):
             self.assertIn(expected, providers)
+        self.assertNotIn("salesforce", providers)
         for i in data["integrations"]:
             self.assertEqual(i["status"], integrations.STATUS_NOT_CONNECTED)
             self.assertFalse(i["connected"])
@@ -317,88 +298,15 @@ class StatusTests(IntegrationTestCase):
     def test_working_integrations_are_available_and_the_rest_are_not(self):
         """The card list must separate "this works" from "this is coming".
 
-        Gmail and Salesforce both WORK — they are just connected by different
-        flows — so both are available. Everything else is a Coming Soon card
+        Gmail works, so it is available. Everything else is a Coming Soon card
         and must never advertise itself as connectable, or an old build could
         offer a connect button the backend cannot honour.
         """
         status, data = parse(call(api.list_integrations, event("GET", "/integrations")))
         by_id = {i["provider"]: i for i in data["integrations"]}
         self.assertTrue(by_id[GMAIL]["available"])
-        self.assertTrue(by_id["salesforce"]["available"])
         for other in ("whatsapp", "google_calendar", "google_tasks"):
             self.assertFalse(by_id[other]["available"])
-
-    def test_salesforce_is_available_but_not_on_the_generic_flow(self):
-        """`available` and `managed_elsewhere` are two separate facts: the card
-        works, and it is connected somewhere else. Collapsing them is how
-        Salesforce ends up either wrongly greyed out or wrongly routed into an
-        OAuth flow that does not exist for it."""
-        _, data = parse(call(api.list_integrations, event("GET", "/integrations")))
-        sf = {i["provider"]: i for i in data["integrations"]}["salesforce"]
-        self.assertTrue(sf["available"])
-        self.assertTrue(sf["managed_elsewhere"])
-        self.assertNotIn("salesforce", integrations.CONNECTABLE)
-        self.assertIn(GMAIL, integrations.CONNECTABLE)
-
-    def test_the_generic_connect_flow_refuses_salesforce(self):
-        """It has no /integrations/salesforce/connect route — claiming
-        otherwise would send the user into a dead flow."""
-        status, _ = parse(call(
-            api.integration_connect,
-            event("POST", "/integrations/{provider}/connect",
-                  body={}, params={"provider": "salesforce"})))
-        self.assertEqual(status, 400)
-
-    def test_the_generic_disconnect_refuses_salesforce(self):
-        """The dangerous one. Without the managed_elsewhere guard this would
-        delete from the Integrations table, report success, and leave the real
-        CrmConnections credential in place — a disconnect that did not."""
-        self.connect_salesforce()
-        status, _ = parse(call(
-            api.integration_disconnect,
-            event("DELETE", "/integrations/{provider}",
-                  params={"provider": "salesforce"})))
-        self.assertEqual(status, 400)
-        self.assertIn((OWNER, "salesforce"), self.crm.items)
-
-    def test_a_linked_salesforce_org_shows_as_connected(self):
-        """Read from CrmConnections and merged into the one catalog — the whole
-        point of moving Salesforce inside Connected apps."""
-        self.connect_salesforce()
-        _, data = parse(call(api.list_integrations, event("GET", "/integrations")))
-        sf = {i["provider"]: i for i in data["integrations"]}["salesforce"]
-        self.assertEqual(sf["status"], integrations.STATUS_CONNECTED)
-        self.assertTrue(sf["connected"])
-        self.assertEqual(sf["account_identifier"], "admin@acme.com")
-        self.assertEqual(sf["connected_at"], "2026-07-01T00:00:00Z")
-
-    def test_a_strangers_salesforce_org_is_not_shown(self):
-        self.connect_salesforce(user_id=STRANGER)
-        _, data = parse(call(api.list_integrations, event("GET", "/integrations")))
-        sf = {i["provider"]: i for i in data["integrations"]}["salesforce"]
-        self.assertFalse(sf["connected"])
-        self.assertNotIn("admin@acme.com", json.dumps(data))
-
-    def test_salesforce_status_never_returns_its_refresh_token(self):
-        self.connect_salesforce()
-        resp = call(api.list_integrations, event("GET", "/integrations"))
-        self.assertNotIn("enc-sf-token", resp["body"])
-
-    def test_a_failed_salesforce_read_degrades_only_that_card(self):
-        """An unconfigured CrmConnections table must not take down the whole
-        Integrations screen — which is also how the Coming Soon cards and the
-        Gmail card reach the user."""
-        self.connect_gmail()
-        with mock.patch.object(api, "_get_salesforce_connection",
-                               side_effect=RuntimeError("no table")):
-            status, data = parse(call(api.list_integrations,
-                                      event("GET", "/integrations")))
-        self.assertEqual(status, 200)
-        by_id = {i["provider"]: i for i in data["integrations"]}
-        self.assertTrue(by_id[GMAIL]["connected"])
-        self.assertFalse(by_id["salesforce"]["connected"])
-        self.assertEqual(len(data["integrations"]), len(integrations.PROVIDERS))
 
     def test_connected_status_reports_the_account(self):
         self.connect_gmail()

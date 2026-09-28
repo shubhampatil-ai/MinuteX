@@ -786,7 +786,7 @@ class TestRoleManagement(OrgHarness):
 # `item["user_id"] == user_id` FIRST and return "OWNER" before anything looked
 # at membership. So a member removed from an organisation kept read AND write
 # access to every meeting they had created there: ~30 mutating routes behind
-# _owned_recording, plus create_share and crm_sync_record, plus the AI's
+# _owned_recording, plus create_share, plus the AI's
 # get_meeting_context (whose owns_recording carried its own copy of the same
 # expression).
 #
@@ -864,9 +864,6 @@ class TestRemovedMemberCannotUseCreatorBypass(OrgHarness):
                       key=self.key, body={}))),
             ("list_shares", lambda: api.list_shares(
                 event(route="/recordings/shares/{key+}", key=self.key))),
-            ("crm_sync_record", lambda: api.crm_sync_record(
-                event(method="POST", route="/crm/salesforce/sync/{key+}",
-                      key=self.key, body={}))),
             ("set_participant", lambda: api.set_participant(
                 event(method="PUT",
                       route="/recordings/participants/{key+}",

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Who_Record_Name__c</fullName>
+    <description>Name of the Contact or Lead this meeting was with, as MinuteX sent it. Written by MinuteX; do not edit.</description>
+    <externalId>false</externalId>
+    <label>Related Person Name</label>
+    <length>255</length>
+    <required>false</required>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

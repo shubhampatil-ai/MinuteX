@@ -64,7 +64,6 @@ TABLES=(
   "${CHAT_SESSIONS_TABLE:-ChatSessions}"
   "${SHARES_TABLE:-Shares}"
   "${INTEGRATIONS_TABLE:-Integrations}"
-  "${CRM_CONNECTIONS_TABLE:-CrmConnections}"
   "${NOTIFICATIONS_TABLE:-Notifications}"
   "${NOTIFICATION_DEDUPE_TABLE:-NotificationDedupe}"
   "${WORKSPACES_TABLE:-Workspaces}"

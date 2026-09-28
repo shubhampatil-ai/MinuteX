@@ -11,6 +11,9 @@ Routes (HTTP API, payload format v2.0):
   POST   /avatars/upload-request {format, scope?, contact_id?, size?} (JWT)
                                                           -> {upload_url, key}
   POST   /me/password          {current_password, new_password} (JWT) -> {changed}
+  POST   /me/push-tokens       {token, installation_id, platform, app_version?,
+                                enabled?} (JWT)             -> {push_token:{...}}
+  DELETE /me/push-tokens/{installation_id} (JWT)           -> {removed}
   POST   /devices/pair-request {device_id}       (JWT)    -> {pairing_code, expires_in}
   POST   /devices/pair         {device_id, pairing_code} (JWT) -> {device:{...}}
   POST   /devices/claim        {apiKey}          (JWT)    -> {device_id, claimed}   (LEGACY)
@@ -76,19 +79,6 @@ Routes (HTTP API, payload format v2.0):
          routes give above, which is why it is /recordings/share/{key+} and
          not /recordings/{key}/share.
 
-  CRM — Salesforce connect + configuration (see the CRM sections below).
-  GET    /crm/salesforce/connect                    (JWT)    -> {authorize_url}
-  GET    /crm/salesforce/callback  ?code&state    (NO JWT — Salesforce redirect) -> 302
-  GET    /crm/salesforce/status                     (JWT)    -> {connected, ...}
-  DELETE /crm/salesforce                             (JWT)    -> {disconnected}
-  GET    /crm/salesforce/objects                    (JWT)    -> {objects, suggested}
-  GET    /crm/salesforce/fields/{object_name}       (JWT)    -> {number_fields, ...}
-  GET    /crm/salesforce/config                     (JWT)    -> {config}
-  PUT    /crm/salesforce/config     {mappings:[...]}  (JWT)   -> {config}
-  POST   /crm/salesforce/lookup     {object, lookup_value} (JWT)
-                              -> {status: found|not_found|ambiguous, ...}
-  POST   /crm/salesforce/sync/{key+} {object}         (JWT)   -> {crm_record}
-
   Integrations — connect MinuteX to external applications (see the
   INTEGRATIONS section). Generic over providers; Gmail is the only one that
   can currently be connected.
@@ -106,12 +96,6 @@ Routes (HTTP API, payload format v2.0):
   GET    /integrations/gmail/recipients/{key+}   -> {recipients, unresolved}
   POST   /integrations/gmail/send/meeting/{key+} {recipients, ...}
   POST   /integrations/gmail/send/task/{task_id} {recipients?, ...}
-
-  Every /crm route that TALKS to Salesforce (objects, fields, config PUT,
-  lookup, sync) answers 409 {"code": "salesforce_reconnect_required"} when the
-  stored Salesforce refresh token is dead. That is NOT 401 on purpose: 401 from
-  this API means the MinuteX JWT itself is bad, and the app reacts by clearing
-  the session and sending the user to /login. See SF_RECONNECT_STATUS.
 
 Recording sources (one AI pipeline, three ways in — see README):
   - Every recording carries a `source` attribute: DEVICE | MOBILE | UPLOAD.
@@ -228,10 +212,15 @@ import integrations
 import mom_schema
 import notification_schema
 import pageindex
+import push_delivery
 import pageindex_store
+import people_store
 import spoken_dates
 import prompts
 import share_schema
+import site_contract
+import site_delivery_client
+import site_salesforce_schema
 import speaker_identity
 import stt_result
 import transcript_store
@@ -243,33 +232,13 @@ USER_DEVICES_TABLE = os.environ.get("USER_DEVICES_TABLE", "UserDevices")
 DEVICE_KEYS_TABLE = os.environ.get("DEVICE_KEYS_TABLE", "DeviceKeys")
 DEVICES_TABLE = os.environ.get("DEVICES_TABLE", "Devices")
 RECORDINGS_TABLE = os.environ.get("RECORDINGS_TABLE", "Recordings")
-CRM_CONNECTIONS_TABLE = os.environ.get("CRM_CONNECTIONS_TABLE", "CrmConnections")
-# Organisation-scoped Salesforce connections (Phase 2D.1) — a SEPARATE table
-# from CrmConnections, never a repurposed row in it. See the "Organisation
-# CRM" section below and scripts/60_create_org_crm_connections_table.sh.
-ORG_CRM_CONNECTIONS_TABLE = os.environ.get("ORG_CRM_CONNECTIONS_TABLE", "OrgCrmConnections")
-# Internal-speaker -> Salesforce User links (Phase 2D.3). One row per
-# (workspace_id, minutex_user_id) — a MinuteX org member's confirmed
-# Salesforce User identity, resolved once and reused by every later meeting
-# rather than re-resolved per meeting. Deliberately its OWN table rather than
-# fields on WorkspaceMemberships (a security/RBAC-critical structure — role,
-# status — that a CRM-vendor-specific identity has no business living in) or
-# on Contacts (which model people OUTSIDE the organisation; a member is
-# already fully modeled by their user_id and has no Contacts row of their
-# own). See scripts/62_create_org_salesforce_user_links_table.sh.
-ORG_SALESFORCE_USER_LINKS_TABLE = os.environ.get(
-    "ORG_SALESFORCE_USER_LINKS_TABLE", "OrgSalesforceUserLinks")
-# Durable CRM sync job state (Phase 2D.4) — one row per asynchronous push
-# ATTEMPT. Distinct from crm_event_synced/crm_tasks_synced/crm_records
-# (Phase 2D.3), which remain the per-OPERATION idempotency record on the
-# Recordings row itself; this table is the OUTER envelope the SQS-driven
-# worker and the app's status polling both read. See
-# scripts/63_create_crm_sync_jobs_table.sh and the "Organisation CRM push"
-# section below for the full state machine.
+# Durable job state for the Salesforce Site flow's asynchronous work (see the
+# CRM SYNC JOBS section) — one row per job. See
+# scripts/63_create_crm_sync_jobs_table.sh.
 CRM_SYNC_JOBS_TABLE = os.environ.get("CRM_SYNC_JOBS_TABLE", "CrmSyncJobs")
 # The SQS queue a CRM sync job is enqueued onto. Empty by default so a
 # deployment that has not yet run scripts/64_create_crm_sync_queue.sh keeps
-# working exactly as before — see create_crm_sync_job's fallback comment.
+# answering 503 rather than silently queueing nowhere (_enqueue_crm_sync_job).
 CRM_SYNC_QUEUE_URL = os.environ.get("CRM_SYNC_QUEUE_URL", "")
 INTEGRATIONS_TABLE = os.environ.get("INTEGRATIONS_TABLE", "Integrations")
 CONTACTS_TABLE = os.environ.get("CONTACTS_TABLE", "Contacts")
@@ -279,6 +248,13 @@ TASKS_TABLE = os.environ.get("TASKS_TABLE", "Tasks")
 NOTIFICATIONS_TABLE = os.environ.get("NOTIFICATIONS_TABLE", "Notifications")
 NOTIFICATION_DEDUPE_TABLE = os.environ.get("NOTIFICATION_DEDUPE_TABLE",
                                            "NotificationDedupe")
+# OS push — one row per app installation (scripts/75). See the PUSH TOKENS
+# section for the route contract.
+PUSH_TOKENS_TABLE = os.environ.get("PUSH_TOKENS_TABLE", "PushTokens")
+# Expo "enhanced push security" access token. Optional: required only when the
+# Expo project has that setting enabled. Used here for RECEIPT checks; the
+# sends happen in transcribeRecording, which reads the same variable.
+EXPO_ACCESS_TOKEN = os.environ.get("EXPO_ACCESS_TOKEN", "")
 DEVICE_INDEX = os.environ.get("DEVICE_INDEX", "device-index")
 USER_INDEX = os.environ.get("USER_INDEX", "user-index")
 PAIRED_USER_INDEX = os.environ.get("PAIRED_USER_INDEX", "paired-user-index")
@@ -353,27 +329,6 @@ PAIRING_CODE_TTL = int(os.environ.get("PAIRING_CODE_TTL", "300"))  # seconds
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
 AUDIO_URL_EXPIRY = int(os.environ.get("AUDIO_URL_EXPIRY", "3600"))  # seconds
 
-# --- Salesforce Connected App (web-server OAuth flow) ---
-SALESFORCE_LOGIN_URL = os.environ.get("SALESFORCE_LOGIN_URL", "https://login.salesforce.com")
-SALESFORCE_CLIENT_ID = os.environ.get("SALESFORCE_CLIENT_ID", "")
-SALESFORCE_REDIRECT_URI = os.environ.get("SALESFORCE_REDIRECT_URI", "")
-SALESFORCE_CLIENT_SECRET_ARN = os.environ.get("SALESFORCE_CLIENT_SECRET_ARN", "")
-SALESFORCE_KMS_KEY_ID = os.environ.get("SALESFORCE_KMS_KEY_ID", "")
-SALESFORCE_STATE_TTL = int(os.environ.get("SALESFORCE_STATE_TTL", "600"))  # seconds
-# REST API version used for every data/metadata call. Pinned, not "latest":
-# Salesforce keeps old versions working for years, and a floating version
-# would let an org's upgrade silently change describe output under us.
-SALESFORCE_API_VERSION = os.environ.get("SALESFORCE_API_VERSION", "v62.0")
-# Where the callback redirects the browser once the exchange is done — a deep
-# link back into the app, e.g. "minutex://crm/salesforce/connected".
-SALESFORCE_RETURN_URL = os.environ.get("SALESFORCE_RETURN_URL", "")
-
-# --- Organisation Salesforce (Phase 2D.1) ---
-# Reuses the SAME Connected App (SALESFORCE_CLIENT_ID/_CLIENT_SECRET_ARN),
-# login URL, API version and KMS key as Personal — only the callback path
-# and the storage table differ. See the "Organisation CRM" section below.
-ORG_SALESFORCE_REDIRECT_URI = os.environ.get("ORG_SALESFORCE_REDIRECT_URI", "")
-
 # --- Integrations (generic) + the Google OAuth client behind Gmail ---
 # ONE Google OAuth client serves every Google-family integration: Gmail today,
 # Calendar and Tasks later. They differ only by the scopes requested at
@@ -383,11 +338,9 @@ ORG_SALESFORCE_REDIRECT_URI = os.environ.get("ORG_SALESFORCE_REDIRECT_URI", "")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET_ARN = os.environ.get("GOOGLE_CLIENT_SECRET_ARN", "")
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "")
-# Separate from SALESFORCE_KMS_KEY_ID so an integration credential and a CRM
-# credential are not protected by the same key — revoking or rotating one must
-# not reach the other. Falls back to the Salesforce key when unset (see
-# _integration_kms_encrypt) so an un-provisioned stack degrades to "still
-# encrypted", never to plaintext.
+# The key that encrypts integration credentials (Gmail refresh tokens) and the
+# Salesforce Site endpoint's stored secrets. Required: with no key,
+# _integration_kms_encrypt refuses rather than storing plaintext.
 INTEGRATIONS_KMS_KEY_ID = os.environ.get("INTEGRATIONS_KMS_KEY_ID", "")
 # Deep link the OAuth callback redirects back to, e.g.
 # "minutex://integrations/connected". One URL for every provider — the
@@ -411,13 +364,6 @@ STATUS_PAIRED = "PAIRED"
 
 # Cosmetic device label (PATCH /devices/{id}); empty clears it.
 DEVICE_NAME_MAX = 64
-
-# A CRM record identifier supplied by hand (PATCH /recordings/{key+}) — a site
-# visit number, a lead email, an opportunity number, whatever the user mapped.
-# Generous ceiling: Salesforce identifiers vary by org and field type, so this
-# is only a sanity bound, not a format rule. Validating the shape is
-# Salesforce's job — the lookup either finds the record or it doesn't.
-CRM_IDENTIFIER_MAX = 255
 
 # ---------------------------------------------------------------------------
 # Recording sources — the enum every recording carries. DEVICE recordings are
@@ -540,13 +486,11 @@ _s3 = boto3.client("s3", region_name=REGION)
 _device_keys = _ddb.Table(DEVICE_KEYS_TABLE)
 _devices = _ddb.Table(DEVICES_TABLE)
 _recordings = _ddb.Table(RECORDINGS_TABLE)
-_crm_connections = _ddb.Table(CRM_CONNECTIONS_TABLE)
-_org_crm_connections = _ddb.Table(ORG_CRM_CONNECTIONS_TABLE)
-_org_salesforce_user_links = _ddb.Table(ORG_SALESFORCE_USER_LINKS_TABLE)
 _crm_sync_jobs = _ddb.Table(CRM_SYNC_JOBS_TABLE)
 _integrations = _ddb.Table(INTEGRATIONS_TABLE)
 _notifications = _ddb.Table(NOTIFICATIONS_TABLE)
 _notification_dedupe = _ddb.Table(NOTIFICATION_DEDUPE_TABLE)
+_push_tokens = _ddb.Table(PUSH_TOKENS_TABLE)
 # Workspace layer (Phase 2A). Constructing a Table handle is a local operation
 # — no network call, no existence check — so these are safe to build even in an
 # environment where scripts/50 has not run yet.
@@ -1627,7 +1571,7 @@ WORKSPACE_HEADER = "x-minutex-workspace"
 # app must branch on `code` rather than on wording.
 #
 # Lowercase snake_case to match the existing codes
-# (salesforce_reconnect_required, integration_not_connected).
+# (integration_not_connected, integration_reauth_required).
 ORG_EMAIL_CONFLICT_CODE = "organisation_email_conflict"
 
 
@@ -2072,31 +2016,6 @@ def _with_source(row: dict) -> dict:
     return row
 
 
-def _with_crm_records(row: dict, user_id: str) -> dict:
-    """Normalize `crm_records` for the detail view.
-
-    Returns one entry per CONFIGURED mapping, in configuration order, so the UI
-    renders straight from this list without cross-referencing the config: a
-    mapping with no identifier yet comes back as not_linked rather than absent.
-    Stored entries for objects the user has since UNMAPPED are omitted from the
-    list (nothing to render them against) but left untouched in DynamoDB, so
-    re-adding the mapping restores the association.
-
-    Only called on the single-recording routes: the list view would pay a
-    config read per request for data it doesn't render.
-    """
-    mappings = _mappings_from_config(_user_crm_config(user_id))
-    stored = row.get("crm_records") or {}
-    out = {}
-    for mapping in mappings:
-        entry = stored.get(mapping["object"])
-        out[mapping["object"]] = (_public_crm_record(entry, mapping)
-                                 if isinstance(entry, dict) and entry
-                                 else _empty_crm_record(mapping))
-    row["crm_records"] = out
-    return row
-
-
 def _as_duration(value):
     """Client-supplied duration -> Decimal seconds (DynamoDB rejects floats).
     Returns None when absent/invalid rather than failing the upload."""
@@ -2533,7 +2452,7 @@ def list_recordings(event):
     #
     # PAGINATED, not a single query: DynamoDB caps a Query response at 1 MB,
     # and BOTH indexes project ALL — so each item carries its full AI payload
-    # (documents, mom, chat_history, crm_records), not just the LIST_FIELDS
+    # (documents, mom, chat_history), not just the LIST_FIELDS
     # this route returns. Without the LastEvaluatedKey loop a heavy account
     # silently loses its OLDEST recordings off the end of the first page, with
     # no error anywhere: the response still looks like a complete list. Matches
@@ -2599,33 +2518,12 @@ def _clean_speaker_names(raw):
     return out
 
 
-def _user_crm_config(user_id: str) -> dict:
-    """The user's stored CRM config, or {} when Salesforce isn't connected."""
-    conn = _get_salesforce_connection(user_id)
-    return (conn or {}).get("config") or {}
-
-
-def _legacy_crm_object_for(user_id: str) -> str:
-    """Which object an old `site_visit_number` PATCH refers to.
-
-    The pre-mappings API had no object in the request because there was only
-    ever one. To keep those callers working, resolve it to the user's FIRST
-    configured mapping — which for an upgraded user is exactly the object their
-    old single-object config became. Returns "" when nothing is configured, and
-    the caller reports that rather than inventing an object name.
-    """
-    mappings = _mappings_from_config(_user_crm_config(user_id))
-    return mappings[0]["object"] if mappings else ""
-
-
 def patch_recording(event):
-    """PATCH /recordings/{key+} {speaker_names?, title?, site_visit_number?}.
+    """PATCH /recordings/{key+} {speaker_names?, title?}.
 
     The only user-editable fields on a recording. Ownership is enforced the
     same way as get_recording — a miss is reported as 404, never 403, so the
     endpoint can't be used to probe for other users' recordings.
-
-    site_visit_number is the CRM manual-entry path: null or "" clears it.
     """
     user_id = _require_auth(event)
     key = _url_unquote((event.get("pathParameters") or {}).get("key", ""))
@@ -2635,7 +2533,7 @@ def patch_recording(event):
     item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
     if not item:
         raise ApiError(404, "recording not found")
-    # A metadata WRITE (title, speaker names, site-visit number), so the
+    # A metadata WRITE (title, speaker names), so the
     # write predicate — which also denies a member removed from the owning
     # organisation.
     if not _can_write_meeting(user_id, item):
@@ -2664,108 +2562,8 @@ def patch_recording(event):
         sets.append("title = :t")
         values[":t"] = title
 
-    # CRM record identifiers — the manual-entry / correction path. The AI
-    # extraction in transcribeRecording finds an identifier when it was spoken;
-    # this is how the user supplies one that wasn't, or fixes a wrong one.
-    #
-    # Written into the generic `crm_records` map keyed by Salesforce object, so
-    # one code path serves every configured object. A human typing the value IS
-    # the authority (confidence "manual", no evidence to ground), which is why
-    # it always outranks an extraction.
-    #
-    #   {"crm_records": {"Lead": "a@b.com", "SiteVisit__c": null}}
-    #
-    # `site_visit_number` is still accepted so an app build from before this
-    # change keeps working; it is normalized into the same map. Reading it
-    # requires knowing which object the user mapped it to, which only the
-    # config knows — hence the lookup below.
-    if "crm_records" in data or "site_visit_number" in data:
-        requested = data.get("crm_records")
-        if requested is None:
-            requested = {}
-        if not isinstance(requested, dict):
-            raise ApiError(400, "crm_records must be an object keyed by "
-                                "Salesforce object name")
-        if "site_visit_number" in data:
-            legacy_object = _legacy_crm_object_for(user_id)
-            if not legacy_object:
-                raise ApiError(400, "no Salesforce object is configured for "
-                                    "this — set up Salesforce mapping first")
-            requested = {**requested, legacy_object: data.get("site_visit_number")}
-
-        mappings_by_object = {m["object"]: m for m
-                              in _mappings_from_config(_user_crm_config(user_id))}
-        stored = dict((item or {}).get("crm_records") or {})
-        for object_name, raw in requested.items():
-            key_name = str(object_name).strip()
-            if not key_name:
-                raise ApiError(400, "crm_records keys must be object names")
-            mapping = mappings_by_object.get(key_name) or {"object": key_name}
-
-            # A bare string is the identifier; an object may additionally carry
-            # a resolved record_id/status (the app sends that after a lookup, so
-            # confirming does not need a second round trip).
-            if isinstance(raw, dict):
-                value = str(raw.get("lookup_value") or "").strip()[:CRM_IDENTIFIER_MAX]
-                record_id = str(raw.get("record_id") or "").strip()[:64]
-                requested_status = str(raw.get("status") or "").strip()
-            else:
-                value = ("" if raw is None
-                         else str(raw).strip()[:CRM_IDENTIFIER_MAX])
-                record_id, requested_status = "", ""
-
-            if not value:
-                # Explicit null/"" removes it — the user saying "this meeting
-                # isn't about one of those", which must be able to undo a bad
-                # extraction. Dropped from the map rather than stored as null so
-                # "absent" has exactly one representation.
-                stored.pop(key_name, None)
-                continue
-
-            prior = stored.get(key_name) if isinstance(stored.get(key_name), dict) else {}
-            prior_value = str(prior.get("lookup_value") or prior.get("value") or "")
-            # Changing the identifier invalidates any record resolved from the
-            # OLD one — keeping the stale record_id would push this meeting's
-            # notes onto the previous record.
-            if value != prior_value:
-                record_id = record_id or ""
-                prior = {}
-
-            status = requested_status if requested_status in CRM_STATUSES else ""
-            if not status:
-                status = (CRM_STATUS_RECORD_FOUND if record_id
-                          else CRM_STATUS_LOOKUP_PENDING)
-            # Confirmation is the user's act, and it is what gates the push.
-            # A client asking to jump straight to synced/syncing is refused:
-            # only the push route may write those.
-            if status in (CRM_STATUS_SYNCING, CRM_STATUS_SYNCED):
-                raise ApiError(400, "sync status is set by the sync itself")
-            if status in (CRM_STATUS_CONFIRMED, CRM_STATUS_RECORD_FOUND) and not record_id:
-                raise ApiError(400, f"{key_name}: a record_id is required to "
-                                    f"mark it {status}")
-
-            entry = {
-                "object": key_name,
-                "label": mapping.get("object_label") or key_name,
-                "lookup_field": mapping.get("lookup_field") or
-                                prior.get("lookup_field") or "",
-                "lookup_value": value,
-                "record_id": record_id,
-                "record_label": str(raw.get("record_label") or "")[:255]
-                                if isinstance(raw, dict) else "",
-                "status": status,
-                # Manual entry always outranks an extraction — a human typing
-                # the identifier IS the authority.
-                "source": "manual",
-                "updated_at": _now_iso(),
-            }
-            stored[key_name] = entry
-        sets.append("crm_records = :cr")
-        values[":cr"] = stored
-
     if not sets:
-        raise ApiError(400, "nothing to update — send speaker_names, title "
-                            "and/or crm_records")
+        raise ApiError(400, "nothing to update — send speaker_names and/or title")
 
     _recordings.update_item(
         Key={"audio_s3_key": key},
@@ -2780,7 +2578,7 @@ def patch_recording(event):
     # moment a user renamed a speaker — which is precisely the screen they are
     # looking at when they do it.
     updated = transcript_store.hydrate(_s3, BUCKET_NAME, updated)
-    return _resp(200, {"recording": _with_crm_records(_with_source(updated), user_id)})
+    return _resp(200, {"recording": _with_source(updated)})
 
 
 # ---------------------------------------------------------------------------
@@ -2794,7 +2592,7 @@ def patch_recording(event):
 # SOFT DELETE IS A FLAG ON THE EXISTING ROW — never a copy, never a second
 # table. `recording_status = "trashed"` plus a `deleted_at` stamp, written with
 # update_item onto the row that is already there. Everything the recording owns
-# (transcript, documents, tasks, chat, highlights, speaker names, crm_records)
+# (transcript, documents, tasks, chat, highlights, speaker names)
 # is an attribute ON that row, so trashing touches none of it and restoring
 # brings all of it back intact. Copying the row into a "trash table" instead
 # would duplicate every AI artifact and give us two rows that could drift.
@@ -3004,7 +2802,7 @@ def permanently_delete_recording(event):
         lives on the row and dies with it, so leaving the object would orphan
         it exactly as an un-deleted transcript would;
       * the DynamoDB row — and with it EVERY AI artifact, because documents,
-        tasks, chat history, highlights, speaker names and crm_records are all
+        tasks, chat history, highlights and speaker names are all
         attributes ON that row rather than separate tables. One delete_item
         takes them all, so nothing can be orphaned.
 
@@ -3104,8 +2902,7 @@ def get_recording(event):
     if isinstance(item.get("overview"), dict):
         item = {**item, "overview": ai_sanitize.sanitize_overview(
             item["overview"], label=f"overview:{key}")}
-    return _resp(200, {"recording": _with_crm_records(
-        _with_source({**item, "audio_url": audio_url}), user_id)})
+    return _resp(200, {"recording": _with_source({**item, "audio_url": audio_url})})
 
 
 def _url_unquote(s):
@@ -5543,23 +5340,18 @@ def _public_contact(item, linked_avatars=None, member_roles=None):
                                           owner_field="owner_user_id"),
         "shared": workspace_schema.is_organisation_workspace_id(
             _row_workspace_id(item, owner_field="owner_user_id")),
-        # Provenance. "manual" today; CRM-imported contacts will carry their
-        # own source once that integration lands, and the field exists now so
-        # the UI does not have to change shape then.
+        # Provenance: "manual", or where the contact came from (e.g. the
+        # Salesforce Site People Store).
         "source": item.get("source", "manual"),
+        # The external directory entry this contact is linked to, if any
+        # ("salesforce" + "contact"/"user"). Provider and type only: the
+        # external record id stays server-side, where tagging and Task
+        # relationships read it.
+        "people_provider": item.get("people_provider", ""),
+        "people_type": item.get("people_type", ""),
         "created_by": item.get("created_by", ""),
         "created_at": item.get("created_at", ""),
         "updated_at": item.get("updated_at", ""),
-        # CRM identity (Phase 2D.3). Present only once EXPLICITLY confirmed
-        # via resolve_speaker_crm_identity — never inferred from name/email
-        # here, so "crm_external_id" being set is always the record of a
-        # deliberate human choice (see that route's docstring for the
-        # matching-priority rule this guarantees).
-        "crm_provider": item.get("crm_provider", ""),
-        "crm_object_type": item.get("crm_object_type", ""),
-        "crm_external_id": item.get("crm_external_id", ""),
-        "crm_account_id": item.get("crm_account_id", ""),
-        "crm_resolved_at": item.get("crm_resolved_at", ""),
     }
     # THE ROLE TAG. Keyed on the LINKED MinuteX account, not on the contact's
     # owner: the point is "this person is a colleague, and this is their role
@@ -9040,92 +8832,18 @@ def _audit(action, user_id, entity_id, **extra):
 
 
 
-# ---------------------------------------------------------------------------
-# CRM — Salesforce connect (Phase 1: OAuth only; no record linking yet).
+# ===========================================================================
+# SHARED SECURITY HELPERS — the KMS client and PKCE (RFC 7636), used by the
+# Integrations OAuth flows (Gmail) and by the Salesforce Site endpoint's
+# stored credentials (_integration_kms_encrypt / _integration_kms_decrypt).
 #
-# Web-server (authorization code) flow:
-#   1. GET  /crm/salesforce/connect  (JWT) mints a signed, expiring `state`
-#      (HMAC over user_id + exp, same secret as the JWT — no extra table
-#      needed for CSRF protection) and returns the Salesforce authorize URL.
-#   2. The app opens that URL in a browser. The user logs in / approves on
-#      Salesforce's own page — we never see their password (see the
-#      Username-Password flow note below for why that path was rejected).
-#   3. Salesforce redirects to GET /crm/salesforce/callback?code=...&state=...
-#      — this route is UNAUTHENTICATED (no JWT: the browser, not the app,
-#      calls it). `state` is verified instead, exactly like the pairing
-#      code hash stands in for a session there.
-#   4. The callback exchanges `code` for tokens over stdlib urllib (matches
-#      the zero-dependency convention — see module docstring), envelope-
-#      encrypts the refresh token with KMS, and writes one CrmConnections
-#      row (PK user_id, SK provider) — a new single-purpose table, same
-#      shape convention as Devices/DeviceKeys/UserDevices.
-#   5. GET /crm/salesforce/status and DELETE /crm/salesforce let the app
-#      show connection state and disconnect, without ever exposing tokens.
-#
-# SalesforceClient is a seam (mirrors FirmwareVerifier): every real network
-# call to Salesforce goes through it, so Phase 5/7 (record lookup, push)
-# plug in later without touching the route handlers, and it is the one
-# place a test can monkeypatch.
-# ---------------------------------------------------------------------------
-CRM_PROVIDER_SALESFORCE = "salesforce"
-
-
-def _salesforce_client_secret():
-    """Connected App consumer secret — Secrets Manager, same lazy-cache
-    pattern as _jwt_secret(). No env-var fallback: unlike the JWT secret
-    there is no pre-existing plaintext deployment to stay compatible with,
-    so this should never be allowed to land as a plaintext env var."""
-    global _salesforce_secret_cache
-    if _salesforce_secret_cache is not None:
-        return _salesforce_secret_cache
-    if not SALESFORCE_CLIENT_SECRET_ARN:
-        raise RuntimeError("SALESFORCE_CLIENT_SECRET_ARN is not set")
-    sm = boto3.client("secretsmanager", region_name=REGION)
-    _salesforce_secret_cache = sm.get_secret_value(
-        SecretId=SALESFORCE_CLIENT_SECRET_ARN)["SecretString"]
-    return _salesforce_secret_cache
-
-
-_salesforce_secret_cache = None
+# PKCE: the verifier is generated server-side at /connect and carried inside
+# the SIGNED state, the only value that provably round-trips through the
+# provider back to /callback — per attempt, tamper-proof, expiring, and
+# never stored at rest or put in a URL of its own.
+# ===========================================================================
 _kms = boto3.client("kms", region_name=REGION)
 
-
-def _kms_encrypt(plaintext: str) -> str:
-    resp = _kms.encrypt(KeyId=SALESFORCE_KMS_KEY_ID, Plaintext=plaintext.encode("utf-8"))
-    return _b64u_encode(resp["CiphertextBlob"])
-
-
-def _kms_decrypt(ciphertext_b64: str) -> str:
-    resp = _kms.decrypt(CiphertextBlob=_b64u_decode(ciphertext_b64), KeyId=SALESFORCE_KMS_KEY_ID)
-    return resp["Plaintext"].decode("utf-8")
-
-
-# ---------------------------------------------------------------------------
-# PKCE (RFC 7636). Salesforce Connected Apps now REQUIRE a code challenge:
-# without one the authorize call fails with
-#   error=invalid_request&error_description=missing required code challenge
-#
-# WHERE THE VERIFIER LIVES — the one design decision worth stating, because the
-# obvious answer is wrong here. In a public-client flow the app keeps the
-# verifier and performs the exchange itself. In THIS flow the app never sees an
-# authorization code: Salesforce redirects to our Lambda, and the Lambda
-# exchanges the code using the client secret from Secrets Manager (which must
-# never ship in a mobile binary). So a verifier stored on the device could
-# never reach the code that needs it.
-#
-# The verifier is therefore generated server-side in /connect and carried
-# inside the SIGNED STATE — the only value that provably round-trips through
-# Salesforce back to /callback. That gives PKCE exactly the properties it
-# needs, for free, from machinery that already exists:
-#   * per attempt      — a fresh verifier every /connect call
-#   * tamper-proof     — the state is HMAC-signed; editing it invalidates it
-#   * expiring         — SALESFORCE_STATE_TTL bounds the transaction
-#   * correctly paired — verifier and state are the SAME string, so a verifier
-#                        from another attempt is structurally impossible
-#
-# The state is opaque to the client and the verifier is never in a URL
-# parameter of its own, never logged, and never stored at rest.
-# ---------------------------------------------------------------------------
 PKCE_VERIFIER_BYTES = 32          # -> 43 chars base64url, RFC 7636 minimum
 PKCE_METHOD = "S256"
 
@@ -9141,3163 +8859,29 @@ def _pkce_challenge(verifier: str) -> str:
     return _b64u_encode(digest)
 
 
-def _sign_oauth_state(user_id: str, verifier: str = "") -> str:
-    """HMAC-signed, expiring state param — the CSRF guard for the redirect
-    round-trip, and the carrier for the PKCE verifier.
+def _meeting_deep_link(key: str) -> str:
+    """A STABLE MinuteX link to this meeting, or "" when the deployment has
+    no public base URL configured.
 
-    Reuses the JWT secret rather than a new one: this is not a session token,
-    just a tamper-proof "this browser redirect really started from an
-    authenticated /connect call for this user" claim. The verifier rides inside
-    the signed payload (see the PKCE note above), so it cannot be swapped
-    between attempts without breaking the signature.
+    Reuses SHARE_BASE_URL (the one already-configured public address of this
+    deployment). NEVER a presigned S3 URL: a presign is a bearer credential
+    with an expiry, so writing one into a customer's CRM produces either a
+    dead link or a leaked recording. This link resolves through MinuteX's own
+    auth when a human clicks it, which is what makes it safe to persist.
     """
-    payload = {"sub": user_id, "exp": int(time.time()) + SALESFORCE_STATE_TTL}
-    if verifier:
-        payload["cv"] = verifier
-    seg = _b64u_encode(json.dumps(payload, separators=(",", ":")).encode())
-    sig = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
-    return seg + "." + _b64u_encode(sig)
-
-
-def _verify_oauth_state(state: str) -> tuple:
-    """Return (user_id, code_verifier) from `state`, or raise ApiError.
-
-    The verifier comes back as "" for a state minted before PKCE existed; the
-    caller decides whether that is acceptable (it is not, for an exchange).
-    """
-    try:
-        seg, sig_b64 = state.split(".")
-        expected = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
-        if not hmac.compare_digest(expected, _b64u_decode(sig_b64)):
-            raise ValueError("bad signature")
-        payload = json.loads(_b64u_decode(seg))
-    except (ValueError, TypeError, KeyError):
-        raise ApiError(400, "invalid or tampered state")
-    if not isinstance(payload, dict) or payload.get("exp", 0) < int(time.time()):
-        raise ApiError(410, "connect session expired — try again")
-    user_id = payload.get("sub")
-    if not user_id:
-        raise ApiError(400, "invalid state")
-    return user_id, str(payload.get("cv") or "")
-
-
-def _salesforce_error_message(body: str) -> str:
-    """Salesforce's own error text out of a REST error body.
-
-    Errors come back as [{"message", "errorCode", "fields": [...]}]. Surfacing
-    the org's wording (and the offending field) is the whole point: only
-    Salesforce knows that a validation rule fired or which field is read-only,
-    and a generic "update failed" would leave the user with nothing to act on.
-    Returns "" when the body isn't parseable, so callers keep their default.
-    """
-    try:
-        parsed = json.loads(body)
-    except (ValueError, TypeError):
+    base = SHARE_BASE_URL.rstrip("/") if SHARE_BASE_URL else ""
+    if not base:
         return ""
-    if isinstance(parsed, dict):
-        parsed = [parsed]
-    if not isinstance(parsed, list):
-        return ""
-    parts = []
-    for err in parsed[:3]:
-        if not isinstance(err, dict):
-            continue
-        message = str(err.get("message") or "").strip()
-        if not message:
-            continue
-        fields = [str(f) for f in (err.get("fields") or []) if f]
-        parts.append(f"{message} ({', '.join(fields)})" if fields else message)
-    return " · ".join(parts)[:500]
-
-
-class SalesforceAuthExpired(Exception):
-    """The ACCESS token was rejected (401) — internal, never surfaced.
-
-    Distinct from the user-visible failure on purpose: this one means "mint a
-    new access token from the refresh token and retry", which _sf_call does
-    transparently. A dead REFRESH token is the user-visible failure and is
-    raised as SalesforceReconnectRequired (HTTP 409) — see below.
-    """
-
-
-# HTTP status for "your MinuteX session is fine, but the SALESFORCE credential
-# behind this route is dead; reconnect Salesforce".
-#
-# It is deliberately NOT 401. 401 on this API means one specific thing — the
-# MinuteX JWT is missing/expired — and the app acts on it globally: lib/api.ts
-# clears the stored token at the single choke point every authenticated call
-# passes through, and the screen then redirects to /login. Returning 401 for a
-# dead Salesforce refresh token made those two unrelated failures
-# indistinguishable on the wire, so opening CRM Mapping with a stale Salesforce
-# connection destroyed a perfectly good MinuteX session and bounced the user to
-# the login screen (the bug this constant exists to prevent).
-#
-# 409 Conflict is the honest code: the request is authenticated and well-formed,
-# but conflicts with the current state of the resource — Salesforce is linked
-# yet unusable. The app reads `code` (not the prose) to offer "Reconnect".
-SF_RECONNECT_STATUS = 409
-SF_RECONNECT_CODE = "salesforce_reconnect_required"
-
-
-class SalesforceReconnectRequired(ApiError):
-    """The user's stored Salesforce refresh token is dead — they must redo the
-    OAuth connect. Carries a stable `code` so the app can branch on identity
-    rather than on wording, and never on a status code that means something
-    else."""
-
-    def __init__(self, message: str):
-        super().__init__(SF_RECONNECT_STATUS, message)
-        self.code = SF_RECONNECT_CODE
-
-
-# Distinct from SF_RECONNECT_CODE on purpose (spec section 16): "not
-# connected" and "connected but the credential died" are different states
-# that need different UI — one shows a Connect button, the other shows
-# Reconnect. Collapsing them into one code would lose that distinction for
-# the organisation flow, which — unlike Personal, where "not connected" is
-# just a 400 nobody branches on — has a Member who needs to know WHICH
-# empty state they are looking at.
-ORG_SF_NOT_CONNECTED_CODE = "organisation_salesforce_not_connected"
-
-
-class OrganisationSalesforceNotConnected(ApiError):
-    """No workspace has connected Salesforce yet. Never falls back to the
-    caller's Personal Salesforce connection — see the module note on why
-    that would be a silent, surprising scope violation."""
-
-    def __init__(self, message: str = "Organisation Salesforce is not connected"):
-        super().__init__(400, message)
-        self.code = ORG_SF_NOT_CONNECTED_CODE
-
-
-class SalesforceClient:
-    """Seam for every real Salesforce network call (mirrors FirmwareVerifier
-    for devices). Zero external dependencies — stdlib urllib, matching the
-    rest of the repo's Groq/ElevenLabs integrations."""
-
-    def _post_form(self, url: str, form: dict, what: str) -> dict:
-        """POST an x-www-form-urlencoded body, return the parsed JSON."""
-        body = urllib.parse.urlencode(form).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=body, method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")
-            print(f"[salesforce] {what} failed: {e.code} {detail[:300]}")
-            raise ApiError(502, f"Salesforce rejected the {what} — try again")
-        except urllib.error.URLError as e:
-            print(f"[salesforce] {what} network error: {e}")
-            raise ApiError(502, "could not reach Salesforce")
-
-    def _get_json(self, url: str, access_token: str, what: str):
-        """Authenticated GET against the REST API.
-
-        Raises SalesforceAuthExpired on 401 so the caller can refresh the
-        access token and retry ONCE — distinguishing "this token is stale"
-        (recoverable, and expected: access tokens are short-lived) from "this
-        request is wrong" (not recoverable by retrying).
-        """
-        req = urllib.request.Request(
-            url, headers={"Authorization": f"Bearer {access_token}"})
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")
-            if e.code == 401:
-                raise SalesforceAuthExpired(detail[:200])
-            print(f"[salesforce] {what} failed: {e.code} {detail[:300]}")
-            if e.code == 403:
-                raise ApiError(403, "your Salesforce user lacks permission for "
-                                    "this — ask your admin")
-            if e.code == 404:
-                raise ApiError(404, f"{what}: not found in your Salesforce org")
-            raise ApiError(502, f"Salesforce {what} failed")
-        except urllib.error.URLError as e:
-            print(f"[salesforce] {what} network error: {e}")
-            raise ApiError(502, "could not reach Salesforce")
-
-    def exchange_code(self, code: str, code_verifier: str = "") -> dict:
-        """Authorization code -> {access_token, refresh_token, instance_url,
-        id, ...}. Raises ApiError(502) on any Salesforce-side failure.
-
-        `code_verifier` completes the PKCE pair whose challenge was sent at
-        authorize time; Salesforce rejects the exchange without it. The client
-        secret still comes from Secrets Manager — PKCE is in ADDITION to it,
-        not a replacement, because this is a confidential client.
-        """
-        form = {"grant_type": "authorization_code",
-                "code": code,
-                "client_id": SALESFORCE_CLIENT_ID,
-                "client_secret": _salesforce_client_secret(),
-                "redirect_uri": SALESFORCE_REDIRECT_URI}
-        if code_verifier:
-            form["code_verifier"] = code_verifier
-        return self._post_form(
-            f"{SALESFORCE_LOGIN_URL}/services/oauth2/token", form, "connection")
-
-    def refresh_access_token(self, refresh_token: str) -> dict:
-        """refresh_token -> a fresh short-lived {access_token, instance_url?}.
-
-        Access tokens are deliberately NOT stored: they expire in hours, and
-        keeping them would mean a second secret to encrypt, rotate and leak.
-        The refresh token is the only durable credential, so every request
-        path mints an access token on demand.
-
-        The response MAY carry a new refresh_token: with Refresh Token Rotation
-        enabled on the Connected App, Salesforce returns one on every refresh
-        and invalidates the token just used. Callers must persist it — see
-        _persist_rotated_refresh_token, which _sf_call invokes on every
-        successful refresh. (This docstring previously claimed Salesforce never
-        rotates here; that is true only with rotation off, and believing it
-        caused every call after the first to fail with invalid_grant.)
-
-        A 400 means the refresh token itself is dead (user revoked access in
-        Salesforce, or an admin uninstalled the Connected App) — surfaced as
-        SF_RECONNECT_STATUS so the app knows to prompt for reconnection rather
-        than retrying, without it being mistaken for MinuteX session expiry.
-        """
-        try:
-            return self._post_form(
-                f"{SALESFORCE_LOGIN_URL}/services/oauth2/token",
-                {"grant_type": "refresh_token",
-                 "refresh_token": refresh_token,
-                 "client_id": SALESFORCE_CLIENT_ID,
-                 "client_secret": _salesforce_client_secret()},
-                "token refresh")
-        except ApiError as e:
-            if e.status == 502 and "rejected" in e.message:
-                raise SalesforceReconnectRequired(
-                    "your Salesforce connection has expired — "
-                    "reconnect Salesforce in Settings")
-            raise
-
-    def whoami(self, instance_url: str, access_token: str) -> dict:
-        """GET the identity URL to confirm the token works and fetch the
-        connected org/user display info shown on the status screen."""
-        try:
-            return self._get_json(f"{instance_url}/services/oauth2/userinfo",
-                                  access_token, "org info")
-        except SalesforceAuthExpired:
-            # Only called immediately after a fresh exchange/refresh, so a 401
-            # here is not the ordinary stale-token case worth retrying.
-            raise ApiError(502, "connected, but could not read Salesforce org info")
-        except ApiError:
-            raise ApiError(502, "connected, but could not read Salesforce org info")
-
-    def list_objects(self, instance_url: str, access_token: str) -> list:
-        """Every object in the org, as [{name, label, custom, createable, ...}].
-
-        The global describe is one call and returns the full object list with
-        enough metadata to filter client-side — much cheaper than describing
-        each object just to decide whether to offer it.
-        """
-        data = self._get_json(
-            f"{instance_url}/services/data/{SALESFORCE_API_VERSION}/sobjects/",
-            access_token, "object list")
-        return data.get("sobjects") or []
-
-    def describe_object(self, instance_url: str, access_token: str,
-                        object_name: str) -> dict:
-        """Full describe of ONE object, including every field's type/length."""
-        return self._get_json(
-            f"{instance_url}/services/data/{SALESFORCE_API_VERSION}"
-            f"/sobjects/{urllib.parse.quote(object_name)}/describe/",
-            access_token, f"describe {object_name}")
-
-    def update_record(self, instance_url: str, access_token: str,
-                      object_name: str, record_id: str, fields: dict) -> None:
-        """PATCH one record's fields. Works for ANY object — the caller supplies
-        the object name, the record Id and the field map, all of which come from
-        the user's configuration, so there is no per-object push code.
-
-        Returns None on success: Salesforce answers 204 with an empty body.
-        Raises SalesforceAuthExpired on 401 (so _sf_call can refresh + retry),
-        and ApiError with Salesforce's own message on a validation/permission
-        failure, because only the org's message says WHICH field it rejected.
-        """
-        body = json.dumps(fields).encode("utf-8")
-        req = urllib.request.Request(
-            f"{instance_url}/services/data/{SALESFORCE_API_VERSION}"
-            f"/sobjects/{urllib.parse.quote(object_name)}"
-            f"/{urllib.parse.quote(record_id)}",
-            data=body, method="PATCH",
-            headers={"Authorization": f"Bearer {access_token}",
-                     "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=25) as r:
-                r.read()
-                return None
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")
-            if e.code == 401:
-                raise SalesforceAuthExpired(detail[:200])
-            message = _salesforce_error_message(detail)
-            print(f"[salesforce] update {object_name}/{record_id} failed: "
-                  f"{e.code} {detail[:300]}")
-            if e.code == 404:
-                # The record was deleted (or is no longer visible) since we
-                # resolved it — the association is stale, not the request wrong.
-                raise ApiError(404, message or "that Salesforce record no longer "
-                                               "exists — look it up again")
-            if e.code == 403:
-                raise ApiError(403, message or "your Salesforce user cannot edit "
-                                               "this record — ask your admin")
-            if e.code in (400, 422):
-                raise ApiError(422, message or "Salesforce rejected the update")
-            raise ApiError(502, message or "Salesforce update failed")
-        except urllib.error.URLError as e:
-            print(f"[salesforce] update network error: {e}")
-            raise ApiError(502, "could not reach Salesforce")
-
-    def query(self, instance_url: str, access_token: str, soql: str) -> dict:
-        """Run a SOQL query. Used to resolve a user-supplied identifier to a
-        Salesforce record Id, against whichever object/field the user mapped."""
-        return self._get_json(
-            f"{instance_url}/services/data/{SALESFORCE_API_VERSION}/query/"
-            f"?q={urllib.parse.quote(soql)}",
-            access_token, "record lookup")
-
-    def create_record(self, instance_url: str, access_token: str,
-                      object_name: str, fields: dict) -> str:
-        """POST a new record, return its Id. Salesforce answers 201 with
-        {"id": ..., "success": true, ...} on success.
-
-        Added in Phase 2D.3 for Salesforce TASK creation from a MinuteX
-        action item (see push_org_meeting_crm) — the only object this
-        codebase creates rather than looks up and updates. Deliberately NOT
-        used for Contact/Account: spec section 5 requires those to be
-        resolved by explicit human selection from a search
-        (crm_search_salesforce_contacts), never auto-created from partial
-        meeting data, which is what keeps this method's blast radius to
-        Task creation only.
-
-        Same error-mapping shape as update_record, for the same reasons:
-        401 -> SalesforceAuthExpired (retry once), 403/400/422 -> a typed
-        ApiError carrying Salesforce's own validation message.
-        """
-        body = json.dumps(fields).encode("utf-8")
-        req = urllib.request.Request(
-            f"{instance_url}/services/data/{SALESFORCE_API_VERSION}"
-            f"/sobjects/{urllib.parse.quote(object_name)}",
-            data=body, method="POST",
-            headers={"Authorization": f"Bearer {access_token}",
-                     "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=25) as r:
-                parsed = json.loads(r.read().decode("utf-8"))
-                return str(parsed.get("id") or "")
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")
-            if e.code == 401:
-                raise SalesforceAuthExpired(detail[:200])
-            message = _salesforce_error_message(detail)
-            print(f"[salesforce] create {object_name} failed: "
-                  f"{e.code} {detail[:300]}")
-            if e.code == 403:
-                raise ApiError(403, message or "your Salesforce user cannot create "
-                                               f"a {object_name} — ask your admin")
-            if e.code in (400, 422):
-                raise ApiError(422, message or f"Salesforce rejected the new {object_name}")
-            raise ApiError(502, message or f"Salesforce {object_name} creation failed")
-        except urllib.error.URLError as e:
-            print(f"[salesforce] create network error: {e}")
-            raise ApiError(502, "could not reach Salesforce")
-
-    def revoke(self, refresh_token: str) -> None:
-        """Best-effort revoke on disconnect — Salesforce still lets the user
-        revoke from their own org's Connected Apps page either way, so a
-        failure here must never block the local disconnect."""
-        form = urllib.parse.urlencode({"token": refresh_token}).encode("utf-8")
-        req = urllib.request.Request(
-            f"{SALESFORCE_LOGIN_URL}/services/oauth2/revoke", data=form, method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"})
-        try:
-            urllib.request.urlopen(req, timeout=10).read()
-        except (urllib.error.HTTPError, urllib.error.URLError) as e:
-            print(f"[salesforce] revoke failed (non-fatal): {e}")
-
-
-_salesforce = SalesforceClient()
-
-
-def _sf_call(user_id: str, fn):
-    """Run `fn(instance_url, access_token)` against the user's Salesforce org.
-
-    Owns the whole access-token lifecycle so no route handler repeats it:
-    decrypt the refresh token, mint an access token, call, and on a 401 mint
-    once more and retry. Access tokens are never persisted (see
-    refresh_access_token) — each request pays one cheap refresh call, which
-    keeps exactly one durable secret per user instead of two.
-
-    Raises ApiError(400) when Salesforce isn't connected, and
-    SalesforceReconnectRequired (409) when the refresh token itself is dead —
-    never 401, which on this API means the MinuteX session died. Overloading
-    401 here signed the user out of MinuteX entirely; see SF_RECONNECT_STATUS.
-    """
-    conn = _get_salesforce_connection(user_id)
-    if not conn or not conn.get("refresh_token_enc"):
-        raise ApiError(400, "Salesforce is not connected")
-    instance_url = conn.get("instance_url") or ""
-    stored_enc = conn["refresh_token_enc"]
-    refresh_token = _kms_decrypt(stored_enc)
-
-    tokens = _salesforce.refresh_access_token(refresh_token)
-    access_token = tokens.get("access_token")
-    if not access_token:
-        raise SalesforceReconnectRequired(
-            "your Salesforce connection has expired — "
-            "reconnect Salesforce in Settings")
-    # Persist BEFORE calling fn(): under rotation the token we just used is
-    # already dead, so losing the replacement to a failure inside fn() would
-    # brick the connection until the user reconnects.
-    rotated = _persist_rotated_refresh_token(user_id, tokens, stored_enc)
-    if rotated:
-        refresh_token = rotated
-    # Salesforce can hand back a different instance_url after an org move.
-    instance_url = tokens.get("instance_url") or instance_url
-    if not instance_url:
-        raise ApiError(502, "Salesforce did not report an instance URL")
-
-    try:
-        return fn(instance_url, access_token)
-    except SalesforceAuthExpired:
-        # The token we just minted was rejected — rare, but it happens when a
-        # session is invalidated mid-flight. One more attempt, then give up.
-        # Uses `refresh_token`, which the block above updated if it rotated:
-        # retrying with the consumed one would fail every time under rotation.
-        print("[salesforce] access token rejected; refreshing once and retrying")
-        stored_enc = _kms_encrypt(refresh_token) if rotated else stored_enc
-        tokens = _salesforce.refresh_access_token(refresh_token)
-        access_token = tokens.get("access_token")
-        if not access_token:
-            raise SalesforceReconnectRequired(
-                "your Salesforce connection has expired — "
-                "reconnect Salesforce in Settings")
-        _persist_rotated_refresh_token(user_id, tokens, stored_enc)
-        try:
-            return fn(tokens.get("instance_url") or instance_url, access_token)
-        except SalesforceAuthExpired:
-            raise SalesforceReconnectRequired(
-                "Salesforce kept rejecting the session — "
-                "reconnect Salesforce in Settings")
-
-
-def salesforce_connect(event):
-    """GET /crm/salesforce/connect (JWT) -> {authorize_url}.
-
-    Mints a fresh PKCE verifier per attempt, sends only its SHA-256 challenge
-    to Salesforce, and carries the verifier itself inside the signed state so
-    /callback can complete the exchange (see the PKCE note above for why the
-    verifier is server-side rather than on the device).
-    """
-    user_id = _require_auth(event)
-    if not SALESFORCE_CLIENT_ID or not SALESFORCE_REDIRECT_URI:
-        raise ApiError(500, "Salesforce integration is not configured")
-    verifier = _new_pkce_verifier()
-    state = _sign_oauth_state(user_id, verifier)
-    qs = urllib.parse.urlencode({
-        "response_type": "code",
-        "client_id": SALESFORCE_CLIENT_ID,
-        "redirect_uri": SALESFORCE_REDIRECT_URI,
-        "state": state,
-        # Only the CHALLENGE goes over the wire. The verifier is never a URL
-        # parameter — that is the entire point of PKCE.
-        "code_challenge": _pkce_challenge(verifier),
-        "code_challenge_method": PKCE_METHOD,
-    })
-    return _resp(200, {"authorize_url": f"{SALESFORCE_LOGIN_URL}/services/oauth2/authorize?{qs}"})
-
-
-def salesforce_callback(event):
-    """GET /crm/salesforce/callback?code&state (Salesforce redirect, NO JWT).
-
-    Verifies `state` instead of a bearer token, exchanges the code, and
-    redirects the browser to SALESFORCE_RETURN_URL (a deep link back into
-    the app) with a simple ok/error query param — the browser tab, not this
-    Lambda, is the one thing that can hand control back to the app.
-    """
-    qs = event.get("queryStringParameters") or {}
-    error = qs.get("error")
-
-    def _redirect(ok: bool, reason: str = "") -> dict:
-        params = {"connected": "1"} if ok else {"connected": "0", "reason": reason}
-        target = SALESFORCE_RETURN_URL or "/"
-        location = f"{target}?{urllib.parse.urlencode(params)}"
-        return {"statusCode": 302, "headers": {"Location": location}, "body": ""}
-
-    if error:
-        print(f"[salesforce] callback error param: {error}")
-        return _redirect(False, "denied")
-
-    code = qs.get("code")
-    state = qs.get("state")
-    if not code or not state:
-        return _redirect(False, "missing_params")
-
-    try:
-        # Verifies the signature and expiry (invalid/tampered/expired state all
-        # raise), and yields the PKCE verifier bound to THIS attempt.
-        user_id, code_verifier = _verify_oauth_state(state)
-        if not code_verifier:
-            # A signed state with no verifier means the /connect that produced
-            # it predates PKCE. Salesforce would reject the exchange anyway;
-            # failing here is clearer and never falls back to a non-PKCE
-            # exchange, which would be a downgrade.
-            print("[salesforce] callback: state carries no PKCE verifier")
-            return _redirect(False, "pkce_missing")
-        tokens = _salesforce.exchange_code(code, code_verifier)
-    except ApiError as e:
-        # e.message is Salesforce's or our own wording — never the code, the
-        # verifier or any token.
-        print(f"[salesforce] callback failed: {e.message}")
-        return _redirect(False, "exchange_failed")
-
-    refresh_token = tokens.get("refresh_token")
-    access_token = tokens.get("access_token")
-    instance_url = tokens.get("instance_url")
-    if not refresh_token or not access_token or not instance_url:
-        print("[salesforce] token response missing required fields")
-        return _redirect(False, "exchange_failed")
-
-    identity = {}
-    try:
-        identity = _salesforce.whoami(instance_url, access_token)
-    except ApiError:
-        pass  # non-fatal — connection still succeeded, org info is cosmetic
-
-    # tokens["id"] is an identity URL of the form
-    # "{instance}/id/{org_id}/{user_id}" — org_id/user_id are also in
-    # `identity` when whoami() succeeded, but that call is best-effort, so
-    # parse the always-present id URL as the reliable fallback.
-    id_parts = (tokens.get("id") or "").rstrip("/").split("/")
-    org_id_fallback = id_parts[-2] if len(id_parts) >= 2 else ""
-
-    now = _now_iso()
-    _crm_connections.put_item(Item={
-        "user_id": user_id,
-        "provider": CRM_PROVIDER_SALESFORCE,
-        "instance_url": instance_url,
-        "refresh_token_enc": _kms_encrypt(refresh_token),
-        "org_id": identity.get("organization_id") or org_id_fallback,
-        "sf_user_id": identity.get("user_id") or "",
-        "sf_username": identity.get("preferred_username") or identity.get("email") or "",
-        "connected_at": now,
-        "updated_at": now,
-    })
-    return _redirect(True)
-
-
-def _get_salesforce_connection(user_id: str) -> dict:
-    return _crm_connections.get_item(
-        Key={"user_id": user_id, "provider": CRM_PROVIDER_SALESFORCE}).get("Item")
-
-
-def _persist_rotated_refresh_token(user_id: str, tokens: dict,
-                                   old_enc: str) -> str:
-    """Store the refresh token Salesforce hands back on a refresh, if it rotated.
-
-    REFRESH TOKEN ROTATION. When the Connected App has rotation enabled,
-    /services/oauth2/token returns a NEW refresh_token on every refresh and
-    invalidates the one just used. Keeping the original then guarantees exactly
-    one working call per connect, and `invalid_grant: expired access/refresh
-    token` on every request after that — which is the bug this exists to fix.
-
-    Rotation is OFF by default, and then no refresh_token comes back at all;
-    that is why this is conditional rather than unconditional. Both modes are
-    handled by the same path: only a token that is present AND different is
-    written.
-
-    Returns the refresh token to use from here on — the rotated one when it
-    rotated, otherwise the caller's existing one.
-
-    CONCURRENCY. Two in-flight requests for the same user can each refresh; the
-    second rotation invalidates the first, and whichever write lands last wins.
-    The conditional write makes the LOSER fail its own update instead of
-    clobbering the newer token with an older one. A lost race still leaves that
-    request's token dead, but the stored token stays the newest one written, so
-    the account self-heals on the next call rather than needing a reconnect.
-    """
-    new_token = (tokens.get("refresh_token") or "").strip()
-    if not new_token:
-        return ""  # rotation off (or nothing returned) — nothing to persist
-
-    new_enc = _kms_encrypt(new_token)
-    try:
-        _crm_connections.update_item(
-            Key={"user_id": user_id, "provider": CRM_PROVIDER_SALESFORCE},
-            UpdateExpression="SET refresh_token_enc = :new, updated_at = :now",
-            # Only overwrite the exact ciphertext we read. A concurrent request
-            # that already rotated past us fails here rather than reinstating a
-            # token Salesforce has since invalidated.
-            ConditionExpression="refresh_token_enc = :old",
-            ExpressionAttributeValues={
-                ":new": new_enc, ":old": old_enc, ":now": _now_iso()},
-        )
-        print("[salesforce] refresh token rotated; stored the new one")
-    except Exception as e:  # noqa: BLE001
-        # Includes ConditionalCheckFailedException (someone else rotated first).
-        # Never fatal: we hold a VALID access token for this request, so failing
-        # the user's call over a bookkeeping write would be strictly worse.
-        print(f"[salesforce] could not persist rotated refresh token "
-              f"(non-fatal): {type(e).__name__}: {e}")
-    return new_token
-
-
-def salesforce_status(event):
-    """GET /crm/salesforce/status (JWT) -> {connected, instance_url?, sf_username?, connected_at?}."""
-    user_id = _require_auth(event)
-    conn = _get_salesforce_connection(user_id)
-    if not conn:
-        return _resp(200, {"connected": False})
-    return _resp(200, {
-        "connected": True,
-        "instance_url": conn.get("instance_url", ""),
-        "sf_username": conn.get("sf_username", ""),
-        "connected_at": conn.get("connected_at", ""),
-    })
-
-
-def salesforce_disconnect(event):
-    """DELETE /crm/salesforce (JWT) -> {disconnected}."""
-    user_id = _require_auth(event)
-    conn = _get_salesforce_connection(user_id)
-    if conn and conn.get("refresh_token_enc"):
-        try:
-            refresh_token = _kms_decrypt(conn["refresh_token_enc"])
-            _salesforce.revoke(refresh_token)
-        except Exception as e:  # noqa: BLE001 - revoke is best-effort, never blocks disconnect
-            print(f"[salesforce] revoke on disconnect failed (non-fatal): {e}")
-    _crm_connections.delete_item(Key={"user_id": user_id, "provider": CRM_PROVIDER_SALESFORCE})
-    return _resp(200, {"disconnected": True})
+    return f"{base}/meetings/{urllib.parse.quote(key, safe='')}"
 
 
 # ===========================================================================
-# ORGANISATION CRM — Salesforce (Phase 2D.1)
-#
-# A WORKSPACE-scoped twin of the Personal flow above. Deliberately built as
-# parallel functions rather than parameterizing the Personal ones: the two
-# differ in identity (user_id vs workspace_id), in authorization (JWT owner
-# vs CAP_MANAGE_INTEGRATIONS), and in storage (CrmConnections vs
-# OrgCrmConnections), and folding both into one code path would mean every
-# future change to either has to reason about the other. What genuinely IS
-# shared is reused directly: SalesforceClient, PKCE helpers, KMS
-# encrypt/decrypt, and the Connected App credentials — there is exactly one
-# OAuth client and one token endpoint either flow talks to.
-#
-# THE SCOPE BOUNDARY (spec section 6), enforced structurally, not by
-# convention:
-#   Personal:     user_id      -> CrmConnections      (unchanged, above)
-#   Organisation: workspace_id -> OrgCrmConnections    (this section)
-# Nothing here ever reads or writes CrmConnections, and nothing above ever
-# reads or writes OrgCrmConnections. A Personal connection can never be used
-# for organisation data and vice versa, because there is no code path that
-# looks in the other table.
-# ---------------------------------------------------------------------------
-
-def _sign_org_crm_state(user_id: str, workspace_id: str, verifier: str) -> str:
-    """HMAC-signed, expiring state for the ORGANISATION connect round-trip.
-
-    A separate signer from _sign_oauth_state (Personal) and
-    _sign_integration_state (Gmail/etc), even though the construction is
-    identical, because this one carries an extra claim that changes what a
-    valid state MEANS: `wid`, the workspace the connection will be created
-    for. That claim is what makes "prevent cross-workspace connection
-    creation" a property of the token instead of something a route has to
-    remember to check — the workspace comes from the SIGNED state at
-    callback time, never from a query/body parameter Salesforce echoes back,
-    because Salesforce does not echo application parameters through its own
-    OAuth redirect.
-    """
-    payload = {"sub": user_id, "wid": workspace_id, "cv": verifier,
-               "exp": int(time.time()) + SALESFORCE_STATE_TTL}
-    seg = _b64u_encode(json.dumps(payload, separators=(",", ":")).encode())
-    sig = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
-    return seg + "." + _b64u_encode(sig)
-
-
-def _verify_org_crm_state(state: str) -> tuple:
-    """(user_id, workspace_id, code_verifier) from `state`, or raise ApiError.
-
-    Signature/expiry checks mirror _verify_oauth_state exactly. The
-    additional requirement — both `sub` AND `wid` present — means a state
-    minted by the PERSONAL connect flow (which carries no `wid`) is rejected
-    here even though it shares the same signing secret: the two states are
-    structurally distinct, not just conventionally so.
-    """
-    try:
-        seg, sig_b64 = state.split(".")
-        expected = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
-        if not hmac.compare_digest(expected, _b64u_decode(sig_b64)):
-            raise ValueError("bad signature")
-        payload = json.loads(_b64u_decode(seg))
-    except (ValueError, TypeError, KeyError):
-        raise ApiError(400, "invalid or tampered state")
-    if not isinstance(payload, dict) or payload.get("exp", 0) < int(time.time()):
-        raise ApiError(410, "connect session expired — try again")
-    user_id = str(payload.get("sub") or "")
-    workspace_id = str(payload.get("wid") or "")
-    verifier = str(payload.get("cv") or "")
-    if not user_id or not workspace_id or not verifier:
-        raise ApiError(400, "invalid state")
-    return user_id, workspace_id, verifier
-
-
-def _get_org_salesforce_connection(workspace_id: str) -> dict:
-    return _org_crm_connections.get_item(
-        Key={"workspace_id": workspace_id, "provider": CRM_PROVIDER_SALESFORCE}
-    ).get("Item")
-
-
-def _sf_call_org(workspace_id: str, fn):
-    """As _sf_call, but against the WORKSPACE's Salesforce connection.
-
-    Identical token lifecycle (decrypt -> refresh -> call -> retry-once on
-    401), against OrgCrmConnections instead of CrmConnections. Kept as its
-    own function rather than a shared helper parameterized by table+key: the
-    two call sites already read differently (_get_salesforce_connection vs
-    _get_org_salesforce_connection, user_id vs workspace_id in the Key), and
-    forcing them through one indirection would obscure exactly the
-    Personal/Organisation boundary this section exists to keep visible.
-    """
-    conn = _get_org_salesforce_connection(workspace_id)
-    if not conn or not conn.get("refresh_token_enc"):
-        raise OrganisationSalesforceNotConnected()
-    instance_url = conn.get("instance_url") or ""
-    stored_enc = conn["refresh_token_enc"]
-    refresh_token = _kms_decrypt(stored_enc)
-
-    tokens = _salesforce.refresh_access_token(refresh_token)
-    access_token = tokens.get("access_token")
-    if not access_token:
-        raise SalesforceReconnectRequired(
-            "the organisation's Salesforce connection has expired — "
-            "an owner or manager must reconnect it")
-    rotated = _persist_rotated_org_refresh_token(workspace_id, tokens, stored_enc)
-    if rotated:
-        refresh_token = rotated
-    instance_url = tokens.get("instance_url") or instance_url
-    if not instance_url:
-        raise ApiError(502, "Salesforce did not report an instance URL")
-
-    try:
-        return fn(instance_url, access_token)
-    except SalesforceAuthExpired:
-        print("[org-salesforce] access token rejected; refreshing once and retrying")
-        stored_enc = _kms_encrypt(refresh_token) if rotated else stored_enc
-        tokens = _salesforce.refresh_access_token(refresh_token)
-        access_token = tokens.get("access_token")
-        if not access_token:
-            raise SalesforceReconnectRequired(
-                "the organisation's Salesforce connection has expired — "
-                "an owner or manager must reconnect it")
-        _persist_rotated_org_refresh_token(workspace_id, tokens, stored_enc)
-        try:
-            return fn(tokens.get("instance_url") or instance_url, access_token)
-        except SalesforceAuthExpired:
-            raise SalesforceReconnectRequired(
-                "Salesforce kept rejecting the organisation session — "
-                "an owner or manager must reconnect it")
-
-
-def _persist_rotated_org_refresh_token(workspace_id: str, tokens: dict,
-                                       old_enc: str) -> str:
-    """As _persist_rotated_refresh_token, keyed by workspace_id/provider."""
-    new_token = (tokens.get("refresh_token") or "").strip()
-    if not new_token:
-        return ""
-
-    new_enc = _kms_encrypt(new_token)
-    try:
-        _org_crm_connections.update_item(
-            Key={"workspace_id": workspace_id, "provider": CRM_PROVIDER_SALESFORCE},
-            UpdateExpression="SET refresh_token_enc = :new, updated_at = :now",
-            ConditionExpression="refresh_token_enc = :old",
-            ExpressionAttributeValues={
-                ":new": new_enc, ":old": old_enc, ":now": _now_iso()},
-        )
-        print(f"[org-salesforce] refresh token rotated for {workspace_id}")
-    except Exception as e:  # noqa: BLE001
-        print(f"[org-salesforce] could not persist rotated refresh token "
-              f"(non-fatal): {type(e).__name__}: {e}")
-    return new_token
-
-
-def org_salesforce_connect(event):
-    """GET /workspaces/{workspace_id}/crm/salesforce/connect (JWT)
-    -> {authorize_url}.
-
-    OWNER/MANAGER ONLY (spec section 5): a Member may use an already-
-    configured organisation connection but must not be able to create or
-    replace one. Enforced server-side via CAP_MANAGE_INTEGRATIONS — the
-    frontend hiding the "Connect" button is presentation, this check is the
-    actual authorization, exactly like every other capability gate in this
-    file.
-
-    Mints a fresh PKCE verifier per attempt and binds this attempt to BOTH
-    the initiating user and the target workspace inside the signed state
-    (see _sign_org_crm_state) — the callback re-validates both at exchange
-    time, so a membership change mid-flow (the user leaves the workspace, or
-    is demoted below Manager, between /connect and /callback) is caught
-    rather than trusted from ten minutes ago.
-    """
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    user_id, wid, membership = _require_workspace_capability(
-        event, workspace_schema.CAP_MANAGE_INTEGRATIONS, workspace_id=workspace_id)
-    if not workspace_schema.is_organisation_workspace_id(wid):
-        # A personal workspace has no "organisation Salesforce" concept —
-        # Personal Salesforce already covers it, and this route silently
-        # creating an OrgCrmConnections row for a personal workspace would
-        # be exactly the "silently promote Personal to Organisation"
-        # behavior the spec forbids.
-        raise ApiError(400, "organisation Salesforce is only available for "
-                            "an organisation workspace")
-    if not SALESFORCE_CLIENT_ID or not ORG_SALESFORCE_REDIRECT_URI:
-        raise ApiError(500, "Organisation Salesforce integration is not configured")
-
-    verifier = _new_pkce_verifier()
-    state = _sign_org_crm_state(user_id, wid, verifier)
-    qs = urllib.parse.urlencode({
-        "response_type": "code",
-        "client_id": SALESFORCE_CLIENT_ID,
-        "redirect_uri": ORG_SALESFORCE_REDIRECT_URI,
-        "state": state,
-        "code_challenge": _pkce_challenge(verifier),
-        "code_challenge_method": PKCE_METHOD,
-    })
-    return _resp(200, {"authorize_url": f"{SALESFORCE_LOGIN_URL}/services/oauth2/authorize?{qs}"})
-
-
-def org_salesforce_callback(event):
-    """GET /crm/salesforce/org-callback?code&state (Salesforce redirect, NO JWT).
-
-    Fixed path — see the module header on why this cannot be
-    /workspaces/{workspace_id}/... — with the workspace and initiating user
-    recovered from the signed `state` instead of the URL. Re-validates BOTH
-    at exchange time (not just at /connect time): a Member who was Manager
-    when they clicked Connect but was demoted or removed while the
-    Salesforce consent screen was open must not have their consent produce a
-    connection. This is the enforcement for "prevent connecting Salesforce
-    to a workspace the user no longer belongs to" — the earlier check in
-    org_salesforce_connect narrows who can START the flow, this one is what
-    actually stops a stale grant from completing it.
-    """
-    qs = event.get("queryStringParameters") or {}
-    error = qs.get("error")
-
-    def _redirect(ok: bool, reason: str = "") -> dict:
-        params = {"connected": "1", "scope": "organisation"} if ok else \
-            {"connected": "0", "scope": "organisation", "reason": reason}
-        target = SALESFORCE_RETURN_URL or "/"
-        location = f"{target}?{urllib.parse.urlencode(params)}"
-        return {"statusCode": 302, "headers": {"Location": location}, "body": ""}
-
-    if error:
-        print(f"[org-salesforce] callback error param: {error}")
-        return _redirect(False, "denied")
-
-    code = qs.get("code")
-    state = qs.get("state")
-    if not code or not state:
-        return _redirect(False, "missing_params")
-
-    try:
-        user_id, workspace_id, code_verifier = _verify_org_crm_state(state)
-    except ApiError as e:
-        print(f"[org-salesforce] callback state rejected: {e.message}")
-        return _redirect(False, "expired")
-
-    # Re-check membership + role NOW, not just at /connect time — see the
-    # docstring above. Fails closed: no membership row, wrong role, or a
-    # read error all deny.
-    membership = _active_membership(workspace_id, user_id)
-    if not membership or not workspace_schema.role_can(
-            membership.get("role"), workspace_schema.CAP_MANAGE_INTEGRATIONS):
-        print(f"[org-salesforce] callback: {user_id} lost Manager+ access to "
-              f"{workspace_id} during the OAuth round-trip")
-        return _redirect(False, "not_authorized")
-
-    try:
-        tokens = _salesforce.exchange_code(code, code_verifier)
-    except ApiError as e:
-        print(f"[org-salesforce] callback failed: {e.message}")
-        return _redirect(False, "exchange_failed")
-
-    refresh_token = tokens.get("refresh_token")
-    access_token = tokens.get("access_token")
-    instance_url = tokens.get("instance_url")
-    if not refresh_token or not access_token or not instance_url:
-        print("[org-salesforce] token response missing required fields")
-        return _redirect(False, "exchange_failed")
-
-    identity = {}
-    try:
-        identity = _salesforce.whoami(instance_url, access_token)
-    except ApiError:
-        pass  # non-fatal — connection still succeeded, org info is cosmetic
-
-    id_parts = (tokens.get("id") or "").rstrip("/").split("/")
-    org_id_fallback = id_parts[-2] if len(id_parts) >= 2 else ""
-    new_org_id = identity.get("organization_id") or org_id_fallback
-
-    # CONFIG SAFETY (Phase 2D.2). A field mapping is only meaningful against
-    # the SPECIFIC Salesforce org it was built from — "SiteVisit__c" on one
-    # org can be a different object, or nothing at all, on another. So a
-    # reconnect PRESERVES the existing mapping only when it is provably the
-    # SAME org (org_id unchanged); any other outcome — a different org, or no
-    # prior connection at all — starts with no config, and an Owner/Manager
-    # must review and re-save it before it applies again. Never guessed,
-    # never silently carried over.
-    previous = _get_org_salesforce_connection(workspace_id)
-    previous_org_id = str((previous or {}).get("org_id") or "")
-    same_org = bool(previous_org_id) and previous_org_id == new_org_id
-    preserved_config = (previous or {}).get("config") if same_org else None
-
-    now = _now_iso()
-    item = {
-        "workspace_id": workspace_id,
-        "provider": CRM_PROVIDER_SALESFORCE,
-        "connected_by_user_id": user_id,
-        "instance_url": instance_url,
-        "refresh_token_enc": _kms_encrypt(refresh_token),
-        "org_id": new_org_id,
-        "sf_user_id": identity.get("user_id") or "",
-        "sf_username": identity.get("preferred_username") or identity.get("email") or "",
-        "connected_at": now,
-        "updated_at": now,
-    }
-    if preserved_config is not None:
-        item["config"] = preserved_config
-    elif previous_org_id and not same_org:
-        # Explicit audit trail for the case that matters most: an admin
-        # reconnected to a DIFFERENT org and any prior mapping was dropped.
-        # Read by org_salesforce_get_config to explain the empty state rather
-        # than leaving an Owner guessing why their mapping "disappeared".
-        item["config_cleared_reason"] = (
-            f"Salesforce organisation changed ({previous_org_id} -> "
-            f"{new_org_id}) on reconnect — mapping must be reconfigured")
-        item["config_cleared_at"] = now
-    # PutItem, not update — a re-connect fully replaces every OTHER field of
-    # the prior connection (new identity, new token); only `config` is ever
-    # deliberately carried across, and only under the same-org condition above.
-    _org_crm_connections.put_item(Item=item)
-    if previous_org_id and not same_org:
-        print(f"[org-salesforce] workspace={workspace_id} reconnected to a "
-              f"DIFFERENT org ({previous_org_id} -> {new_org_id}) — "
-              f"config cleared")
-    print(f"[org-salesforce] connected workspace={workspace_id} by user={user_id}")
-    return _redirect(True)
-
-
-def org_salesforce_status(event):
-    """GET /workspaces/{workspace_id}/crm/salesforce/status (JWT)
-    -> {connected, instance_url?, sf_username?, connected_by_user_id?, connected_at?}.
-
-    Readable by ANY active member (not gated on CAP_MANAGE_INTEGRATIONS): a
-    Member needs to see that Organisation Salesforce is connected — and by
-    whom — to use it on a meeting, per spec section 5 ("Members may use an
-    existing configured organisation CRM connection"). Only connect/
-    disconnect/configure are privileged.
-    """
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    _user_id, wid, _membership = _require_workspace_member(
-        event, workspace_id=workspace_id)
-    conn = _get_org_salesforce_connection(wid)
-    if not conn:
-        return _resp(200, {"connected": False})
-    out = {
-        "connected": True,
-        "instance_url": conn.get("instance_url", ""),
-        "sf_username": conn.get("sf_username", ""),
-        "connected_by_user_id": conn.get("connected_by_user_id", ""),
-        "connected_at": conn.get("connected_at", ""),
-        "configured": bool(_mappings_from_config(conn.get("config") or {})),
-    }
-    # Present only right after a reconnect changed the underlying Salesforce
-    # org — see org_salesforce_callback. Read once and never repeated: the
-    # next config save (or the next reconnect) is what clears it, since by
-    # then either an Owner/Manager has acted on it or a fresher reason exists.
-    if conn.get("config_cleared_reason"):
-        out["config_cleared_reason"] = conn["config_cleared_reason"]
-        out["config_cleared_at"] = conn.get("config_cleared_at", "")
-    return _resp(200, out)
-
-
-def org_salesforce_disconnect(event):
-    """DELETE /workspaces/{workspace_id}/crm/salesforce (JWT) -> {disconnected}.
-
-    OWNER/MANAGER ONLY, same gate as connect.
-    """
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    _user_id, wid, _membership = _require_workspace_capability(
-        event, workspace_schema.CAP_MANAGE_INTEGRATIONS, workspace_id=workspace_id)
-    conn = _get_org_salesforce_connection(wid)
-    if conn and conn.get("refresh_token_enc"):
-        try:
-            refresh_token = _kms_decrypt(conn["refresh_token_enc"])
-            _salesforce.revoke(refresh_token)
-        except Exception as e:  # noqa: BLE001 - revoke is best-effort, never blocks disconnect
-            print(f"[org-salesforce] revoke on disconnect failed (non-fatal): {e}")
-    _org_crm_connections.delete_item(
-        Key={"workspace_id": wid, "provider": CRM_PROVIDER_SALESFORCE})
-    print(f"[org-salesforce] disconnected workspace={wid}")
-    return _resp(200, {"disconnected": True})
-
-
-# ---------------------------------------------------------------------------
-# ORGANISATION CRM configuration (Phase 2D.2).
-#
-# The workspace-scoped twin of the Personal config routes below. Every rule
-# — generic object/field discovery, the four optional content targets, one
-# mapping per object, CRM_MAX_MAPPINGS — is IDENTICAL, because a Salesforce
-# schema does not care who owns the connection. So these three handlers are
-# thin: resolve+authorize the workspace, then call straight into the SAME
-# _sf_object_is_selectable/_score_*/_validate_mapping/_mappings_from_config/
-# _public_mapping/_public_crm_config functions Personal uses, parameterized
-# by _sf_call_org instead of _sf_call. No rule is duplicated; only the
-# identity/authorization/storage differs.
-#
-# READ (objects, fields, config): any active member — a Member must be able
-# to SEE the configured mapping to understand what a push will do, even
-# though only Owner/Manager may change it.
-# WRITE (config): CAP_MANAGE_INTEGRATIONS (Owner/Manager), same gate as
-# connect/disconnect.
-# ---------------------------------------------------------------------------
-
-def org_salesforce_list_objects(event):
-    """GET /workspaces/{workspace_id}/crm/salesforce/objects (JWT)
-    -> {objects:[...], suggested}."""
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    _user_id, wid, _membership = _require_workspace_member(
-        event, workspace_id=workspace_id)
-    raw = _sf_call_org(wid, lambda url, tok: _salesforce.list_objects(url, tok))
-
-    objects, best, best_score = [], None, 0
-    for obj in raw:
-        if not _sf_object_is_selectable(obj):
-            continue
-        objects.append({
-            "name": obj.get("name", ""),
-            "label": obj.get("label", "") or obj.get("name", ""),
-            "custom": bool(obj.get("custom")),
-        })
-        score = _score_site_visit_object(obj)
-        if score > best_score:
-            best, best_score = obj.get("name", ""), score
-
-    objects.sort(key=lambda o: (not o["custom"], o["label"].lower()))
-    return _resp(200, {"objects": objects, "suggested": best})
-
-
-def org_salesforce_list_fields(event):
-    """GET /workspaces/{workspace_id}/crm/salesforce/fields/{object_name} (JWT)
-    -> {object, number_fields, long_text_fields, suggested:{...}}."""
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    _user_id, wid, _membership = _require_workspace_member(
-        event, workspace_id=workspace_id)
-    object_name = (event.get("pathParameters") or {}).get("object_name", "")
-    object_name = _url_unquote(object_name).strip()
-    if not object_name or not re.match(r"^[A-Za-z0-9_]{1,80}$", object_name):
-        raise ApiError(400, "valid object_name required")
-
-    described = _sf_call_org(wid, lambda url, tok:
-                             _salesforce.describe_object(url, tok, object_name))
-    fields = described.get("fields") or []
-
-    number_fields, long_text_fields = [], []
-    best_number, best_number_score = None, 0
-    for f in fields:
-        ftype = f.get("type") or ""
-        public = _public_sf_field(f)
-        if f.get("filterable") and ftype in SF_IDENTIFIER_TYPES:
-            number_fields.append(public)
-            score = _score_number_field(f)
-            if score > best_number_score:
-                best_number, best_number_score = public["name"], score
-        if (f.get("updateable") and ftype in SF_LONG_TEXT_TYPES
-                and not f.get("calculated")):
-            long_text_fields.append(public)
-
-    number_fields.sort(key=lambda f: (not f["custom"], f["label"].lower()))
-    long_text_fields.sort(key=lambda f: (-f["length"], f["label"].lower()))
-
-    suggested = {"lookup_field": best_number}
-    taken = set()
-    for key, label, needs_long in CRM_DATA_TARGETS:
-        pool = [f for f in long_text_fields if f["name"] not in taken
-                and (not needs_long or f["length"] >= 255)]
-        pick, pick_score = None, 0
-        for f in pool:
-            score = _score_data_field(
-                next((x for x in fields if x.get("name") == f["name"]), {}), label)
-            if score > pick_score:
-                pick, pick_score = f["name"], score
-        if pick and pick_score >= 50:
-            suggested[key] = pick
-            taken.add(pick)
-        else:
-            suggested[key] = None
-
-    return _resp(200, {
-        "object": object_name,
-        "label": described.get("label") or object_name,
-        "number_fields": number_fields,
-        "long_text_fields": long_text_fields,
-        "suggested": suggested,
-        "transcript_min_length": SF_TRANSCRIPT_MIN_LENGTH,
-    })
-
-
-def org_salesforce_get_config(event):
-    """GET /workspaces/{workspace_id}/crm/salesforce/config (JWT)
-    -> {config:{enabled, mappings:[...]}}."""
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    _user_id, wid, _membership = _require_workspace_member(
-        event, workspace_id=workspace_id)
-    conn = _get_org_salesforce_connection(wid)
-    if not conn:
-        raise OrganisationSalesforceNotConnected()
-    return _resp(200, {"config": _public_crm_config(conn)})
-
-
-def org_salesforce_put_config(event):
-    """PUT /workspaces/{workspace_id}/crm/salesforce/config (JWT) -> {config}.
-
-    OWNER/MANAGER ONLY. Body shape and every validation rule are identical to
-    Personal's salesforce_put_config — see _validate_mapping. Saving ALSO
-    clears any pending config_cleared_reason from a prior org-change
-    reconnect (see org_salesforce_callback): once Owner/Manager has reviewed
-    and saved a mapping, the "your config was cleared" notice has served its
-    purpose and must not keep reappearing on every status check.
-    """
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    _user_id, wid, _membership = _require_workspace_capability(
-        event, workspace_schema.CAP_MANAGE_INTEGRATIONS, workspace_id=workspace_id)
-    conn = _get_org_salesforce_connection(wid)
-    if not conn:
-        raise OrganisationSalesforceNotConnected()
-
-    data = _body(event)
-    requested = data.get("mappings")
-    if requested is None:
-        raise ApiError(400, "mappings required (a list, possibly empty)")
-    if not isinstance(requested, list):
-        raise ApiError(400, "mappings must be a list")
-    if len(requested) > CRM_MAX_MAPPINGS:
-        raise ApiError(400, f"at most {CRM_MAX_MAPPINGS} mappings")
-    if any(not isinstance(m, dict) for m in requested):
-        raise ApiError(400, "each mapping must be an object")
-
-    mappings, objects_seen = [], set()
-    sf_call = lambda fn: _sf_call_org(wid, fn)  # noqa: E731
-    for raw in requested:
-        mapping = _validate_mapping(sf_call, raw)
-        if mapping["object"] in objects_seen:
-            raise ApiError(400, f"{mapping['object']} is mapped twice — one "
-                                f"lookup field per object")
-        objects_seen.add(mapping["object"])
-        mappings.append(mapping)
-
-    cfg = {"mappings": mappings, "updated_at": _now_iso()}
-    _org_crm_connections.update_item(
-        Key={"workspace_id": wid, "provider": CRM_PROVIDER_SALESFORCE},
-        UpdateExpression=("SET config = :c, updated_at = :now "
-                          "REMOVE config_cleared_reason, config_cleared_at"),
-        ConditionExpression="attribute_exists(workspace_id)",
-        ExpressionAttributeValues={":c": cfg, ":now": _now_iso()},
-    )
-    print(f"[org-salesforce] config saved for workspace={wid}: "
-          + (", ".join(f"{m['object']}.{m['lookup_field']}" for m in mappings)
-             or "no mappings"))
-    updated = _get_org_salesforce_connection(wid)
-    return _resp(200, {"config": _public_crm_config(updated)})
-
-
+# CRM SYNC JOBS — the durable, asynchronous job machinery (CrmSyncJobs table
+# + CrmSyncQueue SQS + crmSyncWorker + CrmSyncDLQ) that the Salesforce Site
+# flow runs on: meeting delivery, people sync, discovery and Task jobs (see
+# SITE_DELIVERY_OPERATIONS). One row per job; the worker re-reads it by
+# job_id, and _finish_crm_sync_job is the one place retry/backoff lives.
 # ===========================================================================
-# MEETING IDENTITY -> SALESFORCE (Phase 2D.3)
-#
-# THE CORE RULE (spec section 1): MinuteX must know WHO participated before
-# it pushes anything meaningful to Salesforce. The Organisation Salesforce
-# CONNECTION (2D.1) is only the technical credential that performs the API
-# call — it is never the business owner of a meeting, and it is never
-# substituted for actually resolving who spoke. This section is the identity
-# layer that sits between "a meeting has a transcript" and "Salesforce has a
-# Contact/User/Account to attach data to":
-#
-#   speaker (MeetingParticipants.identity_role, added above)
-#     INTERNAL -> MinuteX org member (user_id) -> Salesforce USER
-#                 (OrgSalesforceUserLinks, this section)
-#     EXTERNAL -> MinuteX organisation Contact (contact_id) -> Salesforce
-#                 CONTACT (+ ACCOUNT), stored on the Contacts row itself
-#                 (crm_provider/crm_external_id/crm_account_id, added above)
-#
-# ONE SOURCE OF TRUTH (spec section 21): every route below that needs "what
-# is this meeting's resolved CRM picture" calls _meeting_crm_identity_state,
-# and nothing computes that picture a second way. Nothing here ever
-# name-matches a speaker to a Salesforce record automatically — every
-# stored crm_external_id/sf_user_id is the record of an EXPLICIT confirmation
-# (a human picked one candidate from a search), never an inference.
-# ---------------------------------------------------------------------------
-
-def _require_org_meeting(event, *, hydrate=False):
-    """(user_id, key, item, workspace_id) for a meeting that belongs to an
-    ORGANISATION, or a clean error for every other case.
-
-    THE GATE every Phase 2D.3 route in this section opens with. Reuses
-    _owned_recording (the existing, exhaustively-tested write-capable
-    meeting gate — creator/device-owner, org-membership-checked-first) for
-    ownership/authorization, then adds exactly one more check on top: the
-    meeting must actually belong to an organisation. A Personal meeting
-    reaching one of these routes is a client bug, not a permission question,
-    so it is refused with 400 rather than silently resolved against nothing.
-
-    `hydrate` is forwarded to _owned_recording — pass True only for routes
-    that actually read transcript/summary text (the CRM review/push routes),
-    so every identity-only route stays a single DynamoDB read.
-    """
-    user_id, key, item = _owned_recording(event, hydrate=hydrate)
-    workspace_id = _row_workspace_id(item)
-    if not workspace_schema.is_organisation_workspace_id(workspace_id):
-        raise ApiError(400, "this meeting is not part of an organisation")
-    return user_id, key, item, workspace_id
-
-
-def _sf_search(sf_call, object_name: str, select: list, where: str,
-              limit=None) -> list:
-    """Generic SOQL search — reuses _soql_quote's escaping and the same
-    `sf_call` seam every other CRM function in this file takes.
-
-    `where` is a caller-built clause with values ALREADY passed through
-    _soql_quote — kept as one string rather than a structured filter because
-    every call site here has a genuinely different shape (an OR across
-    Email/Phone for a Contact search, a single LIKE for a User search), and
-    forcing them through one filter-builder would buy no real reuse.
-
-    `limit` defaults to CRM_AMBIGUOUS_LIMIT, resolved INSIDE the call rather
-    than as the parameter default: that constant is defined later in this
-    file (in the Personal CRM section), and a default evaluated at function-
-    definition time would raise NameError at import — the same reason
-    several other module-level defaults in this file are resolved lazily.
-    """
-    if limit is None:
-        limit = CRM_AMBIGUOUS_LIMIT
-    soql = f"SELECT {', '.join(select)} FROM {object_name} WHERE {where} LIMIT {limit}"
-    result = sf_call(lambda url, tok: _salesforce.query(url, tok, soql))
-    return [r for r in (result.get("records") or []) if isinstance(r, dict)]
-
-
-def _org_sf_call(workspace_id: str):
-    """The org's sf_call closure — the one place every route in this section
-    gets it, so a future change to how that closure is built (e.g. adding a
-    cache) needs no per-route change."""
-    return lambda fn: _sf_call_org(workspace_id, fn)
-
-
-def crm_search_salesforce_contacts(event):
-    """GET /workspaces/{workspace_id}/crm/salesforce/search/contacts?q=...
-    (JWT, any active member) -> {records:[{record_id, name, email, phone,
-    account_id, account_name}], truncated}
-
-    Used by the speaker-tagging screen to let a human pick the Salesforce
-    Contact an EXTERNAL speaker corresponds to. Matches on email OR phone OR
-    name — a broad, human-reviewed candidate list, never an auto-pick: the
-    caller always confirms via resolve_contact_crm_identity, which is the
-    only route that PERSISTS a match.
-    """
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    _user_id, wid, _membership = _require_workspace_member(
-        event, workspace_id=workspace_id)
-    q = str((event.get("queryStringParameters") or {}).get("q") or "").strip()
-    if not q:
-        raise ApiError(400, "q required")
-    if len(q) > CRM_IDENTIFIER_MAX:
-        raise ApiError(400, f"q must be at most {CRM_IDENTIFIER_MAX} characters")
-
-    sf_call = _org_sf_call(wid)
-    quoted = _soql_quote(q)
-    where = (f"Email = '{quoted}' OR Phone = '{quoted}' OR MobilePhone = '{quoted}' "
-            f"OR Name LIKE '%{quoted}%'")
-    records = _sf_search(
-        sf_call, "Contact",
-        ["Id", "Name", "Email", "Phone", "AccountId", "Account.Name"],
-        where, limit=CRM_AMBIGUOUS_LIMIT + 1)
-    truncated = len(records) > CRM_AMBIGUOUS_LIMIT
-    records = records[:CRM_AMBIGUOUS_LIMIT]
-    return _resp(200, {
-        "records": [{
-            "record_id": str(r.get("Id") or ""),
-            "name": str(r.get("Name") or ""),
-            "email": str(r.get("Email") or ""),
-            "phone": str(r.get("Phone") or ""),
-            "account_id": str(r.get("AccountId") or ""),
-            "account_name": str((r.get("Account") or {}).get("Name") or "")
-                            if isinstance(r.get("Account"), dict) else "",
-        } for r in records],
-        "truncated": truncated,
-    })
-
-
-def crm_search_salesforce_users(event):
-    """GET /workspaces/{workspace_id}/crm/salesforce/search/users?q=...
-    (JWT, any active member) -> {records:[{record_id, name, username, email}],
-    truncated}
-
-    For an INTERNAL speaker: the candidate list of Salesforce Users an org
-    member might correspond to. Deliberately does NOT assume
-    "MinuteX email == Salesforce username" (spec section 7) — it searches
-    Name/Username/Email independently and hands back candidates for a human
-    to confirm, exactly like the Contact search above.
-    """
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    _user_id, wid, _membership = _require_workspace_member(
-        event, workspace_id=workspace_id)
-    q = str((event.get("queryStringParameters") or {}).get("q") or "").strip()
-    if not q:
-        raise ApiError(400, "q required")
-    if len(q) > CRM_IDENTIFIER_MAX:
-        raise ApiError(400, f"q must be at most {CRM_IDENTIFIER_MAX} characters")
-
-    sf_call = _org_sf_call(wid)
-    quoted = _soql_quote(q)
-    where = (f"IsActive = true AND (Username = '{quoted}' OR Email = '{quoted}' "
-            f"OR Name LIKE '%{quoted}%')")
-    records = _sf_search(sf_call, "User", ["Id", "Name", "Username", "Email"],
-                        where, limit=CRM_AMBIGUOUS_LIMIT + 1)
-    truncated = len(records) > CRM_AMBIGUOUS_LIMIT
-    records = records[:CRM_AMBIGUOUS_LIMIT]
-    return _resp(200, {
-        "records": [{
-            "record_id": str(r.get("Id") or ""),
-            "name": str(r.get("Name") or ""),
-            "username": str(r.get("Username") or ""),
-            "email": str(r.get("Email") or ""),
-        } for r in records],
-        "truncated": truncated,
-    })
-
-
-def resolve_contact_crm_identity(event):
-    """PUT /contacts/{contact_id}/crm {record_id, account_id?} (JWT)
-    -> {contact}
-
-    Persists an EXPLICIT match: this organisation Contact IS this Salesforce
-    Contact (optionally with its Account). `record_id` must be one the
-    caller actually saw from crm_search_salesforce_contacts (or already knew)
-    — this route does not search or guess, it only stores what it is told,
-    which is what keeps "who confirmed this match" a real, auditable fact
-    (spec section 21: one source of truth, never re-derived differently
-    elsewhere).
-
-    AUTHORIZATION: the same _taggable_contact/_owned_contact rule every other
-    contact mutation uses — for a SHARED organisation contact that means
-    OWNER/MANAGER only (CAP_MANAGE_CONTACTS), consistent with "only
-    Owner/Manager can modify Organisation CRM configuration"-adjacent data;
-    an ordinary member tagging a speaker as external still triggers a
-    SEARCH+resolve only when the contact isn't already linked, and an Owner/
-    Manager is expected to have done that linking as part of Salesforce
-    setup — mirrors how only Owner/Manager may edit a shared contact at all.
-    """
-    contact_id = str((event.get("pathParameters") or {}).get("contact_id") or "").strip()
-    if not contact_id:
-        raise ApiError(400, "contact id required")
-    user_id = _require_auth(event)
-    contact = _owned_contact(user_id, contact_id, write=True)
-
-    data = _body(event)
-    record_id = str(data.get("record_id") or "").strip()
-    account_id = str(data.get("account_id") or "").strip()
-    if not record_id:
-        raise ApiError(400, "record_id required")
-    if len(record_id) > 40 or len(account_id) > 40:
-        # Salesforce Ids are 15 or 18 chars; 40 is a generous ceiling that
-        # rejects garbage without hardcoding Salesforce's own format rules.
-        raise ApiError(400, "invalid Salesforce record id")
-
-    now = _now_iso()
-    update = {
-        "crm_provider": CRM_PROVIDER_SALESFORCE,
-        "crm_object_type": "Contact",
-        "crm_external_id": record_id,
-        "crm_account_id": account_id,
-        "crm_resolved_at": now,
-        "crm_resolved_by": user_id,
-        "updated_at": now,
-    }
-    names = {f"#{k}": k for k in update}
-    _contacts.update_item(
-        Key={"contact_id": contact_id},
-        UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in update),
-        ExpressionAttributeNames=names,
-        ExpressionAttributeValues={f":{k}": v for k, v in update.items()},
-    )
-    print(f"[crm-identity] contact {contact_id} resolved to Salesforce "
-          f"Contact {record_id} by {user_id}")
-    updated = _contacts.get_item(Key={"contact_id": contact_id}).get("Item") or contact
-    return _resp(200, {"contact": _public_contact(
-        updated, member_roles=_roles_for_contact(updated))})
-
-
-def resolve_member_crm_identity(event):
-    """PUT /workspaces/{workspace_id}/crm/salesforce/members/{user_id}
-    {record_id} (JWT) -> {link}
-
-    Persists an EXPLICIT match: this organisation MEMBER IS this Salesforce
-    User. `record_id` comes from crm_search_salesforce_users — never
-    inferred from "MinuteX email == Salesforce username" (spec section 7).
-
-    RBAC: CAP_MANAGE_INTEGRATIONS (Owner/Manager) — this is organisation-wide
-    identity configuration (one member's Salesforce identity applies to
-    every meeting they are tagged Internal/SM on), not a per-meeting
-    action, so it sits at the same privilege level as connecting Salesforce
-    itself rather than at ordinary meeting-CRM-use level.
-    """
-    workspace_id = _url_unquote(
-        (event.get("pathParameters") or {}).get("workspace_id", ""))
-    target_user_id = str(
-        (event.get("pathParameters") or {}).get("user_id") or "").strip()
-    if not target_user_id:
-        raise ApiError(400, "user id required")
-    actor_id, wid, _membership = _require_workspace_capability(
-        event, workspace_schema.CAP_MANAGE_INTEGRATIONS, workspace_id=workspace_id)
-    # The target must themselves be an active member of THIS workspace — an
-    # Owner cannot pre-link a Salesforce User for someone outside the org.
-    if not _active_membership(wid, target_user_id):
-        raise ApiError(404, "member not found")
-
-    data = _body(event)
-    record_id = str(data.get("record_id") or "").strip()
-    if not record_id:
-        raise ApiError(400, "record_id required")
-    if len(record_id) > 40:
-        raise ApiError(400, "invalid Salesforce record id")
-
-    username = str(data.get("username") or "").strip()[:CONTACT_EMAIL_MAX]
-    now = _now_iso()
-    item = {
-        "workspace_id": wid,
-        "user_id": target_user_id,
-        "sf_user_id": record_id,
-        "sf_username": username,
-        "resolved_by": actor_id,
-        "resolved_at": now,
-        "updated_at": now,
-    }
-    _org_salesforce_user_links.put_item(Item=item)
-    print(f"[crm-identity] workspace={wid} member={target_user_id} resolved "
-          f"to Salesforce User {record_id} by {actor_id}")
-    return _resp(200, {"link": {
-        "user_id": target_user_id, "sf_user_id": record_id,
-        "sf_username": username, "resolved_at": now,
-    }})
-
-
-def _get_member_sf_user_link(workspace_id: str, user_id: str) -> dict:
-    """The stored Salesforce User link for one member, or {} if unresolved."""
-    return _org_salesforce_user_links.get_item(
-        Key={"workspace_id": workspace_id, "user_id": user_id}).get("Item") or {}
-
-
-# ---------------------------------------------------------------------------
-# CRM REVIEW — the ONE function that computes "is this meeting's identity
-# picture ready to push" (spec sections 9, 21). Every route that needs this
-# answer — the review screen AND the push gate — calls THIS, so the rule for
-# "what counts as resolved" is never re-derived two different ways.
-# ---------------------------------------------------------------------------
-SPEAKER_RESOLUTION_RESOLVED = "resolved"
-SPEAKER_RESOLUTION_UNRESOLVED = "unresolved"
-# A speaker tagged Internal/External but whose linked contact/member has no
-# CONFIRMED Salesforce identity yet — distinct from UNRESOLVED (no identity_
-# role/contact at all): this one has a next step ("resolve their Salesforce
-# match"), that one has an earlier one ("tag this speaker first").
-SPEAKER_RESOLUTION_NOT_LINKED = "not_linked"
-
-
-def _speaker_crm_state(row: dict, workspace_id: str) -> dict:
-    """One MeetingParticipants row -> its CRM identity picture.
-
-    Deliberately reads ONLY what set_participant/resolve_contact_crm_identity/
-    resolve_member_crm_identity already persisted — never a live Salesforce
-    call, so opening the review screen is cheap and never itself fails on a
-    dead Salesforce connection (the push step is where a live call happens
-    and where that failure belongs).
-    """
-    speaker_id = row.get("speaker_id", "")
-    identity_role = str(row.get("identity_role") or "")
-    contact_id = str(row.get("contact_id") or "")
-    base = {"speaker_id": speaker_id, "identity_role": identity_role,
-           "contact_id": contact_id}
-
-    if not identity_role:
-        return {**base, "status": SPEAKER_RESOLUTION_UNRESOLVED,
-               "reason": "not tagged Internal or External yet"}
-
-    if identity_role == SPEAKER_IDENTITY_INTERNAL:
-        contact = _contacts.get_item(Key={"contact_id": contact_id}).get("Item") \
-            if contact_id else None
-        member_user_id = str((contact or {}).get("minutex_user_id") or "")
-        if not member_user_id:
-            return {**base, "status": SPEAKER_RESOLUTION_UNRESOLVED,
-                   "reason": "tagged Internal but not linked to an organisation member"}
-        link = _get_member_sf_user_link(workspace_id, member_user_id)
-        if not link.get("sf_user_id"):
-            return {**base, "status": SPEAKER_RESOLUTION_NOT_LINKED,
-                   "minutex_user_id": member_user_id,
-                   "reason": "no Salesforce User confirmed for this member yet"}
-        return {**base, "status": SPEAKER_RESOLUTION_RESOLVED,
-               "minutex_user_id": member_user_id,
-               "sf_user_id": link["sf_user_id"],
-               "sf_username": link.get("sf_username", "")}
-
-    # EXTERNAL.
-    if not contact_id:
-        return {**base, "status": SPEAKER_RESOLUTION_UNRESOLVED,
-               "reason": "tagged External but not linked to a contact yet"}
-    contact = _contacts.get_item(Key={"contact_id": contact_id}).get("Item")
-    if not contact:
-        return {**base, "status": SPEAKER_RESOLUTION_UNRESOLVED,
-               "reason": "linked contact no longer exists"}
-    sf_contact_id = str(contact.get("crm_external_id") or "")
-    if not sf_contact_id:
-        return {**base, "status": SPEAKER_RESOLUTION_NOT_LINKED,
-               "reason": "no Salesforce Contact confirmed for this person yet"}
-    return {**base, "status": SPEAKER_RESOLUTION_RESOLVED,
-           "sf_contact_id": sf_contact_id,
-           "sf_account_id": str(contact.get("crm_account_id") or ""),
-           "contact_name": str(contact.get("name") or "")}
-
-
-def _meeting_crm_identity_state(key: str, item: dict, workspace_id: str) -> dict:
-    """The full CRM identity picture for one meeting — the single function
-    behind BOTH get_meeting_crm_review and the push gate in
-    push_org_meeting_crm, so those two can never disagree about what
-    "ready to push" means.
-
-    Speakers with NO identity_role at all (the ordinary case for a meeting
-    nobody intends to push — most attendees of most meetings) are reported
-    but never block anything by themselves; only a mapping's ACTUAL required
-    fields (see the caller) decide what must be resolved before a push.
-    """
-    rows = _participant_rows(key)
-    speakers = [_speaker_crm_state(r, workspace_id) for r in rows
-               if not _is_self_speaker(r.get("speaker_id", ""))]
-    internal = [s for s in speakers if s["identity_role"] == SPEAKER_IDENTITY_INTERNAL]
-    external = [s for s in speakers if s["identity_role"] == SPEAKER_IDENTITY_EXTERNAL]
-    unresolved = [s for s in speakers
-                 if s["status"] != SPEAKER_RESOLUTION_RESOLVED and s["identity_role"]]
-    return {
-        "speakers": speakers,
-        "internal": internal,
-        "external": external,
-        # Only CLASSIFIED-but-unresolved speakers are surfaced as blocking —
-        # an untagged speaker (identity_role == "") is not "unresolved", it is
-        # simply not part of this meeting's CRM picture at all, per spec
-        # section 4's ordinary resting state.
-        "unresolved": unresolved,
-        "owner": next((s for s in internal
-                      if s["status"] == SPEAKER_RESOLUTION_RESOLVED), None),
-        "primary_client": next((s for s in external
-                                if s["status"] == SPEAKER_RESOLUTION_RESOLVED), None),
-    }
-
-
-def get_meeting_crm_review(event):
-    """GET /recordings/ai/crm-review/{key+} (JWT, organisation meetings only)
-    -> {meeting, identity, content, ready, blocking_reasons}
-
-    Assembles the CRM Review screen's whole payload in one call: the
-    resolved SM/Internal owner, the resolved external Contact(s)/Account,
-    every unresolved speaker, and whether the meeting's CONTENT (summary,
-    action items) is present. Never itself pushes anything — see
-    push_org_meeting_crm for the mutating half.
-
-    `ready` is computed against the mapping actually configured for this
-    workspace (spec section 9: "based on which data is required by the
-    configured Salesforce mapping") — a workspace with no content-field
-    mapping at all is never blocked on identity resolution it does not need
-    to push anything meaningful.
-    """
-    user_id, key, item, workspace_id = _require_org_meeting(event, hydrate=True)
-    identity = _meeting_crm_identity_state(key, item, workspace_id)
-
-    conn = _get_org_salesforce_connection(workspace_id)
-    mappings = _mappings_from_config((conn or {}).get("config") or {}) if conn else []
-
-    summary_text = str(item.get("summary") or "")
-    highlights_text = _render_highlights(item)
-    action_items_text = _render_action_items(item)
-    action_item_count = len(list((item.get("tasks") or {}).values())) \
-        if isinstance(item.get("tasks"), dict) else len(item.get("ai_tasks") or [])
-
-    blocking_reasons = []
-    if not conn:
-        blocking_reasons.append("organisation_salesforce_not_connected")
-    elif not mappings:
-        blocking_reasons.append("no_salesforce_mapping_configured")
-    if identity["unresolved"]:
-        blocking_reasons.append("unresolved_speaker_identity")
-
-    return _resp(200, {
-        "meeting": {"title": item.get("title", ""), "audio_s3_key": key},
-        "identity": identity,
-        "content": {
-            "summary_ready": bool(summary_text.strip()),
-            "highlights_ready": bool(highlights_text.strip()),
-            "action_items_ready": action_item_count > 0,
-            "action_item_count": action_item_count,
-        },
-        "mappings": [_public_mapping(m) for m in mappings],
-        "ready": not blocking_reasons,
-        "blocking_reasons": blocking_reasons,
-    })
-
-
-# ---------------------------------------------------------------------------
-# CRM configuration — the user maps THEIR org's schema, for ANY object.
-#
-# No object or field name is hardcoded anywhere in this codebase, and none
-# should be: every Salesforce org names things differently, and a customer maps
-# whichever objects they actually use — Site Visit, Lead, Contact, Opportunity,
-# a custom object, several at once. The app reads the org's REAL schema through
-# the Describe API and the user picks from it, which also makes an invalid
-# configuration unrepresentable: you cannot select a field that isn't there.
-#
-# The config is a LIST of mappings, each one "this object, identified by this
-# field":
-#
-#   {"enabled": true,
-#    "mappings": [{"object": "Lead", "lookup_field": "Email",
-#                  "label": "Lead Email", ...}, ...]}
-#
-# Every consumer — the API response, the app's inputs, extraction, lookup,
-# push — iterates that list. Adding support for a new object is therefore a
-# configuration change by the customer, never a code change here: there is no
-# `if object == ...` anywhere, and an empty list legitimately means "connected,
-# but show no record fields".
-#
-#   GET  /crm/salesforce/objects        -> the org's objects + a suggestion
-#   GET  /crm/salesforce/fields/{obj}   -> that object's fields, bucketed by
-#                                          what each one is usable FOR
-#   GET  /crm/salesforce/config         -> {enabled, mappings:[...]}
-#   PUT  /crm/salesforce/config         -> validate against Describe, save
-#
-# The suggestion heuristics only PRE-SELECT; the user always confirms.
-# ---------------------------------------------------------------------------
-
-# Field types that can hold a long block of prose (transcript, summary...).
-# A 40-char Text field would silently truncate a 50KB transcript, so those
-# are not offered as targets for the big fields at all.
-SF_LONG_TEXT_TYPES = frozenset({"textarea", "richtextarea"})
-# Minimum length before a textarea is worth offering for a transcript.
-SF_TRANSCRIPT_MIN_LENGTH = 32_768
-# Types that can identify a record by number/name.
-SF_IDENTIFIER_TYPES = frozenset({"string", "double", "int", "currency",
-                                 "percent", "reference", "id", "textarea",
-                                 "phone", "url", "email"})
-
-# The four optional data targets, in the order the UI shows them. `long`
-# marks the ones that need a genuinely large field.
-CRM_DATA_TARGETS = (
-    ("transcript_field", "Transcript", True),
-    ("summary_field", "Summary", True),
-    ("highlights_field", "Highlights", True),
-    ("action_items_field", "Action Items", True),
-)
-CRM_DATA_TARGET_KEYS = tuple(k for k, _, _ in CRM_DATA_TARGETS)
-
-# How many objects one user may map. A ceiling, not a design limit: each
-# mapping costs a describe call to validate and an extraction call per
-# meeting, so an unbounded list would quietly become expensive.
-CRM_MAX_MAPPINGS = int(os.environ.get("CRM_MAX_MAPPINGS", "10"))
-
-# LEGACY key. The first cut of this feature stored ONE object plus a
-# "site_visit_number_field", because Site Visit was the only object the MVP
-# planned for. That was wrong: a customer maps whatever object they use (Lead,
-# Opportunity, a custom object), so the config is now a LIST of mappings and
-# nothing in this file special-cases site visits. Old rows are read through
-# _mappings_from_config below and rewritten to the new shape on the next save,
-# so existing configurations keep working without a migration.
-LEGACY_SITE_VISIT_KEY = "site_visit_number_field"
-
-# ---------------------------------------------------------------------------
-# Sync status — one vocabulary for every mapping, per meeting.
-#
-# Deliberately object-neutral: the same states describe a site visit, a lead or
-# a custom object. They are also the ONLY thing the UI branches on, so a new
-# Salesforce object needs no new status and no new UI condition.
-#
-#   not_linked      no identifier yet (the common resting state)
-#   lookup_pending  an identifier exists but hasn't been resolved
-#   record_found    resolved to exactly one record, awaiting confirmation
-#   ambiguous       the identifier matched several records; the user must pick
-#   confirmed       the user approved this record for syncing
-#   syncing         a push is in flight
-#   synced          the configured fields were written to Salesforce
-#   failed          the last lookup or push failed; retryable
-#
-# CONFIRMATION IS LOAD-BEARING: nothing transitions record_found -> syncing
-# without an explicit user action, because pushing notes onto the wrong record
-# is worse than not pushing at all.
-# ---------------------------------------------------------------------------
-CRM_STATUS_NOT_LINKED = "not_linked"
-CRM_STATUS_LOOKUP_PENDING = "lookup_pending"
-CRM_STATUS_RECORD_FOUND = "record_found"
-CRM_STATUS_AMBIGUOUS = "ambiguous"
-CRM_STATUS_CONFIRMED = "confirmed"
-CRM_STATUS_SYNCING = "syncing"
-CRM_STATUS_SYNCED = "synced"
-CRM_STATUS_FAILED = "failed"
-CRM_STATUSES = (CRM_STATUS_NOT_LINKED, CRM_STATUS_LOOKUP_PENDING,
-                CRM_STATUS_RECORD_FOUND, CRM_STATUS_AMBIGUOUS,
-                CRM_STATUS_CONFIRMED, CRM_STATUS_SYNCING,
-                CRM_STATUS_SYNCED, CRM_STATUS_FAILED)
-
-# Statuses from which a push may start. Anything else means either "nothing to
-# push" or "the user hasn't approved this record yet".
-CRM_PUSHABLE_STATUSES = frozenset({CRM_STATUS_CONFIRMED, CRM_STATUS_SYNCED,
-                                   CRM_STATUS_FAILED})
-
-# The four optional content targets, as the API exposes them (nested) vs. how
-# they are stored on a mapping (flat `<name>_field`). Nested is what the client
-# reads; flat is what the existing config validation already writes, so both
-# shapes stay in sync without a migration.
-CRM_CONTENT_TARGET_NAMES = ("transcript", "summary", "highlights", "action_items")
-
-# "Nothing matched" is a LOOKUP OUTCOME, not a stored status: a meeting whose
-# identifier resolves to nothing stays lookup_pending (the user fixes the
-# identifier), so this sentinel never reaches DynamoDB or the status enum.
-CRM_LOOKUP_NOT_FOUND = "not_found"
-
-# How many ambiguous candidates to offer. A non-unique identifier is a data
-# problem in the org; showing a handful is enough for the user to recognize the
-# right record, and an unbounded list would be unusable anyway.
-CRM_AMBIGUOUS_LIMIT = int(os.environ.get("CRM_AMBIGUOUS_LIMIT", "10"))
-
-
-def _sf_object_is_selectable(obj: dict) -> bool:
-    """Objects worth showing in the picker.
-
-    A global describe returns ~1000 entries in a real org, most of which are
-    Salesforce internals (share rows, history tables, feed items) that nobody
-    would ever push meeting notes to. Requiring updateable+queryable and
-    dropping the machine-generated suffixes keeps the list navigable.
-    """
-    name = obj.get("name") or ""
-    if not obj.get("updateable") or not obj.get("queryable"):
-        return False
-    if obj.get("deprecatedAndHidden") or obj.get("customSetting"):
-        return False
-    return not name.endswith(("Share", "History", "Feed", "ChangeEvent", "Tag"))
-
-
-def _score_site_visit_object(obj: dict) -> int:
-    """How likely this object is the org's "site visit" record. 0 = not."""
-    haystack = f"{obj.get('label', '')} {obj.get('name', '')}".lower()
-    compact = re.sub(r"[^a-z]", "", haystack)
-    if "sitevisit" in compact:
-        return 100
-    if "site" in haystack and "visit" in haystack:
-        return 90
-    if "visit" in haystack:
-        return 50
-    if "inspection" in haystack or "sitesurvey" in compact:
-        return 30
-    return 0
-
-
-def _score_number_field(field: dict) -> int:
-    """How likely this field holds the human-facing site visit number.
-
-    Scored off the API NAME first, then the label. Orgs routinely leave the
-    standard `Name` field labelled "Site Visit Number" while ALSO having a
-    real `Site_Visit_Number__c` — scoring the label alone makes those tie, and
-    the purpose-built custom field is the better guess: someone created it
-    deliberately for exactly this.
-    """
-    name = (field.get("name") or "")
-    label = (field.get("label") or "")
-    name_compact = re.sub(r"[^a-z]", "", name.lower())
-    label_compact = re.sub(r"[^a-z]", "", label.lower())
-    score = 0
-    if "sitevisitnumber" in name_compact:
-        score = 100
-    elif "visitnumber" in name_compact:
-        score = 92
-    elif "sitevisitnumber" in label_compact:
-        score = 85
-    elif "visitnumber" in label_compact:
-        score = 80
-    elif field.get("nameField"):
-        # The org's own Name field is the usual human identifier, and on an
-        # auto-number object it IS the visit number.
-        score = 70
-    elif "number" in name_compact or "reference" in name_compact:
-        score = 60
-    elif "number" in label_compact or "reference" in label_compact:
-        score = 55
-    if field.get("autoNumber"):
-        score += 6
-    if field.get("unique"):
-        score += 6
-    return score
-
-
-def _score_data_field(field: dict, label: str) -> int:
-    """How likely this long-text field is meant for `label`'s content."""
-    haystack = f"{field.get('label', '')} {field.get('name', '')}".lower()
-    want = label.lower().split()
-    score = 0
-    if all(w in haystack for w in want):
-        score = 80
-    elif want[0] in haystack:
-        score = 50
-    # Prefer a roomier field when names tie — a transcript needs the space.
-    return score + min(int(field.get("length") or 0) // 32_768, 5)
-
-
-def _public_sf_field(field: dict) -> dict:
-    return {
-        "name": field.get("name", ""),
-        "label": field.get("label", "") or field.get("name", ""),
-        "type": field.get("type", ""),
-        "length": int(field.get("length") or 0),
-        "custom": bool(field.get("custom")),
-    }
-
-
-def salesforce_list_objects(event):
-    """GET /crm/salesforce/objects (JWT) -> {objects:[...], suggested}.
-
-    `suggested` is the best guess at the org's site-visit object so the app can
-    pre-select it. null when nothing scored — the user then picks manually.
-    """
-    user_id = _require_auth(event)
-    raw = _sf_call(user_id, lambda url, tok: _salesforce.list_objects(url, tok))
-
-    objects, best, best_score = [], None, 0
-    for obj in raw:
-        if not _sf_object_is_selectable(obj):
-            continue
-        objects.append({
-            "name": obj.get("name", ""),
-            "label": obj.get("label", "") or obj.get("name", ""),
-            "custom": bool(obj.get("custom")),
-        })
-        score = _score_site_visit_object(obj)
-        if score > best_score:
-            best, best_score = obj.get("name", ""), score
-
-    objects.sort(key=lambda o: (not o["custom"], o["label"].lower()))
-    print(f"[salesforce] objects: {len(objects)} selectable, suggested={best!r}")
-    return _resp(200, {"objects": objects, "suggested": best})
-
-
-def salesforce_list_fields(event):
-    """GET /crm/salesforce/fields/{object_name} (JWT).
-
-    -> {object, number_fields, long_text_fields, suggested:{...}}
-
-    Two buckets because the two kinds of target have genuinely different
-    requirements: the number field must be readable/filterable to look a
-    record UP, while the content fields must be big enough to hold a
-    transcript without truncating it.
-    """
-    user_id = _require_auth(event)
-    object_name = (event.get("pathParameters") or {}).get("object_name", "")
-    object_name = _url_unquote(object_name).strip()
-    if not object_name or not re.match(r"^[A-Za-z0-9_]{1,80}$", object_name):
-        raise ApiError(400, "valid object_name required")
-
-    described = _sf_call(user_id, lambda url, tok:
-                         _salesforce.describe_object(url, tok, object_name))
-    fields = described.get("fields") or []
-
-    number_fields, long_text_fields = [], []
-    best_number, best_number_score = None, 0
-    for f in fields:
-        ftype = f.get("type") or ""
-        public = _public_sf_field(f)
-
-        # Lookup key: must be filterable (we SOQL on it) — a field we cannot
-        # filter cannot find a record, no matter how well-named it is.
-        if f.get("filterable") and ftype in SF_IDENTIFIER_TYPES:
-            number_fields.append(public)
-            score = _score_number_field(f)
-            if score > best_number_score:
-                best_number, best_number_score = public["name"], score
-
-        # Content target: must be writable AND long. Formula/auto-number
-        # fields are read-only, so a push to them always fails.
-        if (f.get("updateable") and ftype in SF_LONG_TEXT_TYPES
-                and not f.get("calculated")):
-            long_text_fields.append(public)
-
-    number_fields.sort(key=lambda f: (not f["custom"], f["label"].lower()))
-    long_text_fields.sort(key=lambda f: (-f["length"], f["label"].lower()))
-
-    # Suggest a content target per data field, never reusing one field twice:
-    # writing the transcript and the summary to the same field would mean one
-    # silently overwrites the other.
-    # `lookup_field` is the generic key. The old `site_visit_number_field` is
-    # echoed alongside it so an app build from before this change keeps
-    # pre-selecting correctly (see the compatibility note on the config).
-    suggested = {"lookup_field": best_number,
-                 LEGACY_SITE_VISIT_KEY: best_number}
-    taken = set()
-    for key, label, needs_long in CRM_DATA_TARGETS:
-        pool = [f for f in long_text_fields if f["name"] not in taken
-                and (not needs_long or f["length"] >= 255)]
-        pick, pick_score = None, 0
-        for f in pool:
-            score = _score_data_field(
-                next((x for x in fields if x.get("name") == f["name"]), {}), label)
-            if score > pick_score:
-                pick, pick_score = f["name"], score
-        # Only suggest on a real name match. Guessing "the biggest empty text
-        # field" would put a transcript somewhere arbitrary in the user's CRM.
-        if pick and pick_score >= 50:
-            suggested[key] = pick
-            taken.add(pick)
-        else:
-            suggested[key] = None
-
-    return _resp(200, {
-        "object": object_name,
-        "label": described.get("label") or object_name,
-        "number_fields": number_fields,
-        "long_text_fields": long_text_fields,
-        "suggested": suggested,
-        "transcript_min_length": SF_TRANSCRIPT_MIN_LENGTH,
-    })
-
-
-def _mappings_from_config(cfg: dict) -> list:
-    """The stored config -> a list of mappings, in the generic shape.
-
-    THE compatibility seam. A config written by the first version of this
-    feature is a single object with a `site_visit_number_field`; a config
-    written now is `{"mappings": [...]}`. Everything downstream — the API
-    response, the UI, extraction, lookup, push — reads mappings through here
-    and therefore never needs to know which shape it came from, nor that
-    "site visit" was ever special.
-    """
-    if not isinstance(cfg, dict):
-        return []
-    stored = cfg.get("mappings")
-    if isinstance(stored, list):
-        return [m for m in stored if isinstance(m, dict) and m.get("object")
-                and m.get("lookup_field")]
-    # Legacy single-object shape.
-    obj = cfg.get("object")
-    lookup = cfg.get(LEGACY_SITE_VISIT_KEY)
-    if not obj or not lookup:
-        return []
-    legacy = {
-        "object": obj,
-        "object_label": cfg.get("object_label") or obj,
-        "lookup_field": lookup,
-        # The old shape carried no label for the lookup field. "<Object> Number"
-        # is what the old UI hardcoded, so an upgraded user sees the same words
-        # they saw before.
-        "label": f"{cfg.get('object_label') or obj} Number",
-    }
-    for key in CRM_DATA_TARGET_KEYS:
-        legacy[key] = cfg.get(key) or ""
-    return [legacy]
-
-
-def _public_mapping(m: dict) -> dict:
-    out = {
-        "object": m.get("object") or "",
-        "object_label": m.get("object_label") or m.get("object") or "",
-        "lookup_field": m.get("lookup_field") or "",
-        "lookup_field_label": m.get("lookup_field_label") or "",
-        "lookup_field_type": m.get("lookup_field_type") or "",
-        "label": m.get("label") or "",
-    }
-    for key in CRM_DATA_TARGET_KEYS:
-        out[key] = m.get(key) or None
-    # Also nested, which is the shape the push builds from and the clearer one
-    # to read. Same values as the flat keys above — one source, two views.
-    out["content_targets"] = _content_targets(m)
-    return out
-
-
-def _content_targets(mapping: dict) -> dict:
-    """{"transcript": "Field__c", ...} for the targets this mapping configured.
-
-    ONLY configured targets appear: an unmapped target is absent rather than
-    null, so the push can build its payload by iterating this dict without
-    having to filter empties (and can never send an unconfigured field).
-    """
-    out = {}
-    for name in CRM_CONTENT_TARGET_NAMES:
-        field = (mapping or {}).get(f"{name}_field")
-        if field:
-            out[name] = field
-    return out
-
-
-def _empty_crm_record(mapping: dict) -> dict:
-    """The resting state for a mapping with no identifier yet."""
-    return {
-        "object": mapping.get("object") or "",
-        "label": mapping.get("object_label") or mapping.get("object") or "",
-        "lookup_field": mapping.get("lookup_field") or "",
-        "lookup_value": "",
-        "record_id": "",
-        "status": CRM_STATUS_NOT_LINKED,
-        "source": "",
-    }
-
-
-def _public_crm_record(stored: dict, mapping: dict) -> dict:
-    """One stored crm_records entry -> the client-facing view.
-
-    Normalizes shape drift so the UI only ever sees the current contract:
-      * `lookup_value` is the identifier; the extractor's older `value` key is
-        still read, so a meeting written before this change still displays.
-      * `status` is derived when absent — an entry with a record_id but no
-        status predates status tracking and is at least record_found.
-      * mapping-derived labels are refreshed on read, so renaming an object in
-        Salesforce updates every meeting without a data migration.
-    """
-    stored = stored if isinstance(stored, dict) else {}
-    value = str(stored.get("lookup_value") or stored.get("value") or "")
-    record_id = str(stored.get("record_id") or "")
-    status = str(stored.get("status") or "")
-    if status not in CRM_STATUSES:
-        # Derive from what IS known rather than guessing a terminal state.
-        status = (CRM_STATUS_RECORD_FOUND if record_id
-                  else CRM_STATUS_LOOKUP_PENDING if value
-                  else CRM_STATUS_NOT_LINKED)
-    return {
-        "object": stored.get("object") or mapping.get("object") or "",
-        "label": mapping.get("object_label") or stored.get("label") or "",
-        "lookup_field": (stored.get("lookup_field")
-                         or mapping.get("lookup_field") or ""),
-        "lookup_value": value,
-        "record_id": record_id,
-        "record_label": str(stored.get("record_label") or ""),
-        "status": status,
-        "source": str(stored.get("source") or ""),
-        # Extraction provenance — absent for manual entry. The UI shows the
-        # evidence quote so a wrong AI extraction is catchable before a push.
-        "confidence": str(stored.get("confidence") or ""),
-        "evidence": str(stored.get("evidence") or ""),
-        # What the model extracted before spoken digits were normalized ("SV one
-        # zero zero four" behind the "SV1004" we looked up). Surfaced so the
-        # evidence quote and the identifier shown can be reconciled by eye when
-        # a lookup misses; empty when normalization changed nothing.
-        "lookup_value_raw": (raw_value if (raw_value := str(
-            stored.get("value_raw") or "")) != value else ""),
-        "candidates": [c for c in (stored.get("candidates") or [])
-                       if isinstance(c, dict)],
-        "error": str(stored.get("error") or ""),
-        "synced_at": str(stored.get("synced_at") or ""),
-        "updated_at": str(stored.get("updated_at") or ""),
-    }
-
-
-def _public_crm_config(conn: dict) -> dict:
-    """The client-facing configuration.
-
-    `enabled` + `mappings` is the whole contract the UI renders from: it shows
-    one input per mapping and nothing at all when the list is empty. No object
-    name appears in the app's code as a result.
-    """
-    cfg = (conn or {}).get("config") or {}
-    mappings = _mappings_from_config(cfg)
-    return {
-        "enabled": bool(conn),
-        "mappings": [_public_mapping(m) for m in mappings],
-        "configured": bool(mappings),
-        "updated_at": cfg.get("updated_at") or None,
-    }
-
-
-def salesforce_get_config(event):
-    """GET /crm/salesforce/config (JWT) -> {config:{enabled, mappings:[...]}}."""
-    user_id = _require_auth(event)
-    conn = _get_salesforce_connection(user_id)
-    if not conn:
-        raise ApiError(400, "Salesforce is not connected")
-    return _resp(200, {"config": _public_crm_config(conn)})
-
-
-def _validate_mapping(sf_call, raw: dict) -> dict:
-    """One requested mapping -> the validated, storable mapping.
-
-    Every name is re-checked against a live Describe. The app only ever sends
-    names it got FROM Describe, so this is not about distrusting the client —
-    it is about the org changing underneath a config that was valid when it
-    was saved (a field deleted, a permission revoked). Failing here with a
-    clear message beats failing later mid-push.
-
-    `sf_call` is a _sf_call/_sf_call_org-SHAPED function — `fn -> fn(url, tok)`
-    against whichever Salesforce connection (Personal or one workspace's) owns
-    this configuration. Taking the caller rather than a user_id is what lets
-    Organisation config (Phase 2D.2) reuse this without a second copy of every
-    validation rule below; only the ONE line that resolves credentials differs
-    between scopes, and it lives entirely in the caller-supplied function.
-    """
-    object_name = str(raw.get("object") or "").strip()
-    lookup_field = str(raw.get("lookup_field") or "").strip()
-    if not object_name:
-        raise ApiError(400, "each mapping needs an object")
-    if not lookup_field:
-        raise ApiError(400, f"{object_name}: lookup_field required")
-
-    described = sf_call(lambda url, tok:
-                        _salesforce.describe_object(url, tok, object_name))
-    by_name = {f.get("name"): f for f in (described.get("fields") or [])}
-    object_label = described.get("label") or object_name
-
-    lookup = by_name.get(lookup_field)
-    if not lookup:
-        raise ApiError(400, f"{lookup_field} does not exist on {object_name}")
-    if not lookup.get("filterable"):
-        raise ApiError(400, f"{lookup_field} cannot be searched on — pick a "
-                            f"filterable field")
-
-    # The label the UI puts on the input. Defaults to the org's own words for
-    # the field, so "Email" on Lead reads "Lead Email" without anything in our
-    # code knowing what a Lead is.
-    lookup_label = lookup.get("label") or lookup_field
-    label = str(raw.get("label") or "").strip() or f"{object_label} {lookup_label}"
-
-    mapping = {
-        "object": object_name,
-        "object_label": object_label,
-        "lookup_field": lookup_field,
-        "lookup_field_label": lookup_label,
-        "label": label[:100],
-    }
-
-    # The four content targets are OPTIONAL: whatever is left unmapped simply
-    # isn't pushed. A user whose org has nowhere to put Highlights should
-    # still be able to sync a transcript.
-    seen = {}
-    for key, target_label, _needs_long in CRM_DATA_TARGETS:
-        name = str(raw.get(key) or "").strip()
-        if not name:
-            mapping[key] = ""
-            continue
-        f = by_name.get(name)
-        if not f:
-            raise ApiError(400, f"{name} does not exist on {object_name}")
-        if not f.get("updateable") or f.get("calculated"):
-            raise ApiError(400, f"{object_label} {target_label}: {name} is "
-                                f"read-only in Salesforce")
-        if (f.get("type") or "") not in SF_LONG_TEXT_TYPES:
-            raise ApiError(400, f"{object_label} {target_label}: {name} is not "
-                                f"a long text field — it would truncate the content")
-        if name in seen:
-            raise ApiError(400, f"{name} is already used for {seen[name]} — pick "
-                                f"a different field for {target_label}")
-        seen[name] = target_label
-        mapping[key] = name
-    return mapping
-
-
-def salesforce_put_config(event):
-    """PUT /crm/salesforce/config (JWT) -> {config}.
-
-    Body is the generic shape:
-        {"mappings": [{"object", "lookup_field", "label"?, <data targets>?}, ...]}
-
-    An empty list is a legitimate configuration meaning "connected, but don't
-    show me any record fields" — that is exactly what the UI renders nothing
-    for, so it must be storable rather than rejected.
-
-    The legacy single-object body ({"object", "site_visit_number_field"}) is
-    still accepted and normalized into one mapping, so an older app build
-    keeps working against this endpoint without a rebuild.
-    """
-    user_id = _require_auth(event)
-    conn = _get_salesforce_connection(user_id)
-    if not conn:
-        raise ApiError(400, "Salesforce is not connected")
-
-    data = _body(event)
-    requested = data.get("mappings")
-    if requested is None:
-        # Legacy body shape — one object at the top level.
-        if data.get("object"):
-            legacy = dict(data)
-            legacy["lookup_field"] = (data.get("lookup_field")
-                                      or data.get(LEGACY_SITE_VISIT_KEY) or "")
-            requested = [legacy]
-        else:
-            raise ApiError(400, "mappings required (a list, possibly empty)")
-    if not isinstance(requested, list):
-        raise ApiError(400, "mappings must be a list")
-    if len(requested) > CRM_MAX_MAPPINGS:
-        raise ApiError(400, f"at most {CRM_MAX_MAPPINGS} mappings")
-    if any(not isinstance(m, dict) for m in requested):
-        raise ApiError(400, "each mapping must be an object")
-
-    mappings, objects_seen = [], set()
-    sf_call = lambda fn: _sf_call(user_id, fn)  # noqa: E731
-    for raw in requested:
-        mapping = _validate_mapping(sf_call, raw)
-        # One mapping per object: two lookup fields for the same object would
-        # make "which record is this meeting about" ambiguous.
-        if mapping["object"] in objects_seen:
-            raise ApiError(400, f"{mapping['object']} is mapped twice — one "
-                                f"lookup field per object")
-        objects_seen.add(mapping["object"])
-        mappings.append(mapping)
-
-    cfg = {"mappings": mappings, "updated_at": _now_iso()}
-    _crm_connections.update_item(
-        Key={"user_id": user_id, "provider": CRM_PROVIDER_SALESFORCE},
-        UpdateExpression="SET config = :c, updated_at = :now",
-        ConditionExpression="attribute_exists(user_id)",
-        ExpressionAttributeValues={":c": cfg, ":now": _now_iso()},
-    )
-    print(f"[salesforce] config saved for {user_id}: "
-          + (", ".join(f"{m['object']}.{m['lookup_field']}" for m in mappings)
-             or "no mappings"))
-    updated = _get_salesforce_connection(user_id)
-    return _resp(200, {"config": _public_crm_config(updated)})
-
-
-# ---------------------------------------------------------------------------
-# CRM record lookup — identifier -> Salesforce record Id.
-#
-# Generic by construction: the object and the field to match on both come from
-# the user's saved mapping, so this one route resolves a Site Visit number, a
-# Lead email or an Opportunity number without knowing which is which.
-# ---------------------------------------------------------------------------
-def _soql_quote(value: str) -> str:
-    """Escape a string for a SOQL string literal.
-
-    The identifier is user-supplied, so it cannot be interpolated raw: a value
-    containing a quote would otherwise change the query's meaning. Salesforce
-    uses backslash escaping inside single-quoted literals.
-    """
-    return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-def _find_mapping(cfg: dict, object_name: str) -> dict:
-    for m in _mappings_from_config(cfg):
-        if m.get("object") == object_name:
-            return m
-    raise ApiError(400, f"{object_name} is not configured — set it up in "
-                        f"Salesforce mapping first")
-
-
-def _crm_scope_for_meeting(item: dict):
-    """The (sf_call, crm_config) pair a meeting's OWN workspace dictates.
-
-    THE ONE PLACE that decides "does this meeting's CRM activity run against
-    Personal Salesforce or an Organisation's?" — every function that talks to
-    Salesforce on behalf of a MEETING (lookup, resolve, sync, and Phase 2D.3's
-    identity resolution) must go through this rather than deciding for
-    itself, which is what let crm_sync_record/salesforce_lookup_record use
-    _sf_call(user_id, ...) UNCONDITIONALLY for months — silently correct for
-    every personal meeting and silently WRONG for every organisation one
-    (an org meeting's CRM push would use the CALLER's personal Salesforce
-    connection, never the organisation's).
-
-    Resolved from the MEETING's stored workspace_id, never from the caller's
-    JWT or a client-supplied header — a member's personal Salesforce
-    connection must never be reachable through a route that operates on an
-    organisation's meeting, and vice versa. `_row_workspace_id` already
-    encodes "no workspace_id -> personal", so this function needs no
-    parallel fallback logic of its own.
-
-    Returns (sf_call, config) where sf_call is `fn -> fn(url, tok)`, exactly
-    the shape _validate_mapping already takes — Phase 2D.1/2D.2's seam,
-    reused rather than re-invented.
-    """
-    workspace_id = _row_workspace_id(item)
-    if workspace_schema.is_organisation_workspace_id(workspace_id):
-        sf_call = lambda fn: _sf_call_org(workspace_id, fn)  # noqa: E731
-        conn = _get_org_salesforce_connection(workspace_id)
-        return sf_call, (conn or {}).get("config") or {}
-    user_id = item.get("user_id") or ""
-    sf_call = lambda fn: _sf_call(user_id, fn)  # noqa: E731
-    return sf_call, _user_crm_config(user_id)
-
-
-def _sf_name_field(sf_call, object_name: str) -> str:
-    """The object's own "name" field, or "" when it has none.
-
-    Gives the UI something human to confirm against ("Rahul Sharma") beside the
-    raw identifier. Not every object has one, so callers must tolerate "".
-
-    `sf_call` is a _sf_call/_sf_call_org-SHAPED function (see _validate_mapping
-    for the same seam) — this function itself never decides Personal vs
-    Organisation scope.
-    """
-    described = sf_call(lambda url, tok:
-                        _salesforce.describe_object(url, tok, object_name))
-    return next((f.get("name") for f in (described.get("fields") or [])
-                 if f.get("nameField")), "") or ""
-
-
-def _resolve_crm_record(sf_call, mapping: dict, value: str) -> dict:
-    """Identifier -> {status, record_id?, record_label?, candidates?}.
-
-    The generic resolution step: SOQL against the mapping's own object and
-    lookup field, so the same code resolves a site visit number, a lead email or
-    a custom object's reference. Three outcomes, all of them ORDINARY:
-
-      not_found     nothing matched — the user fixes the identifier
-      record_found  exactly one match — awaits confirmation before any push
-      ambiguous     several matched — the user picks; we never choose for them
-
-    Ambiguity is returned as candidates rather than an error precisely because
-    the caller CAN resolve it (by asking); silently taking the first match is
-    the failure this whole flow exists to prevent.
-
-    `sf_call` — see _sf_name_field above; this function is likewise
-    scope-agnostic by construction.
-    """
-    object_name = mapping["object"]
-    lookup_field = mapping["lookup_field"]
-    name_field = _sf_name_field(sf_call, object_name)
-
-    select = ["Id", lookup_field]
-    if name_field and name_field != lookup_field:
-        select.append(name_field)
-    # LIMIT is CRM_AMBIGUOUS_LIMIT + 1 so "more than we can show" is
-    # distinguishable from "exactly this many".
-    soql = (f"SELECT {', '.join(select)} FROM {object_name} "
-            f"WHERE {lookup_field} = '{_soql_quote(value)}' "
-            f"LIMIT {CRM_AMBIGUOUS_LIMIT + 1}")
-
-    result = sf_call(lambda url, tok: _salesforce.query(url, tok, soql))
-    records = [r for r in (result.get("records") or []) if isinstance(r, dict)]
-
-    if not records:
-        print(f"[salesforce] lookup {object_name}.{lookup_field}={value!r}: no match")
-        return {"status": CRM_LOOKUP_NOT_FOUND}
-
-    def _display(rec: dict) -> str:
-        return str((rec.get(name_field) if name_field else "")
-                   or rec.get(lookup_field) or value)
-
-    if len(records) == 1:
-        record = records[0]
-        return {
-            "status": CRM_STATUS_RECORD_FOUND,
-            "record_id": str(record.get("Id") or ""),
-            "record_label": _display(record),
-        }
-
-    print(f"[salesforce] lookup {object_name}.{lookup_field}={value!r}: "
-          f"{len(records)} matches — ambiguous")
-    return {
-        "status": CRM_STATUS_AMBIGUOUS,
-        "candidates": [{"record_id": str(r.get("Id") or ""),
-                        "display_name": _display(r)}
-                       for r in records[:CRM_AMBIGUOUS_LIMIT]],
-        "truncated": len(records) > CRM_AMBIGUOUS_LIMIT,
-    }
-
-
-def salesforce_lookup_record(event):
-    """POST /crm/salesforce/lookup {object, value|lookup_value} (JWT)
-
-    -> {status: "found"|"not_found"|"ambiguous", ...}
-
-    Resolves an identifier to a Salesforce record Id using the configured
-    object + lookup field. Stateless: it only reports what Salesforce says.
-    Persisting the association is a separate, explicit step (see the meeting
-    PATCH), so a lookup can never silently relink a meeting.
-    """
-    user_id = _require_auth(event)
-    conn = _get_salesforce_connection(user_id)
-    if not conn:
-        raise ApiError(400, "Salesforce is not connected")
-
-    data = _body(event)
-    object_name = str(data.get("object") or "").strip()
-    # `lookup_value` is the current name; `value` is accepted for the earlier
-    # shape so a deployed client keeps working.
-    value = str(data.get("lookup_value") or data.get("value") or "").strip()
-    if not object_name:
-        raise ApiError(400, "object required")
-    if not value:
-        raise ApiError(400, "lookup_value required")
-    if len(value) > CRM_IDENTIFIER_MAX:
-        raise ApiError(400, f"lookup_value must be at most "
-                            f"{CRM_IDENTIFIER_MAX} characters")
-
-    mapping = _find_mapping((conn or {}).get("config") or {}, object_name)
-    outcome = _resolve_crm_record(lambda fn: _sf_call(user_id, fn), mapping, value)
-
-    base = {
-        "object": object_name,
-        "label": mapping["object_label"],
-        "lookup_field": mapping["lookup_field"],
-        "lookup_value": value,
-    }
-    if outcome["status"] == CRM_LOOKUP_NOT_FOUND:
-        return _resp(200, {**base, "status": "not_found"})
-    if outcome["status"] == CRM_STATUS_AMBIGUOUS:
-        return _resp(200, {**base, "status": "ambiguous",
-                           "records": outcome["candidates"],
-                           "truncated": outcome.get("truncated", False)})
-    return _resp(200, {**base, "status": "found",
-                       "record_id": outcome["record_id"],
-                       "record_label": outcome["record_label"]})
-
-
-# ---------------------------------------------------------------------------
-# CRM push — write the meeting's content onto the linked Salesforce record.
-#
-# ONE generic update for every object. What gets written is entirely the
-# mapping's configured content targets: only configured targets are sent, and an
-# unconfigured one is omitted rather than blanked (writing "" would erase
-# whatever the customer's own process put there).
-#
-# The push NEVER runs off the back of a lookup. It requires a record the user
-# has confirmed, because notes on the wrong record are worse than no notes.
-# ---------------------------------------------------------------------------
-def _render_highlights(item: dict) -> str:
-    """The meeting's highlights as plain text for a Salesforce long-text field.
-
-    Reads, in order of preference:
-      1. the DYNAMIC OVERVIEW — the current primary output, flattened to text;
-      2. the flat `highlights` list, for a row analysed before the overview;
-      3. the structured `meeting_highlights`, for a row older still.
-
-    Three sources rather than one because this is a PUSH: the alternative to
-    reading a legacy shape is pushing "" into a customer's Salesforce field,
-    and _crm_push_payload skips empty content precisely so that nothing
-    overwrites what is already there. Falling back costs nothing and keeps the
-    back catalogue pushable.
-    """
-    overview = item.get("overview")
-    if isinstance(overview, dict):
-        text = ai_schema.overview_text(overview)
-        if text:
-            return text
-
-    flat = [str(h).strip() for h in (item.get("highlights") or []) if str(h).strip()]
-    if flat:
-        return "\n".join(f"- {h}" for h in flat)
-
-    structured = item.get("meeting_highlights") or {}
-    if not isinstance(structured, dict):
-        return ""
-    lines = []
-    # Iterates a LITERAL section list, not ai_schema.HIGHLIGHT_SECTIONS: this
-    # is a legacy reader, and it must keep rendering the two sections
-    # (important_numbers, risks) that left the live schema but still sit on
-    # rows written before they did.
-    for section in ("decisions", "action_items", "deadlines",
-                    "important_numbers", "open_questions", "risks"):
-        rows = structured.get(section) or []
-        if not rows:
-            continue
-        lines.append(section.replace("_", " ").title())
-        for row in rows:
-            if isinstance(row, dict):
-                text = " — ".join(str(v).strip() for v in row.values() if str(v).strip())
-            else:
-                text = str(row).strip()
-            if text:
-                lines.append(f"- {text}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-def _render_action_items(item: dict) -> str:
-    """Tasks/action items as plain text, from whichever shape exists.
-
-    `tasks` is the CRUD-managed map the app owns; `ai_tasks` is the pipeline's
-    raw extraction. Preferring the managed map means a user's edits (owner, due
-    date, status) are what reaches Salesforce.
-
-    The analysis's older `action_items` field was removed from the schema, so it
-    is no longer read here — an unreprocessed legacy row pushes no action items
-    rather than pushing a stale extraction, and _crm_push_payload already skips
-    empty content so nothing overwrites a value in Salesforce.
-    """
-    rows = []
-    tasks = item.get("tasks")
-    if isinstance(tasks, dict) and tasks:
-        rows = list(tasks.values())
-    elif isinstance(item.get("ai_tasks"), list):
-        rows = item["ai_tasks"]
-
-    lines = []
-    for row in rows:
-        if not isinstance(row, dict):
-            text = str(row).strip()
-            if text:
-                lines.append(f"- {text}")
-            continue
-        text = str(row.get("task") or row.get("title") or "").strip()
-        if not text:
-            continue
-        owner = str(row.get("assignee") or row.get("owner") or "").strip()
-        if isinstance(row.get("assignee"), dict):
-            owner = str(row["assignee"].get("name") or "").strip()
-        due = str(row.get("due_date") or row.get("due") or "").strip()
-        status = str(row.get("status") or "").strip()
-        extra = " · ".join(p for p in (owner, due, status) if p)
-        lines.append(f"- {text}" + (f" ({extra})" if extra else ""))
-    return "\n".join(lines)
-
-
-def _crm_push_payload(mapping: dict, item: dict) -> dict:
-    """{Salesforce field: content} for exactly the configured content targets.
-
-    Iterates the mapping's targets, so an object with only Summary configured
-    gets a one-field payload and nothing else is touched. Empty content is
-    skipped too: pushing "" over an existing value destroys data the customer
-    may have written themselves.
-    """
-    content = {
-        "transcript": str(item.get("transcript") or ""),
-        "summary": str(item.get("summary") or ""),
-        "highlights": _render_highlights(item),
-        "action_items": _render_action_items(item),
-    }
-    payload = {}
-    for name, field in _content_targets(mapping).items():
-        value = content.get(name) or ""
-        if value.strip():
-            payload[field] = value
-    return payload
-
-
-def _write_crm_record(key: str, object_name: str, entry: dict) -> None:
-    """Persist one crm_records entry. Nested-map update so a concurrent write to
-    a DIFFERENT object's entry cannot be clobbered.
-
-    Same two-step shape as _store_document, for the same two DynamoDB reasons
-    documented there:
-
-      * `SET #cr = if_not_exists(#cr, :empty), #cr.#obj = :entry` is REJECTED at
-        parse time — "Two document paths overlap with each other" — because it
-        writes both a map and a key inside that map in one expression. It fails
-        on EVERY call regardless of the item's contents, which is what made
-        "Sync to Salesforce" return a blanket `internal error`.
-      * A nested SET whose parent map is absent raises ValidationException
-        ("...invalid for update"); DynamoDB does not auto-create the parent.
-
-    So: attempt the nested SET (the steady-state path, one round trip), and only
-    if the map is missing create it — guarded by attribute_not_exists so a
-    racing writer's map is never blanked — then retry.
-    """
-    names = {"#cr": "crm_records", "#obj": object_name}
-
-    def _set_nested():
-        _recordings.update_item(
-            Key={"audio_s3_key": key},
-            UpdateExpression="SET #cr.#obj = :entry, updated_at = :now",
-            ExpressionAttributeNames=names,
-            ExpressionAttributeValues={":entry": entry, ":now": _now_iso()},
-        )
-
-    try:
-        _set_nested()
-        return
-    except ClientError as err:
-        # Match the message, not just the code: ValidationException is generic,
-        # and a real expression bug should surface rather than be retried.
-        if err.response.get("Error", {}).get("Code") != "ValidationException" \
-                or "invalid for update" not in str(err):
-            raise
-
-    # The row has no crm_records map yet (the common case: nothing has ever been
-    # linked). Create it, tolerating the race where a concurrent write won.
-    try:
-        _recordings.update_item(
-            Key={"audio_s3_key": key},
-            UpdateExpression="SET #cr = :empty",
-            ConditionExpression="attribute_not_exists(#cr)",
-            ExpressionAttributeNames={"#cr": "crm_records"},
-            ExpressionAttributeValues={":empty": {}},
-        )
-    except ClientError as err:
-        if err.response.get("Error", {}).get("Code") \
-                != "ConditionalCheckFailedException":
-            raise
-        # Someone else created it between our two calls — exactly what we want.
-    _set_nested()
-
-
-def crm_sync_record(event):
-    """POST /crm/salesforce/sync/{key+} {object} (JWT) -> {crm_record}
-
-    Thin HTTP wrapper — see _sync_one_crm_record for the actual logic,
-    extracted in Phase 2D.4 so the CRM worker (an internal caller with no
-    JWT/event to authenticate) can invoke the exact same code as this route
-    without a forged HTTP event or a second, weaker auth path.
-    """
-    user_id, key, item = _owned_recording(event)
-    data = _body(event)
-    object_name = str(data.get("object") or "").strip()
-    if not object_name:
-        raise ApiError(400, "object required")
-    result = _sync_one_crm_record(key, item, object_name)
-    status_code = result.pop("status_code")
-    return _resp(status_code, result)
-
-
-def _sync_one_crm_record(key: str, item: dict, object_name: str) -> dict:
-    """Pushes the meeting's configured content onto the confirmed Salesforce
-    record. Requires a stored record_id AND a confirmed status: this is the
-    only path that writes syncing/synced/failed.
-
-    Uses the STORED record_id — no second SOQL lookup. The identifier is the
-    user's visible reference; the record Id is the association, and re-resolving
-    it on every sync would risk drifting onto a different record if the org's
-    data changed.
-
-    SCOPE (Phase 2D.3 fix): which Salesforce connection this pushes to is
-    decided by _crm_scope_for_meeting from the MEETING's own workspace_id —
-    an organisation-owned meeting pushes through that organisation's
-    OrgCrmConnections, never through the caller's Personal CrmConnections.
-    Before that fix, every push here used _sf_call(user_id, ...)
-    unconditionally, which was silently correct only for personal meetings.
-
-    Takes `item` directly rather than resolving it from an event/JWT — the
-    caller (the HTTP route above, or Phase 2D.4's worker) is responsible for
-    its own authorization; this function itself performs no auth check,
-    exactly like every other _push_*/_execute_* helper in this section.
-
-    A Salesforce failure marks the entry failed and returns the org's message.
-    The meeting's own transcript/summary are never touched by any of this.
-    """
-    sf_call, crm_config = _crm_scope_for_meeting(item)
-    mapping = _find_mapping(crm_config, object_name)
-    stored = (item.get("crm_records") or {}).get(object_name)
-    if not isinstance(stored, dict) or not stored:
-        raise ApiError(400, f"no {mapping['object_label']} is linked to this "
-                            f"meeting yet")
-
-    record = _public_crm_record(stored, mapping)
-    record_id = record["record_id"]
-    if not record_id:
-        raise ApiError(400, f"{mapping['object_label']}: look the record up "
-                            f"before syncing")
-    if record["status"] not in CRM_PUSHABLE_STATUSES:
-        # record_found (not yet confirmed) lands here, which is the point: the
-        # user must approve the record before anything is written to it.
-        raise ApiError(409, f"confirm the {mapping['object_label']} record "
-                            f"before syncing")
-
-    payload = _crm_push_payload(mapping, item)
-    if not payload:
-        raise ApiError(400, f"{mapping['object_label']} has no content fields "
-                            f"configured — set them in Salesforce mapping")
-
-    base = {**stored, "status": CRM_STATUS_SYNCING, "error": "",
-            "updated_at": _now_iso()}
-    _write_crm_record(key, object_name, base)
-
-    try:
-        sf_call(lambda url, tok: _salesforce.update_record(
-            url, tok, object_name, record_id, payload))
-    except ApiError as e:
-        failed = {**base, "status": CRM_STATUS_FAILED,
-                  "error": e.message[:500], "updated_at": _now_iso()}
-        # A 404 means the record is gone: drop the stale record_id so the next
-        # attempt re-resolves instead of retrying a write that cannot succeed.
-        if e.status == 404:
-            failed["record_id"] = ""
-            failed["status"] = CRM_STATUS_LOOKUP_PENDING
-        _write_crm_record(key, object_name, failed)
-        print(f"[salesforce] sync {object_name}/{record_id} failed: {e.message}")
-        # Answers directly rather than re-raising (the caller needs the
-        # persisted crm_record alongside the error), so `code` travels in the
-        # returned dict itself — otherwise a dead Salesforce credential would
-        # reach the app as a bare 409 and lose its "reconnect Salesforce"
-        # identity. `status_code` here is an HTTP-status-SHAPED field on a
-        # plain dict, not an actual response — crm_sync_record (the HTTP
-        # route) is what turns it into one; the worker reads it directly.
-        result = {"error": e.message,
-                 "crm_record": _public_crm_record(failed, mapping),
-                 "status_code": e.status}
-        code = getattr(e, "code", "")
-        if code:
-            result["code"] = code
-        return result
-
-    synced = {**base, "status": CRM_STATUS_SYNCED, "error": "",
-              "synced_at": _now_iso(), "updated_at": _now_iso(),
-              "synced_fields": sorted(payload.keys())}
-    _write_crm_record(key, object_name, synced)
-    print(f"[salesforce] synced {object_name}/{record_id}: "
-          f"{', '.join(sorted(payload))}")
-    return {"crm_record": _public_crm_record(synced, mapping),
-           "synced_fields": sorted(payload.keys()), "status_code": 200}
-
-
-# ---------------------------------------------------------------------------
-# ORGANISATION MEETING PUSH (Phase 2D.3) — extends the push architecture
-# above rather than replacing it. Two distinct pieces of Salesforce state:
-#
-#   1. The mapped OBJECT's content fields — reuses crm_sync_record UNCHANGED
-#      (called as a function here, exactly as the route already does; no
-#      second copy of that state machine).
-#   2. Salesforce TASKS from MinuteX action items — genuinely new (spec
-#      section 13), because a Task is a CREATE, not a field update onto an
-#      already-confirmed record, and needs its own idempotency story.
-#
-# Nothing here runs for a Personal meeting: _require_org_meeting refuses one
-# with 400 before any Salesforce call is made.
-# ---------------------------------------------------------------------------
-
-def _crm_tasks_synced_map(item: dict) -> dict:
-    """{minutex_task_id: {sf_task_id, synced_at}} already pushed for this
-    meeting — the idempotency record for push_org_meeting_crm's Task half."""
-    m = item.get("crm_tasks_synced")
-    return m if isinstance(m, dict) else {}
-
-
-def _write_crm_task_synced(key: str, task_id: str, entry: dict) -> None:
-    """As _write_crm_record, but for the crm_tasks_synced nested map — same
-    two-step SET (create-the-map-then-retry) for the same DynamoDB
-    "overlapping document paths" reason documented on _write_crm_record."""
-    names = {"#ts": "crm_tasks_synced", "#tid": task_id}
-
-    def _set_nested():
-        _recordings.update_item(
-            Key={"audio_s3_key": key},
-            UpdateExpression="SET #ts.#tid = :entry, updated_at = :now",
-            ExpressionAttributeNames=names,
-            ExpressionAttributeValues={":entry": entry, ":now": _now_iso()},
-        )
-
-    try:
-        _set_nested()
-        return
-    except ClientError as err:
-        if err.response.get("Error", {}).get("Code") != "ValidationException" \
-                or "invalid for update" not in str(err):
-            raise
-    try:
-        _recordings.update_item(
-            Key={"audio_s3_key": key},
-            UpdateExpression="SET #ts = :empty",
-            ConditionExpression="attribute_not_exists(#ts)",
-            ExpressionAttributeNames={"#ts": "crm_tasks_synced"},
-            ExpressionAttributeValues={":empty": {}},
-        )
-    except ClientError as err:
-        if err.response.get("Error", {}).get("Code") \
-                != "ConditionalCheckFailedException":
-            raise
-    _set_nested()
-
-
-def _task_assignee_sf_identity(task_row: dict, workspace_id: str) -> dict:
-    """The Salesforce identity (User or Contact) a MinuteX task's assignee
-    resolves to, or {} if it cannot be resolved yet.
-
-    Task assignment and meeting PARTICIPATION are different concepts (spec
-    section 13) — this deliberately does NOT look at identity_role/
-    MeetingParticipants at all. It reads the task's OWN assignee_contact_id
-    and asks the same two questions _speaker_crm_state asks for a speaker:
-    is this an org member (-> Salesforce User) or an external contact
-    (-> Salesforce Contact)? Never falls back to "assign to whoever is
-    convenient" — an unresolvable assignee means the Task is created with
-    no OwnerId/WhoId rather than guessed.
-    """
-    contact_id = str(task_row.get("assignee_contact_id") or "")
-    if not contact_id:
-        return {}
-    contact = _contacts.get_item(Key={"contact_id": contact_id}).get("Item")
-    if not contact:
-        return {}
-    member_user_id = str(contact.get("minutex_user_id") or "")
-    if member_user_id:
-        link = _get_member_sf_user_link(workspace_id, member_user_id)
-        if link.get("sf_user_id"):
-            return {"kind": "user", "sf_id": link["sf_user_id"]}
-        return {}
-    sf_contact_id = str(contact.get("crm_external_id") or "")
-    if sf_contact_id:
-        return {"kind": "contact", "sf_id": sf_contact_id}
-    return {}
-
-
-def _push_action_items_as_tasks(sf_call, key: str, item: dict,
-                                workspace_id: str) -> dict:
-    """Create a Salesforce Task for each eligible, not-yet-synced MinuteX
-    task sourced from this meeting. Returns {created, skipped, failed}
-    counts plus per-task detail for the caller to report.
-
-    IDEMPOTENCY (spec section 15): a MinuteX task_id already present in
-    crm_tasks_synced is skipped outright — no second Salesforce Task is
-    created on a retried push, which is what makes this function safe to
-    call again after a partial failure.
-    """
-    already = _crm_tasks_synced_map(item)
-    rows = [r for r in _tasks_for_recording(key)
-           if str(r.get("status") or "") != TASK_STATUS_CANCELLED]
-
-    created, skipped, failed = [], [], []
-    for row in rows:
-        task_id = str(row.get("task_id") or "")
-        if not task_id:
-            continue
-        if task_id in already:
-            skipped.append({"task_id": task_id, "reason": "already_synced"})
-            continue
-        title = str(row.get("title") or "").strip()
-        if not title:
-            skipped.append({"task_id": task_id, "reason": "no_title"})
-            continue
-
-        identity = _task_assignee_sf_identity(row, workspace_id)
-        fields = {"Subject": title[:255]}
-        description = str(row.get("description") or "").strip()
-        if description:
-            fields["Description"] = description[:32000]
-        due = str(row.get("due_date_normalized") or row.get("due_date") or "")
-        if due:
-            fields["ActivityDate"] = due
-        if identity.get("kind") == "user":
-            fields["OwnerId"] = identity["sf_id"]
-        elif identity.get("kind") == "contact":
-            fields["WhoId"] = identity["sf_id"]
-
-        try:
-            sf_task_id = sf_call(lambda url, tok: _salesforce.create_record(
-                url, tok, "Task", fields))
-        except ApiError as e:
-            # status/code travel WITH the message (Phase 2D.4) so a job-level
-            # rollup can classify this failure correctly rather than
-            # guessing — see execute_crm_sync_job's partial-failure rollup.
-            failed.append({"task_id": task_id, "error": e.message[:500],
-                          "status": e.status, "code": getattr(e, "code", "")})
-            continue
-
-        entry = {"sf_task_id": sf_task_id, "synced_at": _now_iso(),
-                 "assignee_resolved": bool(identity)}
-        _write_crm_task_synced(key, task_id, entry)
-        created.append({"task_id": task_id, "sf_task_id": sf_task_id,
-                        "assignee_resolved": bool(identity)})
-
-    return {"created": created, "skipped": skipped, "failed": failed}
-
-
-# ---------------------------------------------------------------------------
-# SALESFORCE EVENT (Phase 2D.3 completion). The meeting itself, pushed as one
-# Salesforce Activity Event — the third and final Salesforce object this
-# phase creates (Task above; the mapped record's fields via crm_sync_record
-# use update_record, never create_record).
-#
-# FIELDS ACTUALLY SUPPORTED BY THE STANDARD EVENT OBJECT (verified against
-# Salesforce's own object reference, not assumed):
-#   OwnerId   — a Salesforce USER. Valid, and exactly what "meeting owner"
-#               means here — the resolved SM, never the org's connection
-#               identity (spec section 8's whole point).
-#   WhoId     — polymorphic, accepts Contact OR Lead. One value: Event does
-#               not carry a multi-Contact attendee list on the core object
-#               without EventRelation records (a separate related-object
-#               write this codebase does not make — see the note below).
-#   WhatId    — polymorphic, accepts Account (among other objects). Valid
-#               ALONGSIDE WhoId on Event — unlike some Activity
-#               configurations, Event supports "Name" (Who) and "Related To"
-#               (What) at the same time.
-#   Subject, Description — ordinary text fields.
-#   StartDateTime, EndDateTime — the two fields that actually schedule the
-#               Event; Salesforce also accepts DurationInMinutes instead of
-#               EndDateTime, but this codebase always has both ends of the
-#               interval (recorded_at + duration), so EndDateTime is sent
-#               explicitly rather than asking Salesforce to derive it.
-#
-# NOT IMPLEMENTED, DELIBERATELY: EventRelation invitee records for multiple
-# participants. The org's Event page layout and sharing model determine
-# whether/how those are even usable, and inventing that write here would be
-# exactly the "unsupported relationship" this phase was told not to invent.
-# The single resolved SM (Owner) and single resolved primary client (Who) are
-# the relationships _meeting_crm_identity_state already resolves as
-# singular, and are the ones this function uses.
-# ---------------------------------------------------------------------------
-
-def _meeting_start_end_iso(item: dict) -> tuple:
-    """(start_iso, end_iso) for this meeting, or ("", "") when recorded_at is
-    unusable. Salesforce DateTime fields require full ISO 8601 with an
-    offset/Z — a bare date is not accepted, unlike anchor_date's use in
-    spoken_dates (which only ever needs a calendar day).
-
-    recorded_at is written as a Unix epoch STRING by the upload path, but
-    older rows carry an ISO timestamp — the same dual format
-    spoken_dates.anchor_date already has to handle, so both are accepted
-    here rather than assuming one and silently mis-scheduling the Event for
-    every row in the other shape.
-    """
-    raw = str(item.get("recorded_at") or "").strip()
-    start = None
-    if raw:
-        if raw.isdigit():
-            try:
-                start = datetime.fromtimestamp(int(raw), tz=timezone.utc)
-            except (ValueError, OSError, OverflowError):
-                start = None
-        else:
-            try:
-                start = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError:
-                start = None
-    if start is None:
-        return "", ""
-    try:
-        duration_seconds = float(item.get("duration") or 0)
-    except (TypeError, ValueError):
-        duration_seconds = 0
-    # A meeting with no known duration still gets a schedulable Event — one
-    # hour is a reasonable default block, and it is far better than refusing
-    # to create the Event at all over a field the recording pipeline simply
-    # never captured for this row.
-    if duration_seconds <= 0:
-        duration_seconds = 3600
-    end = start + timedelta(seconds=duration_seconds)
-    return (start.isoformat().replace("+00:00", "Z"),
-            end.isoformat().replace("+00:00", "Z"))
-
-
-def _crm_event_synced(item: dict) -> dict:
-    """The Event already pushed for this meeting, or {} if none yet —
-    idempotency record for _push_meeting_as_event, same design as
-    crm_tasks_synced (singular here: one meeting produces at most one
-    Event, never a map keyed by anything)."""
-    m = item.get("crm_event_synced")
-    return m if isinstance(m, dict) else {}
-
-
-def _write_crm_event_synced(key: str, entry: dict) -> None:
-    """Persist the Event idempotency record. A flat top-level attribute, not
-    a nested map like crm_tasks_synced/crm_records — there is only ever ONE
-    Event per meeting, so there is no sibling-key collision to guard against
-    and no "create the parent map first" step is needed."""
-    _recordings.update_item(
-        Key={"audio_s3_key": key},
-        UpdateExpression="SET crm_event_synced = :entry, updated_at = :now",
-        ExpressionAttributeValues={":entry": entry, ":now": _now_iso()},
-    )
-
-
-def _push_meeting_as_event(sf_call, key: str, item: dict,
-                           identity: dict) -> dict:
-    """Create ONE Salesforce Event for this meeting, or report why not.
-
-    Returns {"created": bool, "sf_event_id": str, "skipped_reason": str,
-    "error": str, "code": str} — never raises, so a failure here cannot take
-    down the object-mapping push or Task creation that already ran in the
-    same request (push_org_meeting_crm reports this alongside them
-    instead). `code` mirrors crm_sync_record's own contract (a stable
-    machine-readable identity, e.g. "salesforce_reconnect_required", never
-    just prose) so a dead Salesforce credential is distinguishable from an
-    ordinary validation failure here exactly as it already is for the
-    object-mapping push.
-
-    IDEMPOTENT: an existing crm_event_synced entry short-circuits before any
-    Salesforce call is made — a retried push (client retry, Lambda double
-    invoke, a timeout whose write actually landed) can never create a
-    second Event for the same meeting.
-    """
-    already = _crm_event_synced(item)
-    if already.get("sf_event_id"):
-        return {"created": False, "sf_event_id": already["sf_event_id"],
-               "skipped_reason": "already_synced", "error": "", "code": ""}
-
-    owner = identity.get("owner")
-    if not owner or not owner.get("sf_user_id"):
-        # No resolved SM — an Event with no Owner is not a meaningful
-        # record of "who ran this meeting", so this is a skip, not a
-        # best-effort create with OwnerId absent.
-        return {"created": False, "sf_event_id": "",
-               "skipped_reason": "no_resolved_owner", "error": "", "code": ""}
-
-    start_iso, end_iso = _meeting_start_end_iso(item)
-    if not start_iso or not end_iso:
-        return {"created": False, "sf_event_id": "",
-               "skipped_reason": "no_meeting_time", "error": "", "code": ""}
-
-    fields = {
-        "OwnerId": owner["sf_user_id"],
-        "Subject": str(item.get("title") or "Meeting")[:255],
-        "StartDateTime": start_iso,
-        "EndDateTime": end_iso,
-    }
-    description = str(item.get("summary") or "").strip()
-    if description:
-        fields["Description"] = description[:32000]
-
-    client = identity.get("primary_client")
-    if client and client.get("sf_contact_id"):
-        fields["WhoId"] = client["sf_contact_id"]
-        # WhatId (Account) is populated ONLY when it is the ACCOUNT OF THIS
-        # SAME CONTACT — never a MinuteX-side guess and never a different
-        # client's Account left over from stale state. crm_account_id is
-        # written exclusively by resolve_contact_crm_identity, at the same
-        # moment as crm_external_id, so the two are always a matched pair.
-        if client.get("sf_account_id"):
-            fields["WhatId"] = client["sf_account_id"]
-
-    try:
-        sf_event_id = sf_call(lambda url, tok: _salesforce.create_record(
-            url, tok, "Event", fields))
-    except ApiError as e:
-        # status travels alongside code/error (Phase 2D.4) — see the same
-        # note on the Task failure path above.
-        return {"created": False, "sf_event_id": "", "skipped_reason": "",
-               "error": e.message[:500], "code": getattr(e, "code", ""),
-               "status": e.status}
-
-    entry = {"sf_event_id": sf_event_id, "synced_at": _now_iso(),
-             "owner_sf_user_id": owner["sf_user_id"],
-             "contact_sf_id": (client or {}).get("sf_contact_id", ""),
-             "account_sf_id": fields.get("WhatId", "")}
-    _write_crm_event_synced(key, entry)
-    return {"created": True, "sf_event_id": sf_event_id,
-           "skipped_reason": "", "error": "", "code": ""}
-
-
-def _execute_org_meeting_crm_push(user_id: str, key: str, item: dict,
-                                  workspace_id: str,
-                                  requested_objects=None) -> dict:
-    """Perform the actual Salesforce work for one organisation meeting's CRM
-    push — the exact logic push_org_meeting_crm ran INLINE in Phase 2D.3,
-    extracted unchanged so Phase 2D.4's worker (and the still-synchronous
-    identity/readiness checks) share ONE implementation. Returns a plain
-    dict, never an HTTP response — the caller (the job worker, or a test)
-    decides how to report it.
-
-    Raises ApiError for a condition that blocks the ENTIRE push (not
-    configured, unresolved required identity) — the caller is expected to
-    turn that into the job's terminal state via _classify_crm_error. Any
-    Salesforce-level failure on an INDIVIDUAL operation (one object's sync,
-    one Task, the Event) is instead captured in that operation's own
-    push_errors/tasks/event result, exactly as in 2D.3 — only a whole-push
-    precondition failure raises here.
-    """
-    identity = _meeting_crm_identity_state(key, item, workspace_id)
-
-    conn = _get_org_salesforce_connection(workspace_id)
-    if not conn:
-        raise OrganisationSalesforceNotConnected()
-    mappings = _mappings_from_config(conn.get("config") or {})
-    if not mappings:
-        raise ApiError(400, "no Salesforce mapping is configured for this "
-                            "organisation — set it up in Salesforce mapping first")
-    if identity["unresolved"]:
-        names = ", ".join(s["speaker_id"] for s in identity["unresolved"])
-        raise ApiError(409, "resolve every tagged speaker's Salesforce "
-                            f"identity before pushing (unresolved: {names})")
-
-    if requested_objects is not None and not isinstance(requested_objects, list):
-        raise ApiError(400, "objects must be a list")
-
-    sf_call, _cfg = _crm_scope_for_meeting(item)
-    pushed, push_errors = [], []
-    for mapping in mappings:
-        object_name = mapping["object"]
-        if requested_objects is not None and object_name not in requested_objects:
-            continue
-        stored = (item.get("crm_records") or {}).get(object_name)
-        if not isinstance(stored, dict) or not stored:
-            continue  # not linked to a record at all — nothing to push here
-        record = _public_crm_record(stored, mapping)
-        if record["status"] not in CRM_PUSHABLE_STATUSES or not record["record_id"]:
-            continue  # not yet confirmed — crm_sync_record's own gate applies
-
-        # Delegates to the EXACT SAME function the standalone route calls —
-        # _sync_one_crm_record, given the item this function already has in
-        # hand — so its entire state machine (syncing -> synced/failed,
-        # stale-record recovery) runs unchanged rather than being
-        # re-implemented here. No forged HTTP event/JWT needed (Phase 2D.4):
-        # this function itself takes no event, so neither does its callee.
-        result = _sync_one_crm_record(key, item, object_name)
-        status_code = result.pop("status_code")
-        if status_code == 200:
-            pushed.append({"object": object_name, "crm_record": result["crm_record"]})
-        else:
-            push_errors.append({"object": object_name, "error": result.get("error", ""),
-                                "code": result.get("code", ""), "status": status_code})
-
-    task_result = _push_action_items_as_tasks(sf_call, key, item, workspace_id)
-    event_result = _push_meeting_as_event(sf_call, key, item, identity)
-
-    print(f"[org-crm-push] meeting={key} workspace={workspace_id} "
-          f"requested_by={user_id} "
-          f"objects_pushed={len(pushed)} object_errors={len(push_errors)} "
-          f"tasks_created={len(task_result['created'])} "
-          f"tasks_failed={len(task_result['failed'])} "
-          f"event_created={event_result['created']}")
-
-    return {
-        "pushed": pushed,
-        "push_errors": push_errors,
-        "tasks": task_result,
-        "event": event_result,
-        "identity": identity,
-    }
-
-
-def push_org_meeting_crm(event):
-    """POST /recordings/ai/crm-push/{key+} {objects?: [str]} (JWT,
-    organisation meetings only) -> {job_id, status} — 202 Accepted.
-
-    PHASE 2D.4: this route no longer talks to Salesforce itself. It
-    validates ownership, creates a durable CrmSyncJobs row, enqueues one SQS
-    message naming it, and returns immediately — CRM synchronization must
-    never block recording completion, transcription, AI processing or this
-    very request (spec section 2). The actual Salesforce work
-    (_execute_org_meeting_crm_push, unchanged from Phase 2D.3) now runs in
-    crmSyncWorker, reading the SAME durable rows this route would have read
-    synchronously — nothing about identity resolution moved.
-
-    Readiness is NOT re-validated here beyond ownership/workspace — that
-    would require the same Salesforce-adjacent reads (connection, config)
-    this route is trying to avoid doing synchronously. The worker validates
-    readiness itself, exactly as _execute_org_meeting_crm_push already does,
-    and reports a blocked precondition as the job's own FAILED/RECONNECT_
-    REQUIRED terminal state rather than as an HTTP error the caller has to
-    poll to discover happened at all.
-    """
-    user_id, key, item, workspace_id = _require_org_meeting(event, hydrate=False)
-    data = _body(event)
-    requested_objects = data.get("objects")
-    if requested_objects is not None and not isinstance(requested_objects, list):
-        raise ApiError(400, "objects must be a list")
-
-    job = create_crm_sync_job(
-        workspace_id=workspace_id, recording_key=key, user_id=user_id,
-        requested_objects=requested_objects)
-    return _resp(202, {"job_id": job["job_id"], "status": job["status"]})
-
-
-# ===========================================================================
-# CRM SYNC JOBS (Phase 2D.4) — durable state for an ASYNCHRONOUS push, and
-# the queue/worker contract built on top of the (unchanged) Phase 2D.3
-# identity/push logic above.
-#
-# WHY A SEPARATE STATE MACHINE FROM CRM_STATUS_* (defined earlier in this
-# file). CRM_STATUS_* describes ONE field-mapping record's state
-# (not_linked -> ... -> confirmed -> synced/failed) — a fact about a single
-# Salesforce object association. CRM_JOB_STATUS_* describes the OUTER push
-# ATTEMPT as a whole (this meeting's whole CRM sync, covering the object
-# sync(es) AND Task creation AND Event creation together). They are
-# deliberately not unified: a job can be SYNCED overall while one Task
-# inside it FAILED (see execute_crm_sync_job's rollup rule below), which
-# CRM_STATUS_* has no vocabulary for and should not need one.
-# ---------------------------------------------------------------------------
 CRM_JOB_STATUS_PENDING = "PENDING"
 CRM_JOB_STATUS_SYNCING = "SYNCING"
 CRM_JOB_STATUS_SYNCED = "SYNCED"
@@ -12308,98 +8892,22 @@ CRM_JOB_STATUSES = (CRM_JOB_STATUS_PENDING, CRM_JOB_STATUS_SYNCING,
                    CRM_JOB_STATUS_SYNCED, CRM_JOB_STATUS_RETRYING,
                    CRM_JOB_STATUS_FAILED, CRM_JOB_STATUS_RECONNECT_REQUIRED)
 # Terminal — a job in one of these will never be picked up by the worker
-# again on its own; only an explicit user retry re-queues it (see
-# retry_crm_sync_job).
+# again on its own; only an explicit user retry re-queues it.
 CRM_JOB_TERMINAL_STATUSES = frozenset({CRM_JOB_STATUS_SYNCED, CRM_JOB_STATUS_FAILED,
                                        CRM_JOB_STATUS_RECONNECT_REQUIRED})
 
-CRM_SYNC_OPERATION = "organisation_meeting_crm"
-
-# ---------------------------------------------------------------------------
-# Error classification (spec section 9). ONE function every retry/DLQ
-# decision reads — never re-derived per call site, so "is this worth
-# retrying" has exactly one answer.
-# ---------------------------------------------------------------------------
-CRM_ERROR_TRANSIENT = "transient"    # Salesforce 5xx/timeout/network, AWS hiccup
-CRM_ERROR_REAUTH = "reauth"          # dead/revoked Salesforce refresh token
-CRM_ERROR_PERMISSION = "permission"  # Salesforce/MinuteX authorization denial
-CRM_ERROR_VALIDATION = "validation"  # Salesforce rejected a field/value
+# Error categories a job attempt can end with. Only TRANSIENT is retried.
+CRM_ERROR_TRANSIENT = "transient"    # 5xx/timeout/network, AWS hiccup
+CRM_ERROR_VALIDATION = "validation"  # the receiver rejected a field/value
 CRM_ERROR_PERMANENT = "permanent"    # bad config, missing identity, gone data
 
-# Only these categories are worth a retry. permission/validation/permanent
-# describe a condition that a retry, by itself, cannot fix — the org's
-# Salesforce admin, or an Owner/Manager reconfiguring MinuteX, has to act
-# first. Retrying those anyway would just repeat the same rejection until
-# the DLQ, wasting attempts that could have gone to a genuinely transient
-# job. reauth is also excluded: retrying with the SAME dead refresh token
-# can never succeed until the user reconnects — see RECONNECT_REQUIRED.
-CRM_RETRYABLE_ERROR_CATEGORIES = frozenset({CRM_ERROR_TRANSIENT})
 
+def _crm_job_idempotency_key(workspace_id: str, recording_key: str, op: str) -> str:
+    """Deterministic per (workspace, meeting, operation).
 
-def _classify_crm_error_fields(status: int, code: str) -> str:
-    """The actual classification rule, over raw (status, code) rather than
-    an exception object — so it can classify BOTH a freshly-raised ApiError
-    (via _classify_crm_error below) AND an already-captured per-operation
-    failure dict (push_errors[i], tasks.failed[i], event) that only ever
-    stored status/code/error text, never the original exception instance.
-    Never guesses from prose — only status codes and the stable `code`
-    attribute this codebase already uses everywhere else
-    (SalesforceReconnectRequired, OrganisationSalesforceNotConnected, ...).
-    """
-    code = code or ""
-    status = status or 0
-
-    if code == SF_RECONNECT_CODE:
-        return CRM_ERROR_REAUTH
-    if code in (ORG_SF_NOT_CONNECTED_CODE,):
-        # Not connected/configured at all — nothing to retry until an
-        # Owner/Manager fixes the organisation's Salesforce setup.
-        return CRM_ERROR_PERMANENT
-    if status == 403:
-        return CRM_ERROR_PERMISSION
-    if status in (400, 422):
-        # Salesforce validation rejections use 422 in this codebase's own
-        # convention (see update_record/create_record); a plain 400 here is
-        # MinuteX's own precondition failure (no mapping configured, no
-        # record linked) — both mean "won't succeed without a config/data
-        # change", i.e. permanent, not validation-retry-worthy in the
-        # Salesforce sense. Kept as one bucket: neither should be retried.
-        return CRM_ERROR_VALIDATION if status == 422 else CRM_ERROR_PERMANENT
-    if status == 404:
-        # The linked Salesforce record is gone — crm_sync_record itself
-        # already demotes this to lookup_pending; from the JOB's point of
-        # view this meeting needs a human to re-link before it can proceed.
-        return CRM_ERROR_PERMANENT
-    if status == 429 or status >= 500 or status == 0:
-        # 429 (throttling), 5xx, or 0 (network/timeout — this codebase's
-        # SalesforceClient raises ApiError(502, ...) for both, so 0 covers a
-        # non-ApiError exception the worker wraps defensively).
-        return CRM_ERROR_TRANSIENT
-    return CRM_ERROR_PERMANENT
-
-
-def _classify_crm_error(e) -> str:
-    """One ApiError (or ApiError-like: has .status and optionally .code) ->
-    an error category. Thin wrapper over _classify_crm_error_fields — see
-    that function for the actual rule."""
-    return _classify_crm_error_fields(getattr(e, "status", 0) or 0,
-                                      getattr(e, "code", "") or "")
-
-
-def _crm_job_idempotency_key(workspace_id: str, recording_key: str,
-                             op: str = CRM_SYNC_OPERATION) -> str:
-    """Deterministic per (organisation, meeting, operation) — spec section 5.
-
-    Used to find an EXISTING queued/in-flight job for this meeting before
-    creating a new one (create_crm_sync_job), so a user double-tapping
-    "Push to Salesforce" enqueues one job, not two. This is a MinuteX-level
-    idempotency key, not a Salesforce one — Salesforce itself has no
-    external-id mechanism this codebase can attach to Event/Task creation
-    (evaluated, not invented: neither standard object exposes one in this
-    org's schema without a custom field this codebase does not assume
-    exists), which is exactly why crm_event_synced/crm_tasks_synced —
-    durable state checked BEFORE any Salesforce call — carry the real
-    duplicate-prevention weight; this key only prevents duplicate JOBS.
+    Used to find an EXISTING queued/in-flight job before creating a new one,
+    so a double tap enqueues one job, not two. This only prevents duplicate
+    JOBS; the receiver's own idempotency key prevents duplicate writes.
     """
     return f"{workspace_id}:{recording_key}:{op}"
 
@@ -12429,20 +8937,15 @@ def _active_crm_sync_job_for(recording_key: str, idempotency_key: str) -> dict:
 
 
 def _enqueue_crm_sync_job(job: dict) -> None:
-    """Send the SQS message for one job. MINIMAL PAYLOAD ONLY (spec section
-    6) — job_id, workspace_id, recording_key, operation. No Salesforce
-    token, no meeting content, no identity data: the worker reads all of
-    that itself from DynamoDB via job_id, which is also what makes a
-    duplicate delivery harmless (the worker re-reads current truth every
-    time, never trusts what shipped in the message body).
+    """Send the SQS message for one job. MINIMAL PAYLOAD ONLY — job_id,
+    workspace_id, recording_key, operation. No credential, no meeting
+    content: the worker reads all of that itself from DynamoDB via job_id,
+    which is also what makes a duplicate delivery harmless.
 
-    Best-effort in the sense that a failure here does not lose the job: the
-    row already exists in CrmSyncJobs with status PENDING, so
-    retry_crm_sync_job (or an operator) can re-enqueue it. It DOES raise,
-    though — unlike the codebase's other best-effort async invokes (task
-    seeding), silently swallowing a failed enqueue would leave a job stuck
-    at PENDING forever with nothing telling the user it never actually got
-    queued.
+    A failure here does not lose the job (the row already exists as
+    PENDING, and a stalled PENDING job is re-enqueued on the next push), but
+    it DOES raise: silently swallowing it would leave the job stuck with
+    nothing telling the user it never got queued.
     """
     if not CRM_SYNC_QUEUE_URL:
         # No queue configured — this deployment has not run
@@ -12461,63 +8964,6 @@ def _enqueue_crm_sync_job(job: dict) -> None:
     )
 
 
-def create_crm_sync_job(*, workspace_id: str, recording_key: str, user_id: str,
-                        requested_objects=None) -> dict:
-    """Create (or reuse) the durable job row for one meeting's CRM push, and
-    enqueue it. Returns the job row.
-
-    IDEMPOTENT AT THE JOB LEVEL: an existing non-terminal job for the same
-    (workspace, meeting, operation) is returned AS-IS rather than creating a
-    second one — a double-tap of "Push to Salesforce" before the first
-    attempt finishes must not queue two jobs that would both try to create
-    the same Task/Event (crm_tasks_synced/crm_event_synced would make the
-    second one a no-op Salesforce-side, but there is no reason to burn a
-    second SQS message and worker invocation to learn that).
-    """
-    idempotency_key = _crm_job_idempotency_key(workspace_id, recording_key)
-    existing = _active_crm_sync_job_for(recording_key, idempotency_key)
-    if existing:
-        print(f"[crm-sync] reusing existing job {existing['job_id']} for "
-              f"{recording_key} (status={existing['status']})")
-        return existing
-
-    now = _now_iso()
-    job = {
-        "job_id": uuid.uuid4().hex,
-        "workspace_id": workspace_id,
-        "recording_key": recording_key,
-        "requested_by_user_id": user_id,
-        "operation": CRM_SYNC_OPERATION,
-        "status": CRM_JOB_STATUS_PENDING,
-        "attempt_count": 0,
-        "idempotency_key": idempotency_key,
-        "requested_objects": requested_objects if requested_objects is not None else None,
-        "next_attempt_at": now,
-        "last_error_category": "",
-        "last_error_code": "",
-        "last_error_message": "",
-        "result": {},
-        "created_at": now,
-        "updated_at": now,
-        "completed_at": "",
-    }
-    # requested_objects=None must not be written as DynamoDB NULL noise when
-    # absent — omit rather than write None.
-    if job["requested_objects"] is None:
-        del job["requested_objects"]
-    _crm_sync_jobs.put_item(Item=job)
-    print(f"[crm-sync] job {job['job_id']} created for workspace={workspace_id} "
-          f"meeting={recording_key} by={user_id}")
-
-    try:
-        _enqueue_crm_sync_job(job)
-    except Exception as e:  # noqa: BLE001
-        print(f"[crm-sync] job {job['job_id']} enqueue failed: "
-              f"{type(e).__name__}: {e}")
-        raise
-    return job
-
-
 def _get_crm_sync_job(job_id: str) -> dict:
     return _crm_sync_jobs.get_item(Key={"job_id": job_id}).get("Item")
 
@@ -12533,16 +8979,9 @@ def _update_crm_sync_job(job_id: str, **fields) -> None:
     )
 
 
-# Retry policy (spec section 10): 3 attempts, doubling backoff, then the SQS
-# redrive policy (scripts/64_create_crm_sync_queue.sh,
-# CRM_SYNC_MAX_RECEIVES=5) is what ultimately moves a message to the DLQ.
-# The two numbers are deliberately different: this is the APPLICATION-level
-# "is it worth trying again" decision (recorded durably in CrmSyncJobs, and
-# what governs next_attempt_at); SQS's maxReceiveCount is the transport-
-# level backstop for a worker that crashes/times out without updating the
-# job row at all. A job this function marks FAILED never reaches the queue
-# again on its own regardless of how many SQS receives remain — the two
-# limits are independent safety nets, not one policy expressed twice.
+# Retry policy: 3 attempts, doubling backoff; the SQS redrive policy
+# (scripts/64_create_crm_sync_queue.sh) is the transport-level backstop that
+# moves a message to the DLQ if the worker dies without updating the row.
 CRM_JOB_MAX_ATTEMPTS = int(os.environ.get("CRM_JOB_MAX_ATTEMPTS", "3"))
 CRM_JOB_BACKOFF_SECONDS = (60, 300, 900)  # 1 min, 5 min, 15 min
 
@@ -12552,154 +8991,12 @@ def _next_attempt_delay(attempt_count: int) -> int:
     return CRM_JOB_BACKOFF_SECONDS[idx]
 
 
-def execute_crm_sync_job(job_id: str) -> dict:
-    """THE worker entry point — called by crmSyncWorker's Lambda handler for
-    every SQS message, and directly by tests (no SQS in the offline suite).
-
-    SECURITY (spec section 16): re-verifies workspace/meeting state from
-    DynamoDB using ONLY the job_id the message named — never trusts a
-    workspace_id or recording_key carried in the SQS message body itself
-    (the message is not an authorization boundary). The job row IS the
-    authorization record: it was created by create_crm_sync_job under a
-    verified _require_org_meeting call, so re-reading it (rather than the
-    message) is what makes a forged/tampered SQS message unable to target
-    someone else's workspace no matter what it claims.
-
-    IDEMPOTENT AND CRASH-SAFE: status is written to SYNCING before any
-    Salesforce call, and _execute_org_meeting_crm_push's own per-operation
-    idempotency (crm_records status, crm_tasks_synced, crm_event_synced) is
-    what makes a re-run after a crash — worker died after Salesforce
-    succeeded but before this function persisted SYNCED, a duplicate SQS
-    delivery, a visibility-timeout redelivery — skip everything already
-    done and retry only what is not.
-    """
-    job = _get_crm_sync_job(job_id)
-    if not job:
-        # A job_id with no row is not this function's problem to retry —
-        # either it was never created (a malformed/forged message) or it
-        # was somehow deleted. Either way there is nothing to act on.
-        print(f"[crm-sync] job {job_id} not found — dropping")
-        return {"job_id": job_id, "dropped": True}
-
-    workspace_id = job["workspace_id"]
-    recording_key = job["recording_key"]
-    attempt = int(job.get("attempt_count") or 0) + 1
-    _update_crm_sync_job(job_id, status=CRM_JOB_STATUS_SYNCING, attempt_count=attempt)
-    print(f"[crm-sync] job {job_id} attempt={attempt} workspace={workspace_id} "
-          f"meeting={recording_key} operation={job.get('operation', '')}")
-
-    # Re-validate the meeting/workspace still exist and are still linked the
-    # way the job claims — an organisation could be deleted, or (far more
-    # likely) the meeting could have been deleted, between enqueue and
-    # worker pickup. Fails PERMANENT, not transient: a missing meeting will
-    # never reappear.
-    item = _recordings.get_item(Key={"audio_s3_key": recording_key}).get("Item")
-    if not item:
-        return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_FAILED,
-                                    CRM_ERROR_PERMANENT, "",
-                                    "the meeting no longer exists")
-    row_workspace_id = _row_workspace_id(item)
-    if row_workspace_id != workspace_id:
-        # The meeting's workspace no longer matches what the job was
-        # created for (moved, or the job/message was tampered with). Never
-        # push against the WRONG organisation's Salesforce connection.
-        return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_FAILED,
-                                    CRM_ERROR_PERMANENT, "",
-                                    "this meeting no longer belongs to the "
-                                    "workspace this job was created for")
-    if not workspace_schema.is_organisation_workspace_id(workspace_id):
-        return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_FAILED,
-                                    CRM_ERROR_PERMANENT, "",
-                                    "not an organisation meeting")
-    membership = _workspace_row(workspace_id)
-    if not membership or not workspace_schema.workspace_is_active(membership):
-        return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_FAILED,
-                                    CRM_ERROR_PERMANENT, "",
-                                    "this workspace is no longer active")
-
-    requested_objects = job.get("requested_objects")
-    try:
-        result = _execute_org_meeting_crm_push(
-            job.get("requested_by_user_id", ""), recording_key, item,
-            workspace_id, requested_objects)
-    except ApiError as e:
-        category = _classify_crm_error(e)
-        code = getattr(e, "code", "")
-        return _finish_crm_sync_job(job_id, attempt,
-                                    CRM_JOB_STATUS_RECONNECT_REQUIRED
-                                    if category == CRM_ERROR_REAUTH
-                                    else CRM_JOB_STATUS_FAILED,
-                                    category, code, e.message, retryable=(
-                                        category in CRM_RETRYABLE_ERROR_CATEGORIES))
-    except Exception as e:  # noqa: BLE001
-        # An unexpected failure (not an ApiError this codebase raised on
-        # purpose) is treated as transient — worth one more try — rather
-        # than permanent, since the alternative (never retrying an unknown
-        # failure mode) risks silently dropping a recoverable job.
-        print(f"[crm-sync] job {job_id} unexpected error: "
-              f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
-        return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_FAILED,
-                                    CRM_ERROR_TRANSIENT, "", str(e)[:500],
-                                    retryable=True)
-
-    # PARTIAL FAILURE ROLLUP (spec section 13). The job as a whole is SYNCED
-    # only when every operation it attempted actually succeeded; a Task or
-    # object-sync failure inside an otherwise-successful push must still be
-    # visible as a job-level problem the user can retry, even though the
-    # underlying idempotency state means a retry only repeats the failed
-    # part (crm_event_synced/crm_tasks_synced skip what already succeeded).
-    had_failure = bool(result.get("push_errors")) or bool(result["tasks"].get("failed")) \
-        or bool(result["event"].get("error"))
-    reconnect = any(pe.get("code") == SF_RECONNECT_CODE for pe in result.get("push_errors", [])) \
-        or result["event"].get("code") == SF_RECONNECT_CODE
-    if reconnect:
-        return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_RECONNECT_REQUIRED,
-                                    CRM_ERROR_REAUTH, SF_RECONNECT_CODE,
-                                    "the organisation's Salesforce connection has "
-                                    "expired — reconnect Salesforce", result=result)
-    if had_failure:
-        # At least one operation failed with a non-reauth error. Classify
-        # from the FIRST failure encountered — using its OWN status/code
-        # (Phase 2D.4 addition to push_errors/tasks.failed/event; see those
-        # capture points) rather than assuming transient, so a permission or
-        # validation failure is never retried just because it happened
-        # alongside an otherwise-successful push. The individual
-        # per-operation errors remain fully available in `result` for the UI
-        # to render per spec section 14's example.
-        first_error = next(
-            (pe for pe in result.get("push_errors", []) if pe.get("error")),
-            None)
-        if first_error is None:
-            first_task_failure = next(iter(result["tasks"].get("failed", [])), None)
-            if first_task_failure:
-                message = first_task_failure.get("error") or "task creation failed"
-                category = _classify_crm_error_fields(
-                    first_task_failure.get("status", 0), first_task_failure.get("code", ""))
-            elif result["event"].get("error"):
-                message = result["event"]["error"]
-                category = _classify_crm_error_fields(
-                    result["event"].get("status", 0), result["event"].get("code", ""))
-            else:
-                message = "one or more CRM operations failed"
-                category = CRM_ERROR_TRANSIENT
-        else:
-            message = first_error["error"]
-            category = _classify_crm_error_fields(
-                first_error.get("status", 0), first_error.get("code", ""))
-        return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_FAILED,
-                                    category, "", message, result=result,
-                                    retryable=category in CRM_RETRYABLE_ERROR_CATEGORIES)
-
-    return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_SYNCED,
-                                "", "", "", result=result)
-
-
 def _finish_crm_sync_job(job_id: str, attempt: int, terminal_or_retrying_status: str,
                          error_category: str, error_code: str, error_message: str,
                          *, result=None, retryable: bool = False) -> dict:
     """Persist the outcome of one attempt, deciding RETRYING vs the final
     terminal status. The ONE place attempt-count/backoff/DLQ-eligibility
-    logic lives, so execute_crm_sync_job's callers never duplicate it.
+    logic lives, so the job executors never duplicate it.
     """
     now = _now_iso()
     fields = {
@@ -12765,25 +9062,6 @@ class _CrmSyncJobRetry(Exception):
         self.retry_after_seconds = retry_after_seconds
 
 
-def get_crm_sync_job_status(event):
-    """GET /recordings/ai/crm-sync-jobs/{key+} (JWT, organisation meetings
-    only) -> {job} | {job: null}
-
-    The status the frontend polls after a Push — spec section 21's "CRM
-    sync queued... syncing... synced/failed/reconnect required". Returns
-    the MOST RECENT job for this meeting (by created_at), or null if none
-    was ever created (the meeting has never been pushed).
-    """
-    _user_id, key, _item, _workspace_id = _require_org_meeting(event, hydrate=False)
-    res = _crm_sync_jobs.query(
-        IndexName="recording-index",
-        KeyConditionExpression=Key("recording_key").eq(key),
-        ScanIndexForward=False, Limit=1,
-    )
-    items = res.get("Items") or []
-    return _resp(200, {"job": _public_crm_sync_job(items[0]) if items else None})
-
-
 def _public_crm_sync_job(job: dict) -> dict:
     return {
         "job_id": job.get("job_id", ""),
@@ -12799,42 +9077,6 @@ def _public_crm_sync_job(job: dict) -> dict:
     }
 
 
-def retry_crm_sync_job(event):
-    """POST /recordings/ai/crm-sync-jobs/{key+}/retry (JWT, organisation
-    meetings only) -> {job_id, status} — 202 Accepted.
-
-    User-initiated retry for a job sitting in a TERMINAL state (spec
-    section 14): FAILED (recoverable — Salesforce was down, a transient
-    error), or RECONNECT_REQUIRED (after the user has reconnected
-    Salesforce — see org_salesforce_connect). Re-enqueues the EXISTING job
-    row rather than creating a new one, so attempt_count/history is
-    continuous and idempotency state (crm_event_synced etc.) is read fresh
-    at execution time — if identity was re-resolved or Salesforce
-    reconnected since the failure, THIS retry uses the current truth, never
-    a cached copy (spec section 25).
-    """
-    _user_id, key, _item, _workspace_id = _require_org_meeting(event, hydrate=False)
-    res = _crm_sync_jobs.query(
-        IndexName="recording-index",
-        KeyConditionExpression=Key("recording_key").eq(key),
-        ScanIndexForward=False, Limit=1,
-    )
-    items = res.get("Items") or []
-    if not items:
-        raise ApiError(404, "no CRM sync job exists for this meeting yet")
-    job = items[0]
-    if job["status"] not in CRM_JOB_TERMINAL_STATUSES:
-        raise ApiError(409, "this job is already queued or in progress")
-
-    now = _now_iso()
-    _update_crm_sync_job(job["job_id"], status=CRM_JOB_STATUS_PENDING,
-                         next_attempt_at=now, last_error_category="",
-                         last_error_code="", last_error_message="")
-    refreshed = _get_crm_sync_job(job["job_id"])
-    _enqueue_crm_sync_job(refreshed)
-    print(f"[crm-sync] job {job['job_id']} manually retried")
-    return _resp(202, {"job_id": job["job_id"], "status": CRM_JOB_STATUS_PENDING})
-
 
 # ===========================================================================
 # ELEVENLABS SPEECH-TO-TEXT WEBHOOK
@@ -12845,11 +9087,10 @@ def retry_crm_sync_job(event):
 # docstring for why the transcription is no longer allowed to happen inside a
 # Lambda invocation at all.
 #
-# THIS IS THE SECOND UNAUTHENTICATED ROUTE IN THIS FILE (the first is
-# /crm/salesforce/callback). It is called by ElevenLabs' servers, which have no
-# MinuteX JWT, so a bearer token is impossible. Identity comes from an HMAC
-# signature over the raw body instead — the same substitution the Salesforce
-# callback makes with its signed `state`.
+# THIS IS AN UNAUTHENTICATED ROUTE. It is called by ElevenLabs' servers, which
+# have no MinuteX JWT, so a bearer token is impossible. Identity comes from an
+# HMAC signature over the raw body instead — the same substitution the
+# Integrations callback makes with its signed `state`.
 #
 # Five independent checks, in this order, each rejecting before anything is
 # written. Order matters: the cheap cryptographic checks run before any
@@ -15663,9 +11904,9 @@ def ai_task_intelligence(event):
 #
 # The product goal is the one every meeting-notes tool has: send someone a URL
 # and they read the notes on their phone, with no account, no app and no
-# login. That requirement is what makes this the THIRD unauthenticated route
-# in this file (after /crm/salesforce/callback and the ElevenLabs STT
-# webhook), and it is worth being explicit about what replaces the JWT.
+# login. That requirement is what makes this an unauthenticated route (like
+# the ElevenLabs STT webhook and the Integrations callback), and it is worth
+# being explicit about what replaces the JWT.
 #
 # THE TOKEN IS THE CREDENTIAL. Possession of a 256-bit URL-safe token IS the
 # authorization — there is no identity behind it to check. Everything else
@@ -16478,8 +12719,7 @@ GMAIL_SCOPES = [
 INTEGRATION_GMAIL = integrations.PROVIDER_GMAIL
 
 # HTTP status + code for "MinuteX is fine, but the INTEGRATION behind this
-# route is not usable". Same reasoning as SF_RECONNECT_STATUS above, and the
-# reasoning is worth restating because it is the single most load-bearing
+# route is not usable". The reasoning is worth stating because it is the single most load-bearing
 # decision in this file's error handling: 401 on this API means the MinuteX
 # JWT is dead, and lib/api.ts reacts by clearing the session and bouncing the
 # user to /login. A dead Gmail refresh token must never do that — the user's
@@ -16550,12 +12790,10 @@ _google_secret_cache = None
 def _integration_kms_encrypt(plaintext: str) -> str:
     """Envelope-encrypt a refresh token for storage.
 
-    Uses INTEGRATIONS_KMS_KEY_ID, falling back to the Salesforce key when it
-    is unset so a deployment that has not yet run the new provisioning script
-    still works rather than storing plaintext. Storing plaintext is never an
-    acceptable degradation, so if NEITHER key exists this raises.
+    Uses INTEGRATIONS_KMS_KEY_ID. Storing plaintext is never an acceptable
+    degradation, so with no key configured this raises.
     """
-    key_id = INTEGRATIONS_KMS_KEY_ID or SALESFORCE_KMS_KEY_ID
+    key_id = INTEGRATIONS_KMS_KEY_ID
     if not key_id:
         raise ApiError(500, "integration credential storage is not configured")
     resp = _kms.encrypt(KeyId=key_id, Plaintext=plaintext.encode("utf-8"))
@@ -16572,7 +12810,7 @@ def _integration_kms_decrypt(ciphertext_b64: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Storage — the Integrations table, keyed exactly like CrmConnections.
+# Storage — the Integrations table, one row per (user, provider).
 # ---------------------------------------------------------------------------
 def _get_integration(user_id: str, provider: str):
     return _integrations.get_item(
@@ -16661,8 +12899,7 @@ class IntegrationProvider:
     def _post_form(self, url: str, form: dict, what: str) -> dict:
         """POST x-www-form-urlencoded, return parsed JSON.
 
-        Mirrors SalesforceClient._post_form — stdlib urllib, no dependencies,
-        matching this file's convention. The provider's own error body is
+        stdlib urllib, no dependencies, matching this file's convention. The provider's own error body is
         logged and never returned: an OAuth error body can echo parameters.
         """
         body = urllib.parse.urlencode(form).encode("utf-8")
@@ -16973,33 +13210,6 @@ def _require_integration(user_id: str, provider: str) -> dict:
 # ---------------------------------------------------------------------------
 # Routes — status
 # ---------------------------------------------------------------------------
-def _integration_rows(user_id: str) -> dict:
-    """Every provider's connection row for this user, from EVERY source.
-
-    Two tables feed one catalog. Integrations holds the providers this system
-    manages; CrmConnections holds Salesforce, which predates it and is
-    connected through /crm/salesforce/*. Merging here — rather than teaching
-    the catalog about two tables, or reporting Salesforce as "not connected"
-    because its row lives elsewhere — is what lets the Integrations screen be
-    one honest list.
-
-    The Salesforce read is best-effort: an unconfigured CrmConnections table
-    must degrade that ONE card to "not connected", never take down the whole
-    Integrations screen (which is also how Coming Soon cards reach the user).
-    """
-    rows = _all_integrations(user_id)
-    try:
-        crm = _get_salesforce_connection(user_id)
-    except Exception as e:  # noqa: BLE001
-        print(f"[integrations] salesforce read failed for {user_id}: "
-              f"{type(e).__name__}: {e}")
-        crm = None
-    sf = integrations.salesforce_row(crm)
-    if sf:
-        rows[integrations.PROVIDER_SALESFORCE] = sf
-    return rows
-
-
 def list_integrations(event):
     """GET /integrations (JWT) -> {integrations:[...]}.
 
@@ -17009,17 +13219,17 @@ def list_integrations(event):
     """
     user_id = _require_auth(event)
     return _resp(200, {
-        "integrations": integrations.catalog(_integration_rows(user_id))})
+        "integrations": integrations.catalog(_all_integrations(user_id))})
 
 
 def get_integration(event):
     """GET /integrations/{provider} (JWT) -> {integration:{...}}."""
     user_id = _require_auth(event)
     provider = _path_provider(event)
-    # Reads through the same merge as the catalog, so a single-provider fetch
-    # can never disagree with the list it came from.
+    # Reads the same rows as the catalog, so a single-provider fetch can
+    # never disagree with the list it came from.
     return _resp(200, {"integration": integrations.public_status(
-        provider, _integration_rows(user_id).get(provider))})
+        provider, _all_integrations(user_id).get(provider))})
 
 
 def integration_connect(event):
@@ -17087,8 +13297,8 @@ def integration_callback(event):
     """GET /integrations/{provider}/callback?code&state (NO JWT — the
     provider's browser redirect calls this).
 
-    `state` is the credential here, exactly as in salesforce_callback: a
-    browser redirect cannot carry a bearer token. Ends in a 302 to the app's
+    `state` is the credential here: a browser redirect cannot carry a
+    bearer token. Ends in a 302 to the app's
     deep link with an ok/error param, because the browser tab — not this
     Lambda — is the only thing that can hand control back to the app.
     """
@@ -17099,7 +13309,7 @@ def integration_callback(event):
         params = {"provider": provider}
         params.update({"connected": "1"} if ok
                       else {"connected": "0", "reason": reason})
-        target = INTEGRATION_RETURN_URL or SALESFORCE_RETURN_URL or "/"
+        target = INTEGRATION_RETURN_URL or "/"
         return {"statusCode": 302,
                 "headers": {"Location": f"{target}?{urllib.parse.urlencode(params)}"},
                 "body": ""}
@@ -17187,16 +13397,6 @@ def integration_disconnect(event):
     """
     user_id = _require_auth(event)
     provider = _path_provider(event)
-
-    # A provider whose connection this system does not own must not be
-    # disconnected through here. Without this guard the delete below would run
-    # against the Integrations table for a Salesforce row that lives in
-    # CrmConnections — reporting success while leaving the real credential in
-    # place, which is the worst possible outcome for a "disconnect".
-    meta = integrations.PROVIDERS_BY_ID.get(provider) or {}
-    if meta.get("managed_elsewhere"):
-        raise ApiError(400, f"Disconnect {meta.get('name', provider)} from its "
-                            f"own settings screen.")
 
     row = _get_integration(user_id, provider)
     if row and row.get("refresh_token_enc"):
@@ -18110,6 +14310,139 @@ def mark_all_notifications_read(event):
 
 
 # ---------------------------------------------------------------------------
+# PUSH TOKENS — one row per app installation, many per user.
+#
+#   POST   /me/push-tokens  {token, installation_id, platform, app_version?,
+#                            enabled?}                     -> {push_token:{...}}
+#   DELETE /me/push-tokens/{installation_id}               -> {removed}
+#
+# WHY UNDER /me. A token is a property of the signed-in account on one device,
+# exactly like the profile and the password — the same family of routes, the
+# same "the user is the JWT, never the body" rule.
+#
+# THE REGISTRATION IS THE PREFERENCE. `enabled` on the row is that device's
+# "Brief-ready notifications" switch (Settings). The sender reads it
+# (push_delivery.is_deliverable), so the toggle controls backend delivery
+# rather than decorating the screen. Omitting `enabled` on a re-registration
+# (every app start does this) keeps whatever the user last chose.
+#
+# OWNERSHIP. The token is the table key, so a token belongs to exactly ONE
+# account at a time. When a different account registers the same token (a
+# shared phone, sign-out then sign-in as someone else) the row is rewritten
+# for the new account and the previous one stops receiving on that device —
+# which is the correct outcome: the device now belongs to whoever is signed
+# in. The sign-out DELETE handles the common case explicitly.
+#
+# Known limit: someone who OBTAINED another user's Expo token could register
+# it to themselves, which would divert that device's notifications (to their
+# own account's briefs) — never expose anyone's content. Expo tokens are not
+# exposed by any MinuteX API (public_token omits it), which keeps that an
+# on-device-access scenario.
+# ---------------------------------------------------------------------------
+def _user_push_rows(user_id):
+    return push_delivery.user_rows(_push_tokens, user_id, Key)
+
+
+def register_push_token(event):
+    user_id = _require_auth(event)
+    data = _body(event)
+    token = str(data.get("token") or "").strip()
+    installation_id = str(data.get("installation_id") or "").strip()
+    platform = str(data.get("platform") or "").strip().lower()
+    if not push_delivery.is_expo_token(token):
+        raise ApiError(400, "a valid Expo push token is required")
+    if not push_delivery.is_installation_id(installation_id):
+        raise ApiError(400, "a valid installation_id is required")
+    if platform not in push_delivery.PLATFORMS:
+        raise ApiError(400, "platform must be 'ios' or 'android'")
+    enabled_in = data.get("enabled")
+    if enabled_in is not None and not isinstance(enabled_in, bool):
+        raise ApiError(400, "enabled must be true or false")
+    app_version = str(data.get("app_version") or "").strip()[
+        :push_delivery.MAX_APP_VERSION]
+
+    now = _now_iso()
+    existing = _push_tokens.get_item(Key={"push_token": token}).get("Item")
+    same_owner = bool(existing) and existing.get("user_id") == user_id
+    if existing and not same_owner:
+        print(f"[push] token {push_delivery.mask_token(token)} moved to "
+              f"user={user_id} from another account")
+
+    if enabled_in is None:
+        enabled = bool(existing.get("enabled", True)) if same_owner else True
+    else:
+        enabled = enabled_in
+
+    rows = _user_push_rows(user_id)
+
+    # Receipts first, while the parked ids are still on the rows (the put
+    # below rewrites this token's row). Best-effort and bounded: it only makes
+    # a network call when a receipt is actually due.
+    try:
+        push_delivery.check_receipts(
+            _push_tokens, user_id,
+            post=push_delivery.urllib_transport(timeout=4,
+                                                access_token=EXPO_ACCESS_TOKEN),
+            key_cls=Key, now_iso=now, now_epoch=int(time.time()))
+    except Exception as err:  # noqa: BLE001 — never fail a registration over it
+        print(f"[push] receipt check skipped: {type(err).__name__}")
+
+    # Expo can rotate an installation's token. The old one would keep
+    # receiving (twice per brief, once dead) unless it is dropped here.
+    for row in rows:
+        if (row.get("installation_id") == installation_id
+                and row.get("push_token") != token):
+            try:
+                _push_tokens.delete_item(Key={"push_token": row["push_token"]})
+            except Exception as err:  # noqa: BLE001
+                print(f"[push] could not prune rotated token: {type(err).__name__}")
+
+    item = {
+        "push_token": token,
+        "user_id": user_id,
+        "installation_id": installation_id,
+        "platform": platform,
+        "app_version": app_version,
+        "enabled": enabled,
+        "created_at": (existing.get("created_at") if same_owner else "") or now,
+        "updated_at": now,
+        "last_seen_at": now,
+        # No invalid_at: the app just obtained this token from Expo, which is
+        # fresher evidence than any earlier DeviceNotRegistered.
+    }
+    _push_tokens.put_item(Item=item)
+    return _resp(200, {"push_token": push_delivery.public_token(item)})
+
+
+def delete_push_token(event):
+    """Sign-out. Idempotent, and scoped to the caller: an installation id that
+    is not theirs removes nothing and answers the same as one that is gone."""
+    user_id = _require_auth(event)
+    installation_id = str((event.get("pathParameters") or {})
+                          .get("installation_id") or "").strip()
+    if not push_delivery.is_installation_id(installation_id):
+        raise ApiError(400, "a valid installation_id is required")
+    removed = 0
+    for row in _user_push_rows(user_id):
+        if row.get("installation_id") != installation_id:
+            continue
+        try:
+            _push_tokens.delete_item(
+                Key={"push_token": row["push_token"]},
+                # Re-checked at the write: the row could have moved to another
+                # account between the query and the delete.
+                ConditionExpression="user_id = :u",
+                ExpressionAttributeValues={":u": user_id},
+            )
+            removed += 1
+        except ClientError as err:
+            if err.response.get("Error", {}).get("Code") != \
+                    "ConditionalCheckFailedException":
+                raise
+    return _resp(200, {"installation_id": installation_id, "removed": removed})
+
+
+# ---------------------------------------------------------------------------
 # EAGER TASK SEEDING — the pipeline's entry point into the task layer.
 #
 # WHY THIS EXISTS. Task seeding used to happen only LAZILY: `_seed_ai_tasks`
@@ -18813,6 +15146,2966 @@ def remove_member(event):
                        "workspace_id": wid})
 
 
+# ===========================================================================
+# SALESFORCE SITE DELIVERY — delivery_type = "salesforce_site"
+#
+# A NEW, ISOLATED delivery path. MinuteX POSTs to ONE Apex REST endpoint the
+# customer exposes through a Salesforce Site (salesforce/minutex-site):
+#
+#   push meeting -> CrmSyncJobs row -> SQS -> crmSyncWorker
+#       -> execute_site_delivery_job -> HTTPS POST -> Site -> Apex REST
+#
+# WHAT IT SHARES WITH THE EXISTING SALESFORCE INTEGRATION, AND WHAT IT DOES
+# NOT. It reuses the job/queue machinery only: the CrmSyncJobs table, the
+# SQS queue and DLQ, the worker Lambda, _finish_crm_sync_job (attempt count,
+# backoff, RETRYING -> _CrmSyncJobRetry -> ChangeMessageVisibility) and
+# _enqueue_crm_sync_job. No OAuth, no Salesforce token, no field mapping.
+# Its jobs carry their own `operation` values (SITE_DELIVERY_OPERATIONS),
+# which is what the worker routes on.
+#
+# SWITCHED ON PER WORKSPACE by a SiteDeliveryEndpoints row with enabled=true.
+# Nothing is migrated: a workspace with an existing Salesforce OAuth
+# connection keeps it, untouched, and gets this path only if someone
+# configures an endpoint for it.
+#
+# TENANCY. Everything is keyed by workspace_id, verified through
+# _require_workspace_capability / _owned_recording — never from the client.
+# ===========================================================================
+SITE_DELIVERY_ENDPOINTS_TABLE = os.environ.get(
+    "SITE_DELIVERY_ENDPOINTS_TABLE", "SiteDeliveryEndpoints")
+PEOPLE_TABLE = os.environ.get("PEOPLE_TABLE", "People")
+# Public origin for audio links written into Salesforce. Falls back to the
+# share base URL (the API's public address), which is what the share audio
+# route already uses.
+SITE_AUDIO_BASE_URL = os.environ.get("SITE_AUDIO_BASE_URL", "")
+SITE_AUDIO_URL_TTL_SECONDS = int(os.environ.get("SITE_AUDIO_URL_TTL_SECONDS",
+                                                str(30 * 24 * 3600)))
+SITE_DELIVERY_TIMEOUT_SECONDS = int(os.environ.get(
+    "SITE_DELIVERY_TIMEOUT_SECONDS", "20"))
+SITE_HEALTH_TIMEOUT_SECONDS = 10
+SITE_PEOPLE_PAGE_SIZE = int(os.environ.get("SITE_PEOPLE_PAGE_SIZE", "200"))
+# Worker time spent on one people-sync segment before it saves its cursor and
+# re-enqueues itself. Well under the worker's 120s timeout.
+SITE_PEOPLE_SYNC_BUDGET_SECONDS = int(os.environ.get(
+    "SITE_PEOPLE_SYNC_BUDGET_SECONDS", "60"))
+SITE_PEOPLE_MAX_PAGES = 1000
+SITE_DELIVERY_ALLOWED_HOST_SUFFIXES = site_delivery_client.allowed_suffixes_from_env(
+    os.environ.get("SITE_DELIVERY_ALLOWED_HOST_SUFFIXES", ""))
+# A PENDING job not picked up in this long is re-enqueued when someone pushes
+# again, so a lost SQS send cannot strand a job forever.
+SITE_STALLED_JOB_SECONDS = 120
+
+SITE_OP_MEETING = "salesforce_site_meeting"
+SITE_OP_PEOPLE_SYNC = "salesforce_site_people_sync"
+# Authenticated-channel jobs (see the AUTHENTICATED ORG CONNECTION section).
+SITE_OP_SF_DISCOVER = "salesforce_site_discover"
+SITE_OP_SF_TASK = "salesforce_site_task"
+SITE_DELIVERY_OPERATIONS = frozenset({SITE_OP_MEETING, SITE_OP_PEOPLE_SYNC,
+                                      SITE_OP_SF_DISCOVER, SITE_OP_SF_TASK})
+SITE_NOT_CONFIGURED_CODE = "site_delivery_not_configured"
+SITE_PEOPLE_PROVIDER = "salesforce"
+CONTACT_SOURCE_PEOPLE = "people_sync"
+
+_site_endpoints = _ddb.Table(SITE_DELIVERY_ENDPOINTS_TABLE)
+_people = _ddb.Table(PEOPLE_TABLE)
+# Decrypted endpoint credentials, per container, keyed by the CIPHERTEXT: a
+# rotated secret has a new ciphertext, so it can never be served stale. Saves
+# a KMS call per audio seek.
+_site_secret_cache = {}
+
+
+class SiteDeliveryApiError(ApiError):
+    """An ApiError carrying a stable `code` the app branches on."""
+
+    def __init__(self, status, message, code):
+        super().__init__(status, message)
+        self.code = code
+
+
+def _site_client(timeout=None):
+    return site_delivery_client.SiteDeliveryClient(
+        timeout=timeout or SITE_DELIVERY_TIMEOUT_SECONDS,
+        allowed_host_suffixes=SITE_DELIVERY_ALLOWED_HOST_SUFFIXES)
+
+
+def _site_endpoint(workspace_id):
+    if not workspace_id:
+        return None
+    return _site_endpoints.get_item(
+        Key={"workspace_id": workspace_id}).get("Item")
+
+
+def _site_endpoint_enabled(endpoint):
+    return bool(endpoint) and bool(endpoint.get("enabled")) and \
+        endpoint.get("delivery_type") == site_contract.DELIVERY_TYPE_SALESFORCE_SITE
+
+
+def _site_secrets(endpoint):
+    ciphertext = str((endpoint or {}).get("secrets_enc") or "")
+    if not ciphertext:
+        return {}
+    cached = _site_secret_cache.get(ciphertext)
+    if cached is None:
+        cached = json.loads(_integration_kms_decrypt(ciphertext))
+        if len(_site_secret_cache) > 256:
+            _site_secret_cache.clear()
+        _site_secret_cache[ciphertext] = cached
+    return dict(cached)
+
+
+def _site_auth(endpoint):
+    return site_delivery_client.make_auth(
+        str(endpoint.get("auth_mode") or ""),
+        _site_secrets(endpoint).get("hmac_secret", ""))
+
+
+def _public_site_endpoint(endpoint):
+    if not endpoint:
+        return {"configured": False, "enabled": False,
+                "delivery_type": site_contract.DELIVERY_TYPE_SALESFORCE_SITE}
+    return {
+        "configured": True,
+        "enabled": bool(endpoint.get("enabled")),
+        "delivery_type": endpoint.get("delivery_type", ""),
+        "url": endpoint.get("url", ""),
+        "auth_mode": endpoint.get("auth_mode", ""),
+        "has_shared_secret": endpoint.get("auth_mode") == site_delivery_client.AUTH_MODE_HMAC,
+        "last_health": endpoint.get("last_health") or {},
+        "people_sync": endpoint.get("people_sync") or {},
+        "updated_at": endpoint.get("updated_at", ""),
+    }
+
+
+def _site_path_workspace(event):
+    return _url_unquote(
+        (event.get("pathParameters") or {}).get("workspace_id", ""))
+
+
+def site_delivery_get(event):
+    """GET /workspaces/{workspace_id}/site-delivery (JWT, any member)
+    -> {endpoint}. Never returns a secret."""
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    return _resp(200, {"endpoint": _public_site_endpoint(_site_endpoint(wid))})
+
+
+def site_delivery_put(event):
+    """PUT /workspaces/{workspace_id}/site-delivery
+    {url, auth_mode, shared_secret?, enabled?, rotate_audio_links?}
+    (JWT, CAP_MANAGE_INTEGRATIONS) -> {endpoint, warnings}
+
+    `shared_secret` is write-only: send it to set or change it; omit it to
+    keep the stored one. The audio signing key is generated on first save and
+    kept across edits — rotating it (rotate_audio_links=true) invalidates
+    every audio link already written into Salesforce.
+    """
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    data = _body(event)
+    try:
+        url = site_delivery_client.validate_endpoint_url(
+            data.get("url"), SITE_DELIVERY_ALLOWED_HOST_SUFFIXES)
+    except ValueError as e:
+        raise ApiError(400, str(e))
+    auth_mode = str(data.get("auth_mode") or "").strip().lower()
+    if auth_mode not in site_delivery_client.auth_modes():
+        raise ApiError(400, "auth_mode must be one of "
+                            f"{', '.join(site_delivery_client.auth_modes())}")
+    secret = data.get("shared_secret")
+    if secret is not None and not isinstance(secret, str):
+        raise ApiError(400, "shared_secret must be a string")
+    enabled = data.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ApiError(400, "enabled must be true or false")
+
+    current = _site_endpoint(wid) or {}
+    creds = _site_secrets(current)
+    if auth_mode == site_delivery_client.AUTH_MODE_HMAC:
+        if secret:
+            if len(secret) < site_delivery_client.MIN_SECRET_CHARS:
+                raise ApiError(400, "shared_secret must be at least "
+                                    f"{site_delivery_client.MIN_SECRET_CHARS} characters")
+            creds["hmac_secret"] = secret
+        elif not creds.get("hmac_secret"):
+            raise ApiError(400, "shared_secret is required for hmac_sha256")
+    else:
+        creds.pop("hmac_secret", None)
+    if data.get("rotate_audio_links") is True or not creds.get("audio_key"):
+        creds["audio_key"] = secrets.token_urlsafe(32)
+
+    now = _now_iso()
+    row = {
+        "workspace_id": wid,
+        "delivery_type": site_contract.DELIVERY_TYPE_SALESFORCE_SITE,
+        "url": url,
+        "auth_mode": auth_mode,
+        "enabled": enabled,
+        "secrets_enc": _integration_kms_encrypt(json.dumps(creds)),
+        "created_at": current.get("created_at") or now,
+        "created_by": current.get("created_by") or user_id,
+        "updated_at": now,
+        "updated_by": user_id,
+        "last_health": current.get("last_health") or {},
+        "people_sync": current.get("people_sync") or {},
+    }
+    _site_endpoints.put_item(Item=row)
+    _audit("site_delivery.configured", user_id, wid, auth_mode=auth_mode,
+           enabled=enabled)
+    warnings = []
+    if auth_mode == site_delivery_client.AUTH_MODE_NONE:
+        warnings.append("auth_mode none sends requests unsigned. Use it only "
+                        "with a development org.")
+    return _resp(200, {"endpoint": _public_site_endpoint(row),
+                       "warnings": warnings})
+
+
+def site_delivery_delete(event):
+    """DELETE /workspaces/{workspace_id}/site-delivery
+    (JWT, CAP_MANAGE_INTEGRATIONS) -> {deleted}
+
+    Removes the endpoint and its keys, so every audio link already written
+    into Salesforce stops working immediately. People already synced are
+    kept; a new endpoint's first sync refreshes them.
+    """
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    _site_endpoints.delete_item(Key={"workspace_id": wid})
+    _audit("site_delivery.removed", user_id, wid)
+    return _resp(200, {"deleted": True})
+
+
+def site_delivery_health(event):
+    """POST /workspaces/{workspace_id}/site-delivery/health
+    (JWT, CAP_MANAGE_INTEGRATIONS) -> {health}
+
+    Calls the receiver's `health` action now and records the outcome. A
+    failing receiver is a 200 with health.ok=false — the check itself ran;
+    what it found is the answer.
+    """
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    endpoint = _site_endpoint(wid)
+    if not endpoint:
+        raise SiteDeliveryApiError(409, "Salesforce Site delivery is not "
+                                        "configured", SITE_NOT_CONFIGURED_CODE)
+    request_id = site_contract.new_request_id()
+    env = site_contract.envelope(site_contract.ACTION_HEALTH,
+                                 request_id=request_id)
+    checked_at = _now_iso()
+    try:
+        resp = _site_client(SITE_HEALTH_TIMEOUT_SECONDS).post(
+            endpoint["url"], _site_auth(endpoint), env)
+        result = resp.result
+        health = {
+            "ok": True, "checked_at": checked_at, "request_id": request_id,
+            "receiver_version": resp.receiver_version,
+            # Lets the authenticated connection prove it is the same org.
+            "org_id": str(result.get("org_id") or ""),
+            "receiver_auth_mode": str(result.get("auth_mode") or ""),
+            "max_transcript_chars": int(result.get("max_transcript_chars") or 0),
+            "elapsed_ms": resp.elapsed_ms,
+        }
+    except site_delivery_client.SiteDeliveryError as e:
+        health = {"ok": False, "checked_at": checked_at,
+                  "request_id": request_id, "code": e.code,
+                  "message": e.message, "http_status": e.http_status}
+    _site_endpoints.update_item(
+        Key={"workspace_id": wid},
+        UpdateExpression="SET last_health = :h",
+        ExpressionAttributeValues={":h": health})
+    print(f"[site-delivery] health workspace={wid} by={user_id} "
+          f"ok={health['ok']} code={health.get('code', '')} "
+          f"request={request_id}")
+    return _resp(200, {"health": health})
+
+
+# ---------------------------------------------------------------------------
+# Jobs (CrmSyncJobs rows with a site operation)
+# ---------------------------------------------------------------------------
+
+def _site_job_is_stalled(job):
+    if job.get("status") != CRM_JOB_STATUS_PENDING:
+        return False
+    try:
+        updated = datetime.fromisoformat(
+            str(job.get("updated_at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - updated).total_seconds() \
+        > SITE_STALLED_JOB_SECONDS
+
+
+def _enqueue_site_job(job):
+    # The existing enqueue, unchanged: same queue, same minimal message
+    # (job_id, workspace_id, recording_key, operation). A people-sync job has
+    # no recording, so it travels with recording_key "".
+    _enqueue_crm_sync_job({**job, "recording_key": job.get("recording_key", "")})
+
+
+def _create_site_job(*, workspace_id, operation, user_id, recording_key="",
+                     extra=None, existing_job_id=None):
+    """Create (or reuse an in-flight) site delivery job, and enqueue it.
+
+    In-flight reuse: by recording for meeting jobs; by `existing_job_id` when
+    the caller tracks its own job (Tasks, discovery); otherwise the
+    workspace's people-sync job."""
+    idempotency_key = _crm_job_idempotency_key(workspace_id, recording_key,
+                                               operation)
+    existing = None
+    if recording_key:
+        existing = _active_crm_sync_job_for(recording_key, idempotency_key)
+    else:
+        job_id = existing_job_id if existing_job_id is not None \
+            else _site_people_sync_job_id(workspace_id)
+        row = _get_crm_sync_job(job_id) if job_id else None
+        if row and row.get("workspace_id") == workspace_id \
+                and row.get("status") not in CRM_JOB_TERMINAL_STATUSES:
+            existing = row
+    if existing:
+        if _site_job_is_stalled(existing):
+            _update_crm_sync_job(existing["job_id"], next_attempt_at=_now_iso())
+            _enqueue_site_job(existing)
+            print(f"[site-delivery] re-enqueued stalled job {existing['job_id']}")
+        return existing
+
+    now = _now_iso()
+    job = {
+        "job_id": uuid.uuid4().hex,
+        "workspace_id": workspace_id,
+        "requested_by_user_id": user_id,
+        "operation": operation,
+        "delivery_type": site_contract.DELIVERY_TYPE_SALESFORCE_SITE,
+        "status": CRM_JOB_STATUS_PENDING,
+        "attempt_count": 0,
+        "delivery_generation": 0,
+        "idempotency_key": idempotency_key,
+        "next_attempt_at": now,
+        "last_error_category": "",
+        "last_error_code": "",
+        "last_error_message": "",
+        "result": {},
+        "created_at": now,
+        "updated_at": now,
+        "completed_at": "",
+    }
+    # recording_key is the recording-index GSI key: omitted, never "", for a
+    # job that has no recording.
+    if recording_key:
+        job["recording_key"] = recording_key
+    job.update(extra or {})
+    _crm_sync_jobs.put_item(Item=job)
+    print(f"[site-delivery] job {job['job_id']} created op={operation} "
+          f"workspace={workspace_id} meeting={recording_key or '-'} by={user_id}")
+    _enqueue_site_job(job)
+    return job
+
+
+def _public_site_job(job):
+    if not job:
+        return None
+    out = _public_crm_sync_job(job)
+    out["operation"] = job.get("operation", "")
+    out["delivery_type"] = job.get("delivery_type", "")
+    if job.get("operation") == SITE_OP_PEOPLE_SYNC:
+        out["people_pages"] = int(job.get("people_pages") or 0)
+        out["people_counts"] = job.get("people_counts") or {}
+    return out
+
+
+def _latest_site_meeting_job(key):
+    res = _crm_sync_jobs.query(
+        IndexName="recording-index",
+        KeyConditionExpression=Key("recording_key").eq(key),
+        ScanIndexForward=False,
+    )
+    for row in res.get("Items", []):
+        if row.get("operation") == SITE_OP_MEETING:
+            return row
+    return None
+
+
+def site_meeting_push(event):
+    """POST /recordings/site-delivery/{key+} (JWT, meeting write access)
+    -> 202 {job}
+
+    Queues one meeting for delivery to the workspace's Salesforce Site.
+    Refuses up front (422 transcript_too_large) when the transcript cannot be
+    delivered whole, rather than queueing a job that is certain to fail.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=True)
+    wid = _row_workspace_id(item)
+    if not _site_endpoint_enabled(_site_endpoint(wid)):
+        raise SiteDeliveryApiError(
+            409, "Salesforce Site delivery is not enabled for this workspace",
+            SITE_NOT_CONFIGURED_CODE)
+    chars = site_contract.text_length(str(item.get("transcript") or "").strip())
+    if chars > site_contract.MAX_TRANSCRIPT_CHARS:
+        raise SiteDeliveryApiError(
+            422, str(site_contract.TranscriptTooLarge(chars)),
+            "transcript_too_large")
+    job = _create_site_job(workspace_id=wid, operation=SITE_OP_MEETING,
+                           user_id=user_id, recording_key=key)
+    return _resp(202, {"job": _public_site_job(job)})
+
+
+def site_meeting_status(event):
+    """GET /recordings/site-delivery/{key+} (JWT, meeting write access)
+    -> {job, endpoint}"""
+    _user_id, key, item = _owned_recording(event, hydrate=False)
+    wid = _row_workspace_id(item)
+    endpoint = _site_endpoint(wid)
+    return _resp(200, {
+        "job": _public_site_job(_latest_site_meeting_job(key)),
+        "endpoint": {"configured": bool(endpoint),
+                     "enabled": _site_endpoint_enabled(endpoint)},
+        "meeting_record": _public_meeting_record(
+            _site_meeting_record(item, _site_sf_connection(wid))),
+    })
+
+
+def site_meeting_retry(event):
+    """POST /recordings/site-delivery-retry/{key+} (JWT, meeting write
+    access) -> 202 {job}
+
+    Re-queues the latest FAILED site delivery. The retry is a new delivery
+    intent: delivery_generation is bumped so the receiver processes it rather
+    than answering from the failed attempt's idempotency key, and the
+    attempt budget starts again.
+    """
+    _user_id, key, item = _owned_recording(event, hydrate=False)
+    if not _site_endpoint_enabled(_site_endpoint(_row_workspace_id(item))):
+        raise SiteDeliveryApiError(
+            409, "Salesforce Site delivery is not enabled for this workspace",
+            SITE_NOT_CONFIGURED_CODE)
+    job = _latest_site_meeting_job(key)
+    if not job:
+        raise ApiError(404, "this meeting has not been delivered yet")
+    if job.get("status") not in (CRM_JOB_STATUS_FAILED,
+                                 CRM_JOB_STATUS_RECONNECT_REQUIRED):
+        raise ApiError(409, "only a failed delivery can be retried")
+    _update_crm_sync_job(
+        job["job_id"], status=CRM_JOB_STATUS_PENDING, attempt_count=0,
+        delivery_generation=int(job.get("delivery_generation") or 0) + 1,
+        next_attempt_at=_now_iso(), completed_at="",
+        last_error_category="", last_error_code="", last_error_message="")
+    refreshed = _get_crm_sync_job(job["job_id"])
+    _enqueue_site_job(refreshed)
+    return _resp(202, {"job": _public_site_job(refreshed)})
+
+
+# ---------------------------------------------------------------------------
+# Worker entry point
+# ---------------------------------------------------------------------------
+
+def execute_site_delivery_job(job_id):
+    """THE worker entry point: crmSyncWorker routes every job here.
+
+    The job ROW is authoritative: a message that claims a site operation for
+    a row that is not one is dropped, and workspace/meeting state is
+    re-validated from DynamoDB on every attempt.
+
+    DUPLICATE EXECUTION. A job already SYNCED, or terminally FAILED, is not
+    run again by a stale or duplicated SQS message — only a user retry (which
+    sets PENDING first) re-opens it. Two workers racing on a live job both
+    POST the same idempotency_key, and the receiver processes it once.
+    """
+    job = _get_crm_sync_job(job_id)
+    if not job:
+        print(f"[site-delivery] job {job_id} not found — dropping")
+        return {"job_id": job_id, "dropped": True}
+    operation = job.get("operation", "")
+    if operation not in SITE_DELIVERY_OPERATIONS:
+        print(f"[site-delivery] job {job_id} has operation={operation!r}, "
+              f"not a site operation — dropping")
+        return {"job_id": job_id, "dropped": True}
+    if job.get("status") in CRM_JOB_TERMINAL_STATUSES:
+        print(f"[site-delivery] job {job_id} already {job.get('status')} — "
+              f"duplicate message ignored")
+        return job
+
+    attempt = int(job.get("attempt_count") or 0) + 1
+    _update_crm_sync_job(job_id, status=CRM_JOB_STATUS_SYNCING,
+                         attempt_count=attempt)
+    print(f"[site-delivery] job {job_id} attempt={attempt} op={operation} "
+          f"workspace={job.get('workspace_id')} "
+          f"meeting={job.get('recording_key', '-')}")
+    runners = {
+        SITE_OP_MEETING: _run_site_meeting_job,
+        SITE_OP_PEOPLE_SYNC: _run_site_people_job,
+        SITE_OP_SF_DISCOVER: _run_site_sf_discover_job,
+        SITE_OP_SF_TASK: _run_site_sf_task_job,
+    }
+    return runners[operation](job, attempt)
+
+
+def _site_fail(job_id, attempt, category, code, message, *, result=None):
+    return _finish_crm_sync_job(
+        job_id, attempt, CRM_JOB_STATUS_FAILED, category, code, message,
+        result=result,
+        retryable=category == site_delivery_client.CATEGORY_TRANSIENT)
+
+
+def _site_endpoint_for_job(job, attempt):
+    """The enabled endpoint for this job's workspace, or a finished FAILED job
+    (returned as the second element)."""
+    wid = job["workspace_id"]
+    if workspace_schema.is_organisation_workspace_id(wid):
+        row = _workspace_row(wid)
+        if not row or not workspace_schema.workspace_is_active(row):
+            return None, _site_fail(job["job_id"], attempt, CRM_ERROR_PERMANENT,
+                                    "workspace_inactive",
+                                    "this workspace is no longer active")
+    endpoint = _site_endpoint(wid)
+    if not _site_endpoint_enabled(endpoint):
+        return None, _site_fail(job["job_id"], attempt, CRM_ERROR_PERMANENT,
+                                SITE_NOT_CONFIGURED_CODE,
+                                "Salesforce Site delivery is not enabled for "
+                                "this workspace")
+    return endpoint, None
+
+
+def _run_site_meeting_job(job, attempt):
+    job_id, key, wid = job["job_id"], job.get("recording_key", ""), job["workspace_id"]
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") if key else None
+    if not item:
+        return _site_fail(job_id, attempt, CRM_ERROR_PERMANENT, "meeting_gone",
+                          "the meeting no longer exists")
+    if _row_workspace_id(item) != wid:
+        return _site_fail(job_id, attempt, CRM_ERROR_PERMANENT,
+                          "workspace_mismatch",
+                          "this meeting no longer belongs to the workspace "
+                          "this job was created for")
+    endpoint, finished = _site_endpoint_for_job(job, attempt)
+    if finished is not None:
+        return finished
+
+    # NOT best-effort, unlike the OAuth path: delivering a transcript-less
+    # meeting because S3 blinked would write an empty transcript into the
+    # customer's record and report success. A retry is the honest outcome.
+    try:
+        item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+    except Exception as e:  # noqa: BLE001
+        print(f"[site-delivery] job {job_id} transcript hydrate failed: "
+              f"{type(e).__name__}: {e}")
+        return _site_fail(job_id, attempt, CRM_ERROR_TRANSIENT,
+                          "transcript_unavailable",
+                          "the transcript could not be read; will retry")
+
+    tasks = [r for r in _tasks_for_recording(key)
+             if str(r.get("status") or "") != TASK_STATUS_CANCELLED]
+    try:
+        payload = site_contract.build_meeting_payload(
+            item, tasks,
+            participants=_site_participants(key, item),
+            workspace=_site_workspace_block(wid),
+            meeting_url=_meeting_deep_link(key),
+            audio=_site_audio_block(key, item, endpoint, job_id),
+            relation=_site_meeting_relation_for_delivery(wid, key, item))
+    except site_contract.ContractError as e:
+        return _site_fail(job_id, attempt, CRM_ERROR_VALIDATION, e.code,
+                          e.message)
+
+    request_id = site_contract.new_request_id()
+    idempotency_key = site_contract.meeting_idempotency_key(
+        job_id, job.get("delivery_generation") or 0)
+    env = site_contract.envelope(site_contract.ACTION_UPSERT_MEETING, payload,
+                                 request_id=request_id,
+                                 idempotency_key=idempotency_key)
+    counts = site_contract.payload_counts(payload)
+    base_result = {
+        "delivery_type": site_contract.DELIVERY_TYPE_SALESFORCE_SITE,
+        "action": site_contract.ACTION_UPSERT_MEETING,
+        "meeting_id": payload["meeting"]["id"],
+        "request_id": request_id,
+        "idempotency_key": idempotency_key,
+        "counts": counts,
+    }
+    try:
+        auth = _site_auth(endpoint)
+    except Exception as e:  # noqa: BLE001
+        print(f"[site-delivery] job {job_id} credentials unavailable: "
+              f"{type(e).__name__}")
+        return _site_fail(job_id, attempt, CRM_ERROR_TRANSIENT,
+                          "credentials_unavailable",
+                          "the endpoint credentials could not be read; will retry",
+                          result=base_result)
+    try:
+        resp = _site_client().post(endpoint["url"], auth, env)
+    except site_delivery_client.SiteDeliveryError as e:
+        print(f"[site-delivery] job {job_id} delivery failed "
+              f"category={e.category} code={e.code} http={e.http_status} "
+              f"request={request_id}")
+        return _site_fail(job_id, attempt, e.category, e.code, e.message,
+                          result={**base_result, "error": e.as_dict()})
+
+    result = {
+        **base_result,
+        "operation": str(resp.result.get("operation") or ""),
+        "duplicate": resp.duplicate,
+        "external_record_id": str(resp.result.get("record_id") or ""),
+        "http_status": resp.http_status,
+        "receiver_version": resp.receiver_version,
+        "elapsed_ms": resp.elapsed_ms,
+        "delivered_at": _now_iso(),
+    }
+    print(f"[site-delivery] job {job_id} delivered operation={result['operation']} "
+          f"duplicate={result['duplicate']} request={request_id} "
+          f"chars={counts['transcript_chars']} elapsed_ms={resp.elapsed_ms}")
+    _site_record_meeting_delivery(key, wid, job_id, payload, resp, result)
+    return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_SYNCED, "", "",
+                                "", result=result)
+
+
+SITE_MEETING_OBJECT = "MinuteX_Site_Meeting__c"
+SITE_MEETING_OBJECT_LABEL = "MinuteX Meeting"
+SITE_MEETING_ATTR = "salesforce_meeting"
+
+
+def _site_record_meeting_delivery(key, wid, job_id, payload, resp, result):
+    """Remember, on the Recordings row, the Salesforce record this meeting now
+    lives in (MinuteX_Site_Meeting__c) and what it was delivered related to.
+
+    Two readers: the meeting screen ("In Salesforce: MinuteX Meeting ...,
+    related to Asha Rao") and Task pushes, which attach every Task to this
+    record (Related To) — which is why a Task can only be pushed after the
+    meeting. Best-effort: the delivery already succeeded in Salesforce.
+    """
+    record_id = str(result.get("external_record_id") or "")
+    if not record_id:
+        return
+    relation = {}
+    for slot, ref in ((payload.get("relation") or {}).items()):
+        if isinstance(ref, dict) and ref.get("record_id"):
+            obj = _site_sf_object(wid, ref.get("object_type")) or {}
+            relation[slot] = {"object_type": ref.get("object_type", ""),
+                              "object_label": obj.get("label") or ref.get("object_type", ""),
+                              "record_id": ref.get("record_id", ""),
+                              "name": ref.get("name", "")}
+    url = str(resp.result.get("record_url") or "")
+    try:
+        _recordings.update_item(
+            Key={"audio_s3_key": key},
+            UpdateExpression=f"SET {SITE_MEETING_ATTR} = :m",
+            ConditionExpression="attribute_exists(audio_s3_key)",
+            ExpressionAttributeValues={":m": {
+                "org_id": str(resp.body.get("org_id") or ""),
+                "object_type": SITE_MEETING_OBJECT,
+                "record_id": record_id,
+                "record_url": url if url.startswith("https://") else "",
+                "meeting_id": (payload.get("meeting") or {}).get("id", ""),
+                "title": str((payload.get("meeting") or {}).get("title") or "")[:255],
+                "relation": relation,
+                "job_id": job_id,
+                "delivered_at": result.get("delivered_at", ""),
+            }})
+    except ClientError as e:
+        print(f"[site-delivery] meeting record not remembered: "
+              f"{e.response.get('Error', {}).get('Code', '')}")
+
+
+def _site_meeting_record(item, conn):
+    """The pushed meeting's Salesforce record for THIS connection's org, or
+    None (never pushed, or pushed to an org the workspace no longer uses)."""
+    rec = item.get(SITE_MEETING_ATTR) if isinstance(item.get(SITE_MEETING_ATTR), dict) else None
+    if not rec or not rec.get("record_id"):
+        return None
+    if conn and rec.get("org_id") and _site_org(rec["org_id"]) != _site_org(conn.get("org_id")):
+        return None
+    return rec
+
+
+def _public_meeting_record(rec):
+    """Where the meeting is in Salesforce, as a person reads it: the object
+    label, the meeting title, what it is related to, and a link — never an id
+    as text."""
+    if not rec:
+        return None
+    relation = rec.get("relation") or {}
+    return {
+        "object_label": SITE_MEETING_OBJECT_LABEL,
+        "name": rec.get("title", ""),
+        "related_to": [{"slot": slot, "object_label": relation[slot].get("object_label", ""),
+                        "name": relation[slot].get("name", "")}
+                       for slot in ("who", "what") if relation.get(slot)],
+        "url": rec.get("record_url", ""),
+        "delivered_at": rec.get("delivered_at", ""),
+    }
+
+
+def _site_set_people_sync(wid, summary):
+    """Mirror people-sync progress onto the endpoint row (what the settings
+    screen reads). Best-effort: the job row is the record of truth."""
+    try:
+        _site_endpoints.update_item(
+            Key={"workspace_id": wid},
+            UpdateExpression="SET people_sync = :p",
+            ConditionExpression="attribute_exists(workspace_id)",
+            ExpressionAttributeValues={":p": summary})
+    except ClientError:
+        pass
+
+
+def _site_people_sync_job_id(wid):
+    return ((_site_endpoint(wid) or {}).get("people_sync") or {}).get("job_id") or ""
+
+
+def _site_people_channel(job, attempt):
+    """(post(env) -> DeliveryResponse, None), or (None, finished job)."""
+    wid = job["workspace_id"]
+    if workspace_schema.is_organisation_workspace_id(wid):
+        row = _workspace_row(wid)
+        if not row or not workspace_schema.workspace_is_active(row):
+            return None, _site_fail(job["job_id"], attempt, CRM_ERROR_PERMANENT,
+                                    "workspace_inactive",
+                                    "this workspace is no longer active")
+    endpoint = _site_endpoint(wid)
+    if not _site_endpoint_enabled(endpoint):
+        return None, _site_fail(job["job_id"], attempt, CRM_ERROR_PERMANENT,
+                                SITE_NOT_CONFIGURED_CODE,
+                                "Salesforce Site delivery is not enabled for "
+                                "this workspace")
+    try:
+        auth = _site_auth(endpoint)
+    except Exception as e:  # noqa: BLE001
+        print(f"[site-delivery] people job {job['job_id']} credentials "
+              f"unavailable: {type(e).__name__}")
+        return None, _site_fail(job["job_id"], attempt, CRM_ERROR_TRANSIENT,
+                                "credentials_unavailable",
+                                "the endpoint credentials could not be read; will retry")
+    return (lambda env: _site_client().post(endpoint["url"], auth, env)), None
+
+
+def _run_site_people_job(job, attempt):
+    """Walk the receiver's people_sync pages into the People Store.
+
+    RESUMABLE: the cursor is saved on the job row after every page. A
+    transient failure retries from the saved cursor, and a large directory is
+    walked in segments of SITE_PEOPLE_SYNC_BUDGET_SECONDS, each re-enqueueing
+    the next, so no single worker invocation approaches its timeout.
+    """
+    job_id, wid = job["job_id"], job["workspace_id"]
+    post, finished = _site_people_channel(job, attempt)
+    if finished is not None:
+        _site_set_people_sync(wid, {"job_id": job_id, "status": finished.get("status", ""),
+                                    "updated_at": _now_iso()})
+        return finished
+
+    run_id = str(job.get("people_run_id") or job_id)
+    cursor = str(job.get("people_cursor") or "")
+    counts = {k: int(v) for k, v in (job.get("people_counts") or {}).items()}
+    pages = int(job.get("people_pages") or 0)
+    deadline = time.monotonic() + SITE_PEOPLE_SYNC_BUDGET_SECONDS
+
+    # The walk already reached its last page on an earlier attempt, which
+    # then failed while finalizing. Finalize again; never re-walk from the
+    # (now empty) cursor, which would restart at page one.
+    if job.get("people_walk_complete"):
+        return _finish_site_people_sync(job_id, attempt, wid, run_id, pages, counts)
+
+    while True:
+        request_id = site_contract.new_request_id()
+        env = site_contract.envelope(
+            site_contract.ACTION_PEOPLE_SYNC,
+            {"people": [], "cursor": cursor, "page_size": SITE_PEOPLE_PAGE_SIZE},
+            request_id=request_id)
+        try:
+            resp = post(env)
+        except site_delivery_client.SiteDeliveryError as e:
+            print(f"[site-delivery] people job {job_id} page {pages + 1} failed "
+                  f"category={e.category} code={e.code} request={request_id}")
+            _site_set_people_sync(wid, {
+                "job_id": job_id, "status": "RETRYING" if e.retryable else "FAILED",
+                "pages": pages, "counts": counts, "error_code": e.code,
+                "updated_at": _now_iso()})
+            return _site_fail(job_id, attempt, e.category, e.code, e.message,
+                              result={"delivery_type": site_contract.DELIVERY_TYPE_SALESFORCE_SITE,
+                                      "action": site_contract.ACTION_PEOPLE_SYNC,
+                                      "pages": pages, "counts": counts,
+                                      "error": e.as_dict()})
+
+        people = resp.result.get("people")
+        if not isinstance(people, list):
+            return _site_fail(job_id, attempt, CRM_ERROR_PERMANENT,
+                              "invalid_response",
+                              "the receiver's people_sync response has no people list")
+        page_counts = people_store.upsert_people(_people, wid, people, run_id,
+                                                 _now_iso())
+        for k, v in page_counts.items():
+            counts[k] = counts.get(k, 0) + v
+        pages += 1
+        next_cursor = str(resp.result.get("next_cursor") or "")
+        done = resp.result.get("done") is True or not next_cursor
+        if not done and next_cursor == cursor:
+            return _site_fail(job_id, attempt, CRM_ERROR_PERMANENT,
+                              "cursor_stalled",
+                              "the receiver returned the same cursor twice")
+        cursor = next_cursor
+        _update_crm_sync_job(job_id, people_cursor=cursor, people_counts=counts,
+                             people_pages=pages, people_run_id=run_id,
+                             people_walk_complete=done)
+
+        if done:
+            return _finish_site_people_sync(job_id, attempt, wid, run_id, pages,
+                                            counts)
+        if pages >= SITE_PEOPLE_MAX_PAGES:
+            return _site_fail(job_id, attempt, CRM_ERROR_PERMANENT,
+                              "too_many_people",
+                              f"stopped after {pages} pages")
+        if time.monotonic() > deadline:
+            # Segment budget spent: hand the rest to a fresh invocation. The
+            # attempt budget resets because a continuation is progress, not a
+            # failure.
+            _update_crm_sync_job(job_id, status=CRM_JOB_STATUS_PENDING,
+                                 attempt_count=0, next_attempt_at=_now_iso())
+            _enqueue_site_job(job)
+            _site_set_people_sync(wid, {"job_id": job_id, "status": CRM_JOB_STATUS_SYNCING,
+                                        "pages": pages, "counts": counts,
+                                        "updated_at": _now_iso()})
+            print(f"[site-delivery] people job {job_id} continuing after "
+                  f"{pages} pages")
+            return _get_crm_sync_job(job_id)
+
+
+def _finish_site_people_sync(job_id, attempt, wid, run_id, pages, counts):
+    """Close a COMPLETE walk: people this run never saw are marked deleted."""
+    counts = dict(counts)
+    counts["deleted"] = people_store.mark_missing(
+        _people, Key, wid, SITE_PEOPLE_PROVIDER, run_id, _now_iso())
+    completed_at = _now_iso()
+    _site_set_people_sync(wid, {"job_id": job_id, "status": CRM_JOB_STATUS_SYNCED,
+                                "pages": pages, "counts": counts,
+                                "completed_at": completed_at,
+                                "updated_at": completed_at})
+    print(f"[site-delivery] people job {job_id} done pages={pages} "
+          f"counts={counts}")
+    return _finish_crm_sync_job(
+        job_id, attempt, CRM_JOB_STATUS_SYNCED, "", "", "",
+        result={"delivery_type": site_contract.DELIVERY_TYPE_SALESFORCE_SITE,
+                "action": site_contract.ACTION_PEOPLE_SYNC,
+                "pages": pages, "counts": counts,
+                "completed_at": completed_at})
+
+
+# ---------------------------------------------------------------------------
+# Payload inputs
+# ---------------------------------------------------------------------------
+
+def _site_workspace_block(wid):
+    # Only an ORGANISATION is named: a personal workspace id embeds the
+    # owner's user id, which has no place in a customer's CRM.
+    if not workspace_schema.is_organisation_workspace_id(wid):
+        return None
+    row = _workspace_row(wid) or {}
+    return {"id": wid, "name": str(row.get("name") or "")}
+
+
+def _site_participants(key, item):
+    """Participants for the payload, from MeetingParticipants + Contacts.
+
+    Tagged speakers first (with whatever the tag resolved to), then any
+    diarized speaker nobody tagged, so the receiver always sees every voice.
+    Read directly rather than through _readable_contact: the worker has no
+    caller identity, and the job row was authorized when it was created.
+    """
+    speaker_names = item.get("speaker_names") if isinstance(
+        item.get("speaker_names"), dict) else {}
+    blurbs = {}
+    for entry in item.get("participants") or []:
+        if isinstance(entry, dict) and str(entry.get("speaker") or "").strip():
+            blurbs[str(entry["speaker"]).strip()] = str(entry.get("summary") or "")
+
+    rows = sorted(_participant_rows(key), key=lambda r: (
+        1 if _is_self_speaker(r.get("speaker_id", "")) else 0,
+        _speaker_sort_key(r.get("speaker_id", ""))))
+    out, seen = [], set()
+    for row in rows:
+        speaker_id = str(row.get("speaker_id") or "")
+        attendance = _is_self_speaker(speaker_id)
+        contact = {}
+        contact_id = str(row.get("contact_id") or "")
+        if contact_id:
+            contact = _contacts.get_item(Key={"contact_id": contact_id}).get("Item") or {}
+            if not contact and _is_member_contact(contact_id):
+                # A projected member has no Contacts row; their profile is
+                # the identity.
+                user = _users.get_item(Key={"user_id": contact_id[len(MEMBER_CONTACT_PREFIX):]}) \
+                    .get("Item") or {}
+                contact = {"name": user.get("name", ""), "email": user.get("email", "")}
+        external = None
+        if contact.get("people_external_id"):
+            external = {"provider": contact.get("people_provider", ""),
+                        "type": contact.get("people_type", ""),
+                        "external_id": contact.get("people_external_id", "")}
+        out.append({
+            "speaker_id": "" if attendance else speaker_id,
+            "name": contact.get("name") or speaker_names.get(speaker_id, ""),
+            "email": contact.get("email", ""),
+            "phone": contact.get("phone", ""),
+            "company": contact.get("company", ""),
+            "identity_role": row.get("identity_role", ""),
+            "participant_role": row.get("participant_role", ""),
+            "contribution_summary": "" if attendance else blurbs.get(speaker_id, ""),
+            "attendance_only": attendance,
+            "tagged": True,
+            "external_identity": external,
+        })
+        seen.add(speaker_id)
+    for speaker_id in _speaker_labels(item):
+        if speaker_id in seen:
+            continue
+        out.append({"speaker_id": speaker_id,
+                    "name": speaker_names.get(speaker_id, ""),
+                    "contribution_summary": blurbs.get(speaker_id, ""),
+                    "tagged": False})
+    return out
+
+
+_SITE_AUDIO_TYPES = {".wav": "audio/wav", ".m4a": "audio/mp4",
+                     ".mp3": "audio/mpeg", ".aac": "audio/aac"}
+
+
+def _site_audio_block(key, item, endpoint, job_id):
+    """The audio section: a signed MinuteX link, never the bytes.
+
+    Works for any recording size — the link redirects to S3, so an 85 MB WAV
+    streams straight from S3 and this Lambda never touches a byte of it.
+    Omitted (available=false) rather than faked when the deployment has no
+    public base URL or the recording has no audio object.
+    """
+    base = (SITE_AUDIO_BASE_URL or SHARE_BASE_URL or "").rstrip("/")
+    audio_key = _site_secrets(endpoint).get("audio_key", "")
+    if not (base and BUCKET_NAME and audio_key and key and job_id):
+        print(f"[site-delivery] audio link omitted for {key}: "
+              f"base_url={'set' if base else 'unset'}")
+        return site_contract.audio_block(None)
+    size, content_type = 0, ""
+    try:
+        head = _s3.head_object(Bucket=BUCKET_NAME, Key=key)
+        size = int(head.get("ContentLength") or 0)
+        content_type = str(head.get("ContentType") or "")
+    except Exception as e:  # noqa: BLE001
+        code = str(getattr(e, "response", {}).get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return site_contract.audio_block(None)
+        print(f"[site-delivery] audio head failed for {key}: {type(e).__name__}")
+    if not content_type.startswith("audio/"):
+        content_type = _SITE_AUDIO_TYPES.get(os.path.splitext(key)[1].lower(),
+                                             "audio/wav")
+    expires = int(time.time()) + SITE_AUDIO_URL_TTL_SECONDS
+    token = site_contract.sign_audio_token(job_id, expires, audio_key)
+    duration = item.get("duration_seconds") or item.get("duration") or 0
+    try:
+        duration = float(duration)
+        duration = int(duration) if duration.is_integer() else duration
+    except (TypeError, ValueError):
+        duration = 0
+    return site_contract.audio_block(
+        f"{base}/delivery/audio/{token}", size_bytes=size,
+        content_type=content_type, duration_seconds=duration,
+        expires_at=datetime.fromtimestamp(expires, tz=timezone.utc)
+        .isoformat().replace("+00:00", "Z"))
+
+
+def site_delivery_audio(event):
+    """GET /delivery/audio/{token} -> 302 to a 15-minute presigned GET. NO JWT.
+
+    AN UNAUTHENTICATED ROUTE: the token is the credential. Every request
+    resolves the delivery job it names (the job row, not the token, says
+    which workspace and recording), re-verifies the token against that
+    workspace's CURRENT audio key, re-checks that Site delivery is still
+    enabled and that the meeting still exists in that workspace, and only
+    then signs a fresh short presign. Disabling or deleting the endpoint,
+    rotating its audio key, deleting the meeting or passing the expiry each
+    kill the link on the next request.
+    """
+    no_store = {"Cache-Control": "no-store, no-cache, must-revalidate, private",
+                "Referrer-Policy": "no-referrer",
+                "X-Robots-Tag": "noindex, nofollow"}
+
+    def gone(status):
+        return {"statusCode": status,
+                "headers": {"Content-Type": "application/json", **no_store},
+                "body": json.dumps({"error": "this audio link is not valid"})}
+
+    token = str((event.get("pathParameters") or {}).get("token") or "")
+    claims = site_contract.read_audio_token(token)
+    if not claims:
+        return gone(404)
+    if claims["e"] < int(time.time()):
+        return gone(410)
+    job = _get_crm_sync_job(claims["j"])
+    if not job or job.get("operation") != SITE_OP_MEETING \
+            or not job.get("recording_key"):
+        return gone(404)
+    wid, key = job["workspace_id"], job["recording_key"]
+    endpoint = _site_endpoint(wid)
+    if not _site_endpoint_enabled(endpoint):
+        return gone(404)
+    try:
+        audio_key = _site_secrets(endpoint).get("audio_key", "")
+    except Exception as e:  # noqa: BLE001
+        print(f"[site-delivery] audio key unavailable: {type(e).__name__}")
+        return gone(503)
+    if not site_contract.verify_audio_token(token, audio_key):
+        return gone(404)
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item or _row_workspace_id(item) != wid or not BUCKET_NAME:
+        return gone(404)
+    try:
+        url = _s3.generate_presigned_url(
+            "get_object", Params={"Bucket": BUCKET_NAME, "Key": key},
+            ExpiresIn=share_schema.SHARE_AUDIO_URL_EXPIRY)
+    except Exception as e:  # noqa: BLE001
+        print(f"[site-delivery] audio presign failed: {type(e).__name__}")
+        return gone(503)
+    return {"statusCode": 302, "headers": {"Location": url, **no_store},
+            "body": ""}
+
+
+# ---------------------------------------------------------------------------
+# People Store routes and participant tagging
+# ---------------------------------------------------------------------------
+
+def site_people_sync_start(event):
+    """POST /workspaces/{workspace_id}/site-delivery/people-sync
+    (JWT, CAP_MANAGE_CONTACTS) -> 202 {job}
+
+    Queues a full Contacts + Users sync from the Salesforce Site into the
+    People Store. A sync already in flight is returned rather than doubled.
+    """
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_CONTACTS,
+        workspace_id=_site_path_workspace(event))
+    if not _site_endpoint_enabled(_site_endpoint(wid)):
+        raise SiteDeliveryApiError(
+            409, "Salesforce Site delivery is not enabled for this workspace",
+            SITE_NOT_CONFIGURED_CODE)
+    job = _create_site_job(workspace_id=wid, operation=SITE_OP_PEOPLE_SYNC,
+                           user_id=user_id,
+                           extra={"people_cursor": "", "people_pages": 0,
+                                  "people_counts": {}})
+    if job.get("status") == CRM_JOB_STATUS_PENDING and not job.get("people_pages"):
+        _site_set_people_sync(wid, {"job_id": job["job_id"],
+                                    "status": CRM_JOB_STATUS_PENDING,
+                                    "requested_by": user_id,
+                                    "updated_at": _now_iso()})
+    return _resp(202, {"job": _public_site_job(job)})
+
+
+def site_people_sync_status(event):
+    """GET /workspaces/{workspace_id}/site-delivery/people-sync
+    (JWT, any member) -> {people_sync, job}"""
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    summary = (_site_endpoint(wid) or {}).get("people_sync") or {}
+    job = _get_crm_sync_job(summary["job_id"]) if summary.get("job_id") else None
+    if job and job.get("workspace_id") != wid:
+        job = None
+    return _resp(200, {"people_sync": summary, "job": _public_site_job(job)})
+
+
+def people_search(event):
+    """GET /workspaces/{workspace_id}/people?q=&type=&limit=&include_inactive=
+    (JWT, any member) -> {people, truncated}
+
+    Reads the local People Store only — no Salesforce call — which is what
+    makes participant tagging instant and independent of the customer's org.
+    """
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    qs = event.get("queryStringParameters") or {}
+    person_type = str(qs.get("type") or "").strip().lower()
+    if person_type and person_type not in site_contract.PEOPLE_TYPES:
+        raise ApiError(400, "type must be contact or user")
+    try:
+        limit = max(1, min(100, int(qs.get("limit") or 50)))
+    except ValueError:
+        raise ApiError(400, "limit must be a number")
+    counts = {}
+    people, truncated = people_store.search_people(
+        _people, Key, wid, str(qs.get("q") or "")[:100], person_type, limit,
+        include_inactive=str(qs.get("include_inactive") or "") == "true",
+        counts=counts)
+    return _resp(200, {"people": people, "truncated": truncated, "counts": counts})
+
+
+def people_contact(event):
+    """POST /workspaces/{workspace_id}/people/contact {person_key}
+    (JWT, any member) -> {contact}
+
+    The MinuteX Contact a synced external person is used as — found or
+    created ONCE (see _site_contact_for_person) and returned in the ordinary
+    contact shape. This is what lets every "choose a person" sheet (speaker
+    tagging, attendance, task assignment) offer Salesforce Contacts and Users
+    without learning a second person type: the sheet resolves the pick to a
+    Contact and carries on exactly as for a hand-picked one. Reads the local
+    People Store only; no Salesforce call.
+    """
+    user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    person_key = str(_body(event).get("person_key") or "").strip()
+    if not person_key or len(person_key) > 400:
+        raise ApiError(400, "person_key required")
+    person = people_store.get_person(_people, wid, person_key)
+    if not person or person.get("status") == people_store.STATUS_DELETED:
+        raise ApiError(404, "person not found")
+    contact_id = _site_contact_for_person(user_id, wid, person)
+    item = _taggable_contact(user_id, contact_id, workspace_id=wid)
+    return _resp(200, {"contact": _public_contact(
+        item, member_roles=_roles_for_contact(item))})
+
+
+def _site_contact_for_person(user_id, wid, person):
+    """The Contact a People Store person tags as, found or created ONCE.
+
+    Order: a Salesforce User who is an active member of this organisation is
+    that member's own directory entry; then the contact this person was
+    already linked to; then an existing contact with the same email (never a
+    name — two people share names); otherwise a new contact, stamped with the
+    person's external identity so the delivered payload can carry it.
+    """
+    email_lc = _norm_email(person.get("email"))
+    now = _now_iso()
+    if person.get("type") == "user" and email_lc \
+            and workspace_schema.is_organisation_workspace_id(wid):
+        member_uid = _resolve_minutex_user(email_lc)
+        if member_uid and _active_membership(wid, member_uid):
+            contact_id = _member_contact_id(member_uid)
+            people_store.link_contact(_people, wid, person["person_key"],
+                                      contact_id, now)
+            return contact_id
+
+    linked = str(person.get("linked_contact_id") or "")
+    if linked:
+        try:
+            _taggable_contact(user_id, linked, workspace_id=wid)
+            return linked
+        except ApiError:
+            pass  # deleted since, or no longer taggable here: re-resolve
+
+    people_fields = {
+        "people_key": person["person_key"],
+        "people_provider": person.get("provider", ""),
+        "people_type": person.get("type", ""),
+        "people_external_id": person.get("external_id", ""),
+    }
+    existing = _find_contact_by_email(user_id, email_lc, workspace_id=wid) \
+        if email_lc else None
+    if existing:
+        contact_id = existing["contact_id"]
+        if not _is_member_contact(contact_id) \
+                and existing.get("source") != CONTACT_SOURCE_MEMBER \
+                and not existing.get("people_key"):
+            _apply_update(_contacts, {"contact_id": contact_id},
+                          {**people_fields, "updated_at": now}, [])
+    else:
+        item = _contact_item(user_id, person.get("name") or person.get("email"),
+                             email=person.get("email", ""),
+                             phone=person.get("phone", ""),
+                             company=person.get("company", ""),
+                             role=person.get("title", ""), workspace_id=wid)
+        item["source"] = CONTACT_SOURCE_PEOPLE
+        item.update(people_fields)
+        _contacts.put_item(Item=item,
+                           ConditionExpression="attribute_not_exists(contact_id)")
+        contact_id = item["contact_id"]
+    people_store.link_contact(_people, wid, person["person_key"], contact_id, now)
+    return contact_id
+
+
+def site_participant_tag(event):
+    """PUT /recordings/site-participants/{key+}
+    {speaker_id?, person_key, identity_role?, participant_role?,
+     attendance_only?} (JWT, meeting write access) -> set_participant's reply
+
+    Tags a speaker with a person from the local People Store. Resolves the
+    person to a Contact, then hands off to set_participant UNCHANGED, so
+    speaker names, task resolution and every other side effect of tagging
+    behave exactly as they do for a hand-picked contact.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+    person_key = str(data.get("person_key") or "").strip()
+    if not person_key or len(person_key) > 400:
+        raise ApiError(400, "person_key required")
+    wid = _row_workspace_id(item)
+    person = people_store.get_person(_people, wid, person_key)
+    if not person or person.get("status") == people_store.STATUS_DELETED:
+        raise ApiError(404, "person not found")
+    identity_role = str(data.get("identity_role") or "").strip().lower() or (
+        SPEAKER_IDENTITY_INTERNAL if person.get("type") == "user"
+        else SPEAKER_IDENTITY_EXTERNAL)
+    contact_id = _site_contact_for_person(user_id, wid, person)
+    forwarded = dict(event)
+    forwarded["isBase64Encoded"] = False
+    forwarded["body"] = json.dumps({
+        "speaker_id": data.get("speaker_id") or "",
+        "contact_id": contact_id,
+        "identity_role": identity_role,
+        "participant_role": data.get("participant_role") or "",
+        "attendance_only": bool(data.get("attendance_only")),
+    })
+    return set_participant(forwarded)
+
+
+# ===========================================================================
+# SALESFORCE SITE — ORG CONNECTION (discovery, mappings, record search, Tasks)
+#
+# Part of the Site architecture (delivery_type = salesforce_site), NOT of the
+# existing OAuth integration. There is ONE API boundary: the workspace's
+# Salesforce Site endpoint (SiteDeliveryEndpoints) and its Apex REST receiver.
+# Every call below goes there, authenticated by that endpoint's PLUGGABLE
+# auth mode (site_delivery_client.make_auth: `none` for development,
+# `hmac_sha256` available, production modes can be registered). No External
+# Client App, no OAuth token, no credential beyond the endpoint's own.
+#
+#   connect -> org_info (org id)            PUT  .../site-salesforce/connect
+#   discover -> objects, fields (job)       POST .../site-salesforce/discover
+#   manual Task mapping                     .../site-salesforce/task-mappings
+#   record search (live)                    .../objects/{object}/records
+#   create / update Task (job)              .../site-salesforce/tasks
+#
+# NO LLM ANYWHERE IN THIS SECTION. Objects, fields and picklist values come
+# from the org's describe; which object a Task belongs to, which record, and
+# who it is assigned to are chosen by a person. See site_salesforce_schema.
+#
+# PERMISSIONS. The receiver works within the configured INTEGRATION USER's
+# Salesforce permissions (MinuteXSitePermissions in the Apex project) —
+# object, field, Task and record-sharing access, computed from Salesforce's
+# own permission data. MinuteX additionally refuses up front, from discovered
+# metadata, what that user plainly cannot do.
+#
+# TENANCY. Rows are keyed by workspace_id (verified membership). The
+# Salesforce org id is the connection's tenant identity: pinned at connect,
+# and every receiver response carries its org id, which _site_sf_call checks
+# against the pinned one. Mappings and Tasks record the org they were made for
+# and are refused against any other.
+# ===========================================================================
+SITE_SF_CONNECTIONS_TABLE = os.environ.get("SITE_SF_CONNECTIONS_TABLE",
+                                           "SiteSalesforceConnections")
+SITE_SF_SCHEMA_TABLE = os.environ.get("SITE_SF_SCHEMA_TABLE", "SiteSalesforceSchema")
+SITE_SF_MAPPINGS_TABLE = os.environ.get("SITE_SF_MAPPINGS_TABLE",
+                                        "SiteSalesforceTaskMappings")
+SITE_SF_TASKS_TABLE = os.environ.get("SITE_SF_TASKS_TABLE", "SiteSalesforceTasks")
+SITE_SF_DISCOVER_BUDGET_SECONDS = int(os.environ.get(
+    "SITE_SF_DISCOVER_BUDGET_SECONDS", "60"))
+SITE_SF_OBJECT_PAGE = 200
+SITE_SF_FIELD_BATCH = 10
+SITE_SF_NOT_CONNECTED_CODE = "salesforce_not_connected"
+SITE_SF_STATUS_CONNECTED = "connected"
+# Refusals about the connection's configuration or identity: 409 + code,
+# NEVER 401 (a 401 from userApi signs the MinuteX user out of the app).
+_SITE_SF_CONFIG_CODES = frozenset({
+    "org_mismatch", "integration_user_not_configured", "integration_user_invalid",
+    "receiver_disabled", "receiver_misconfigured", "auth_failed", "site_requires_login",
+    "site_redirected", "endpoint_not_found", "invalid_response", "invalid_endpoint",
+    SITE_NOT_CONFIGURED_CODE})
+
+_site_sf_connections = _ddb.Table(SITE_SF_CONNECTIONS_TABLE)
+_site_sf_schema = _ddb.Table(SITE_SF_SCHEMA_TABLE)
+_site_sf_mappings = _ddb.Table(SITE_SF_MAPPINGS_TABLE)
+_site_sf_tasks = _ddb.Table(SITE_SF_TASKS_TABLE)
+
+
+def _site_org(org_id):
+    """15- and 18-character forms of one org id compare equal."""
+    return str(org_id or "").strip()[:15]
+
+
+def _site_sf_connection(wid):
+    if not wid:
+        return None
+    return _site_sf_connections.get_item(Key={"workspace_id": wid}).get("Item")
+
+
+def _site_sf_connected(conn):
+    return bool(conn) and conn.get("status") == SITE_SF_STATUS_CONNECTED \
+        and bool(conn.get("org_id"))
+
+
+def _site_sf_call(conn, env, timeout=None):
+    """POST one envelope to the workspace's Site receiver.
+
+    Uses the endpoint's own pluggable auth, and refuses an answer from any
+    org other than the connection's pinned org (every receiver response
+    carries its org id)."""
+    endpoint = _site_endpoint(conn["workspace_id"])
+    if not _site_endpoint_enabled(endpoint):
+        raise site_delivery_client.SiteDeliveryError(
+            site_delivery_client.CATEGORY_PERMANENT, SITE_NOT_CONFIGURED_CODE,
+            "Salesforce Site delivery is not enabled for this workspace")
+    try:
+        auth = _site_auth(endpoint)
+    except Exception as e:  # noqa: BLE001
+        print(f"[site-salesforce] endpoint auth unavailable: {type(e).__name__}")
+        raise site_delivery_client.SiteDeliveryError(
+            site_delivery_client.CATEGORY_TRANSIENT, "credentials_unavailable",
+            "the Site endpoint's credentials could not be read; will retry")
+    resp = _site_client(timeout).post(endpoint["url"], auth, env)
+    expected, got = _site_org(conn.get("org_id")), _site_org(resp.body.get("org_id"))
+    if expected and got and expected != got:
+        raise site_delivery_client.SiteDeliveryError(
+            site_delivery_client.CATEGORY_PERMISSION, "org_mismatch",
+            "The Salesforce Site answered for a different org than the one this "
+            "workspace connected.")
+    return resp
+
+
+def _site_sf_api_error(e):
+    """A SiteDeliveryError from the receiver -> the ApiError a route raises."""
+    code, message = e.code, e.message
+    if code in _SITE_SF_CONFIG_CODES:
+        status = 409
+    elif e.category == site_delivery_client.CATEGORY_PERMISSION:
+        status, code = 403, ("salesforce_permission_denied"
+                             if code in ("permission_denied", "forbidden") else code)
+    elif e.category == site_delivery_client.CATEGORY_VALIDATION:
+        status = 400
+    elif e.category == site_delivery_client.CATEGORY_TRANSIENT:
+        status = 503
+    else:
+        status = 502
+    return SiteDeliveryApiError(status, message, code)
+
+
+def _site_sf_require_connection(wid):
+    conn = _site_sf_connection(wid)
+    if not _site_sf_connected(conn):
+        raise SiteDeliveryApiError(409, "Salesforce is not connected for this "
+                                        "workspace", SITE_SF_NOT_CONNECTED_CODE)
+    return conn
+
+
+def _public_site_sf_connection(conn, endpoint=None):
+    base = {"site_endpoint_configured": _site_endpoint_enabled(endpoint),
+            "auth_mode": (endpoint or {}).get("auth_mode", "")}
+    if not conn:
+        return {**base, "connected": False}
+    return {
+        **base,
+        "connected": _site_sf_connected(conn),
+        "status": conn.get("status", ""),
+        "org_id": conn.get("org_id", ""),
+        "org_name": conn.get("org_name", ""),
+        "is_sandbox": bool(conn.get("is_sandbox")),
+        "edition": conn.get("edition", ""),
+        "integration_user": conn.get("integration_user") or {},
+        "task_permissions": conn.get("task_permissions") or {},
+        "discovery": conn.get("discovery") or {},
+        "connected_at": conn.get("connected_at", ""),
+        "updated_at": conn.get("updated_at", ""),
+    }
+
+
+def _site_sf_apply_org_info(conn, info):
+    """Copy org_info's answer onto the connection row (in memory)."""
+    org = info.get("org") or {}
+    user = info.get("user") or {}
+    task = info.get("task") or {}
+    conn["org_name"] = str(org.get("org_name") or "")[:255]
+    conn["is_sandbox"] = org.get("is_sandbox") is True
+    conn["edition"] = str(org.get("edition") or "")[:80]
+    conn["integration_user"] = {"id": str(user.get("id") or ""),
+                                "username": str(user.get("username") or "")[:255],
+                                "name": str(user.get("name") or "")[:255]}
+    conn["task_permissions"] = {k: task.get(k) is True
+                                for k in ("accessible", "createable", "updateable")}
+    conn["task_what_objects"] = [n for n in task.get("what_objects") or []
+                                 if site_salesforce_schema.is_api_name(n)]
+    conn["task_who_objects"] = [n for n in task.get("who_objects") or []
+                                if site_salesforce_schema.is_api_name(n)]
+    return conn
+
+
+def _site_sf_purge(table, wid, prefix=""):
+    """Delete a workspace's rows (optionally only one SK prefix)."""
+    sk = "item_key" if table is _site_sf_schema else "mapping_id"
+    cond = Key("workspace_id").eq(wid)
+    if prefix:
+        cond = cond & Key(sk).begins_with(prefix)
+    query = {"KeyConditionExpression": cond}
+    removed = 0
+    while True:
+        res = table.query(**query)
+        for row in res.get("Items", []):
+            table.delete_item(Key={"workspace_id": wid, sk: row[sk]})
+            removed += 1
+        if not res.get("LastEvaluatedKey"):
+            return removed
+        query["ExclusiveStartKey"] = res["LastEvaluatedKey"]
+
+
+# ---------------------------------------------------------------------------
+# Connection routes
+# ---------------------------------------------------------------------------
+
+def site_sf_connect(event):
+    """PUT /workspaces/{workspace_id}/site-salesforce/connect
+    {allow_org_change?} (JWT, CAP_MANAGE_INTEGRATIONS) -> {connection}
+
+    Reads org_info through the workspace's Site endpoint (proving the
+    receiver is installed, enabled, reachable with the endpoint's auth mode,
+    and has an integration user configured) and pins the org id. No
+    credential is sent or stored here: the Site endpoint's auth is the only
+    authentication, configured once via PUT .../site-delivery.
+    """
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    data = _body(event)
+    endpoint = _site_endpoint(wid)
+    if not _site_endpoint_enabled(endpoint):
+        raise SiteDeliveryApiError(409, "Configure and enable the Salesforce Site "
+                                        "endpoint for this workspace first",
+                                   SITE_NOT_CONFIGURED_CODE)
+    current = _site_sf_connection(wid) or {}
+    try:
+        resp = _site_sf_call({"workspace_id": wid}, site_contract.envelope(
+            site_contract.ACTION_ORG_INFO, request_id=site_contract.new_request_id()), 15)
+    except site_delivery_client.SiteDeliveryError as e:
+        print(f"[site-salesforce] connect workspace={wid} failed code={e.code} "
+              f"http={e.http_status}")
+        raise _site_sf_api_error(e)
+    info = resp.result
+    org_id = str((info.get("org") or {}).get("org_id") or resp.body.get("org_id") or "")
+    if not org_id.startswith("00D"):
+        raise SiteDeliveryApiError(502, "The receiver did not report its org id",
+                                   "invalid_response")
+    if current.get("org_id") and _site_org(current["org_id"]) != _site_org(org_id) \
+            and data.get("allow_org_change") is not True:
+        # Named by org NAME, never id: this message is shown to people.
+        was = current.get("org_name") or "another Salesforce org"
+        now_name = str((info.get("org") or {}).get("org_name") or "") or "a different org"
+        raise SiteDeliveryApiError(
+            409, f"This workspace is connected to {was}; the Site now answers for "
+                 f"{now_name}. Switching orgs clears the discovered metadata and Task "
+                 "mappings — send allow_org_change to confirm.", "org_mismatch")
+
+    org_changed = bool(current.get("org_id")) and _site_org(current["org_id"]) != _site_org(org_id)
+    if org_changed:
+        _site_sf_purge(_site_sf_schema, wid)
+        _site_sf_purge(_site_sf_mappings, wid)
+    now = _now_iso()
+    row = {
+        "workspace_id": wid,
+        "delivery_type": site_contract.DELIVERY_TYPE_SALESFORCE_SITE,
+        "status": SITE_SF_STATUS_CONNECTED,
+        "org_id": org_id,
+        "connected_at": current.get("connected_at") if not org_changed and current.get("connected_at") else now,
+        "connected_by": user_id,
+        "updated_at": now,
+        "discovery": {} if org_changed else (current.get("discovery") or {}),
+    }
+    _site_sf_apply_org_info(row, info)
+    _site_sf_connections.put_item(Item=row)
+    _audit("site_salesforce.connected", user_id, wid, org_id=org_id,
+           org_changed=org_changed)
+    return _resp(200, {"connection": _public_site_sf_connection(row, endpoint)})
+
+
+def site_sf_get(event):
+    """GET /workspaces/{workspace_id}/site-salesforce (JWT, any member)."""
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    return _resp(200, {"connection": _public_site_sf_connection(
+        _site_sf_connection(wid), _site_endpoint(wid))})
+
+
+def site_sf_disconnect(event):
+    """DELETE /workspaces/{workspace_id}/site-salesforce (JWT,
+    CAP_MANAGE_INTEGRATIONS). Forgets the pinned org and the discovered
+    metadata cache. Task mappings and Task history are kept (they record
+    their org id and are refused against any other org). The Site endpoint
+    itself (meeting delivery) is untouched."""
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    _site_sf_connections.delete_item(Key={"workspace_id": wid})
+    removed = _site_sf_purge(_site_sf_schema, wid, site_salesforce_schema.OBJ_PREFIX) \
+        + _site_sf_purge(_site_sf_schema, wid, site_salesforce_schema.FLD_PREFIX)
+    _audit("site_salesforce.disconnected", user_id, wid, schema_rows=removed)
+    return _resp(200, {"disconnected": True})
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+def _site_sf_set_discovery(wid, summary):
+    try:
+        _site_sf_connections.update_item(
+            Key={"workspace_id": wid}, UpdateExpression="SET discovery = :d",
+            ConditionExpression="attribute_exists(workspace_id)",
+            ExpressionAttributeValues={":d": summary})
+    except ClientError:
+        pass
+
+
+def site_sf_discover_start(event):
+    """POST /workspaces/{workspace_id}/site-salesforce/discover
+    (JWT, CAP_MANAGE_INTEGRATIONS) -> 202 {job}
+
+    Refreshes org info, every accessible object and each one's readable
+    fields, as the integration user sees them. Runs as a job (it is many
+    Salesforce calls); re-runnable at any time without reconnecting.
+    """
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    conn = _site_sf_require_connection(wid)
+    job = _create_site_job(
+        workspace_id=wid, operation=SITE_OP_SF_DISCOVER, user_id=user_id,
+        existing_job_id=(conn.get("discovery") or {}).get("job_id") or "",
+        extra={"discover_phase": "org", "discover_cursor": "", "discover_queue": [],
+               "discover_counts": {}})
+    if not job.get("discover_run_id") and job.get("attempt_count", 0) == 0:
+        _site_sf_set_discovery(wid, {"job_id": job["job_id"], "status": job["status"],
+                                     "requested_by": user_id, "updated_at": _now_iso()})
+    return _resp(202, {"job": _public_site_job(job)})
+
+
+def site_sf_discover_status(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/discover (JWT, member)."""
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    summary = (_site_sf_connection(wid) or {}).get("discovery") or {}
+    job = _get_crm_sync_job(summary["job_id"]) if summary.get("job_id") else None
+    if job and job.get("workspace_id") != wid:
+        job = None
+    out = _public_site_job(job)
+    if out is not None:
+        out["discover_phase"] = job.get("discover_phase", "")
+        out["discover_counts"] = job.get("discover_counts") or {}
+    return _resp(200, {"discovery": summary, "job": out})
+
+
+def _run_site_sf_discover_job(job, attempt):
+    """org -> objects (paged) -> fields (batched) -> finalize, resumable.
+
+    Progress is saved on the job row after every Salesforce call; a transient
+    failure retries from there, and a large org is walked in segments of
+    SITE_SF_DISCOVER_BUDGET_SECONDS that re-enqueue themselves.
+    """
+    job_id, wid = job["job_id"], job["workspace_id"]
+    conn = _site_sf_connection(wid)
+    if not _site_sf_connected(conn):
+        return _site_fail(job_id, attempt, CRM_ERROR_PERMANENT, SITE_SF_NOT_CONNECTED_CODE,
+                          "Salesforce is not connected for this workspace")
+    run_id = str(job.get("discover_run_id") or job_id)
+    phase = str(job.get("discover_phase") or "org")
+    cursor = str(job.get("discover_cursor") or "")
+    queue = list(job.get("discover_queue") or [])
+    counts = {k: int(v) for k, v in (job.get("discover_counts") or {}).items()}
+    deadline = time.monotonic() + SITE_SF_DISCOVER_BUDGET_SECONDS
+
+    def bump(key, n=1):
+        counts[key] = counts.get(key, 0) + int(n)
+
+    def save():
+        _update_crm_sync_job(job_id, discover_phase=phase, discover_cursor=cursor,
+                             discover_queue=queue, discover_counts=counts,
+                             discover_run_id=run_id)
+
+    def call(action, payload=None):
+        return _site_sf_call(conn, site_contract.envelope(
+            action, payload, request_id=site_contract.new_request_id())).result
+
+    try:
+        while True:
+            now = _now_iso()
+            if phase == "org":
+                info = call("org_info")
+                _site_sf_apply_org_info(conn, info)
+                _site_sf_connections.update_item(
+                    Key={"workspace_id": wid},
+                    UpdateExpression=("SET org_name = :n, is_sandbox = :s, edition = :e, "
+                                      "integration_user = :u, task_permissions = :t, "
+                                      "task_what_objects = :w, task_who_objects = :h, "
+                                      "updated_at = :now"),
+                    ExpressionAttributeValues={
+                        ":n": conn["org_name"], ":s": conn["is_sandbox"],
+                        ":e": conn["edition"], ":u": conn["integration_user"],
+                        ":t": conn["task_permissions"], ":w": conn["task_what_objects"],
+                        ":h": conn["task_who_objects"], ":now": now})
+                phase = "objects"
+            elif phase == "objects":
+                result = call("object_schema", {"mode": "objects", "cursor": cursor,
+                                                "page_size": SITE_SF_OBJECT_PAGE})
+                for raw in result.get("objects") or []:
+                    obj = site_salesforce_schema.normalize_object(
+                        raw, conn.get("task_what_objects"), conn.get("task_who_objects"))
+                    if obj is None:
+                        bump("objects_rejected")
+                        continue
+                    # The CATALOG: every queryable business/custom object,
+                    # minus technical, MinuteX and unqueryable ones (see
+                    # site_salesforce_schema.catalog_exclusion). Task is kept
+                    # for its fields. Nothing here needs Task compatibility.
+                    if not site_salesforce_schema.keep_in_discovery(obj):
+                        bump("objects_excluded")
+                        bump("excluded_" + (site_salesforce_schema.catalog_exclusion(obj)
+                                            or "other"))
+                        continue
+                    key = site_salesforce_schema.OBJ_PREFIX + obj["api_name"].lower()
+                    prior = _site_sf_schema.get_item(
+                        Key={"workspace_id": wid, "item_key": key}).get("Item") or {}
+                    _site_sf_schema.put_item(Item={
+                        **obj, "workspace_id": wid, "item_key": key, "run_id": run_id,
+                        "synced_at": now, "fields_synced_at": prior.get("fields_synced_at", "")})
+                    # Fields up front only for Task and the recommended
+                    # objects; any other object is described live on first
+                    # view (site_sf_object_fields), so 1,000+ catalogued
+                    # objects never mean 100+ describe calls here.
+                    if site_salesforce_schema.describe_fields_at_discovery(obj["api_name"]):
+                        queue.append(obj["api_name"])
+                    if site_salesforce_schema.is_usable_object(obj):
+                        bump("objects")
+                        if obj.get("is_custom"):
+                            bump("objects_custom")
+                        if obj.get("task_relation"):
+                            bump("objects_task_capable")
+                bump("objects_inaccessible", result.get("skipped_inaccessible") or 0)
+                cursor = str(result.get("next_cursor") or "")
+                if result.get("done") is True or not cursor:
+                    phase, cursor = "fields", ""
+            elif phase == "fields":
+                batch, queue = queue[:SITE_SF_FIELD_BATCH], queue[SITE_SF_FIELD_BATCH:]
+                if batch:
+                    result = call("object_schema", {"mode": "fields", "objects": batch})
+                    for described in result.get("objects") or []:
+                        name = str(described.get("api_name") or "")
+                        if not site_salesforce_schema.is_api_name(name):
+                            continue
+                        fields = [f for f in (site_salesforce_schema.normalize_field(r)
+                                              for r in described.get("fields") or []) if f]
+                        fields, trimmed = site_salesforce_schema.fit_fields(fields)
+                        _site_sf_schema.put_item(Item={
+                            "workspace_id": wid,
+                            "item_key": site_salesforce_schema.FLD_PREFIX + name.lower(),
+                            "api_name": name, "fields": fields, "field_count": len(fields),
+                            "inaccessible_field_count": int(
+                                described.get("inaccessible_field_count") or 0),
+                            "picklists_trimmed": trimmed, "run_id": run_id, "synced_at": now})
+                        _site_sf_schema.update_item(
+                            Key={"workspace_id": wid,
+                                 "item_key": site_salesforce_schema.OBJ_PREFIX + name.lower()},
+                            UpdateExpression="SET fields_synced_at = :now",
+                            ExpressionAttributeValues={":now": now})
+                        bump("fields_objects")
+                        bump("fields", len(fields))
+                    bump("fields_unavailable", len(result.get("unknown") or [])
+                         + len(result.get("inaccessible") or []))
+                if not queue:
+                    phase = "finalize"
+            elif phase == "finalize":
+                # Objects/fields not seen in THIS run are gone or no longer
+                # accessible: drop them so nothing offers a stale object.
+                removed = 0
+                query = {"KeyConditionExpression": Key("workspace_id").eq(wid)}
+                while True:
+                    res = _site_sf_schema.query(**query)
+                    for row in res.get("Items", []):
+                        if not str(row.get("item_key", "")).startswith(
+                                (site_salesforce_schema.OBJ_PREFIX,
+                                 site_salesforce_schema.FLD_PREFIX)):
+                            continue  # PREF#: the workspace's own choices
+                        if row.get("run_id") != run_id:
+                            _site_sf_schema.delete_item(
+                                Key={"workspace_id": wid, "item_key": row["item_key"]})
+                            removed += 1
+                    if not res.get("LastEvaluatedKey"):
+                        break
+                    query["ExclusiveStartKey"] = res["LastEvaluatedKey"]
+                counts["removed"] = removed
+                summary = {"job_id": job_id, "status": CRM_JOB_STATUS_SYNCED,
+                           "counts": counts, "completed_at": now, "updated_at": now}
+                _site_sf_set_discovery(wid, summary)
+                save()
+                print(f"[site-salesforce] discovery {job_id} done counts={counts}")
+                return _finish_crm_sync_job(
+                    job_id, attempt, CRM_JOB_STATUS_SYNCED, "", "", "",
+                    result={"delivery_type": site_contract.DELIVERY_TYPE_SALESFORCE_SITE,
+                            "action": "discover", "counts": counts, "completed_at": now})
+            save()
+            if time.monotonic() > deadline:
+                _update_crm_sync_job(job_id, status=CRM_JOB_STATUS_PENDING,
+                                     attempt_count=0, next_attempt_at=_now_iso())
+                _enqueue_site_job(job)
+                _site_sf_set_discovery(wid, {"job_id": job_id, "status": CRM_JOB_STATUS_SYNCING,
+                                             "phase": phase, "counts": counts,
+                                             "updated_at": _now_iso()})
+                return _get_crm_sync_job(job_id)
+    except site_delivery_client.SiteDeliveryError as e:
+        save()
+        print(f"[site-salesforce] discovery {job_id} failed in {phase} code={e.code}")
+        _site_sf_set_discovery(wid, {"job_id": job_id,
+                                     "status": "RETRYING" if e.retryable else "FAILED",
+                                     "phase": phase, "counts": counts, "error_code": e.code,
+                                     "updated_at": _now_iso()})
+        return _site_fail(job_id, attempt, e.category, e.code, e.message)
+
+
+# ---------------------------------------------------------------------------
+# Discovered metadata reads (from MinuteX's copy; no Salesforce call)
+# ---------------------------------------------------------------------------
+
+def _site_sf_object(wid, api_name):
+    if not site_salesforce_schema.is_api_name(api_name):
+        return None
+    return _site_sf_schema.get_item(Key={
+        "workspace_id": wid,
+        "item_key": site_salesforce_schema.OBJ_PREFIX + str(api_name).lower()}).get("Item")
+
+
+def _site_sf_fields_item(wid, api_name):
+    return _site_sf_schema.get_item(Key={
+        "workspace_id": wid,
+        "item_key": site_salesforce_schema.FLD_PREFIX + str(api_name).lower()}).get("Item")
+
+
+def _site_sf_task_fields(wid):
+    return site_salesforce_schema.fields_by_name(_site_sf_fields_item(wid, "Task"))
+
+
+def _site_sf_path_object(event, wid):
+    name = _url_unquote((event.get("pathParameters") or {}).get("object", ""))
+    obj = _site_sf_object(wid, name)
+    if obj is None:
+        raise SiteDeliveryApiError(404, "That object has not been discovered in this "
+                                        "Salesforce org", "unknown_object")
+    return obj
+
+
+def _site_sf_catalog(wid):
+    rows, query = [], {"KeyConditionExpression": Key("workspace_id").eq(wid)
+                       & Key("item_key").begins_with(site_salesforce_schema.OBJ_PREFIX)}
+    while True:
+        res = _site_sf_schema.query(**query)
+        rows.extend(res.get("Items", []))
+        if not res.get("LastEvaluatedKey"):
+            return rows
+        query["ExclusiveStartKey"] = res["LastEvaluatedKey"]
+
+
+def _site_sf_prefs(wid, conn=None):
+    """The workspace's enabled objects (a list of API names) for the
+    connected org. A list saved for another org is ignored."""
+    row = _site_sf_schema.get_item(Key={"workspace_id": wid,
+                                        "item_key": site_salesforce_schema.PREFS_KEY}).get("Item") or {}
+    conn = conn if conn is not None else _site_sf_connection(wid)
+    if row.get("org_id") and _site_org(row["org_id"]) != _site_org((conn or {}).get("org_id")):
+        return []
+    return [str(n) for n in row.get("enabled") or []]
+
+
+def _site_sf_save_prefs(wid, conn, enabled, user_id):
+    _site_sf_schema.put_item(Item={
+        "workspace_id": wid, "item_key": site_salesforce_schema.PREFS_KEY,
+        "enabled": enabled, "org_id": (conn or {}).get("org_id", ""),
+        "updated_by": user_id, "updated_at": _now_iso()})
+
+
+def _site_sf_remember_object(wid, conn, api_name, user_id):
+    """Using a non-recommended object (linking a meeting or a Task to one of
+    its records) enables it for the workspace, so nobody searches for it
+    again. Best-effort."""
+    if not api_name or api_name in site_salesforce_schema.RECOMMENDED_OBJECTS:
+        return
+    try:
+        enabled = _site_sf_prefs(wid, conn)
+        if api_name not in enabled:
+            _site_sf_save_prefs(wid, conn, (enabled + [api_name])[
+                -site_salesforce_schema.MAX_ENABLED_OBJECTS:], user_id)
+    except ClientError as e:
+        print(f"[site-salesforce] object preference not saved: "
+              f"{e.response.get('Error', {}).get('Code', '')}")
+
+
+def site_sf_objects(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/objects
+    ?scope=visible|all &q= &capability=meeting|task &custom=true|false &limit=
+    (JWT, member)
+
+    The object CATALOG (site_salesforce_schema): every queryable business and
+    custom object discovery kept. What is returned:
+
+      scope=visible (default)  the RECOMMENDED objects + the workspace's
+                               ENABLED objects — the short list a person sees
+      scope=all                the whole catalog, for "Find another
+                               Salesforce object" (with q: a label search)
+
+    capability=task narrows to objects a Salesforce Task can be attached to
+    (only when creating/changing a Task); meeting (default) is every catalog
+    object. Each object carries category, recommended, enabled and both
+    capability flags. Filtered at READ time too, so rows stored by an older
+    discovery run follow today's rules. `task_relatable=true` = capability=task
+    (older clients).
+    """
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    qs = event.get("queryStringParameters") or {}
+    needle = str(qs.get("q") or "").strip().lower()[:80]
+    custom = str(qs.get("custom") or "")
+    scope = str(qs.get("scope") or "visible").strip()
+    if scope not in ("visible", "all"):
+        raise ApiError(400, "scope must be visible or all")
+    capability = "task" if str(qs.get("task_relatable") or "") == "true" \
+        else str(qs.get("capability") or "meeting").strip()
+    if capability not in ("meeting", "task"):
+        raise ApiError(400, "capability must be meeting or task")
+    try:
+        limit = max(1, min(1000, int(qs.get("limit") or (500 if scope == "all" else 200))))
+    except ValueError:
+        raise ApiError(400, "limit must be a number")
+    enabled = set(_site_sf_prefs(wid))
+    out, catalogued = [], 0
+    for row in _site_sf_catalog(wid):
+        if not site_salesforce_schema.is_usable_object(row):
+            continue
+        catalogued += 1
+        name = row.get("api_name", "")
+        if scope == "visible" and not (site_salesforce_schema.is_recommended(row)
+                                       or name in enabled):
+            continue
+        if capability == "task" and not site_salesforce_schema.task_relationship_supported(row):
+            continue
+        if needle and needle not in name.lower() \
+                and needle not in str(row.get("label", "")).lower() \
+                and needle not in str(row.get("label_plural", "")).lower():
+            continue
+        if custom in ("true", "false") and bool(row.get("is_custom")) != (custom == "true"):
+            continue
+        out.append(site_salesforce_schema.public_object(row, enabled))
+    out.sort(key=lambda o: site_salesforce_schema.object_sort_key(o, enabled))
+    return _resp(200, {"objects": out[:limit], "total": len(out),
+                       "truncated": len(out) > limit, "catalog_size": catalogued})
+
+
+def site_sf_object_prefs(event):
+    """PUT /workspaces/{workspace_id}/site-salesforce/object-preferences
+    {enable?: [api_name], disable?: [api_name]} (JWT; enable: any member,
+    disable: CAP_MANAGE_INTEGRATIONS) -> {enabled: [objects]}
+
+    Which catalog objects this workspace shows next to the recommended ones.
+    Only catalogued objects can be enabled; recommended ones need no entry.
+    """
+    user_id, wid, membership = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    conn = _site_sf_require_connection(wid)
+    data = _body(event)
+    enable = [str(n) for n in data.get("enable") or [] if isinstance(n, str)][:50]
+    disable = [str(n) for n in data.get("disable") or [] if isinstance(n, str)][:50]
+    if disable and not workspace_schema.role_can(membership.get("role"),
+                                                 workspace_schema.CAP_MANAGE_INTEGRATIONS):
+        raise ApiError(403, "only an owner or manager can remove objects from the list")
+    known = {r.get("api_name") for r in _site_sf_catalog(wid)
+             if site_salesforce_schema.is_usable_object(r)}
+    unknown = [n for n in enable if n not in known]
+    if unknown:
+        raise SiteDeliveryApiError(400, "That Salesforce object is not available in this org. "
+                                        "Refresh Salesforce metadata.", "unknown_object")
+    current = [n for n in _site_sf_prefs(wid, conn) if n not in disable]
+    enabled = site_salesforce_schema.normalize_enabled(
+        current + [n for n in enable if n not in site_salesforce_schema.RECOMMENDED_OBJECTS],
+        known)
+    _site_sf_save_prefs(wid, conn, enabled, user_id)
+    _audit("site_salesforce.object_preferences", user_id, wid, enabled=len(enabled))
+    rows = {r.get("api_name"): r for r in _site_sf_catalog(wid)}
+    return _resp(200, {"enabled": [site_salesforce_schema.public_object(rows[n], set(enabled))
+                                   for n in enabled if n in rows]})
+
+
+def site_sf_object_fields(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/objects/{object}/fields
+    ?refresh=true (JWT, member; refresh re-describes this one object live)"""
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    obj = _site_sf_path_object(event, wid)
+    item = _site_sf_fields_item(wid, obj["api_name"])
+    refresh = str((event.get("queryStringParameters") or {}).get("refresh") or "") == "true"
+    if refresh or item is None:
+        conn = _site_sf_require_connection(wid)
+        try:
+            result = _site_sf_call(conn, site_contract.envelope(
+                "object_schema", {"mode": "fields", "objects": [obj["api_name"]]},
+                request_id=site_contract.new_request_id())).result
+        except site_delivery_client.SiteDeliveryError as e:
+            raise _site_sf_api_error(e)
+        described = (result.get("objects") or [None])[0]
+        if not described:
+            raise SiteDeliveryApiError(403, "The integration user can no longer read "
+                                            f"{obj.get('label')}", "salesforce_permission_denied")
+        fields = [f for f in (site_salesforce_schema.normalize_field(r)
+                              for r in described.get("fields") or []) if f]
+        fields, trimmed = site_salesforce_schema.fit_fields(fields)
+        item = {"workspace_id": wid,
+                "item_key": site_salesforce_schema.FLD_PREFIX + obj["api_name"].lower(),
+                "api_name": obj["api_name"], "fields": fields, "field_count": len(fields),
+                "inaccessible_field_count": int(described.get("inaccessible_field_count") or 0),
+                "picklists_trimmed": trimmed, "run_id": obj.get("run_id", ""),
+                "synced_at": _now_iso()}
+        _site_sf_schema.put_item(Item=item)
+    return _resp(200, {"object": site_salesforce_schema.public_object(obj),
+                       "fields": item.get("fields") or [],
+                       "inaccessible_field_count": int(item.get("inaccessible_field_count") or 0),
+                       "picklists_trimmed": bool(item.get("picklists_trimmed")),
+                       "synced_at": item.get("synced_at", "")})
+
+
+def site_sf_object_records(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/objects/{object}/records
+    ?q=&limit= (JWT, member) -> {records:[{id, name}]}
+
+    Live search in Salesforce, as the integration user (USER_MODE: only
+    records it can see). The object must be one discovery found and the user
+    can query; the name is never passed through unvalidated.
+    """
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    obj = _site_sf_path_object(event, wid)
+    if not obj.get("queryable"):
+        raise SiteDeliveryApiError(403, "Salesforce permissions do not allow reading "
+                                        f"{obj.get('label_plural') or obj['api_name']} "
+                                        "for the integration user",
+                                   "salesforce_permission_denied")
+    conn = _site_sf_require_connection(wid)
+    qs = event.get("queryStringParameters") or {}
+    query = str(qs.get("q") or "").strip()
+    if len(query) > 100:
+        raise ApiError(400, "q must be at most 100 characters")
+    try:
+        limit = max(1, min(50, int(qs.get("limit") or 20)))
+    except ValueError:
+        raise ApiError(400, "limit must be a number")
+    try:
+        result = _site_sf_call(conn, site_contract.envelope(
+            "record_search", {"object": obj["api_name"], "query": query, "limit": limit},
+            request_id=site_contract.new_request_id())).result
+    except site_delivery_client.SiteDeliveryError as e:
+        raise _site_sf_api_error(e)
+    records = [{"id": str(r.get("id") or ""), "name": str(r.get("name") or "")[:255]}
+               for r in result.get("records") or [] if isinstance(r, dict)
+               and site_salesforce_schema.valid_record_id(r.get("id"), obj.get("key_prefix"))]
+    return _resp(200, {"object": obj["api_name"], "name_field": result.get("name_field", ""),
+                       "records": records})
+
+
+# ---------------------------------------------------------------------------
+# Manual Task mappings
+# ---------------------------------------------------------------------------
+
+def _site_sf_validate_mapping(wid, data, current=None):
+    task_fields = _site_sf_task_fields(wid)
+    if not task_fields:
+        raise SiteDeliveryApiError(409, "Run discovery first: MinuteX has not read "
+                                        "this org's Task fields yet", "discovery_required")
+    try:
+        return site_salesforce_schema.validate_mapping(
+            data, get_object=lambda name: _site_sf_object(wid, name),
+            task_fields=task_fields,
+            get_person=lambda key: people_store.get_person(_people, wid, key),
+            current=current)
+    except site_salesforce_schema.SchemaError as e:
+        raise SiteDeliveryApiError(e.status, e.message, e.code)
+
+
+def _public_site_sf_mapping(row, wid=None):
+    out = {k: row.get(k) for k in (
+        "mapping_id", "name", "object_api_name", "subject", "description", "status",
+        "priority", "default_assignee_person_key", "due_rule", "record_required",
+        "default_record_id", "default_record_name", "extra_fields", "enabled", "org_id",
+        "created_by", "created_at", "updated_at")}
+    if wid is not None:
+        obj = _site_sf_object(wid, row.get("object_api_name"))
+        out["object_label"] = (obj or {}).get("label", "")
+        problems = []
+        if obj is None:
+            problems.append("object_not_discovered")
+        elif not obj.get("task_relation") or not obj.get("queryable"):
+            problems.append("object_not_usable")
+        out["problems"] = problems
+    return out
+
+
+def _site_sf_mapping(wid, mapping_id):
+    return _site_sf_mappings.get_item(Key={"workspace_id": wid,
+                                           "mapping_id": str(mapping_id or "")}).get("Item")
+
+
+def site_sf_mappings_list(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/task-mappings (member)"""
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    rows = _site_sf_mappings.query(KeyConditionExpression=Key("workspace_id").eq(wid)).get("Items", [])
+    rows.sort(key=lambda r: str(r.get("name") or "").lower())
+    return _resp(200, {"mappings": [_public_site_sf_mapping(r, wid) for r in rows]})
+
+
+def site_sf_mapping_create(event):
+    """POST /workspaces/{workspace_id}/site-salesforce/task-mappings
+    {name, object_api_name, subject, description?, status?, priority?,
+     default_assignee_person_key?, due_rule?, record_required?,
+     default_record_id?, extra_fields?} (JWT, CAP_MANAGE_INTEGRATIONS)"""
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    conn = _site_sf_require_connection(wid)
+    mapping = _site_sf_validate_mapping(wid, _body(event))
+    now = _now_iso()
+    row = {**mapping, "workspace_id": wid, "mapping_id": uuid.uuid4().hex[:16],
+           "org_id": conn["org_id"], "created_by": user_id, "created_at": now,
+           "updated_at": now}
+    _site_sf_mappings.put_item(Item=row)
+    _audit("site_salesforce.mapping_created", user_id, wid, mapping=row["mapping_id"],
+           object=row["object_api_name"])
+    return _resp(201, {"mapping": _public_site_sf_mapping(row, wid)})
+
+
+def site_sf_mapping_update(event):
+    """PUT /workspaces/{workspace_id}/site-salesforce/task-mappings/{mapping_id}"""
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    conn = _site_sf_require_connection(wid)
+    mapping_id = (event.get("pathParameters") or {}).get("mapping_id", "")
+    current = _site_sf_mapping(wid, mapping_id)
+    if not current:
+        raise ApiError(404, "mapping not found")
+    mapping = _site_sf_validate_mapping(wid, _body(event), current=current)
+    row = {**current, **mapping, "org_id": conn["org_id"], "updated_at": _now_iso(),
+           "updated_by": user_id}
+    _site_sf_mappings.put_item(Item=row)
+    return _resp(200, {"mapping": _public_site_sf_mapping(row, wid)})
+
+
+def site_sf_mapping_delete(event):
+    """DELETE /workspaces/{workspace_id}/site-salesforce/task-mappings/{mapping_id}"""
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    mapping_id = (event.get("pathParameters") or {}).get("mapping_id", "")
+    if not _site_sf_mapping(wid, mapping_id):
+        raise ApiError(404, "mapping not found")
+    _site_sf_mappings.delete_item(Key={"workspace_id": wid, "mapping_id": mapping_id})
+    return _resp(200, {"deleted": True})
+
+
+# ---------------------------------------------------------------------------
+# The meeting's Salesforce relationship
+#
+# WHAT A MEETING IS ABOUT, in Salesforce terms: a Who (the Contact or Lead)
+# and optionally a What (the Account, Opportunity, custom record...). See
+# site_salesforce_schema's Task relationship notes for why these are two
+# different things.
+#
+# AUTOMATIC by default: tagging a speaker with a synced Salesforce CONTACT
+# makes that Contact the meeting's Who — the stored Salesforce record id comes
+# from the People Store, so nobody picks an object, an API name or an id. The
+# first tagged Salesforce Contact (in speaker order) wins; the others are
+# offered as one-tap alternatives.
+#
+# MANUAL when a person says so ("Change Salesforce record"): the choice is
+# stored on the Recordings row as `salesforce_relation` {org_id, who, what},
+# each side validated against DISCOVERED metadata. A stored Who replaces the
+# automatic one; a stored What is added to it. A choice made for another org
+# is ignored, never sent.
+#
+# Delivered with the meeting (upsert_meeting `relation`) and INHERITED by the
+# meeting's Tasks unless a push says otherwise. Nothing here reads meeting
+# text or guesses: every record is either one a person tagged or one a person
+# picked.
+# ---------------------------------------------------------------------------
+SITE_SF_RELATION_ATTR = "salesforce_relation"
+
+
+def _site_sf_tagged_contacts(wid, key):
+    """Synced Salesforce CONTACTS tagged in this meeting, in speaker order,
+    one per person: [(person_row, contact_row)]."""
+    rows = sorted(_participant_rows(key), key=lambda r: (
+        1 if _is_self_speaker(r.get("speaker_id", "")) else 0,
+        1 if r.get("attendance_only") else 0,
+        _speaker_sort_key(r.get("speaker_id", ""))))
+    out, seen = [], set()
+    for row in rows:
+        contact_id = str(row.get("contact_id") or "")
+        if not contact_id or _is_member_contact(contact_id):
+            continue
+        contact = _contacts.get_item(Key={"contact_id": contact_id}).get("Item") or {}
+        if contact.get("people_provider") != SITE_PEOPLE_PROVIDER \
+                or contact.get("people_type") != "contact":
+            continue
+        person_key = str(contact.get("people_key") or site_contract.person_key(
+            SITE_PEOPLE_PROVIDER, "contact", contact.get("people_external_id", "")))
+        if person_key in seen:
+            continue
+        person = people_store.get_person(_people, wid, person_key)
+        if not person or person.get("status") == people_store.STATUS_DELETED:
+            continue
+        seen.add(person_key)
+        out.append((person, contact))
+    return out
+
+
+def _site_sf_person_ref(wid, person, source):
+    """A synced Salesforce Contact -> the meeting's Who, or None when the
+    Contact object is not usable in this org (not discovered / no access)."""
+    obj = _site_sf_object(wid, "Contact")
+    try:
+        return site_salesforce_schema.relation_ref(
+            obj, person.get("external_id"), person.get("name"), source=source,
+            person_key=person.get("person_key", ""))
+    except site_salesforce_schema.SchemaError:
+        return None
+
+
+def _site_sf_stored_ref(wid, ref):
+    """A stored side, re-validated against today's discovered metadata."""
+    if not isinstance(ref, dict) or not ref.get("record_id"):
+        return None
+    try:
+        return site_salesforce_schema.relation_ref(
+            _site_sf_object(wid, ref.get("object_api_name")), ref.get("record_id"),
+            ref.get("record_name"), source=ref.get("source") or "manual",
+            person_key=ref.get("person_key") or "")
+    except site_salesforce_schema.SchemaError:
+        return None
+
+
+def _site_sf_meeting_relation(wid, key, item, conn=None):
+    """(relations {who, what}, context) for one meeting.
+
+    context: {automatic, candidates, problems} — what the meeting screen
+    needs to explain the relationship without showing an id."""
+    conn = conn if conn is not None else _site_sf_connection(wid)
+    stored = item.get(SITE_SF_RELATION_ATTR) if isinstance(
+        item.get(SITE_SF_RELATION_ATTR), dict) else {}
+    problems = []
+    if stored and _site_org(stored.get("org_id")) != _site_org((conn or {}).get("org_id")):
+        stored = {}  # chosen for another org: never offered, never sent
+    tagged = _site_sf_tagged_contacts(wid, key)
+    candidates = []
+    for person, _contact in tagged:
+        ref = _site_sf_person_ref(wid, person, "tagged_contact")
+        if ref:
+            candidates.append((person, ref))
+    manual = {}
+    for slot in site_salesforce_schema.RELATION_SLOTS:
+        if stored.get(slot):
+            ref = _site_sf_stored_ref(wid, stored[slot])
+            if ref:
+                manual[slot] = ref
+            else:
+                problems.append(f"{slot}_unavailable")
+    who = manual.get("who") or (candidates[0][1] if candidates else None)
+    relations = {"who": who, "what": manual.get("what")}
+    if (who or {}).get("object_api_name") == "Lead":
+        relations["what"] = None
+    context = {
+        "automatic": bool(who) and "who" not in manual,
+        "candidates": [{"person_key": p.get("person_key", ""), "name": p.get("name", ""),
+                        "company": p.get("company", ""), "title": p.get("title", "")}
+                       for p, _r in candidates],
+        "problems": problems,
+    }
+    return relations, context
+
+
+def _public_relation_side(ref):
+    if not ref:
+        return None
+    return {
+        "object_label": ref.get("object_label", ""),
+        "name": site_salesforce_schema.relation_label(ref),
+        "source": ref.get("source", ""),
+        "person_key": ref.get("person_key", ""),
+        # False: the meeting is about this record, but Salesforce Tasks
+        # cannot be attached to its object (activities off).
+        "tasks_supported": ref.get("tasks_supported", True) is not False,
+    }
+
+
+def _public_meeting_relation(relations, context):
+    """The relationship as the app shows it: names and object labels, never
+    a Salesforce record id or API name."""
+    return {
+        "who": _public_relation_side(relations.get("who")),
+        "what": _public_relation_side(relations.get("what")),
+        "automatic": context["automatic"],
+        "candidates": context["candidates"],
+        "problems": context["problems"],
+    }
+
+
+def _site_sf_relation_meeting(event, wid, *, write):
+    user_id = _require_auth(event)
+    key = _url_unquote(str((event.get("queryStringParameters") or {}).get("meeting_key")
+                           or _body(event).get("meeting_key") or ""))
+    if not key:
+        raise ApiError(400, "meeting_key required")
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    allowed = _can_write_meeting(user_id, item) if write else _can_read_meeting(user_id, item)
+    if not item or _row_workspace_id(item) != wid or not allowed:
+        raise ApiError(404, "recording not found")
+    return user_id, key, item
+
+
+def site_sf_meeting_relation_get(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/meeting-relation
+    ?meeting_key= (JWT, member who can read the meeting) -> {relation}"""
+    _uid, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    _user_id, key, item = _site_sf_relation_meeting(event, wid, write=False)
+    conn = _site_sf_connection(wid)
+    if not _site_sf_connected(conn):
+        return _resp(200, {"relation": None, "connected": False})
+    relations, context = _site_sf_meeting_relation(wid, key, item, conn)
+    return _resp(200, {"relation": _public_meeting_relation(relations, context),
+                       "meeting_record": _public_meeting_record(_site_meeting_record(item, conn)),
+                       "connected": True})
+
+
+def site_sf_meeting_relation_put(event):
+    """PUT /workspaces/{workspace_id}/site-salesforce/meeting-relation
+    {meeting_key, person_key} | {meeting_key, object_api_name, record_id,
+     record_name} | {meeting_key, reset: "who"|"what"|"all"}
+    (JWT, member who can EDIT the meeting) -> {relation}
+
+    person_key: a synced Salesforce Contact becomes the Who (tagged or not).
+    object/record: the "Change Salesforce record" pick — a Who or a What by
+    the object's own Task relationship; the other side is kept.
+    reset: forget a manual choice (the Who goes back to the tagged Contact).
+    """
+    user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    _uid, key, item = _site_sf_relation_meeting(event, wid, write=True)
+    conn = _site_sf_require_connection(wid)
+    data = _body(event)
+    stored = item.get(SITE_SF_RELATION_ATTR) if isinstance(
+        item.get(SITE_SF_RELATION_ATTR), dict) else {}
+    if _site_org(stored.get("org_id")) != _site_org(conn["org_id"]):
+        stored = {}
+    current = {slot: stored.get(slot) for slot in site_salesforce_schema.RELATION_SLOTS}
+
+    reset = str(data.get("reset") or "").strip()
+    person_key = str(data.get("person_key") or "").strip()
+    try:
+        if reset:
+            if reset not in ("who", "what", "all"):
+                raise ApiError(400, "reset must be who, what or all")
+            for slot in site_salesforce_schema.RELATION_SLOTS:
+                if reset in (slot, "all"):
+                    current[slot] = None
+        elif person_key:
+            person = people_store.get_person(_people, wid, person_key[:400])
+            if not person or person.get("status") == people_store.STATUS_DELETED \
+                    or person.get("provider") != SITE_PEOPLE_PROVIDER \
+                    or person.get("type") != "contact":
+                raise SiteDeliveryApiError(400, "Choose a synced Salesforce Contact",
+                                           "invalid_person")
+            ref = site_salesforce_schema.relation_ref(
+                _site_sf_object(wid, "Contact"), person.get("external_id"),
+                person.get("name"), source="chosen_contact", person_key=person["person_key"])
+            current = site_salesforce_schema.combine_relations(current, ref)
+        else:
+            object_api_name = str(data.get("object_api_name") or "").strip()
+            ref = site_salesforce_schema.relation_ref(
+                _site_sf_object(wid, object_api_name)
+                if site_salesforce_schema.is_api_name(object_api_name) else None,
+                str(data.get("record_id") or "").strip(),
+                str(data.get("record_name") or ""), source="manual")
+            current = site_salesforce_schema.combine_relations(current, ref)
+            _site_sf_remember_object(wid, conn, ref["object_api_name"], user_id)
+    except site_salesforce_schema.SchemaError as e:
+        raise SiteDeliveryApiError(e.status, e.message, e.code)
+
+    if any(current.values()):
+        _recordings.update_item(
+            Key={"audio_s3_key": key}, UpdateExpression=f"SET {SITE_SF_RELATION_ATTR} = :r",
+            ExpressionAttributeValues={":r": {**current, "org_id": conn["org_id"],
+                                              "updated_by": user_id,
+                                              "updated_at": _now_iso()}})
+    else:
+        _recordings.update_item(Key={"audio_s3_key": key},
+                                UpdateExpression=f"REMOVE {SITE_SF_RELATION_ATTR}")
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") or item
+    relations, context = _site_sf_meeting_relation(wid, key, item, conn)
+    _audit("site_salesforce.meeting_relation_set", user_id, wid,
+           who=bool(relations.get("who")), what=bool(relations.get("what")))
+    return _resp(200, {"relation": _public_meeting_relation(relations, context),
+                       "connected": True})
+
+
+def _site_meeting_relation_for_delivery(wid, key, item):
+    """The relation block for upsert_meeting, or None. Best-effort: a meeting
+    is still delivered (unrelated) when the relationship cannot be read."""
+    try:
+        conn = _site_sf_connection(wid)
+        if not _site_sf_connected(conn):
+            return None
+        relations, _ctx = _site_sf_meeting_relation(wid, key, item, conn)
+        return relations if any(relations.values()) else None
+    except Exception as e:  # noqa: BLE001
+        print(f"[site-delivery] relation unavailable for a meeting: {type(e).__name__}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+
+TASK_DENIED_CREATE ="Salesforce permissions do not allow Task creation for this object/user."
+TASK_DENIED_UPDATE = "Salesforce permissions do not allow Task updates for this user."
+# Who wrote a Task row's current content. Today only MinuteX writes; a future
+# Salesforce -> MinuteX sync stamps "salesforce" on what it imports, and skips
+# any Salesforce change whose last-modified stamp equals the one MinuteX's own
+# write produced (sf_last_modified_at) — that is how a round trip is told
+# apart from a person editing the Task in Salesforce (loop prevention).
+SITE_SF_TASK_ORIGIN_MINUTEX = "minutex"
+# The Task fields a sync compares. Snapshotted at every confirmed write
+# (synced_snapshot) so a later sync can tell which side changed what.
+SITE_SF_TASK_SYNC_FIELDS = ("subject", "description", "due_date", "status", "priority",
+                            "assigned_user_id", "who_record_id", "what_record_id")
+_SITE_SF_TASK_IN_FLIGHT = (CRM_JOB_STATUS_PENDING, CRM_JOB_STATUS_SYNCING,
+                           CRM_JOB_STATUS_RETRYING)
+
+
+def _site_sf_task(wid, task_ref):
+    return _site_sf_tasks.get_item(Key={"workspace_id": wid,
+                                        "task_ref": str(task_ref or "")}).get("Item")
+
+
+def _public_site_sf_task(row):
+    out = {k: row.get(k) for k in (
+        "task_ref", "mapping_id", "mapping_name", "subject", "description", "due_date",
+        "status", "priority", "assigned_user_id", "assignee_person_key", "assignee_name",
+        "related_object_type", "related_record_id", "related_record_name",
+        "meeting_key", "minutex_task_id", "sync_status", "salesforce_task_id",
+        "last_error", "version", "org_id", "created_by", "created_at", "updated_at",
+        "synced_at")}
+    # What a person sees for the relationship: names and object labels, Who
+    # then What. The ids above stay for older clients; the app shows these.
+    out["related_to"] = [
+        {"slot": slot, "object_label": row.get(f"{slot}_object_label", ""),
+         "name": row.get(f"{slot}_record_name", "") or row.get(f"{slot}_object_label", "")}
+        for slot in site_salesforce_schema.RELATION_SLOTS if row.get(f"{slot}_record_id")]
+    if not out["related_to"] and row.get("related_record_id"):
+        out["related_to"] = [{"slot": "", "object_label": row.get("related_object_type", ""),
+                              "name": row.get("related_record_name", "")}]
+    return out
+
+
+def _site_sf_relation_fields(relations):
+    """{who, what} -> the Task row's flat relationship columns. related_* is
+    the single primary record (What, else Who) that a pre-1.2 receiver and
+    older clients read."""
+    out = {}
+    for slot in site_salesforce_schema.RELATION_SLOTS:
+        ref = (relations or {}).get(slot) or {}
+        out[f"{slot}_object_type"] = ref.get("object_api_name", "")
+        out[f"{slot}_object_label"] = ref.get("object_label", "")
+        out[f"{slot}_record_id"] = ref.get("record_id", "")
+        out[f"{slot}_record_name"] = ref.get("record_name", "")
+    primary = site_salesforce_schema.primary_relation(relations) or {}
+    out["related_object_type"] = primary.get("object_api_name", "")
+    out["related_record_id"] = primary.get("record_id", "")
+    out["related_record_name"] = primary.get("record_name", "")
+    return out
+
+
+def _site_sf_row_relations(wid, row):
+    """The {who, what} a stored Task row already has (kept on an edit). Rows
+    written before Who and What were separate carry only related_*."""
+    out = {"who": None, "what": None}
+    has_split = any(row.get(f"{slot}_record_id") for slot in site_salesforce_schema.RELATION_SLOTS)
+    pairs = ([(row.get(f"{slot}_object_type"), row.get(f"{slot}_record_id"),
+               row.get(f"{slot}_record_name")) for slot in site_salesforce_schema.RELATION_SLOTS]
+             if has_split else
+             [(row.get("related_object_type"), row.get("related_record_id"),
+               row.get("related_record_name"))])
+    for obj_name, record_id, record_name in pairs:
+        if not record_id:
+            continue
+        if obj_name == SITE_MEETING_OBJECT:
+            # MinuteX's own record: never "discovered" (it is not offered as
+            # a choice), but always a Task's Related To.
+            out["what"] = _site_sf_meeting_record_ref(
+                {"record_id": str(record_id), "title": str(record_name or "")})
+            out["what"]["source"] = "stored"
+            continue
+        obj = _site_sf_object(wid, obj_name)
+        if not obj or not obj.get("task_relation"):
+            continue
+        out[obj["task_relation"]] = {
+            "slot": obj["task_relation"], "object_api_name": obj["api_name"],
+            "object_label": obj.get("label") or obj["api_name"],
+            "record_id": str(record_id), "record_name": str(record_name or ""),
+            "source": "stored", "person_key": ""}
+    return out
+
+
+def _site_sf_resolve_task_fields(wid, conn, mapping, data, current=None, inherited=None):
+    """The validated Task fields for a create (current=None) or an edit.
+
+    THE RELATIONSHIP (Who and/or What, see site_salesforce_schema):
+      * `inherited` - the meeting's relationship (a push that did not choose
+        a record), or the row's own on an edit;
+      * an EXPLICIT record - what the person selected now ("Change related
+        Salesforce record"); else, on create, the mapping's default record -
+        replaces the side of `inherited` it belongs to and keeps the other.
+    A mapping names an object; without one the object is the request's
+    `object_api_name`, or none at all when the Task simply inherits.
+
+    Validation is against discovered metadata and the People Store only; the
+    receiver re-checks everything live, as the integration user, at delivery.
+    """
+    base = current or {}
+    task_fields = _site_sf_task_fields(wid)
+    obj = None
+    if mapping.get("object_api_name"):
+        obj = _site_sf_object(wid, mapping["object_api_name"])
+        if obj is None or not obj.get("queryable"):
+            raise SiteDeliveryApiError(409, "That Salesforce object is no longer available "
+                                            "for Tasks in this org. Refresh Salesforce "
+                                            "metadata.", "mapping_invalid")
+        if not obj.get("task_relation"):
+            raise SiteDeliveryApiError(400, _site_sf_no_tasks_message(obj),
+                                       "object_not_task_relatable")
+    # A meeting can be about a record whose object does not allow activities;
+    # a Task cannot carry that side, so it is dropped here (and named in the
+    # error if nothing else is left to relate the Task to).
+    inherited, dropped = site_salesforce_schema.task_relations(inherited)
+
+    def pick(key, fallback=""):
+        return data[key] if key in data else base.get(key, fallback)
+
+    # The explicit record: what the person selected now; else (create) the
+    # mapping's default record. An edit without a new pick keeps `inherited`.
+    if "record_id" in data and obj is not None:
+        record_id = str(data.get("record_id") or "").strip()
+        record_name = str(data.get("record_name") or "")[:255]
+    elif current is None and obj is not None:
+        record_id = str(mapping.get("default_record_id") or "")
+        record_name = str(mapping.get("default_record_name") or "")
+    else:
+        record_id, record_name = "", ""
+    explicit = None
+    if record_id:
+        if not site_salesforce_schema.valid_record_id(record_id, obj.get("key_prefix")):
+            raise SiteDeliveryApiError(400, f"That is not a {obj.get('label')} record",
+                                       "invalid_record")
+        explicit = {"slot": obj["task_relation"], "object_api_name": obj["api_name"],
+                    "object_label": obj.get("label") or obj["api_name"],
+                    "record_id": record_id, "record_name": record_name,
+                    "source": "manual", "person_key": ""}
+    relations = site_salesforce_schema.combine_relations(inherited, explicit)
+    if not any(relations.values()) and mapping.get("record_required", True):
+        if dropped and obj is None:
+            raise SiteDeliveryApiError(400, _site_sf_no_tasks_message(
+                {"label_plural": dropped[0].get("object_label")}), "object_not_task_relatable")
+        if obj is not None:
+            raise SiteDeliveryApiError(400, f"Select the {obj.get('label')} record this Task "
+                                            "belongs to", "record_required")
+        raise SiteDeliveryApiError(400, "Tag a Salesforce Contact in this meeting, or choose "
+                                        "the Salesforce record these Tasks belong to",
+                                   "record_required")
+
+    person_key = str(data.get("assignee_person_key") or base.get("assignee_person_key")
+                     or mapping.get("default_assignee_person_key") or "")
+    if not person_key:
+        raise SiteDeliveryApiError(400, "Select the Salesforce User to assign this Task to",
+                                   "assignee_required")
+    try:
+        person = site_salesforce_schema.require_assignee(
+            people_store.get_person(_people, wid, person_key))
+    except site_salesforce_schema.SchemaError as e:
+        raise SiteDeliveryApiError(400, e.message, e.code)
+
+    subject = str(pick("subject", mapping.get("subject")) or "").strip()[:255]
+    if not subject:
+        raise SiteDeliveryApiError(400, "subject is required", "invalid_task")
+    try:
+        due = site_salesforce_schema.parse_iso_date(pick("due_date", ""))
+        status = site_salesforce_schema.validate_picklist(
+            pick("status", mapping.get("status")), task_fields.get("Status"), "status")
+        priority = site_salesforce_schema.validate_picklist(
+            pick("priority", mapping.get("priority")), task_fields.get("Priority"), "priority")
+    except site_salesforce_schema.SchemaError as e:
+        raise SiteDeliveryApiError(400, e.message, e.code)
+    return {
+        "subject": subject,
+        "description": str(pick("description", mapping.get("description")) or "")[:32000],
+        "due_date": due,
+        "status": status,
+        "priority": priority,
+        "assigned_user_id": person["external_id"],
+        "assignee_person_key": person_key,
+        "assignee_name": str(person.get("name") or "")[:255],
+        **_site_sf_relation_fields(relations),
+    }
+
+
+def _site_sf_no_tasks_message(obj):
+    return (f"Salesforce does not allow Tasks on {obj.get('label_plural') or obj.get('label') or 'that object'}"
+            " (Allow Activities is off for it). Turn it on in Salesforce Setup, or choose another "
+            "related record for these Tasks.")
+
+
+def _site_sf_meeting_record_ref(rec, title=""):
+    return {"slot": "what", "object_api_name": SITE_MEETING_OBJECT,
+            "object_label": SITE_MEETING_OBJECT_LABEL, "record_id": rec["record_id"],
+            "record_name": str(rec.get("title") or title or "")[:255],
+            "source": "meeting_record", "person_key": "", "tasks_supported": True}
+
+
+def _site_sf_inherited_relation(wid, conn, meeting_key):
+    """What a meeting's Task is related to by default:
+
+      Related To (What) = the meeting's own Salesforce record
+                          (MinuteX_Site_Meeting__c, from Push Meeting)
+      Name (Who)        = the meeting's Contact (the tagged Salesforce Contact,
+                          or the person chosen for the meeting)
+
+    So a Task shows on the meeting record, on the Contact and — through the
+    Contact — on its Account. A business record chosen for the meeting
+    (Account, Opportunity, ...) stays linked on the meeting record itself.
+    Raises 409 meeting_not_pushed until the meeting is in Salesforce.
+    """
+    if not meeting_key:
+        return None
+    item = _recordings.get_item(Key={"audio_s3_key": meeting_key}).get("Item")
+    if not item:
+        return None
+    rec = _site_meeting_record(item, conn)
+    if not rec:
+        raise SiteDeliveryApiError(409, "Push the meeting to Salesforce first: its Tasks are "
+                                        "attached to the meeting's Salesforce record.",
+                                   "meeting_not_pushed")
+    relations, _ctx = _site_sf_meeting_relation(wid, meeting_key, item, conn)
+    who = relations.get("who")
+    if (who or {}).get("object_api_name") == "Lead":
+        # Salesforce: a Task whose Name is a Lead cannot have a Related To.
+        # The meeting record wins; the Lead stays linked on that record.
+        who = None
+    return {"who": who, "what": _site_sf_meeting_record_ref(rec, item.get("title"))}
+
+
+def _site_sf_defaults_from_minutex_task(wid, task, meeting_title):
+    """A MinuteX task (AI-extracted or user-created) -> Salesforce Task fields.
+
+    Copied, never inferred: the subject is the task's own title, the due date
+    is the task's RESOLVED calendar date (a phrase nobody resolved — "next
+    week" — is kept in the description rather than guessed into a date), and
+    status/priority map only onto values active in this org's picklists.
+    """
+    task_fields = _site_sf_task_fields(wid)
+    title = str(task.get("title") or "").strip()[:255]
+    spoken = str(task.get("due_date") or "").strip()
+    due = ""
+    for candidate in (task.get("due_date_normalized"), spoken):
+        try:
+            due = site_salesforce_schema.parse_iso_date(str(candidate or "")[:10])
+        except site_salesforce_schema.SchemaError:
+            due = ""
+        if due:
+            break
+    lines = [str(task.get("description") or "").strip()]
+    if spoken and not due:
+        lines.append(f"Due (as said in the meeting): {spoken}")
+    if meeting_title:
+        lines.append(f"From the MinuteX meeting \u201c{meeting_title}\u201d.")
+    return {
+        "subject": title,
+        "description": "\n\n".join(line for line in lines if line)[:32000],
+        "due_date": due,
+        "status": site_salesforce_schema.equivalent_picklist_value(
+            task.get("status"), task_fields.get("Status"),
+            site_salesforce_schema.TASK_STATUS_EQUIVALENTS),
+        "priority": site_salesforce_schema.equivalent_picklist_value(
+            task.get("priority"), task_fields.get("Priority"),
+            site_salesforce_schema.TASK_PRIORITY_EQUIVALENTS),
+    }
+
+
+def _site_sf_minutex_task_ref(wid, minutex_task_id):
+    """ONE Salesforce Task per MinuteX task: pushing it again is an update."""
+    return hashlib.sha256(f"{wid}:minutex-task:{minutex_task_id}".encode()).hexdigest()[:32]
+
+
+def site_sf_task_create(event):
+    """POST /workspaces/{workspace_id}/site-salesforce/tasks
+    {minutex_task_id? , mapping_id? | object_api_name?, record_id?,
+     record_name?, assignee_person_key?, due_date?, subject?, description?,
+     status?, priority?, meeting_key?, client_request_id?}
+    (JWT, member) -> 202 {task, updated?}
+
+    PUSHING AN EXISTING MINUTEX TASK (`minutex_task_id`) is the main path: the
+    task an AI extracted from the meeting, or one a user added. Its title,
+    description, resolved due date, status and priority become the Salesforce
+    Task's (any of them can be overridden in the request); its meeting is the
+    meeting_key. The caller must be able to see the task. The Salesforce Task
+    is linked 1:1 to it, so pushing the same task again UPDATES that Task
+    rather than creating a second one (202 {updated: true}).
+
+    THE RELATIONSHIP IS INHERITED BY DEFAULT: a push without a mapping takes
+    the meeting's Salesforce relationship (the tagged Salesforce Contact as
+    Who, plus any record chosen for the meeting as What — see
+    _site_sf_meeting_relation). `object_api_name` + `record_id` is the
+    advanced "Change related Salesforce record" pick: it replaces the side of
+    that relationship it belongs to. A Task mapping is an optional TEMPLATE
+    (`mapping_id`) naming its own object. The Salesforce User is always the
+    person's choice. Without a minutex_task_id this creates a stand-alone
+    Task, and `client_request_id` makes a double-tap return the first one
+    instead of creating a second.
+    """
+    user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    conn = _site_sf_require_connection(wid)
+    data = _body(event)
+
+    minutex_task_id = str(data.get("minutex_task_id") or "").strip()[:64]
+    if minutex_task_id:
+        source = _visible_task(user_id, minutex_task_id)   # 404 unless visible
+        source_key = str(source.get("source_recording_id") or "")
+        if not source_key:
+            raise SiteDeliveryApiError(400, "Only a task from a meeting can be pushed "
+                                            "to Salesforce", "task_not_from_meeting")
+        if str(data.get("meeting_key") or source_key) != source_key:
+            raise ApiError(400, "meeting_key does not match the task's meeting")
+        meeting = _recordings.get_item(Key={"audio_s3_key": source_key}).get("Item") or {}
+        defaults = _site_sf_defaults_from_minutex_task(wid, source, meeting.get("title"))
+        data = {**defaults, **{k: v for k, v in data.items() if v is not None},
+                "meeting_key": source_key}
+        existing = _site_sf_task(wid, _site_sf_minutex_task_ref(wid, minutex_task_id))
+        if existing:
+            return _site_sf_repush_minutex_task(user_id, wid, conn, existing, data)
+    if str(data.get("mapping_id") or "").strip():
+        mapping = _site_sf_mapping(wid, data.get("mapping_id"))
+        if not mapping or not mapping.get("enabled", True):
+            raise ApiError(404, "mapping not found")
+        if _site_org(mapping.get("org_id")) != _site_org(conn["org_id"]):
+            raise SiteDeliveryApiError(409, "This mapping was made for a different Salesforce "
+                                            "org", "mapping_invalid")
+    else:
+        object_api_name = str(data.get("object_api_name") or "").strip()
+        if object_api_name and not site_salesforce_schema.is_api_name(object_api_name):
+            raise SiteDeliveryApiError(400, "Select the Salesforce object this Task belongs "
+                                            "to", "invalid_object")
+        if not object_api_name and not str(data.get("meeting_key") or "").strip():
+            raise SiteDeliveryApiError(400, "Select the Salesforce object this Task belongs "
+                                            "to", "invalid_object")
+        # No template: the meeting's relationship, optionally with one side
+        # replaced by the object/record the person chose.
+        mapping = {"mapping_id": "", "name": "", "object_api_name": object_api_name,
+                   "record_required": True, "due_rule": {"type": "none"},
+                   "extra_fields": {}}
+    if not (conn.get("task_permissions") or {}).get("createable"):
+        raise SiteDeliveryApiError(403, TASK_DENIED_CREATE, "salesforce_permission_denied")
+
+    client_request_id = str(data.get("client_request_id") or "").strip()[:100]
+    if minutex_task_id:
+        task_ref = _site_sf_minutex_task_ref(wid, minutex_task_id)
+    elif client_request_id:
+        task_ref = hashlib.sha256(f"{wid}:{client_request_id}".encode()).hexdigest()[:32]
+        existing = _site_sf_task(wid, task_ref)
+        if existing:
+            return _resp(200, {"task": _public_site_sf_task(existing), "duplicate": True})
+    else:
+        task_ref = uuid.uuid4().hex
+
+    meeting_key = str(data.get("meeting_key") or "").strip()
+    started = ""
+    if meeting_key:
+        item = _recordings.get_item(Key={"audio_s3_key": meeting_key}).get("Item")
+        if not item or _row_workspace_id(item) != wid or not _can_read_meeting(user_id, item):
+            raise ApiError(404, "recording not found")
+        started = site_salesforce_schema.meeting_started_at(item.get("recorded_at"))
+
+    inherited = (_site_sf_inherited_relation(wid, conn, meeting_key)
+                 if not mapping["mapping_id"] else None)
+    fields = _site_sf_resolve_task_fields(wid, conn, mapping, data, inherited=inherited)
+    if not mapping["mapping_id"] and mapping.get("object_api_name"):
+        _site_sf_remember_object(wid, conn, mapping["object_api_name"], user_id)
+    if not fields["due_date"]:
+        fields["due_date"] = site_salesforce_schema.compute_due_date(
+            mapping.get("due_rule"), meeting_started_at=started)
+    now = _now_iso()
+    row = {**fields, "workspace_id": wid, "task_ref": task_ref, "org_id": conn["org_id"],
+           "mapping_id": mapping["mapping_id"], "mapping_name": mapping.get("name", ""),
+           "record_required": mapping.get("record_required", True),
+           "extra_fields": mapping.get("extra_fields") or {},
+           "meeting_key": meeting_key, "minutex_task_id": minutex_task_id,
+           "sync_status": CRM_JOB_STATUS_PENDING, "salesforce_task_id": "",
+           "version": 1, "generation": 0, "last_error": {}, "job_id": "",
+           # Sync bookkeeping (see _run_site_sf_task_job): who wrote the
+           # current content, and what Salesforce last confirmed.
+           "origin": SITE_SF_TASK_ORIGIN_MINUTEX, "synced_version": 0,
+           "created_by": user_id, "created_at": now, "updated_at": now}
+    try:
+        _site_sf_tasks.put_item(Item=row, ConditionExpression="attribute_not_exists(task_ref)")
+    except ClientError:
+        existing = _site_sf_task(wid, task_ref)
+        return _resp(200, {"task": _public_site_sf_task(existing or row), "duplicate": True})
+    job = _create_site_job(workspace_id=wid, operation=SITE_OP_SF_TASK, user_id=user_id,
+                           existing_job_id="", extra={"task_ref": task_ref})
+    _site_sf_tasks.update_item(Key={"workspace_id": wid, "task_ref": task_ref},
+                               UpdateExpression="SET job_id = :j",
+                               ExpressionAttributeValues={":j": job["job_id"]})
+    row["job_id"] = job["job_id"]
+    _audit("site_salesforce.task_requested", user_id, wid, task=task_ref,
+           object=row["related_object_type"])
+    return _resp(202, {"task": _public_site_sf_task(row)})
+
+
+def site_sf_tasks_list(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/tasks?meeting_key= (member)"""
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    meeting_key = str((event.get("queryStringParameters") or {}).get("meeting_key") or "")
+    rows, query = [], {"KeyConditionExpression": Key("workspace_id").eq(wid)}
+    while True:
+        res = _site_sf_tasks.query(**query)
+        rows.extend(r for r in res.get("Items", [])
+                    if not meeting_key or r.get("meeting_key") == meeting_key)
+        if not res.get("LastEvaluatedKey"):
+            break
+        query["ExclusiveStartKey"] = res["LastEvaluatedKey"]
+    rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    return _resp(200, {"tasks": [_public_site_sf_task(r) for r in rows[:200]]})
+
+
+def site_sf_task_get(event):
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    row = _site_sf_task(wid, (event.get("pathParameters") or {}).get("task_ref"))
+    if not row:
+        raise ApiError(404, "task not found")
+    return _resp(200, {"task": _public_site_sf_task(row)})
+
+
+def _site_sf_editable_task(event):
+    user_id, wid, membership = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    row = _site_sf_task(wid, (event.get("pathParameters") or {}).get("task_ref"))
+    if not row:
+        raise ApiError(404, "task not found")
+    if row.get("created_by") != user_id and not workspace_schema.role_can(
+            membership.get("role"), workspace_schema.CAP_MANAGE_INTEGRATIONS):
+        raise ApiError(403, "only the person who created this Task or a manager can change it")
+    if row.get("sync_status") in _SITE_SF_TASK_IN_FLIGHT:
+        raise SiteDeliveryApiError(409, "This Task is still being sent to Salesforce",
+                                   "task_in_flight")
+    conn = _site_sf_require_connection(wid)
+    if _site_org(row.get("org_id")) != _site_org(conn["org_id"]):
+        raise SiteDeliveryApiError(409, "This Task belongs to a different Salesforce org",
+                                   "org_mismatch")
+    return user_id, wid, conn, row
+
+
+def _site_sf_requeue_task(user_id, wid, row, updates, *, new_generation):
+    updates = dict(updates)
+    updates.update(sync_status=CRM_JOB_STATUS_PENDING, last_error={}, updated_at=_now_iso())
+    if new_generation:
+        updates["generation"] = int(row.get("generation") or 0) + 1
+    job = _create_site_job(workspace_id=wid, operation=SITE_OP_SF_TASK, user_id=user_id,
+                           existing_job_id="", extra={"task_ref": row["task_ref"]})
+    updates["job_id"] = job["job_id"]
+    _apply_update(_site_sf_tasks, {"workspace_id": wid, "task_ref": row["task_ref"]},
+                  updates, [])
+    return _site_sf_task(wid, row["task_ref"])
+
+
+def _site_sf_repush_minutex_task(user_id, wid, conn, row, data):
+    """Push a MinuteX task that already has a Salesforce Task: update it (or
+    re-send a create that failed) with the task's current content and the
+    person's current choices. 409 while the previous push is still running."""
+    if row.get("sync_status") in (CRM_JOB_STATUS_PENDING, CRM_JOB_STATUS_SYNCING,
+                                  CRM_JOB_STATUS_RETRYING):
+        raise SiteDeliveryApiError(409, "This task is still being sent to Salesforce",
+                                   "task_in_flight")
+    if _site_org(row.get("org_id")) != _site_org(conn["org_id"]):
+        raise SiteDeliveryApiError(409, "This task was pushed to a different Salesforce org",
+                                   "org_mismatch")
+    if row.get("salesforce_task_id") and not (conn.get("task_permissions") or {}).get("updateable"):
+        raise SiteDeliveryApiError(403, TASK_DENIED_UPDATE, "salesforce_permission_denied")
+    # What the push screen shows is what is sent: the meeting's relationship
+    # now (it may have changed since the last push), with the person's
+    # explicit pick, if any, replacing one side.
+    object_api_name = str(data.get("object_api_name") or "").strip()
+    if object_api_name and not site_salesforce_schema.is_api_name(object_api_name):
+        raise SiteDeliveryApiError(400, "Select the Salesforce object this Task belongs to",
+                                   "invalid_object")
+    mapping = {"object_api_name": object_api_name, "record_required": True}
+    inherited = _site_sf_inherited_relation(wid, conn, row.get("meeting_key"))
+    if not inherited or not any(inherited.values()):
+        inherited = _site_sf_row_relations(wid, row)
+    fields = _site_sf_resolve_task_fields(wid, conn, mapping, data, current=row,
+                                          inherited=inherited)
+    updates = {**fields, "version": int(row.get("version") or 1) + 1}
+    refreshed = _site_sf_requeue_task(user_id, wid, row, updates,
+                                      new_generation=not row.get("salesforce_task_id"))
+    _audit("site_salesforce.task_repushed", user_id, wid, task=row["task_ref"])
+    return _resp(202, {"task": _public_site_sf_task(refreshed), "updated": True})
+
+
+def site_sf_task_update(event):
+    """PATCH /workspaces/{workspace_id}/site-salesforce/tasks/{task_ref}
+    {subject?, description?, due_date?, status?, priority?,
+     assignee_person_key?, record_id?, record_name?} -> 202 {task}
+
+    Updates the Salesforce Task when it exists (update_task), or re-sends a
+    create that failed. Needs Task update permission for an existing Task.
+    """
+    user_id, wid, conn, row = _site_sf_editable_task(event)
+    data = _body(event)
+    if row.get("salesforce_task_id") and not (conn.get("task_permissions") or {}).get("updateable"):
+        raise SiteDeliveryApiError(403, TASK_DENIED_UPDATE, "salesforce_permission_denied")
+    mapping = _site_sf_mapping(wid, row.get("mapping_id")) or {
+        "object_api_name": str(data.get("object_api_name") or "").strip()
+        or row.get("related_object_type"),
+        "record_required": row.get("record_required", True)}
+    if mapping.get("object_api_name") \
+            and not site_salesforce_schema.is_api_name(mapping["object_api_name"]):
+        raise SiteDeliveryApiError(400, "Select the Salesforce object this Task belongs to",
+                                   "invalid_object")
+    fields = _site_sf_resolve_task_fields(wid, conn, mapping, data, current=row,
+                                          inherited=_site_sf_row_relations(wid, row))
+    updates = {**fields, "version": int(row.get("version") or 1) + 1}
+    refreshed = _site_sf_requeue_task(user_id, wid, row, updates,
+                                      new_generation=not row.get("salesforce_task_id"))
+    return _resp(202, {"task": _public_site_sf_task(refreshed)})
+
+
+def site_sf_task_retry(event):
+    """POST /workspaces/{workspace_id}/site-salesforce/tasks/{task_ref}/retry"""
+    user_id, wid, _conn, row = _site_sf_editable_task(event)
+    if row.get("sync_status") != CRM_JOB_STATUS_FAILED:
+        raise ApiError(409, "only a failed Task can be retried")
+    refreshed = _site_sf_requeue_task(user_id, wid, row, {}, new_generation=True)
+    return _resp(202, {"task": _public_site_sf_task(refreshed)})
+
+
+def _site_sf_link_minutex_task(row, sf_task_id, synced_version, synced_at):
+    """Record the Salesforce Task on the MinuteX task it was pushed from.
+
+    The SiteSalesforceTasks row (task_ref = hash of workspace + MinuteX task)
+    is the authoritative link; this copy on the Tasks row lets anything that
+    reads a MinuteX task know it lives in Salesforce without a second lookup.
+    Best-effort: Salesforce already holds the Task, so a failure here is
+    logged and the job still succeeds.
+    """
+    minutex_task_id = str(row.get("minutex_task_id") or "")
+    if not minutex_task_id or not sf_task_id:
+        return
+    try:
+        _tasks.update_item(
+            Key={"task_id": minutex_task_id},
+            UpdateExpression="SET salesforce_sync = :s",
+            ConditionExpression="attribute_exists(task_id)",
+            ExpressionAttributeValues={":s": {
+                "provider": SITE_PEOPLE_PROVIDER,
+                "org_id": str(row.get("org_id") or ""),
+                "task_ref": str(row.get("task_ref") or ""),
+                "salesforce_task_id": sf_task_id,
+                "synced_version": synced_version,
+                "synced_at": synced_at,
+                "origin": SITE_SF_TASK_ORIGIN_MINUTEX,
+            }})
+    except ClientError as e:
+        print(f"[site-salesforce] task link not written: "
+              f"{e.response.get('Error', {}).get('Code', '')}")
+
+
+def _run_site_sf_task_job(job, attempt):
+    """Send one Task to Salesforce: create_task, or update_task once it has a
+    Salesforce id. Reads the Task row at execution time, so a retry always
+    sends the current fields."""
+    job_id, wid = job["job_id"], job["workspace_id"]
+    task_ref = str(job.get("task_ref") or "")
+    row = _site_sf_task(wid, task_ref)
+    if not row:
+        return _site_fail(job_id, attempt, CRM_ERROR_PERMANENT, "task_gone",
+                          "the Task no longer exists in MinuteX")
+    key = {"workspace_id": wid, "task_ref": task_ref}
+
+    def mark(status, **extra):
+        _apply_update(_site_sf_tasks, key,
+                      {"sync_status": status, "updated_at": _now_iso(), **extra}, [])
+
+    conn = _site_sf_connection(wid)
+    if not _site_sf_connected(conn):
+        mark(CRM_JOB_STATUS_FAILED, last_error={"code": SITE_SF_NOT_CONNECTED_CODE})
+        return _site_fail(job_id, attempt, CRM_ERROR_PERMANENT, SITE_SF_NOT_CONNECTED_CODE,
+                          "Salesforce is not connected for this workspace")
+    if _site_org(row.get("org_id")) != _site_org(conn["org_id"]):
+        mark(CRM_JOB_STATUS_FAILED, last_error={"code": "org_mismatch"})
+        return _site_fail(job_id, attempt, CRM_ERROR_PERMANENT, "org_mismatch",
+                          "this Task was made for a different Salesforce org")
+
+    creating = not row.get("salesforce_task_id")
+    spec = {k: row.get(k) or "" for k in (
+        "subject", "description", "due_date", "status", "priority", "assigned_user_id",
+        "related_object_type", "related_record_id")}
+    # Contract 1.2: the full relationship, Who AND What. A 1.1 receiver
+    # ignores it and relates the Task to related_* (the primary record).
+    relations = _site_sf_row_relations(wid, row)
+    related_records = site_contract.task_related_records(relations)
+    if related_records:
+        spec["related_records"] = related_records
+    generation = int(row.get("generation") or 0)
+    if creating:
+        spec["record_required"] = row.get("record_required", True) is not False
+        spec["extra_fields"] = row.get("extra_fields") or {}
+        if not spec["related_record_id"]:
+            spec.pop("related_object_type")
+            spec.pop("related_record_id")
+        action, idem = "create_task", f"minutex:task:{task_ref}:create:g{generation}"
+    else:
+        spec["salesforce_task_id"] = row["salesforce_task_id"]
+        if not spec["related_record_id"]:
+            spec.pop("related_object_type")
+            spec.pop("related_record_id")
+        action = "update_task"
+        idem = f"minutex:task:{task_ref}:v{int(row.get('version') or 1)}:g{generation}"
+    request_id = site_contract.new_request_id()
+    mark(CRM_JOB_STATUS_SYNCING)
+    try:
+        resp = _site_sf_call(conn, site_contract.envelope(
+            action, {"task": spec}, request_id=request_id, idempotency_key=idem))
+    except site_delivery_client.SiteDeliveryError as e:
+        will_retry = e.retryable and attempt < CRM_JOB_MAX_ATTEMPTS
+        mark(CRM_JOB_STATUS_RETRYING if will_retry else CRM_JOB_STATUS_FAILED,
+             last_error={"code": e.code, "message": e.message[:500],
+                         "category": e.category, "http_status": e.http_status})
+        print(f"[site-salesforce] task {task_ref} {action} failed code={e.code} "
+              f"http={e.http_status} request={request_id}")
+        return _site_fail(job_id, attempt, e.category, e.code, e.message,
+                          result={"action": action, "task_ref": task_ref,
+                                  "idempotency_key": idem, "error": e.as_dict()})
+    sf_task_id = str(resp.result.get("task_id") or row.get("salesforce_task_id") or "")
+    synced_at = _now_iso()
+    synced_version = int(row.get("version") or 1)
+    # What Salesforce now holds, as MinuteX wrote it, plus Salesforce's own
+    # last-modified stamp for that write (1.3+ receivers return it). A future
+    # two-way sync compares against these to see which side changed a field,
+    # and ignores the echo of this very write.
+    mark(CRM_JOB_STATUS_SYNCED, salesforce_task_id=sf_task_id, synced_at=synced_at,
+         synced_version=synced_version, last_error={},
+         synced_snapshot={k: str(row.get(k) or "") for k in SITE_SF_TASK_SYNC_FIELDS},
+         sf_last_modified_at=str(resp.result.get("last_modified_at") or ""),
+         origin=SITE_SF_TASK_ORIGIN_MINUTEX)
+    _site_sf_link_minutex_task(row, sf_task_id, synced_version, synced_at)
+    print(f"[site-salesforce] task {task_ref} {action} ok duplicate={resp.duplicate} "
+          f"request={request_id}")
+    return _finish_crm_sync_job(job_id, attempt, CRM_JOB_STATUS_SYNCED, "", "", "", result={
+        "delivery_type": site_contract.DELIVERY_TYPE_SALESFORCE_SITE, "action": action,
+        "task_ref": task_ref, "salesforce_task_id": sf_task_id,
+        "operation": str(resp.result.get("operation") or ""), "duplicate": resp.duplicate,
+        "idempotency_key": idem, "request_id": request_id})
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -18904,10 +18197,6 @@ _ROUTES = {
     ("GET", "/contacts/{contact_id}"): get_contact,
     ("PATCH", "/contacts/{contact_id}"): update_contact,
     ("DELETE", "/contacts/{contact_id}"): delete_contact,
-    # Contact -> Salesforce Contact/Account identity (Phase 2D.3). Separate
-    # from the general PATCH above: this persists an EXPLICIT CRM match, not
-    # an edit of the contact's own fields.
-    ("PUT", "/contacts/{contact_id}/crm"): resolve_contact_crm_identity,
     # Cross-meeting task queries — the Task Tracker's read side.
     ("GET", "/tasks"): list_all_tasks,
     ("GET", "/tasks/{task_id}"): get_task,
@@ -18938,41 +18227,8 @@ _ROUTES = {
     # POST despite being a read: it runs a generation, so it must not be
     # cached or retried by a proxy that assumes GET is free.
     ("POST", "/ai/task-intelligence"): ai_task_intelligence,
-    # CRM — Salesforce connect (Phase 1). /callback is the one route in this
-    # file Salesforce's browser redirect calls directly — no JWT, verified
-    # via `state` instead. See the section above for the full flow.
-    ("GET", "/crm/salesforce/connect"): salesforce_connect,
-    ("GET", "/crm/salesforce/callback"): salesforce_callback,
-    ("GET", "/crm/salesforce/status"): salesforce_status,
-    ("DELETE", "/crm/salesforce"): salesforce_disconnect,
-    # CRM configuration — the user maps their OWN org's object/fields; no
-    # object or field API name is ever hardcoded (see the section above).
-    ("GET", "/crm/salesforce/objects"): salesforce_list_objects,
-    ("GET", "/crm/salesforce/fields/{object_name}"): salesforce_list_fields,
-    ("GET", "/crm/salesforce/config"): salesforce_get_config,
-    ("PUT", "/crm/salesforce/config"): salesforce_put_config,
-    # Identifier -> Salesforce record Id, using the configured object + field.
-    ("POST", "/crm/salesforce/lookup"): salesforce_lookup_record,
-    # Push the meeting's configured content onto the confirmed record. The
-    # recording key comes LAST for the same API Gateway reason as the AI routes
-    # (a greedy {key+} is only legal in the final position).
-    ("POST", "/crm/salesforce/sync/{key+}"): crm_sync_record,
-    # CRM Review (Phase 2D.3) — organisation meetings only. Read-only
-    # identity/content picture; see push_org_meeting_crm for the push itself.
-    ("GET", "/recordings/ai/crm-review/{key+}"): get_meeting_crm_review,
-    # The push itself — now ASYNC (Phase 2D.4): returns {job_id, status}
-    # immediately rather than the push result, gated on the SAME readiness
-    # rule crm-review reports (validated inside the worker).
-    ("POST", "/recordings/ai/crm-push/{key+}"): push_org_meeting_crm,
-    # Poll/retry for the job the push above created. The retry action word
-    # comes BEFORE the greedy {key+} (same API Gateway constraint as the AI
-    # routes above — a greedy variable is only legal in the final position,
-    # so "/crm-sync-jobs/{key+}/retry" cannot exist as a route at all).
-    ("GET", "/recordings/ai/crm-sync-jobs/{key+}"): get_crm_sync_job_status,
-    ("POST", "/recordings/ai/crm-sync-jobs-retry/{key+}"): retry_crm_sync_job,
-    # ElevenLabs' asynchronous STT completion callback. The SECOND
-    # unauthenticated route in this file (after /crm/salesforce/callback):
-    # ElevenLabs has no MinuteX JWT, so identity is proven by an HMAC signature
+    # ElevenLabs' asynchronous STT completion callback — an unauthenticated
+    # route: ElevenLabs has no MinuteX JWT, so identity is proven by an HMAC signature
     # over the raw body instead. See the section above for all five checks.
     # --- Meeting Share. The first four are owner-only (JWT); /share/{token}
     # is the ONLY unauthenticated way to read a meeting, and it authorizes on
@@ -18990,9 +18246,8 @@ _ROUTES = {
     ("GET", "/share/{token}/audio"): public_share_audio,
     # --- Integrations. Generic connect/status/disconnect for ANY provider;
     # only the ones flagged available in shared/integrations.py can actually
-    # start a flow. /callback is the THIRD unauthenticated route in this file
-    # (after the Salesforce callback and the ElevenLabs webhook), for the same
-    # reason: a provider's browser redirect carries no JWT, so the signed
+    # start a flow. /callback is unauthenticated (like the ElevenLabs
+    # webhook), for the same reason: a provider's browser redirect carries no JWT, so the signed
     # `state` is the credential there.
     ("GET", "/integrations"): list_integrations,
     ("GET", "/integrations/{provider}"): get_integration,
@@ -19016,6 +18271,10 @@ _ROUTES = {
     ("GET", "/notifications/unread-count"): get_unread_count,
     ("POST", "/notifications/{notification_id}/read"): mark_notification_read,
     ("POST", "/notifications/read-all"): mark_all_notifications_read,
+    # OS push: register / refresh this installation's token, or drop it on
+    # sign-out. See the PUSH TOKENS section.
+    ("POST", "/me/push-tokens"): register_push_token,
+    ("DELETE", "/me/push-tokens/{installation_id}"): delete_push_token,
     # --- Workspaces (Phase 2A). READ ONLY, deliberately: creation,
     # invitation and role changes wait on the identity decision documented at
     # the end of shared/workspace_schema.py. Both are JWT-authenticated and
@@ -19030,28 +18289,6 @@ _ROUTES = {
     ("POST", "/workspaces/{workspace_id}/members/invite"): invite_member,
     ("PATCH", "/workspaces/{workspace_id}/members/{user_id}"): update_member,
     ("DELETE", "/workspaces/{workspace_id}/members/{user_id}"): remove_member,
-    # Organisation CRM — Salesforce (Phase 2D.1). Workspace-scoped twin of
-    # the Personal /crm/salesforce/* routes above; see the "Organisation
-    # CRM" section for why /org-callback is a fixed path while connect/
-    # status/disconnect carry {workspace_id}. connect/disconnect require
-    # CAP_MANAGE_INTEGRATIONS (Owner/Manager); status is any active member.
-    ("GET", "/workspaces/{workspace_id}/crm/salesforce/connect"): org_salesforce_connect,
-    ("GET", "/crm/salesforce/org-callback"): org_salesforce_callback,
-    ("GET", "/workspaces/{workspace_id}/crm/salesforce/status"): org_salesforce_status,
-    ("DELETE", "/workspaces/{workspace_id}/crm/salesforce"): org_salesforce_disconnect,
-    # Organisation CRM configuration (Phase 2D.2) — the workspace-scoped twin
-    # of /crm/salesforce/{objects,fields,config} below. Read is any active
-    # member; PUT config requires CAP_MANAGE_INTEGRATIONS.
-    ("GET", "/workspaces/{workspace_id}/crm/salesforce/objects"): org_salesforce_list_objects,
-    ("GET", "/workspaces/{workspace_id}/crm/salesforce/fields/{object_name}"): org_salesforce_list_fields,
-    ("GET", "/workspaces/{workspace_id}/crm/salesforce/config"): org_salesforce_get_config,
-    ("PUT", "/workspaces/{workspace_id}/crm/salesforce/config"): org_salesforce_put_config,
-    # Meeting identity -> Salesforce (Phase 2D.3). Search is any active
-    # member; resolving a MEMBER's own Salesforce User identity requires
-    # CAP_MANAGE_INTEGRATIONS (it applies org-wide, not just to one meeting).
-    ("GET", "/workspaces/{workspace_id}/crm/salesforce/search/contacts"): crm_search_salesforce_contacts,
-    ("GET", "/workspaces/{workspace_id}/crm/salesforce/search/users"): crm_search_salesforce_users,
-    ("PUT", "/workspaces/{workspace_id}/crm/salesforce/members/{user_id}"): resolve_member_crm_identity,
     # Acceptance is JWT-authenticated: the token proves possession of the
     # link, the JWT proves WHO is spending it, and both must agree.
     ("POST", "/workspace-invitations/{token}/accept"): accept_invitation,
@@ -19060,6 +18297,47 @@ _ROUTES = {
     # JWT-authenticated and owner-scoped — this one is for the user/operator,
     # not for ElevenLabs.
     ("POST", "/recordings/ai/stt-reconcile/{key+}"): stt_reconcile,
+
+    # Salesforce Site delivery (delivery_type=salesforce_site); see the
+    # SALESFORCE SITE DELIVERY section.
+    ("GET", "/workspaces/{workspace_id}/site-delivery"): site_delivery_get,
+    ("PUT", "/workspaces/{workspace_id}/site-delivery"): site_delivery_put,
+    ("DELETE", "/workspaces/{workspace_id}/site-delivery"): site_delivery_delete,
+    ("POST", "/workspaces/{workspace_id}/site-delivery/health"): site_delivery_health,
+    ("POST", "/workspaces/{workspace_id}/site-delivery/people-sync"): site_people_sync_start,
+    ("GET", "/workspaces/{workspace_id}/site-delivery/people-sync"): site_people_sync_status,
+    ("GET", "/workspaces/{workspace_id}/people"): people_search,
+    ("POST", "/workspaces/{workspace_id}/people/contact"): people_contact,
+    ("POST", "/recordings/site-delivery/{key+}"): site_meeting_push,
+    ("GET", "/recordings/site-delivery/{key+}"): site_meeting_status,
+    ("POST", "/recordings/site-delivery-retry/{key+}"): site_meeting_retry,
+    ("PUT", "/recordings/site-participants/{key+}"): site_participant_tag,
+    # UNAUTHENTICATED: the signed token is the credential — see
+    # site_delivery_audio.
+    ("GET", "/delivery/audio/{token}"): site_delivery_audio,
+
+    # Salesforce Site — org connection through the Site endpoint:
+    # discovery, manual Task mappings, record selection, Tasks.
+    ("PUT", "/workspaces/{workspace_id}/site-salesforce/connect"): site_sf_connect,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce"): site_sf_get,
+    ("DELETE", "/workspaces/{workspace_id}/site-salesforce"): site_sf_disconnect,
+    ("POST", "/workspaces/{workspace_id}/site-salesforce/discover"): site_sf_discover_start,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/discover"): site_sf_discover_status,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/objects"): site_sf_objects,
+    ("PUT", "/workspaces/{workspace_id}/site-salesforce/object-preferences"): site_sf_object_prefs,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/objects/{object}/fields"): site_sf_object_fields,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/objects/{object}/records"): site_sf_object_records,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/task-mappings"): site_sf_mappings_list,
+    ("POST", "/workspaces/{workspace_id}/site-salesforce/task-mappings"): site_sf_mapping_create,
+    ("PUT", "/workspaces/{workspace_id}/site-salesforce/task-mappings/{mapping_id}"): site_sf_mapping_update,
+    ("DELETE", "/workspaces/{workspace_id}/site-salesforce/task-mappings/{mapping_id}"): site_sf_mapping_delete,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/meeting-relation"): site_sf_meeting_relation_get,
+    ("PUT", "/workspaces/{workspace_id}/site-salesforce/meeting-relation"): site_sf_meeting_relation_put,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/tasks"): site_sf_tasks_list,
+    ("POST", "/workspaces/{workspace_id}/site-salesforce/tasks"): site_sf_task_create,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/tasks/{task_ref}"): site_sf_task_get,
+    ("PATCH", "/workspaces/{workspace_id}/site-salesforce/tasks/{task_ref}"): site_sf_task_update,
+    ("POST", "/workspaces/{workspace_id}/site-salesforce/tasks/{task_ref}/retry"): site_sf_task_retry,
 }
 
 

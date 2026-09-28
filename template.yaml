@@ -15,7 +15,7 @@
 #
 # NO SECRET VALUES APPEAR IN THIS FILE. Lambda environment variables are
 # represented by NAME only; every value is a REDACTED placeholder or a
-# CloudFormation parameter. The four Secrets Manager secrets are referenced
+# CloudFormation parameter. The three Secrets Manager secrets are referenced
 # by ARN and their contents are never read.
 # =============================================================================
 AWSTemplateFormatVersion: '2010-09-09'
@@ -36,7 +36,11 @@ Description: |
 #   userApi             --> Groq                api.groq.com (on-demand AI, chat)
 #   userApi             --> Google OAuth+Gmail  accounts.google.com,
 #                             oauth2.googleapis.com, gmail.googleapis.com
-#   userApi             --> Salesforce REST     login.salesforce.com + instance
+#   userApi/crmSyncWorker --> Salesforce Site  Apex REST receiver at
+#                             https://<site>/services/apexrest/minutex/v1/
+#                             (delivery_type=salesforce_site; runs on the CrmSyncJobs table,
+#                             CrmSyncQueue/CrmSyncDLQ and the crmSyncWorker Lambda, which
+#                             post-date this capture and are NOT modelled here)
 #
 # NOTE: Google OAuth here is the GMAIL INTEGRATION only. There is no Google
 # Sign-In backend; the app's Google button is UI-only (coming soon).
@@ -52,7 +56,7 @@ Metadata:
       - ElevenLabs Scribe (STT)
       - Groq (LLM)
       - Google OAuth + Gmail API (integration only, NOT sign-in)
-      - Salesforce REST API (CRM)
+      - Salesforce Site + Apex REST receiver (CRM delivery)
 
 Parameters:
 
@@ -93,7 +97,7 @@ Resources:
             Action: sts:AssumeRole
       # No managed policies attached in the deployed account.
       # Existing deployed permission. Not changed during architecture capture.
-      # 13 inline policies and NO managed policies -- not even
+      # 12 inline policies and NO managed policies -- not even
       # AWSLambdaBasicExecutionRole; CloudWatch Logs access is granted by the
       # 'Logs' statement inside userApi-inline instead.
       Policies:
@@ -141,28 +145,6 @@ Resources:
                   - s3:GetObject
                   - s3:DeleteObject
                 Resource: arn:aws:s3:::meeting-recorder-shubham-aps1/avatars/*
-        - PolicyName: userApi-crm-salesforce
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: CrmConnections
-                Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/CrmConnections
-              - Sid: SalesforceTokenKms
-                Effect: Allow
-                Action:
-                  - kms:Encrypt
-                  - kms:Decrypt
-                Resource: arn:aws:kms:ap-south-1:624734879550:key/b5a78676-4c51-4ba4-8f2a-bb0a77bfcec4
-              - Sid: SalesforceClientSecret
-                Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/salesforceClientSecret-vUDtk6
         - PolicyName: userApi-inline
           PolicyDocument:
             Version: '2012-10-17'
@@ -471,14 +453,6 @@ Resources:
                 Action:
                   - dynamodb:PutItem
                 Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/NotificationDedupe
-        - PolicyName: transcribe-crm-config-read
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: CrmConnectionsRead
-                Effect: Allow
-                Action: dynamodb:GetItem
-                Resource: arn:aws:dynamodb:ap-south-1:624734879550:table/CrmConnections
         - PolicyName: transcribe-invoke-userapi
           PolicyDocument:
             Version: '2012-10-17'
@@ -534,6 +508,10 @@ Resources:
   # UNVERIFIED and re-read it before any import. See AWS_ARCHITECTURE.md.
   # ===========================================================================
 
+  # alias/crm-salesforce: RETAINED, PENDING RETIREMENT. The legacy Salesforce
+  # OAuth integration that used it has been removed; the key is kept because it
+  # may have encrypted legacy Gmail tokens (not verified). Not in use by the
+  # Salesforce Site integration.
   CrmSalesforceKey:
     Type: AWS::KMS::Key
     DeletionPolicy: Retain
@@ -591,7 +569,7 @@ Resources:
       TargetKeyId: !Ref IntegrationsKey
 
   # ===========================================================================
-  # SECRETS MANAGER  --  four secrets, all read by userApi only
+  # SECRETS MANAGER  --  three secrets, all read by userApi only
   #
   # NO SecretString AND NO GenerateSecretString IS DECLARED, DELIBERATELY.
   # Declaring either would embed a real secret in version control, or
@@ -603,7 +581,7 @@ Resources:
   # {{resolve:secretsmanager:...}} template reference. Adding a resolve here
   # would misrepresent the deployed mechanism, so none is used.
   #
-  # Rotation is not configured on any of the four (existing state).
+  # Rotation is not configured on any of the three (existing state).
   # ===========================================================================
 
   JwtSecret:
@@ -624,16 +602,6 @@ Resources:
     Properties:
       Name: userApi/googleClientSecret
       Description: Google OAuth client secret (MinuteX Gmail integration)
-      # SecretString intentionally omitted -- see the section note above.
-
-  SalesforceClientSecret:
-    Type: AWS::SecretsManager::Secret
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    # Deployed ARN: arn:aws:secretsmanager:ap-south-1:624734879550:secret:userApi/salesforceClientSecret-vUDtk6
-    Properties:
-      Name: userApi/salesforceClientSecret
-      Description: Salesforce Connected App consumer secret (MinuteX CRM OAuth)
       # SecretString intentionally omitted -- see the section note above.
 
   ElevenLabsWebhookSecret:
@@ -696,9 +664,9 @@ Resources:
             Function: !GetAtt TranscribeRecordingFunction.Arn
 
   # ===========================================================================
-  # DYNAMODB  --  16 tables
+  # DYNAMODB  --  15 tables
   #
-  # EXISTING STATE PRESERVED ACROSS ALL 16:
+  # EXISTING STATE PRESERVED ACROSS ALL 15:
   #   BillingMode                  PAY_PER_REQUEST
   #   PointInTimeRecovery          DISABLED
   #   DeletionProtection           DISABLED
@@ -1166,28 +1134,6 @@ Resources:
         PointInTimeRecoveryEnabled: false # existing deployed state
       DeletionProtectionEnabled: false # existing deployed state
 
-  CrmConnectionsTable:
-    Type: AWS::DynamoDB::Table
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    # Per-user Salesforce OAuth tokens and field mappings, envelope-encrypted with the crm-salesforce CMK.
-    Properties:
-      TableName: CrmConnections
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: provider
-          AttributeType: S
-        - AttributeName: user_id
-          AttributeType: S
-      KeySchema:
-        - AttributeName: user_id
-          KeyType: HASH
-        - AttributeName: provider
-          KeyType: RANGE
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: false # existing deployed state
-      DeletionProtectionEnabled: false # existing deployed state
-
   NotificationsTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
@@ -1286,11 +1232,11 @@ Resources:
       # ===========================================================================
       # API GATEWAY  --  HTTP API (v2) 'iot-audio-api', deployed id q87zfn5vyj
       #
-      # 105 routes, ONE stage ($default) with AutoDeploy enabled.
-      #   102 routes -> userApi
+      # 95 routes, ONE stage ($default) with AutoDeploy enabled.
+      #    92 routes -> userApi
       #     3 routes -> getUploadUrl
       #
-      # AUTHORIZATION: every one of the 105 routes has AuthorizationType NONE and
+      # AUTHORIZATION: every one of the 95 routes has AuthorizationType NONE and
       # ApiKeyRequired false. There are NO API Gateway authorizers in the account.
       # All authentication and authorization happens INSIDE the Lambda code (JWT
       # via _require_auth, x-api-key for device routes, HMAC-SHA256 for the STT
@@ -1348,10 +1294,10 @@ Resources:
     Type: AWS::Serverless::Function
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
-    # The main application API. Serves 102 of the 105 HTTP API routes: auth, recordings, AI workspace, per-meeting and workspace chat, tasks, CRM, Gmail, shares, notifications, and the ElevenLabs STT webhook. Also handles an internal asynchronous tasks.seed invoke from transcribeRecording.
+    # The main application API. Serves 92 of the 95 HTTP API routes: auth, recordings, AI workspace, per-meeting and workspace chat, tasks, Gmail, shares, notifications, and the ElevenLabs STT webhook. Also handles an internal asynchronous tasks.seed invoke from transcribeRecording.
     Properties:
       FunctionName: userApi
-      Description: Main application API - 102 HTTP routes plus the ElevenLabs STT
+      Description: Main application API - 92 HTTP routes plus the ElevenLabs STT
         webhook and an internal task-seeding invoke.
       Runtime: python3.12
       Handler: lambda_function.lambda_handler
@@ -1365,13 +1311,13 @@ Resources:
       CodeUri: cloud/functions/userapi/
       Tracing: PassThrough # X-Ray not enabled in the deployed account
       # ---------------------------------------------------------------
-      # ENVIRONMENT VARIABLES -- 53 variables, NAMES ONLY.
+      # ENVIRONMENT VARIABLES -- 45 variables, NAMES ONLY.
       # Every value below is a REDACTED placeholder. The real values were
       # never read during capture and MUST NOT be committed here.
       #
       # SECURITY NOTE (existing deployed state, not changed):
       # GROQ_API_KEY and ELEVENLABS_API_KEY are stored as PLAINTEXT Lambda
-      # environment variables, while the other four secrets correctly use
+      # environment variables, while the other three secrets correctly use
       # Secrets Manager. Captured as-is; see AWS_ARCHITECTURE.md risks.
       # ---------------------------------------------------------------
       Environment:
@@ -1386,7 +1332,6 @@ Resources:
           CHAT_SESSIONS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
           CHAT_SESSIONS_USER_INDEX: !Ref RedactedPlaceholder # [REDACTED]
           CONTACTS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
-          CRM_CONNECTIONS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
           ELEVENLABS_API_KEY: !Ref RedactedPlaceholder # [REDACTED - plaintext secret in deployed env]
           ELEVENLABS_WEBHOOK_SECRET_ARN: !Ref RedactedPlaceholder # [REDACTED]
           FOLDERS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
@@ -1416,13 +1361,6 @@ Resources:
           PAGEINDEX_PREFIX: !Ref RedactedPlaceholder # [REDACTED]
           PAGEINDEX_RETRIEVAL_DEADLINE: !Ref RedactedPlaceholder # [REDACTED]
           REPROCESS_COOLDOWN_SECONDS: !Ref RedactedPlaceholder # [REDACTED]
-          SALESFORCE_API_VERSION: !Ref RedactedPlaceholder # [REDACTED]
-          SALESFORCE_CLIENT_ID: !Ref RedactedPlaceholder # [REDACTED]
-          SALESFORCE_CLIENT_SECRET_ARN: !Ref RedactedPlaceholder # [REDACTED]
-          SALESFORCE_KMS_KEY_ID: !Ref RedactedPlaceholder # [REDACTED]
-          SALESFORCE_LOGIN_URL: !Ref RedactedPlaceholder # [REDACTED]
-          SALESFORCE_REDIRECT_URI: !Ref RedactedPlaceholder # [REDACTED]
-          SALESFORCE_RETURN_URL: !Ref RedactedPlaceholder # [REDACTED]
           SHARES_RECORDING_INDEX: !Ref RedactedPlaceholder # [REDACTED]
           SHARES_TABLE: !Ref RedactedPlaceholder # [REDACTED]
           SHARES_TOKEN_INDEX: !Ref RedactedPlaceholder # [REDACTED]
@@ -1430,7 +1368,7 @@ Resources:
           TASKS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
           TRANSCRIBE_LAMBDA_NAME: !Ref RedactedPlaceholder # [REDACTED]
       # ---------------------------------------------------------------
-      # API GATEWAY ROUTES -- 102 routes, all AuthorizationType NONE.
+      # API GATEWAY ROUTES -- 92 routes, all AuthorizationType NONE.
       # ---------------------------------------------------------------
       Events:
         Route001:
@@ -1445,12 +1383,6 @@ Resources:
             ApiId: !Ref MinuteXHttpApi
             Method: delete
             Path: /contacts/{contact_id}
-        Route003:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: delete
-            Path: /crm/salesforce
         Route004:
           Type: HttpApi
           Properties:
@@ -1547,42 +1479,6 @@ Resources:
             ApiId: !Ref MinuteXHttpApi
             Method: get
             Path: /contacts/{contact_id}
-        Route020:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: get
-            Path: /crm/salesforce/callback
-        Route021:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: get
-            Path: /crm/salesforce/config
-        Route022:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: get
-            Path: /crm/salesforce/connect
-        Route023:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: get
-            Path: /crm/salesforce/fields/{object_name}
-        Route024:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: get
-            Path: /crm/salesforce/objects
-        Route025:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: get
-            Path: /crm/salesforce/status
         Route026:
           Type: HttpApi
           Properties:
@@ -1829,18 +1725,6 @@ Resources:
             ApiId: !Ref MinuteXHttpApi
             Method: post
             Path: /contacts
-        Route067:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: post
-            Path: /crm/salesforce/lookup
-        Route068:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: post
-            Path: /crm/salesforce/sync/{key+}
         Route069:
           Type: HttpApi
           Properties:
@@ -2027,12 +1911,6 @@ Resources:
             ApiId: !Ref MinuteXHttpApi
             Method: post
             Path: /webhooks/elevenlabs/stt
-        Route100:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref MinuteXHttpApi
-            Method: put
-            Path: /crm/salesforce/config
         Route101:
           Type: HttpApi
           Properties:
@@ -2121,19 +1999,18 @@ Resources:
       CodeUri: cloud/functions/transcribe/
       Tracing: PassThrough # X-Ray not enabled in the deployed account
       # ---------------------------------------------------------------
-      # ENVIRONMENT VARIABLES -- 19 variables, NAMES ONLY.
+      # ENVIRONMENT VARIABLES -- 18 variables, NAMES ONLY.
       # Every value below is a REDACTED placeholder. The real values were
       # never read during capture and MUST NOT be committed here.
       #
       # SECURITY NOTE (existing deployed state, not changed):
       # GROQ_API_KEY and ELEVENLABS_API_KEY are stored as PLAINTEXT Lambda
-      # environment variables, while the other four secrets correctly use
+      # environment variables, while the other three secrets correctly use
       # Secrets Manager. Captured as-is; see AWS_ARCHITECTURE.md risks.
       # ---------------------------------------------------------------
       Environment:
         Variables:
           BUCKET_NAME: !Ref RedactedPlaceholder # [REDACTED]
-          CRM_CONNECTIONS_TABLE: !Ref RedactedPlaceholder # [REDACTED]
           ELEVENLABS_API_KEY: !Ref RedactedPlaceholder # [REDACTED - plaintext secret in deployed env]
           ELEVENLABS_MODEL: !Ref RedactedPlaceholder # [REDACTED]
           GROQ_API_KEY: !Ref RedactedPlaceholder # [REDACTED - plaintext secret in deployed env]
@@ -2240,11 +2117,11 @@ Outputs:
 
   DynamoDbTableCount:
     Description: Number of DynamoDB tables in the deployed MinuteX system
-    Value: '16'
+    Value: '15'
 
   RouteCount:
-    Description: Total HTTP API routes (102 to userApi, 3 to getUploadUrl)
-    Value: '105'
+    Description: Total HTTP API routes (92 to userApi, 3 to getUploadUrl)
+    Value: '95'
 
   CaptureNotice:
     Description: Deployment status of this template

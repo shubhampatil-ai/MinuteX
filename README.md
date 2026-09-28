@@ -84,7 +84,7 @@ MinuteX is built as three main components:
 | Storage        | Amazon S3                |
 | Speech-to-text | ElevenLabs Scribe        |
 | AI             | Groq                     |
-| CRM            | Salesforce               |
+| CRM            | Salesforce (Site + Apex REST) |
 | Hardware       | ESP32-S3                 |
 
 All AWS resources currently run in **`ap-south-1`**.
@@ -394,7 +394,6 @@ docs/
 ├── database/
 ├── api/
 ├── ai/
-├── crm/
 ├── device/
 ├── deployment/
 └── migrations/

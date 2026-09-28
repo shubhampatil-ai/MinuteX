@@ -1,31 +1,17 @@
-# cloud/functions/crm-sync-worker/lambda_function.py — the CRM sync worker
-# (Phase 2D.4).
+# cloud/functions/crm-sync-worker/lambda_function.py — the job worker for
+# the Salesforce Site flow (delivery_type = salesforce_site).
 #
-# WHAT THIS IS. An SQS-triggered Lambda that performs the actual Salesforce
-# work for one organisation meeting's CRM push, so the HTTP route
-# (userApi's push_org_meeting_crm) can enqueue a job and return immediately
-# instead of blocking the request on Salesforce. See
-# docs/WORKSPACE_PHASE2D.md's Phase 2D.4 section for the full architecture.
+# WHAT THIS IS. An SQS-triggered Lambda that runs one CrmSyncJobs job per
+# message — meeting delivery, people sync, object discovery, Salesforce Task
+# create/update (userapi.SITE_DELIVERY_OPERATIONS) — so the HTTP routes can
+# enqueue a job and return immediately instead of blocking on Salesforce.
 #
-# WHY THIS FILE IMPORTS userapi's lambda_function DIRECTLY, RATHER THAN
-# DUPLICATING ITS LOGIC OR EXTRACTING A SHARED MODULE. The CRM push logic
-# (execute_crm_sync_job, _execute_org_meeting_crm_push, _sf_call_org,
-# identity resolution, crm_sync_record, Task/Event creation) is several
-# hundred lines deeply intertwined with userapi's other table clients
-# (_contacts, _tasks, _recordings, _org_crm_connections, ...) and helpers.
-# Re-implementing it here would be a second copy of a state machine that
-# must never drift from the first (spec section 3: the worker must NOT
-# re-resolve identity or invent a parallel decision about what counts as
-# "ready"). Extracting it into shared/ was evaluated and rejected: shared/
-# today holds pure domain-logic modules (ai_schema.py, workspace_schema.py)
-# with no live AWS client objects; the CRM push logic owns several
-# (DynamoDB tables, the Salesforce client, KMS) that would need to be
-# re-threaded as parameters throughout, a real extraction risk for a
-# working, tested system, for no behavioural gain. Importing the module
-# directly — the deploy script bundles a copy of userapi's
-# lambda_function.py (plus shared/) into THIS Lambda's own zip, exactly
-# like every other Lambda in this codebase already bundles shared/ flat —
-# reuses the existing, tested code with zero duplication.
+# WHY THIS FILE IMPORTS userapi's lambda_function DIRECTLY. The job logic is
+# deeply intertwined with userapi's table clients and helpers; a second copy
+# here would be a state machine that must never drift from the first. The
+# deploy script bundles a copy of userapi's lambda_function.py (plus
+# shared/) into THIS Lambda's own zip, exactly like every other Lambda here
+# bundles shared/ flat.
 #
 # THIS LAMBDA HAS NO HTTP ROUTES OF ITS OWN. It is never reachable through
 # API Gateway; its only trigger is the CRM sync SQS queue (event source
@@ -40,8 +26,8 @@
 # handler would make Lambda/SQS treat the WHOLE BATCH as failed and
 # redeliver every message, including ones that already succeeded — a
 # needless duplicate-processing risk this codebase's idempotency layer
-# would absorb but that costs real Salesforce API calls and worker time for
-# no reason. Instead this handler reports exactly which message ids need
+# would absorb but that costs real receiver calls and worker time for no
+# reason. Instead this handler reports exactly which message ids need
 # retrying via `batchItemFailures`, which requires the event source mapping
 # to be created with `FunctionResponseTypes=["ReportBatchItemFailures"]`
 # (see the deploy script) — a message not listed there is treated as
@@ -70,7 +56,7 @@ def lambda_handler(event, context):
     """SQS trigger. `event["Records"]` is a batch of CRM sync queue
     messages (see userapi.CRM_SYNC_QUEUE_URL / _enqueue_crm_sync_job for the
     message shape: job_id, workspace_id, recording_key, operation — no
-    Salesforce credential, no meeting content, ever).
+    credential, no meeting content, ever).
     """
     batch_item_failures = []
 
@@ -94,11 +80,12 @@ def lambda_handler(event, context):
             print(f"[crm-sync-worker] message {message_id} has no job_id — dropping")
             continue
 
-        # SECURITY (spec section 16): workspace_id/recording_key/operation in
-        # the message are NEVER trusted for authorization — only job_id is
-        # used to look up the job, and execute_crm_sync_job re-reads the
-        # AUTHORITATIVE workspace_id/recording_key from the CrmSyncJobs row
-        # and re-validates the meeting/workspace state itself. The message
+        # SECURITY: workspace_id/recording_key/operation in the message are
+        # NEVER trusted for authorization — only job_id is used to look up
+        # the job, and execute_site_delivery_job re-reads the AUTHORITATIVE
+        # operation/workspace/meeting from the CrmSyncJobs row and
+        # re-validates that state itself (a row that is not a Site job is
+        # dropped there). The message
         # body fields exist only for structured logging here, before the
         # job row has even been read.
         workspace_id = str(payload.get("workspace_id") or "")
@@ -108,7 +95,7 @@ def lambda_handler(event, context):
               f"meeting={recording_key} operation={operation} message={message_id}")
 
         try:
-            userapi.execute_crm_sync_job(job_id)
+            userapi.execute_site_delivery_job(job_id)
         except userapi._CrmSyncJobRetry as retry:
             # A RETRYING outcome — the job row already records the intended
             # next_attempt_at. Reporting this message as a batch item
@@ -144,13 +131,11 @@ def lambda_handler(event, context):
                   f"(delay={delay}s)")
             batch_item_failures.append({"itemIdentifier": message_id})
         except Exception as e:  # noqa: BLE001
-            # An exception ESCAPING execute_crm_sync_job means something
-            # failed before that function could even persist a FAILED/
-            # RETRYING state itself (e.g. a DynamoDB outage) — report it as
-            # a failure so SQS retries, and let the job row's own state
-            # (still SYNCING from the attempt-count bump at the top of
-            # execute_crm_sync_job) tell the next attempt/an operator that
-            # something interrupted this run uncleanly.
+            # An exception ESCAPING the executor means something failed
+            # before it could persist a FAILED/RETRYING state itself (e.g. a
+            # DynamoDB outage) — report it as a failure so SQS retries; the
+            # job row (still SYNCING) tells the next attempt/an operator that
+            # this run was interrupted uncleanly.
             print(f"[crm-sync-worker] job={job_id} worker-level failure: "
                   f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
             batch_item_failures.append({"itemIdentifier": message_id})

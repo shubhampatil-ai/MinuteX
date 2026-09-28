@@ -730,7 +730,7 @@ function engineStatus():
   | (Pick<
       RecorderState,
       "isRecording" | "metering" | "mediaServicesDidReset" | "durationMillis"
-    > & { micUnavailable?: boolean })
+    > & { micUnavailable?: boolean; displayDb?: number | null })
   | null {
   try {
     if (wavRecorder) {
@@ -742,7 +742,9 @@ function engineStatus():
         durationMillis: st.durationMillis,
         // WAV only: the native capture loop's verdict on the frames themselves.
         micUnavailable: st.micUnavailable === true,
-      } as RecorderState & { micUnavailable?: boolean };
+        // WAV only: RMS for the waveform. Never read by reconcile().
+        displayDb: st.displayDb ?? null,
+      } as RecorderState & { micUnavailable?: boolean; displayDb?: number | null };
     }
     // AAC leaves micUnavailable undefined — expo-audio cannot see the frames,
     // so the metering-based detector below stays its only interruption signal.
@@ -757,17 +759,73 @@ function hasLiveRecorder(): boolean {
   return recorder != null || wavRecorder != null;
 }
 
+// -- Live input level (the waveform's feed) ---------------------------------
+//
+// The waveform wants the input level ~14 times a second; reconcile() runs
+// twice a second. Rather than speed up the whole state machine, the waveform
+// reads the level through readInputLevel() on its own timer, while it is
+// mounted and only while RECORDING.
+//
+// THE TRAP THIS AVOIDS. On Android AAC, expo-audio's metering is
+// MediaRecorder.getMaxAmplitude(), which returns the peak SINCE THE LAST CALL
+// and resets. A second reader would therefore steal most of each tick's window
+// from the silence detector below, which decides "the mic has been taken" from
+// that very number. So every reading the waveform takes is folded into
+// meterWindowMaxDb, and reconcile() judges the MAX over its whole tick — the
+// loudest thing heard in 500ms, which is exactly what one getMaxAmplitude()
+// read covering the full window would have returned. With no waveform
+// mounted, the window is empty and reconcile() reads the meter exactly as it
+// always has.
+//
+// For the engines whose meter does not reset on read (iOS average power, the
+// WAV engine's last-buffer peak) the max over the window can only be louder
+// than a single sample. The detector acts on a sustained run of HARDWARE ZERO
+// (-160 dB), which a stolen mic produces on every read, so it still fires.
+
+let meterWindowMaxDb: number | null = null;
+
+/**
+ * The live input level in dBFS, for the waveform — or null when nothing is
+ * being captured. Synchronous and side-effect-free apart from the metering
+ * window described above; safe to call at display rate.
+ *
+ * Returns the RMS where the engine computes it (WAV), otherwise the engine's
+ * own meter. Never drives any state transition.
+ */
+export function readInputLevel(): number | null {
+  if (!session || session.state !== "RECORDING" || !hasLiveRecorder()) return null;
+  const status = engineStatus();
+  if (!status) return null;
+  const peak = status.metering;
+  if (peak != null && Number.isFinite(peak)) {
+    meterWindowMaxDb = meterWindowMaxDb == null ? peak : Math.max(meterWindowMaxDb, peak);
+  }
+  const display = status.displayDb;
+  if (display != null && Number.isFinite(display)) return display;
+  return peak != null && Number.isFinite(peak) ? peak : null;
+}
+
+/** Consume the metering window: the loudest peak since the last tick. */
+function takeMeterWindow(current: number | null | undefined): number | null | undefined {
+  const w = meterWindowMaxDb;
+  meterWindowMaxDb = null;
+  if (w == null) return current;
+  if (current == null || !Number.isFinite(current)) return w;
+  return Math.max(w, current);
+}
+
 function reconcile(): void {
   if (!session || !hasLiveRecorder()) return;
   const s = session;
 
   const status = engineStatus();
+  // See "Live input level" above: the tick's full-window peak.
+  const meterDb = takeMeterWindow(status?.metering);
 
-  if (status?.metering != null) {
+  if (meterDb != null) {
     // Metering is dBFS (roughly -160..0). Map to 0..1 over the top 60 dB,
     // which is the band a room's speech actually occupies.
-    const db = status.metering;
-    level = Math.max(0, Math.min(1, (db + 60) / 60));
+    level = Math.max(0, Math.min(1, (meterDb + 60) / 60));
   }
 
   // A media-services reset invalidates the recorder outright: the platform
@@ -837,7 +895,7 @@ function reconcile(): void {
       // hardware-zero metering means the encoder is writing silence — the
       // recording is already being lost, so treat it exactly like any other
       // interruption: pause, preserve, and resume onto a fresh recorder.
-      if (status?.metering != null && status.metering <= SILENCE_DB_FLOOR) {
+      if (meterDb != null && meterDb <= SILENCE_DB_FLOOR) {
         silenceCount += 1;
         if (silenceCount >= SILENCE_TICKS) {
           // A RINGING phone is the one case where sustained digital zero is not
@@ -1923,6 +1981,7 @@ async function teardown(): Promise<void> {
   wavRecorder?.release();
   wavRecorder = null;
   level = null;
+  meterWindowMaxDb = null;
   stallCount = 0;
   resumeCooldown = 0;
   await releaseSession();
@@ -1964,6 +2023,7 @@ export function reset(): void {
   session = null;
   lastError = null;
   level = null;
+  meterWindowMaxDb = null;
   inputName = null;
   emit();
 }

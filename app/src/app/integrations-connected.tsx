@@ -1,7 +1,6 @@
 // src/app/integrations-connected.tsx — the OAuth redirect landing route.
 //
-// WHY THIS FILE EXISTS. Exactly the reason crm-connected.tsx exists, and the
-// bug it fixes is the same one: openAuthSessionAsync does NOT intercept the
+// WHY THIS FILE EXISTS. openAuthSessionAsync does NOT intercept the
 // redirect itself. Per the Expo SDK 57 docs the OS delivers the deep link back
 // to the app, so the browser's final hop to
 //
@@ -28,9 +27,8 @@ import { FONT, S, useTheme, ColorScale } from "../../lib/theme";
 import { Loading } from "../../lib/ui";
 
 // Mirrors REASON_COPY in lib/integrations.tsx — the same backend ?reason=
-// codes. Kept in sync deliberately rather than shared, following the same
-// split crm-connected.tsx makes: that module owns the in-session browser
-// flow, this one owns the cold-start fallback.
+// codes. Kept in sync deliberately rather than shared: that module owns the
+// in-session browser flow, this one owns the cold-start fallback.
 const REASON_COPY: Record<string, string> = {
   denied: "Access was declined.",
   missing_params: "The provider didn’t return a valid response.",

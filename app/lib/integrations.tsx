@@ -3,8 +3,8 @@
 //
 // TWO RESPONSIBILITIES, AND THE SECOND IS THE IMPORTANT ONE.
 //
-// 1. connectIntegration() runs the browser round-trip, exactly as
-//    lib/salesforce.ts does for Salesforce. Split from lib/api.ts on purpose:
+// 1. connectIntegration() runs the browser round-trip. Split from lib/api.ts
+//    on purpose:
 //    api.ts is pure HTTP, this owns platform behaviour worth isolating.
 //
 // 2. IntegrationsProvider / useIntegration() are the CENTRAL integration
@@ -78,8 +78,7 @@ const REASON_COPY: Record<string, string> = {
  *
  * openAuthSessionAsync does the redirect detection itself, so there is
  * deliberately NO Linking listener here — the Expo docs warn that adding one
- * alongside an auth session causes side effects on iOS. (Same reasoning as
- * lib/salesforce.ts.)
+ * alongside an auth session causes side effects on iOS.
  */
 export async function connectIntegration(
   provider: string

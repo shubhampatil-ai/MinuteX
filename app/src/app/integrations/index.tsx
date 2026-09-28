@@ -5,15 +5,13 @@
 // on the active workspace, so the same route never reads as "the same
 // screen twice" no matter which way the user arrived:
 //
-//   PERSONAL (useWorkspace().isOrganisation === false): unchanged from
-//   before this file gained organisation-awareness — the full personal
-//   catalog (Gmail, Salesforce, and every server-listed provider), because
-//   this IS "my personal/user-level connected applications."
+//   PERSONAL (useWorkspace().isOrganisation === false): the full personal
+//   catalog (Gmail and every server-listed provider), because this IS "my
+//   personal/user-level connected applications."
 //
 //   ORGANISATION: shows ONLY what is relevant to the active organisation —
-//   the Organisation Salesforce connection (workspace-owned, see
-//   OrgSalesforceCard) and Gmail (the SAME per-user connection Personal
-//   already shows, re-labelled here as "Your Gmail account" / "used for
+//   the Salesforce (Site) entry when the build enables it, and Gmail (the
+//   SAME per-user connection Personal already shows, re-labelled here as "Your Gmail account" / "used for
 //   organisation actions" — never a second OAuth connection, never a
 //   shared organisation mailbox). Every other personal-only provider
 //   (Google Calendar, Google Tasks, WhatsApp, Outlook, ...) is hidden here:
@@ -30,14 +28,6 @@
 // already only ever used the sending user's own Gmail token (see
 // gmail_send_meeting/gmail_send_task in lambda_function.py) — this screen
 // now just says that honestly instead of leaving it unlabelled.
-//
-// SALESFORCE IS ORGANISATION-OWNED. OrgCrmConnections is keyed by
-// workspace_id, entirely separate from CrmConnections (Personal, keyed by
-// user_id) — see org-salesforce.tsx and shared/integrations.py. The
-// Personal Salesforce card is never shown in Organisation mode, and the
-// Organisation Salesforce card is never shown in Personal mode: showing
-// both together (as this screen briefly did) was itself the source of the
-// "which Salesforce is this" confusion.
 //
 // THE CARD LIST COMES FROM THE SERVER. It is not a constant in this file. The
 // backend's PROVIDERS registry decides which integrations exist and which are
@@ -66,9 +56,12 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { S, R, CAPS, FONT, useTheme, ColorScale } from "../../../lib/theme";
 import { ErrorText, Masthead, SectionRule, SoonBadge } from "../../../lib/ui";
 import { IntegrationLogo } from "../../../lib/integration-logos";
-import { Integration, OrgSalesforceStatus, getOrgSalesforceStatus } from "../../../lib/api";
+import { Integration } from "../../../lib/api";
 import { useGmail, useIntegrations } from "../../../lib/integrations";
 import { useWorkspace, workspaceLabel } from "../../../lib/workspace-context";
+// Salesforce (Site + Apex REST): a separate entry, shown only when the build
+// enables it (EXPO_PUBLIC_SITE_SALESFORCE=1).
+import { SITE_SALESFORCE_ENABLED, SiteSalesforceEntry } from "../../../lib/site-salesforce-ui";
 
 // The logo tile sits on a neutral surface rather than a per-brand tinted one.
 // With real multi-colour marks a tinted backdrop fights the artwork — Gmail's
@@ -131,11 +124,10 @@ function buildStyles(C: ColorScale) {
 }
 
 // Category -> section title, in the order sections render. Mirrors
-// shared/integrations.py's PROVIDERS categories ("crm", "communication",
+// shared/integrations.py's PROVIDERS categories ("communication",
 // "productivity") — a new category the backend introduces falls into
 // OTHER_CATEGORY below rather than disappearing.
 const SECTIONS: { category: string; title: string }[] = [
-  { category: "crm", title: "CRM" },
   { category: "communication", title: "Email" },
   { category: "productivity", title: "Calendar" },
 ];
@@ -153,38 +145,14 @@ export default function IntegrationsScreen() {
   const [connectError, setConnectError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
 
-  // The ORGANISATION Salesforce card — a second, independent status fetched
-  // alongside the personal catalog above rather than merged into it (see the
-  // module note in shared/integrations.py's public_org_salesforce_status).
-  // Only fetched when the active workspace IS an organisation: a personal
-  // workspace has no organisation connection to show, and calling the route
-  // for one would only ever answer "not connected" for a card this screen
-  // should not render at all.
-  const [orgSalesforce, setOrgSalesforce] = useState<OrgSalesforceStatus | null>(null);
-  const [orgSalesforceLoading, setOrgSalesforceLoading] = useState(false);
-
-  const loadOrgSalesforce = useCallback(async () => {
-    if (!isOrganisation || !active) { setOrgSalesforce(null); return; }
-    setOrgSalesforceLoading(true);
-    try {
-      setOrgSalesforce(await getOrgSalesforceStatus(active.workspace_id));
-    } catch {
-      // Degrade to "not shown" rather than breaking the whole screen — the
-      // Personal cards above must still render.
-      setOrgSalesforce(null);
-    } finally {
-      setOrgSalesforceLoading(false);
-    }
-  }, [isOrganisation, active]);
-
   // Re-read on every return to this screen — coming back from the Gmail
-  // Manage screen (or org-salesforce.tsx) must show the new state, and a
-  // connection can also change on another device.
-  useFocusEffect(useCallback(() => { refresh(); void loadOrgSalesforce(); }, [refresh, loadOrgSalesforce]));
+  // Manage screen must show the new state, and a connection can also change
+  // on another device.
+  useFocusEffect(useCallback(() => { refresh(); }, [refresh]));
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await Promise.all([refresh(), loadOrgSalesforce()]);
+    await refresh();
     setRefreshing(false);
   };
 
@@ -199,10 +167,6 @@ export default function IntegrationsScreen() {
 
   const openManage = (provider: string) => {
     if (provider === "gmail") { router.push("/integrations/gmail"); return; }
-    // Salesforce predates this system and keeps its own screen (see
-    // managed_elsewhere in shared/integrations.py). Routing there rather than
-    // duplicating a manage screen is the whole reason that flag exists.
-    if (provider === "salesforce") { router.push("/salesforce"); return; }
   };
 
   const grouped = useMemo(() => {
@@ -245,13 +209,12 @@ export default function IntegrationsScreen() {
             </View>
           ) : (
             <>
-              <SectionRule>CRM</SectionRule>
-              <OrgSalesforceCard
-                workspaceName={workspaceLabel(active)}
-                status={orgSalesforce}
-                loading={orgSalesforceLoading}
-                onPress={() => router.push("/org-salesforce")}
-              />
+              {SITE_SALESFORCE_ENABLED ? (
+                <>
+                  <SectionRule>CRM</SectionRule>
+                  <SiteSalesforceEntry onPress={() => router.push("/site-salesforce" as never)} />
+                </>
+              ) : null}
 
               <SectionRule>Communication</SectionRule>
               <OrgGmailCard
@@ -265,8 +228,7 @@ export default function IntegrationsScreen() {
           )}
 
           <Text style={st.footnote}>
-            Salesforce here is this organisation&apos;s own connection, managed by an
-            owner or manager. Gmail uses your own personal connection — the same one
+            Gmail uses your own personal connection — the same one
             shown in Settings — so email always sends from your address, never a
             shared organisation mailbox.
           </Text>
@@ -306,6 +268,13 @@ export default function IntegrationsScreen() {
                 );
               })}
 
+              {SITE_SALESFORCE_ENABLED ? (
+                <View>
+                  <SectionRule>Salesforce (Site)</SectionRule>
+                  <SiteSalesforceEntry onPress={() => router.push("/site-salesforce" as never)} />
+                </View>
+              ) : null}
+
               {other.length ? (
                 <View>
                   <SectionRule>{OTHER_CATEGORY}</SectionRule>
@@ -331,75 +300,6 @@ export default function IntegrationsScreen() {
         </>
       )}
     </ScrollView>
-  );
-}
-
-/** The Organisation Salesforce card — same visual language as
- *  IntegrationCard below, but reading OrgSalesforceStatus (a second,
- *  independent connection) rather than the personal Integration catalog.
- *  Kept as its own small component rather than forcing OrgSalesforceStatus
- *  into the Integration shape: the two have genuinely different fields
- *  (`configured`, `config_cleared_reason`, `connected_by_user_id` have no
- *  Personal equivalent), and coercing one into the other would be the kind
- *  of union-type nobody can reason about that shared/integrations.py's own
- *  docstring warns against. */
-function OrgSalesforceCard({
-  workspaceName, status, loading, onPress,
-}: {
-  workspaceName: string;
-  status: OrgSalesforceStatus | null;
-  loading: boolean;
-  onPress: () => void;
-}) {
-  const { C } = useTheme();
-  const st = useMemo(() => buildStyles(C), [C]);
-  const connected = status?.connected === true;
-  const label = loading ? "Checking…" : connected ? "Connected" : "Not connected";
-  const color = loading ? C.textFaint : connected ? C.success : C.textFaint;
-
-  return (
-    <Pressable
-      onPress={onPress}
-      style={({ pressed }) => [st.card, pressed && { opacity: 0.85 }]}
-    >
-      <View style={st.cardHead}>
-        <View style={st.logoTile}>
-          <IntegrationLogo provider="salesforce" size={26} />
-        </View>
-        <View style={{ flex: 1 }}>
-          <Text style={st.name}>Salesforce</Text>
-          <Text style={st.scopeBadge}>Organisation connection</Text>
-          <Text style={[st.statusCaps, { color, marginTop: 5 }]}>{label}</Text>
-        </View>
-      </View>
-
-      <Text style={st.desc}>
-        Push {workspaceName}&apos;s meeting notes onto your organisation&apos;s CRM records.
-      </Text>
-
-      {connected && status?.sf_username ? (
-        <Text style={st.account}>{status.sf_username}</Text>
-      ) : null}
-
-      {/* "Managed by organisation" — always true for this card (an
-          Owner/Manager connects/configures/disconnects it, never a
-          per-member action), so it is shown regardless of who is looking,
-          the same way the label on the card itself never changes by role. */}
-      {connected ? <Text style={st.scopeBadge}>Managed by organisation</Text> : null}
-
-      {connected && status?.config_cleared_reason ? (
-        <Text style={st.warnNote}>{status.config_cleared_reason}</Text>
-      ) : null}
-
-      <View style={st.statusRow}>
-        <View />
-        <View style={[st.action, connected ? st.actionQuiet : st.actionPrimary]}>
-          <Text style={connected ? st.actionTxtQuiet : st.actionTxtPrimary}>
-            {connected ? "Manage" : "Connect Salesforce"}
-          </Text>
-        </View>
-      </View>
-    </Pressable>
   );
 }
 
@@ -496,9 +396,7 @@ function IntegrationCard({
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
 
-  // "Coming soon" is about AVAILABILITY, not about which flow connects it.
-  // Salesforce is available and managed_elsewhere, so it is a working card
-  // that happens to open its own screen — never a dimmed placeholder.
+  // "Coming soon" is about AVAILABILITY.
   const soon = !integration.available;
 
   const { label, color } = statusLabel(integration, C);
@@ -555,23 +453,6 @@ function CardAction({
 }) {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
-
-  // Salesforce: its own screen owns BOTH connecting and managing, so the tap
-  // goes there either way. The LABEL still tracks real status rather than
-  // saying a generic "Open" — a card that reads "Not connected" next to a
-  // button that says "Open" makes the user guess what the button will do.
-  if (integration.managed_elsewhere) {
-    return (
-      <Pressable onPress={onManage} style={({ pressed }) => [
-        st.action, integration.connected ? st.actionQuiet : st.actionPrimary,
-        pressed && { opacity: 0.6 },
-      ]}>
-        <Text style={integration.connected ? st.actionTxtQuiet : st.actionTxtPrimary}>
-          {integration.connected ? "Manage" : `Connect ${integration.name}`}
-        </Text>
-      </Pressable>
-    );
-  }
 
   if (integration.connected) {
     return (

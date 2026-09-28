@@ -293,84 +293,10 @@ export type RecordingDetail = RecordingSummary & {
   // under; comparing the two is how the app knows a document may still say
   // an old name. Absent on an older backend response — treat as 0.
   speaker_mapping_version?: number;
-  // Record identifiers for CRM linking, keyed by Salesforce OBJECT name —
-  // whatever objects the user configured. Absent or empty on most meetings, and
-  // always empty for a user with no Salesforce mappings; that is the NORMAL
-  // case (the extractor only returns a value when it was actually spoken, and
-  // an ungrounded guess is discarded server-side), so the UI treats "nothing
-  // here" as ordinary and simply renders no inputs.
-  crm_records?: Record<string, CrmRecordValue> | null;
-  // WHOSE workspace this meeting belongs to (Phase 2D.3). Absent on a
-  // personal meeting (and on every recording made before workspaces
-  // existed) — present and equal to an ORGANISATION id only when the
-  // meeting was recorded/owned inside one. This is what the Overview
-  // screen reads to decide whether to show the organisation CRM Review/
-  // Push block instead of (never in addition to — see meeting-crm-records)
-  // the personal Salesforce mapping block.
+  // WHOSE workspace this meeting belongs to. Absent on a personal meeting
+  // made before workspaces existed. The meeting screen passes it to the
+  // Salesforce (Site) block, whose connection is per workspace.
   workspace_id?: string;
-};
-
-// Where one mapping stands for one meeting. Object-neutral: the same states
-// describe a site visit, a lead or a custom object, and the UI branches ONLY on
-// these — so a new Salesforce object needs no new UI condition.
-//
-//   not_linked      no identifier yet (the common resting state)
-//   lookup_pending  an identifier exists but hasn't been resolved
-//   record_found    resolved to one record, awaiting the user's confirmation
-//   ambiguous       matched several records; the user must pick one
-//   confirmed       approved for syncing
-//   syncing         a push is in flight
-//   synced          the configured fields were written to Salesforce
-//   failed          the last lookup or push failed; retryable
-export type CrmSyncStatus =
-  | "not_linked" | "lookup_pending" | "record_found" | "ambiguous"
-  | "confirmed" | "syncing" | "synced" | "failed";
-
-// One ambiguous-lookup candidate the user chooses between.
-export type CrmCandidate = { record_id: string; display_name: string };
-
-// One extracted (or hand-entered) CRM record association — a site visit number,
-// a lead email, an opportunity number, whatever the configured object uses.
-//
-// `lookup_value` is the user's visible business reference; `record_id` is the
-// internal Salesforce association key, and once resolved it is what every
-// subsequent sync writes to (no repeated SOQL).
-//
-// `confidence` is a coarse label, not a float the model emitted:
-//   explicit — stated outright in the meeting
-//   probable — clearly this meeting's record, said less directly
-//   manual   — typed by the user, which outranks any extraction
-// `evidence` is the verbatim transcript sentence the value came from ("" for
-// manual entry). Show it before confirming: it is what makes a wrong extraction
-// auditable before anything is pushed to Salesforce.
-export type CrmRecordValue = {
-  object: string;
-  label: string;
-  lookup_field: string;
-  lookup_value: string;
-  record_id: string;
-  record_label?: string;
-  status: CrmSyncStatus;
-  source?: "manual" | "ai" | "";
-  confidence?: string;
-  evidence?: string;
-  candidates?: CrmCandidate[];
-  error?: string;
-  synced_at?: string;
-  updated_at?: string;
-};
-
-// POST /crm/salesforce/lookup — three ordinary outcomes, not two plus an error.
-export type CrmLookupResult = {
-  status: "found" | "not_found" | "ambiguous";
-  object: string;
-  label: string;
-  lookup_field: string;
-  lookup_value: string;
-  record_id?: string;
-  record_label?: string;
-  records?: CrmCandidate[];
-  truncated?: boolean;
 };
 
 export type LoginResult = { token: string; user_id: string; email: string; name?: string };
@@ -412,103 +338,6 @@ export type DeviceInfo = {
   serial_number: string | null;
   battery: number | null;
   storage: number | null;
-};
-
-// Salesforce connection state. Only ever describes the connection — tokens
-// live server-side (KMS-encrypted) and are never sent to the app.
-export type SalesforceStatus = {
-  connected: boolean;
-  instance_url?: string;
-  sf_username?: string;
-  connected_at?: string;
-};
-
-// ---- Salesforce schema mapping ----
-// These describe the USER'S org, read live from Salesforce's Describe API.
-// Nothing here is a constant in our code: "SiteVisit__c" is one org's name for
-// it, not the product's.
-export type SalesforceObject = {
-  name: string;    // API name, e.g. "SiteVisit__c"
-  label: string;   // what the org's users call it, e.g. "Site Visit"
-  custom: boolean;
-};
-
-export type SalesforceField = {
-  name: string;
-  label: string;
-  type: string;
-  length: number;
-  custom: boolean;
-};
-
-// The four data targets are keyed exactly as the backend expects them.
-export type SalesforceFieldKey =
-  | "lookup_field"
-  | "transcript_field"
-  | "summary_field"
-  | "highlights_field"
-  | "action_items_field";
-
-export type SalesforceFieldsResponse = {
-  object: string;
-  label: string;
-  // Filterable fields — a lookup key must be searchable to find a record.
-  number_fields: SalesforceField[];
-  // Writable long-text fields — anything shorter would truncate a transcript.
-  long_text_fields: SalesforceField[];
-  suggested: Partial<Record<SalesforceFieldKey, string | null>>;
-  transcript_min_length: number;
-};
-
-// One configured object: "this Salesforce object, identified by this field".
-// The UI renders one input per mapping and knows nothing about which objects
-// exist — adding Lead or Opportunity support is a configuration change, not a
-// code change.
-export type CrmMapping = {
-  object: string;             // API name, e.g. "SiteVisit__c" | "Lead"
-  object_label: string;       // the org's words, e.g. "Site Visit" | "Lead"
-  lookup_field: string;       // e.g. "Site_Visit_Number__c" | "Email"
-  lookup_field_label: string; // the org's label for that field
-  lookup_field_type?: string; // Salesforce type — drives the keyboard
-  label: string;              // what to call the input, e.g. "Lead Email"
-  transcript_field: string | null;
-  summary_field: string | null;
-  highlights_field: string | null;
-  action_items_field: string | null;
-  // The same four targets, nested and containing ONLY the configured ones.
-  // The push sends exactly these fields; an unmapped target is absent, never
-  // blanked. Use this to tell the user what a sync will actually write.
-  content_targets: Partial<Record<
-    "transcript" | "summary" | "highlights" | "action_items", string>>;
-};
-
-// The whole client-facing Salesforce configuration.
-//
-// `mappings` is the contract the meeting UI renders from: one input per entry,
-// and NOTHING when the list is empty. An empty list is a legitimate state
-// meaning "connected, but no record fields" — not an error.
-export type SalesforceConfig = {
-  enabled: boolean;
-  mappings: CrmMapping[];
-  // True when at least one mapping exists — i.e. record linking is usable.
-  configured: boolean;
-  updated_at: string | null;
-};
-
-export type SalesforceMappingInput = {
-  object: string;
-  lookup_field: string;
-  label?: string;
-  transcript_field?: string | null;
-  summary_field?: string | null;
-  highlights_field?: string | null;
-  action_items_field?: string | null;
-};
-
-export type SalesforceConfigInput = {
-  // Possibly empty: saving [] is how a user turns record linking off without
-  // disconnecting Salesforce.
-  mappings: SalesforceMappingInput[];
 };
 
 // ---------------------------------------------------------------------------
@@ -671,21 +500,6 @@ export class ApiError extends Error {
     this.status = status;
     this.code = code;
   }
-}
-
-// The backend's "your MinuteX session is fine, but the SALESFORCE credential
-// behind this route is dead" answer (HTTP 409 + this code).
-//
-// It is deliberately NOT a 401. Salesforce-backed routes used to report a dead
-// refresh token as 401, which is indistinguishable on the wire from an expired
-// MinuteX JWT — so opening CRM Mapping after the Salesforce connection went
-// stale ran the session-expiry path below, cleared a perfectly valid token and
-// redirected the user to the login screen. Reconnecting Salesforce is the fix
-// for this error; signing out of MinuteX never was.
-export const SALESFORCE_RECONNECT_CODE = "salesforce_reconnect_required";
-
-export function isSalesforceReconnect(e: unknown): boolean {
-  return e instanceof ApiError && e.code === SALESFORCE_RECONNECT_CODE;
 }
 
 async function request<T>(
@@ -901,9 +715,8 @@ export async function removeMember(
 // the message text, and never on the bare 409: acceptance has other 409s
 // (an already-spent invitation) that mean something completely different.
 //
-// Deliberately not a 401, for the same reason as SALESFORCE_RECONNECT_CODE:
-// a 401 clears the JWT and would sign the user out of the very personal
-// account this error tells them to keep.
+// Deliberately not a 401: a 401 clears the JWT and would sign the user out of
+// the very personal account this error tells them to keep.
 export const ORGANISATION_EMAIL_CONFLICT_CODE = "organisation_email_conflict";
 
 export function isOrganisationEmailConflict(e: unknown): boolean {
@@ -1073,392 +886,10 @@ export async function factoryResetDevice(
   });
 }
 
-// ---- Salesforce (CRM) ----
-// Three-legged OAuth: this returns the Salesforce authorize URL to open in a
-// browser. The backend handles the redirect + code exchange, so the app never
-// sees a Salesforce token — see lib/salesforce.ts for the browser half.
-export async function getSalesforceAuthorizeUrl(): Promise<string> {
-  const res = await request<{ authorize_url: string }>("/crm/salesforce/connect");
-  return res.authorize_url;
-}
-
-export async function getSalesforceStatus(): Promise<SalesforceStatus> {
-  return request<SalesforceStatus>("/crm/salesforce/status");
-}
-
-export async function disconnectSalesforce(): Promise<void> {
-  await request("/crm/salesforce", { method: "DELETE" });
-}
-
-// ---- Salesforce configuration (the user maps their OWN org's schema) ----
-// No object or field API name is hardcoded anywhere in the app: every org
-// names things differently, so the picker is populated from the org's live
-// Describe metadata and `suggested` is only a pre-selection the user confirms.
-export async function getSalesforceObjects(): Promise<{
-  objects: SalesforceObject[];
-  suggested: string | null;
-}> {
-  return request("/crm/salesforce/objects");
-}
-
-export async function getSalesforceFields(
-  objectName: string
-): Promise<SalesforceFieldsResponse> {
-  return request(`/crm/salesforce/fields/${encodeURIComponent(objectName)}`);
-}
-
-export async function getSalesforceConfig(): Promise<SalesforceConfig> {
-  const res = await request<{ config: SalesforceConfig }>("/crm/salesforce/config");
-  return res.config;
-}
-
-export async function saveSalesforceConfig(
-  config: SalesforceConfigInput
-): Promise<SalesforceConfig> {
-  const res = await request<{ config: SalesforceConfig }>("/crm/salesforce/config", {
-    method: "PUT",
-    body: config,
-  });
-  return res.config;
-}
-
-// Resolve an identifier to a Salesforce record Id using the configured object +
-// lookup field. Stateless — it reports what Salesforce says and persists
-// nothing, so a lookup can never silently relink a meeting.
-export async function lookupCrmRecord(
-  object: string,
-  lookupValue: string
-): Promise<CrmLookupResult> {
-  return request<CrmLookupResult>("/crm/salesforce/lookup", {
-    method: "POST",
-    body: { object, lookup_value: lookupValue },
-  });
-}
-
-// Push the meeting's configured content onto the confirmed record. Requires a
-// confirmed association — the backend refuses an unconfirmed one.
-export async function syncCrmRecord(
-  key: string,
-  object: string
-): Promise<{ crm_record: CrmRecordValue; synced_fields: string[] }> {
-  return request(`/crm/salesforce/sync/${encodeURIComponent(key)}`, {
-    method: "POST",
-    body: { object },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Meeting identity -> Salesforce (Phase 2D.3) — ORGANISATION meetings only.
-//
-// The connection that performs the Salesforce API call is never the same
-// question as who owns the meeting's business content: an organisation
-// meeting's SM/Internal speaker resolves to a Salesforce User who becomes
-// the pushed Task's owner, and an external/Client speaker resolves to a
-// Salesforce Contact/Account — neither is ever the identity that happened
-// to run the Salesforce OAuth connect flow. See the CRM Review screen,
-// which is the one place all of this is surfaced together before a push.
-// ---------------------------------------------------------------------------
-
+// A speaker's side of the meeting: "internal" (a member of the organisation)
+// or "external" (a client). Sent with the meeting's participants to the
+// Salesforce Site; "" is unclassified.
 export type SpeakerIdentityRole = "internal" | "external" | "";
-
-export type SalesforceContactCandidate = {
-  record_id: string; name: string; email: string; phone: string;
-  account_id: string; account_name: string;
-};
-
-export type SalesforceUserCandidate = {
-  record_id: string; name: string; username: string; email: string;
-};
-
-export async function searchSalesforceContacts(
-  workspaceId: string, q: string
-): Promise<{ records: SalesforceContactCandidate[]; truncated: boolean }> {
-  return request(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/search/contacts`
-    + `?q=${encodeURIComponent(q)}`
-  );
-}
-
-export async function searchSalesforceUsers(
-  workspaceId: string, q: string
-): Promise<{ records: SalesforceUserCandidate[]; truncated: boolean }> {
-  return request(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/search/users`
-    + `?q=${encodeURIComponent(q)}`
-  );
-}
-
-// Persists an EXPLICIT match only — never a search, never a guess. `recordId`
-// must come from searchSalesforceContacts (or be already known).
-export async function resolveContactCrmIdentity(
-  contactId: string, recordId: string, accountId?: string
-): Promise<{ contact: ApiContact }> {
-  return request(`/contacts/${encodeURIComponent(contactId)}/crm`, {
-    method: "PUT",
-    body: { record_id: recordId, account_id: accountId || undefined },
-  });
-}
-
-export type OrgSalesforceUserLink = {
-  user_id: string; sf_user_id: string; sf_username: string; resolved_at: string;
-};
-
-// Owner/Manager only (CAP_MANAGE_INTEGRATIONS) — an org member's Salesforce
-// User identity applies workspace-wide, not just to one meeting.
-export async function resolveMemberCrmIdentity(
-  workspaceId: string, userId: string, recordId: string, username?: string
-): Promise<{ link: OrgSalesforceUserLink }> {
-  const res = await request<{ link: OrgSalesforceUserLink }>(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/members/`
-    + encodeURIComponent(userId),
-    { method: "PUT", body: { record_id: recordId, username } }
-  );
-  return res;
-}
-
-export type SpeakerCrmState = {
-  speaker_id: string;
-  identity_role: SpeakerIdentityRole;
-  contact_id?: string;
-  status: "resolved" | "unresolved" | "not_linked";
-  reason?: string;
-  minutex_user_id?: string;
-  sf_user_id?: string;
-  sf_username?: string;
-  sf_contact_id?: string;
-  sf_account_id?: string;
-  contact_name?: string;
-};
-
-export type MeetingCrmIdentity = {
-  speakers: SpeakerCrmState[];
-  internal: SpeakerCrmState[];
-  external: SpeakerCrmState[];
-  unresolved: SpeakerCrmState[];
-  owner: SpeakerCrmState | null;
-  primary_client: SpeakerCrmState | null;
-};
-
-export type MeetingCrmReview = {
-  meeting: { title: string; audio_s3_key: string };
-  identity: MeetingCrmIdentity;
-  content: {
-    summary_ready: boolean; highlights_ready: boolean;
-    action_items_ready: boolean; action_item_count: number;
-  };
-  mappings: CrmMapping[];
-  ready: boolean;
-  blocking_reasons: string[];
-};
-
-export async function getMeetingCrmReview(key: string): Promise<MeetingCrmReview> {
-  return request(`/recordings/ai/crm-review/${encodeURIComponent(key)}`);
-}
-
-export type MeetingCrmPushResult = {
-  pushed: { object: string; crm_record: CrmRecordValue }[];
-  push_errors: { object: string; error: string; code: string }[];
-  tasks: {
-    created: { task_id: string; sf_task_id: string; assignee_resolved: boolean }[];
-    skipped: { task_id: string; reason: string }[];
-    failed: { task_id: string; error: string }[];
-  };
-  /** The meeting itself, pushed as ONE Salesforce Event (Phase 2D.3
-   *  completion) — OwnerId is the resolved SM, WhoId the resolved primary
-   *  client Contact, WhatId that Contact's own Account (never a guessed
-   *  one). Idempotent per meeting: a retried push reports
-   *  `created: false, skipped_reason: "already_synced"` rather than a
-   *  second Event. `code` mirrors push_errors[].code — a stable id like
-   *  "salesforce_reconnect_required", never just prose, present only on
-   *  a genuine failure (not on an ordinary skip). */
-  event: {
-    created: boolean;
-    sf_event_id: string;
-    skipped_reason: string;
-    error: string;
-    code: string;
-  };
-  identity: MeetingCrmIdentity;
-};
-
-// ---------------------------------------------------------------------------
-// CRM sync JOBS (Phase 2D.4) — the push itself is now ASYNCHRONOUS.
-//
-// pushMeetingCrm no longer waits for Salesforce: it returns {job_id, status}
-// immediately (HTTP 202), and the actual Event/Task/record-field work runs
-// in a queue-driven worker. The app must poll getCrmSyncJobStatus (or use
-// its own refresh mechanism) to learn the outcome — a successful POST here
-// means "queued", never "Salesforce received it".
-// ---------------------------------------------------------------------------
-export type CrmSyncJobStatus =
-  | "PENDING" | "SYNCING" | "SYNCED" | "RETRYING" | "FAILED" | "RECONNECT_REQUIRED";
-
-export type CrmSyncJob = {
-  job_id: string;
-  status: CrmSyncJobStatus;
-  attempt_count: number;
-  /** "transient" | "reauth" | "permission" | "validation" | "permanent" |
-   *  "" (none yet). Drives which action the UI offers — see
-   *  lib/meeting-crm-records.tsx's OrgCrmReviewBlock for the mapping. */
-  last_error_category: string;
-  last_error_code: string;
-  last_error_message: string;
-  /** The SAME shape pushMeetingCrm used to return synchronously in Phase
-   *  2D.3 — populated once the job has actually run at least once
-   *  (SYNCING or later); {} while still PENDING. */
-  result: Partial<MeetingCrmPushResult>;
-  created_at: string;
-  updated_at: string;
-  completed_at: string;
-};
-
-// Terminal statuses — a job in one of these will not progress further
-// without an explicit retryCrmSyncJob call.
-export const CRM_SYNC_JOB_TERMINAL_STATUSES: CrmSyncJobStatus[] =
-  ["SYNCED", "FAILED", "RECONNECT_REQUIRED"];
-
-export function isCrmSyncJobTerminal(status: CrmSyncJobStatus): boolean {
-  return CRM_SYNC_JOB_TERMINAL_STATUSES.includes(status);
-}
-
-// Enqueues the push and returns immediately — see the module note above.
-// Idempotent at the job level: a second call while a job for this meeting
-// is still non-terminal reuses the SAME job_id rather than creating a
-// second one (the backend's create_crm_sync_job).
-export async function pushMeetingCrm(
-  key: string, objects?: string[]
-): Promise<{ job_id: string; status: CrmSyncJobStatus }> {
-  return request(`/recordings/ai/crm-push/${encodeURIComponent(key)}`, {
-    method: "POST",
-    body: objects ? { objects } : undefined,
-  });
-}
-
-// The most recent CRM sync job for this meeting, or null if the meeting has
-// never been pushed. This is what the UI polls after pushMeetingCrm to learn
-// "queued -> syncing -> synced/failed/reconnect required".
-export async function getCrmSyncJobStatus(key: string): Promise<CrmSyncJob | null> {
-  const res = await request<{ job: CrmSyncJob | null }>(
-    `/recordings/ai/crm-sync-jobs/${encodeURIComponent(key)}`
-  );
-  return res.job;
-}
-
-// User-initiated retry for a job sitting in a TERMINAL state (FAILED —
-// recoverable, e.g. Salesforce was briefly down — or RECONNECT_REQUIRED,
-// after the user has reconnected Salesforce). Re-enqueues the SAME job
-// (attempt_count/history continues) rather than creating a new one; the
-// worker reads whatever identity/config is current AT RETRY TIME, never a
-// cached copy from the original push.
-export async function retryCrmSyncJob(
-  key: string
-): Promise<{ job_id: string; status: CrmSyncJobStatus }> {
-  return request(`/recordings/ai/crm-sync-jobs-retry/${encodeURIComponent(key)}`, {
-    method: "POST",
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Organisation Salesforce (Phase 2D) — a SEPARATE connection from Personal
-// above, scoped to one workspace rather than one user.
-//
-// WHY THESE TAKE `workspaceId` EXPLICITLY, unlike every other call in this
-// file. `request()` auto-attaches whichever workspace is currently ACTIVE
-// (see WORKSPACE_HEADER above) — that is correct for resources that live
-// "in the active workspace" implicitly. Organisation Salesforce routes carry
-// `workspace_id` as an explicit PATH segment instead (see the backend's
-// Phase 2D.1/2D.2 routes), precisely so the Integrations screen can show the
-// Personal card and the Organisation card SIMULTANEOUSLY without switching
-// the active workspace back and forth to read each one — the active-header
-// mechanism can only ever address one workspace at a time.
-export type OrgSalesforceStatus = {
-  connected: boolean;
-  instance_url?: string;
-  sf_username?: string;
-  connected_by_user_id?: string;
-  connected_at?: string;
-  /** True once at least one object mapping is saved — the org connection
-   *  can be CONNECTED but not yet CONFIGURED (nothing to push to). */
-  configured?: boolean;
-  /** Present only right after a reconnect changed the underlying Salesforce
-   *  organisation (see the backend's org_salesforce_callback) — an
-   *  Owner/Manager must review and re-save the mapping. Cleared the next
-   *  time config is saved. */
-  config_cleared_reason?: string;
-  config_cleared_at?: string;
-};
-
-export async function getOrgSalesforceAuthorizeUrl(
-  workspaceId: string
-): Promise<string> {
-  const res = await request<{ authorize_url: string }>(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/connect`
-  );
-  return res.authorize_url;
-}
-
-export async function getOrgSalesforceStatus(
-  workspaceId: string
-): Promise<OrgSalesforceStatus> {
-  return request<OrgSalesforceStatus>(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/status`
-  );
-}
-
-export async function disconnectOrgSalesforce(workspaceId: string): Promise<void> {
-  await request(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce`,
-    { method: "DELETE" }
-  );
-}
-
-export async function getOrgSalesforceObjects(
-  workspaceId: string
-): Promise<{ objects: SalesforceObject[]; suggested: string | null }> {
-  return request(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/objects`
-  );
-}
-
-export async function getOrgSalesforceFields(
-  workspaceId: string,
-  objectName: string
-): Promise<SalesforceFieldsResponse> {
-  return request(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/fields/`
-    + encodeURIComponent(objectName)
-  );
-}
-
-export async function getOrgSalesforceConfig(
-  workspaceId: string
-): Promise<SalesforceConfig> {
-  const res = await request<{ config: SalesforceConfig }>(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/config`
-  );
-  return res.config;
-}
-
-export async function saveOrgSalesforceConfig(
-  workspaceId: string,
-  config: SalesforceConfigInput
-): Promise<SalesforceConfig> {
-  const res = await request<{ config: SalesforceConfig }>(
-    `/workspaces/${encodeURIComponent(workspaceId)}/crm/salesforce/config`,
-    { method: "PUT", body: config }
-  );
-  return res.config;
-}
-
-// The backend's "no workspace has connected Salesforce yet" answer (HTTP 400
-// + this code) — distinct from SALESFORCE_RECONNECT_CODE, which means a
-// connection EXISTS but its credential died. One shows a Connect button, the
-// other shows Reconnect; collapsing them would lose that distinction.
-export const ORG_SALESFORCE_NOT_CONNECTED_CODE = "organisation_salesforce_not_connected";
-
-export function isOrgSalesforceNotConnected(e: unknown): boolean {
-  return e instanceof ApiError && e.code === ORG_SALESFORCE_NOT_CONNECTED_CODE;
-}
 
 // ---------------------------------------------------------------------------
 // Integrations — connecting MinuteX to external applications.
@@ -1487,10 +918,6 @@ export type Integration = {
    *  an app update — and an old build can never offer a connect button for
    *  something the backend cannot honour. */
   available: boolean;
-  /** True for Salesforce: listed here so the Integrations screen is a complete
-   *  picture, but connected through its own existing screen rather than the
-   *  generic flow. The card routes there instead of calling connect. */
-  managed_elsewhere: boolean;
   status: IntegrationStatusValue;
   connected: boolean;
   /** The connected account as the user knows it — a Gmail address today. */
@@ -1507,9 +934,8 @@ export type Integration = {
 // The backend's "your MinuteX session is fine, but this INTEGRATION cannot
 // serve the request" answers (HTTP 409 + one of these codes).
 //
-// Deliberately NOT 401, for exactly the reason SALESFORCE_RECONNECT_CODE
-// documents above: a 401 makes `request` below clear the stored JWT and bounce
-// the user to /login, and a dead Gmail token must never sign anyone out of
+// Deliberately NOT 401: a 401 makes `request` below clear the stored JWT and
+// bounce the user to /login, and a dead Gmail token must never sign anyone out of
 // MinuteX. Reconnecting Gmail is the fix; signing out never was.
 export const INTEGRATION_NOT_CONNECTED_CODE = "integration_not_connected";
 export const INTEGRATION_REAUTH_CODE = "integration_reauth_required";
@@ -1738,27 +1164,11 @@ export async function requestUpload(params: {
 // PATCH /recordings/{key} — the only user-editable fields on a recording.
 // Pass a speaker_names map to rename speakers; a blank/absent name clears
 // that mapping. Returns the updated row so callers can adopt it directly.
-//
-// crm_records is the CRM association path, keyed by Salesforce object name.
-// Per object, send either:
-//   * a string — the identifier alone (clears any record resolved from a
-//     different identifier, since that association no longer applies);
-//   * null/"" — remove the association entirely (undo a wrong extraction);
-//   * {lookup_value, record_id, status} — the identifier plus a record already
-//     resolved by /crm/salesforce/lookup, so confirming needs no extra round
-//     trip. `syncing`/`synced` are refused here; only the sync route sets those.
-// Omit the key entirely to leave associations untouched.
 export async function updateRecording(
   key: string,
   patch: {
     speaker_names?: Record<string, string>;
     title?: string;
-    crm_records?: Record<string, string | null | {
-      lookup_value: string;
-      record_id?: string;
-      record_label?: string;
-      status?: CrmSyncStatus;
-    }>;
   }
 ): Promise<RecordingDetail> {
   const res = await request<{ recording: RecordingDetail }>(
@@ -2493,6 +1903,9 @@ export type ApiTask = {
   title?: string;
   description?: string;
   due_date?: string;
+  // The resolved calendar date (YYYY-MM-DD) beside the spoken phrase in
+  // due_date; "" when the phrase could not be resolved.
+  due_date_normalized?: string;
   // Computed server-side from due_date + status, never stored — so it is
   // always correct rather than correct-as-of-the-last-write.
   is_overdue?: boolean;
@@ -2705,18 +2118,16 @@ export type ApiContact = {
    * membership on every read, so it cannot be stale. Render it as the tag
    * next to the name. */
   workspace_role?: WorkspaceRole | "";
+  /** The external directory entry this contact is linked to ("salesforce"),
+   *  and what it is there ("contact" = someone you meet, "user" = an internal
+   *  Salesforce user). Empty for an ordinary contact. The external record id
+   *  never reaches the app. */
+  people_provider?: string;
+  people_type?: "contact" | "user" | "";
   /** True when this entry IS an organisation member. Their name and photo
    * come from their own MinuteX profile, so Edit and Delete must be hidden —
    * the API answers 409 `contact_is_member` for both. */
   is_member?: boolean;
-  /** CRM identity (Phase 2D.3) — present only once EXPLICITLY confirmed via
-   * resolveContactCrmIdentity. Never inferred from name/email; absent means
-   * "no Salesforce match confirmed yet", not "looked up and found none". */
-  crm_provider?: string;
-  crm_object_type?: string;
-  crm_external_id?: string;
-  crm_account_id?: string;
-  crm_resolved_at?: string;
   created_at: string;
   updated_at: string;
 };
@@ -3354,4 +2765,509 @@ export async function markAllNotificationsRead(): Promise<{
   remaining: number;
 }> {
   return request("/notifications/read-all", { method: "POST", body: {} });
+}
+
+// ---------------------------------------------------------------------------
+// OS push tokens — one per app installation (see lib/push.ts and the PUSH
+// TOKENS section in functions/userapi). The server owns the preference:
+// `enabled` on the stored row is this device's "Brief-ready notifications"
+// switch, and it is what the sender reads.
+// ---------------------------------------------------------------------------
+export type PushTokenState = {
+  installation_id: string;
+  platform: string;
+  enabled: boolean;
+  /** false once Expo reported the token dead; a re-registration revives it. */
+  active: boolean;
+  updated_at: string;
+};
+
+/** Register or refresh this installation's Expo push token. Omit `enabled`
+ *  to keep whatever the user last chose (every app start does this). */
+export async function registerPushToken(params: {
+  token: string;
+  installation_id: string;
+  platform: "ios" | "android";
+  app_version?: string;
+  enabled?: boolean;
+}): Promise<PushTokenState> {
+  const res = await request<{ push_token: PushTokenState }>("/me/push-tokens", {
+    method: "POST",
+    body: params,
+  });
+  return res.push_token;
+}
+
+/** Remove this installation's token — sign-out. Idempotent. */
+export async function unregisterPushToken(installationId: string): Promise<void> {
+  await request(`/me/push-tokens/${encodeURIComponent(installationId)}`, {
+    method: "DELETE",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Salesforce Site — org connection (NEW architecture)
+//
+// delivery_type = salesforce_site: backend routes under
+// /workspaces/{id}/site-delivery and /workspaces/{id}/site-salesforce, and the
+// screens in src/app/site-salesforce/*.
+//
+// Every call goes through the workspace's Salesforce Site endpoint with that
+// endpoint's auth mode (configured once on the backend). The app sends and
+// stores no Salesforce credential of any kind.
+//
+// Every object/field/picklist the UI offers comes from the org's own
+// discovered metadata; which object, record and assignee a Task gets is
+// always the person's explicit choice. Nothing here classifies anything.
+// ---------------------------------------------------------------------------
+
+export type SiteSfConnection = {
+  connected: boolean;
+  status?: string;
+  org_id?: string;
+  org_name?: string;
+  is_sandbox?: boolean;
+  edition?: string;
+  /** The workspace's Site endpoint is configured and enabled (connect needs it). */
+  site_endpoint_configured: boolean;
+  /** That endpoint's auth mode ("none" in development, "hmac_sha256", ...). */
+  auth_mode: string;
+  integration_user?: { id: string; username: string; name: string };
+  task_permissions?: { accessible: boolean; createable: boolean; updateable: boolean };
+  discovery?: { job_id?: string; status?: string; counts?: Record<string, number>;
+                completed_at?: string; phase?: string; error_code?: string };
+  connected_at?: string;
+};
+
+export type SitePeopleSync = {
+  job_id?: string; status?: string; counts?: Record<string, number>; completed_at?: string;
+};
+
+export type SiteSfObject = {
+  api_name: string;
+  label: string;
+  label_plural: string;
+  key_prefix: string;
+  is_custom: boolean;
+  queryable: boolean;
+  searchable: boolean;
+  createable: boolean;
+  updateable: boolean;
+  deletable: boolean;
+  /** "what" (Task.WhatId), "who" (Task.WhoId) or "" (Tasks can't relate). */
+  task_relation: "what" | "who" | "";
+  /** "standard" (a business object such as Account) or "custom". The backend
+   *  returns only objects a meeting can relate to; `task_relation` says
+   *  whether a Salesforce Task can be attached too. */
+  category?: "standard" | "custom" | "";
+  /** A common object shown by default (Account, Contact, Lead, Opportunity,
+   *  Case). A default, not a filter: every catalog object is searchable. */
+  recommended?: boolean;
+  /** The workspace added it to its list (or used it once). */
+  enabled?: boolean;
+  /** A meeting can be linked to its records (every catalog object). */
+  meeting_relationship_supported?: boolean;
+  /** Salesforce lets a Task point at it — checked only for Tasks. */
+  task_relationship_supported?: boolean;
+  fields_synced_at?: string;
+};
+
+export type SiteSfField = {
+  api_name: string;
+  label: string;
+  type: string;
+  createable: boolean;
+  updateable: boolean;
+  required: boolean;
+  is_custom: boolean;
+  name_field: boolean;
+  reference_to: string[];
+  picklist_values?: { value: string; label: string; default: boolean }[];
+};
+
+export type SiteSfDueRule = {
+  type: "none" | "days_after_meeting" | "days_after_creation";
+  days: number;
+};
+
+export type SiteSfMapping = {
+  mapping_id: string;
+  name: string;
+  object_api_name: string;
+  object_label?: string;
+  subject: string;
+  description: string;
+  status: string;
+  priority: string;
+  default_assignee_person_key: string;
+  due_rule: SiteSfDueRule;
+  record_required: boolean;
+  default_record_id: string;
+  default_record_name: string;
+  extra_fields: Record<string, string | number | boolean>;
+  enabled: boolean;
+  problems?: string[];
+};
+
+export type SiteSfTask = {
+  task_ref: string;
+  mapping_id: string;
+  mapping_name: string;
+  subject: string;
+  description: string;
+  due_date: string;
+  status: string;
+  priority: string;
+  assigned_user_id: string;
+  assignee_person_key: string;
+  assignee_name: string;
+  related_object_type: string;
+  related_record_id: string;
+  related_record_name: string;
+  meeting_key: string;
+  /** The MinuteX task this Salesforce Task was pushed from ("" for none). */
+  minutex_task_id?: string;
+  /** The relationship as a person reads it: Who then What, by name. */
+  related_to?: { slot: "who" | "what" | ""; object_label: string; name: string }[];
+  sync_status: "PENDING" | "SYNCING" | "RETRYING" | "SYNCED" | "FAILED" | string;
+  salesforce_task_id: string;
+  last_error?: { code?: string; message?: string };
+  version: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SitePerson = {
+  /** Opaque handle, sent back to choose this person. Never displayed. */
+  person_key: string;
+  provider: string;
+  type: "contact" | "user";
+  external_id: string;
+  name: string;
+  email: string;
+  phone?: string;
+  title: string;
+  company: string;
+  status: string;
+  last_synced_at?: string;
+  /** The MinuteX contact this person was already used as, if any. */
+  linked_contact_id?: string;
+};
+
+export type SitePeopleCounts = { contacts: number; users: number };
+
+/** One side of a meeting's Salesforce relationship, as a person reads it. */
+export type SiteSfRelationSide = {
+  object_label: string;
+  name: string;
+  /** "tagged_contact" (automatic), "chosen_contact" or "manual". */
+  source: string;
+  person_key: string;
+  /** false: the meeting is about this record, but Salesforce does not allow
+   *  Tasks on its object (Allow Activities is off), so Tasks skip it. */
+  tasks_supported?: boolean;
+};
+
+/** Where Push Meeting put this meeting in Salesforce (a MinuteX Meeting
+ *  record) and what it was related to at that push. Names and a link only. */
+export type SiteSfMeetingRecord = {
+  object_label: string;
+  /** The meeting's title as sent. */
+  name: string;
+  related_to: { slot: "who" | "what"; object_label: string; name: string }[];
+  /** Opens the record in Salesforce; "" when the receiver did not send one. */
+  url: string;
+  delivered_at: string;
+};
+
+export type SiteSfMeetingRelation = {
+  /** The Contact or Lead the meeting was with. */
+  who: SiteSfRelationSide | null;
+  /** The Account, Opportunity or other record it is about. */
+  what: SiteSfRelationSide | null;
+  /** True when the Who is the tagged Salesforce Contact (nobody chose it). */
+  automatic: boolean;
+  /** Synced Salesforce Contacts tagged in this meeting — one-tap choices. */
+  candidates: { person_key: string; name: string; company: string; title: string }[];
+  problems: string[];
+  /** The meeting's Salesforce record, once pushed; Tasks are attached to it. */
+  meeting_record?: SiteSfMeetingRecord | null;
+};
+
+export type SiteJob = {
+  job_id: string;
+  status: string;
+  attempt_count: number;
+  last_error_code: string;
+  last_error_message: string;
+  operation: string;
+};
+
+const siteSf = (workspaceId: string) =>
+  `/workspaces/${encodeURIComponent(workspaceId)}/site-salesforce`;
+
+export async function getSiteSalesforce(workspaceId: string): Promise<SiteSfConnection> {
+  const r = await request<{ connection: SiteSfConnection }>(siteSf(workspaceId));
+  return r.connection;
+}
+
+/** Reads the org id through the Site endpoint and pins it. A 409
+ *  `org_mismatch` means the Site now answers for a different org; send
+ *  allow_org_change (after the user confirms) to switch, which clears the
+ *  discovered metadata and Task mappings. */
+export async function connectSiteSalesforce(
+  workspaceId: string, opts: { allow_org_change?: boolean } = {},
+): Promise<SiteSfConnection> {
+  const r = await request<{ connection: SiteSfConnection }>(`${siteSf(workspaceId)}/connect`, {
+    method: "PUT", body: { allow_org_change: opts.allow_org_change === true },
+  });
+  return r.connection;
+}
+
+export async function disconnectSiteSalesforce(workspaceId: string): Promise<void> {
+  await request(siteSf(workspaceId), { method: "DELETE" });
+}
+
+export async function startSiteSalesforceDiscovery(workspaceId: string): Promise<SiteJob> {
+  const r = await request<{ job: SiteJob }>(`${siteSf(workspaceId)}/discover`, { method: "POST" });
+  return r.job;
+}
+
+export async function getSiteSalesforceDiscovery(
+  workspaceId: string,
+): Promise<{ discovery: SiteSfConnection["discovery"]; job: SiteJob | null }> {
+  return request(`${siteSf(workspaceId)}/discover`);
+}
+
+/** The Salesforce object catalog.
+ *  scope "visible" (default): the recommended objects + the ones this
+ *  workspace added — the short list a person sees. scope "all": the whole
+ *  catalog, for "Find another Salesforce object" (use `q`).
+ *  capability "task": only objects a Salesforce Task can be attached to. */
+export async function listSiteSalesforceObjects(
+  workspaceId: string,
+  opts: { q?: string; scope?: "visible" | "all"; capability?: "meeting" | "task";
+          taskRelatable?: boolean; custom?: boolean; limit?: number } = {},
+): Promise<SiteSfObject[]> {
+  return (await listSiteSalesforceObjectsPage(workspaceId, opts)).objects;
+}
+
+export async function listSiteSalesforceObjectsPage(
+  workspaceId: string,
+  opts: { q?: string; scope?: "visible" | "all"; capability?: "meeting" | "task";
+          taskRelatable?: boolean; custom?: boolean; limit?: number } = {},
+): Promise<{ objects: SiteSfObject[]; total: number; truncated: boolean; catalog_size: number }> {
+  const qs = new URLSearchParams();
+  if (opts.q) qs.set("q", opts.q);
+  if (opts.scope) qs.set("scope", opts.scope);
+  const capability = opts.taskRelatable ? "task" : opts.capability;
+  if (capability) qs.set("capability", capability);
+  if (opts.custom !== undefined) qs.set("custom", opts.custom ? "true" : "false");
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const r = await request<{ objects: SiteSfObject[]; total?: number; truncated?: boolean; catalog_size?: number }>(
+    `${siteSf(workspaceId)}/objects${qs.toString() ? `?${qs}` : ""}`);
+  return { objects: r.objects, total: r.total ?? r.objects.length, truncated: r.truncated === true,
+           catalog_size: r.catalog_size ?? r.objects.length };
+}
+
+/** Add objects to (or, owner/manager only, remove them from) the workspace's
+ *  list, so nobody has to search for the same object again. */
+export async function setSiteSalesforceObjectPrefs(
+  workspaceId: string, change: { enable?: string[]; disable?: string[] },
+): Promise<SiteSfObject[]> {
+  const r = await request<{ enabled: SiteSfObject[] }>(`${siteSf(workspaceId)}/object-preferences`, {
+    method: "PUT", body: change,
+  });
+  return r.enabled;
+}
+
+export async function getSiteSalesforceFields(
+  workspaceId: string, objectApiName: string, refresh = false,
+): Promise<{ object: SiteSfObject; fields: SiteSfField[]; synced_at: string }> {
+  return request(`${siteSf(workspaceId)}/objects/${encodeURIComponent(objectApiName)}/fields`
+    + (refresh ? "?refresh=true" : ""));
+}
+
+export async function searchSiteSalesforceRecords(
+  workspaceId: string, objectApiName: string, q: string,
+): Promise<{ id: string; name: string }[]> {
+  const r = await request<{ records: { id: string; name: string }[] }>(
+    `${siteSf(workspaceId)}/objects/${encodeURIComponent(objectApiName)}/records`
+    + `?q=${encodeURIComponent(q)}`);
+  return r.records;
+}
+
+export async function listSiteSalesforceMappings(workspaceId: string): Promise<SiteSfMapping[]> {
+  const r = await request<{ mappings: SiteSfMapping[] }>(`${siteSf(workspaceId)}/task-mappings`);
+  return r.mappings;
+}
+
+export async function saveSiteSalesforceMapping(
+  workspaceId: string, mapping: Partial<SiteSfMapping>, mappingId?: string,
+): Promise<SiteSfMapping> {
+  const path = mappingId
+    ? `${siteSf(workspaceId)}/task-mappings/${encodeURIComponent(mappingId)}`
+    : `${siteSf(workspaceId)}/task-mappings`;
+  const r = await request<{ mapping: SiteSfMapping }>(path, {
+    method: mappingId ? "PUT" : "POST", body: mapping,
+  });
+  return r.mapping;
+}
+
+export async function deleteSiteSalesforceMapping(workspaceId: string, mappingId: string) {
+  await request(`${siteSf(workspaceId)}/task-mappings/${encodeURIComponent(mappingId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Push an EXISTING MinuteX task (AI-extracted or user-created) to Salesforce.
+ *  The backend takes the subject, description, resolved due date, status and
+ *  priority from the task itself, and the relationship from the MEETING (the
+ *  tagged Salesforce Contact, plus any record chosen for the meeting). Pass
+ *  object_api_name + record_id only for "Change related Salesforce record":
+ *  it replaces the side of that relationship it belongs to. The Salesforce
+ *  User is always the person's choice. One Salesforce Task per MinuteX task:
+ *  pushing the same task again updates it (`updated: true`). */
+export async function pushTaskToSalesforce(
+  workspaceId: string,
+  body: { minutex_task_id: string; object_api_name?: string; record_id?: string;
+          record_name?: string; assignee_person_key: string },
+): Promise<{ task: SiteSfTask; updated: boolean }> {
+  const r = await request<{ task: SiteSfTask; updated?: boolean }>(`${siteSf(workspaceId)}/tasks`, {
+    method: "POST", body,
+  });
+  return { task: r.task, updated: r.updated === true };
+}
+
+// -- The workspace's Site endpoint (the only API boundary) -------------------
+
+export type SiteEndpoint = {
+  configured: boolean;
+  enabled: boolean;
+  url?: string;
+  auth_mode?: string;
+  last_health?: SiteHealth;
+  people_sync?: SitePeopleSync;
+  updated_at?: string;
+};
+
+export type SiteHealth = {
+  ok?: boolean; checked_at?: string; code?: string; message?: string;
+  org_id?: string; receiver_version?: string; elapsed_ms?: number;
+};
+
+const siteDelivery = (workspaceId: string) =>
+  `/workspaces/${encodeURIComponent(workspaceId)}/site-delivery`;
+
+export async function getSiteDelivery(workspaceId: string): Promise<SiteEndpoint> {
+  const r = await request<{ endpoint: SiteEndpoint }>(siteDelivery(workspaceId));
+  return r.endpoint;
+}
+
+/** Saves the Site receiver URL. `auth_mode` is the endpoint's pluggable mode
+ *  ("none" for development); the app never sends a shared secret, so an
+ *  endpoint already set to a signed mode keeps the secret stored server-side. */
+export async function saveSiteDelivery(
+  workspaceId: string, body: { url: string; auth_mode: string; enabled: boolean },
+): Promise<{ endpoint: SiteEndpoint; warnings: string[] }> {
+  return request(siteDelivery(workspaceId), { method: "PUT", body });
+}
+
+/** Calls the receiver's health action now. A failing Site is a 200 with
+ *  health.ok = false: the check ran, and that is its answer. */
+export async function checkSiteDeliveryHealth(workspaceId: string): Promise<SiteHealth> {
+  const r = await request<{ health: SiteHealth }>(`${siteDelivery(workspaceId)}/health`, { method: "POST" });
+  return r.health;
+}
+
+// -- One meeting -> MinuteX_Site_Meeting__c ----------------------------------
+
+export async function getSiteMeetingDelivery(
+  meetingKey: string,
+): Promise<{ job: SiteJob | null; endpoint: { configured: boolean; enabled: boolean };
+             meeting_record?: SiteSfMeetingRecord | null }> {
+  return request(`/recordings/site-delivery/${encodeURIComponent(meetingKey)}`);
+}
+
+export async function pushSiteMeeting(meetingKey: string): Promise<SiteJob> {
+  const r = await request<{ job: SiteJob }>(
+    `/recordings/site-delivery/${encodeURIComponent(meetingKey)}`, { method: "POST" });
+  return r.job;
+}
+
+export async function retrySiteMeeting(meetingKey: string): Promise<SiteJob> {
+  const r = await request<{ job: SiteJob }>(
+    `/recordings/site-delivery-retry/${encodeURIComponent(meetingKey)}`, { method: "POST" });
+  return r.job;
+}
+
+export async function listSiteSalesforceTasks(
+  workspaceId: string, meetingKey?: string,
+): Promise<SiteSfTask[]> {
+  const r = await request<{ tasks: SiteSfTask[] }>(`${siteSf(workspaceId)}/tasks`
+    + (meetingKey ? `?meeting_key=${encodeURIComponent(meetingKey)}` : ""));
+  return r.tasks;
+}
+
+export async function startSitePeopleSync(workspaceId: string): Promise<SiteJob> {
+  const r = await request<{ job: SiteJob }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/site-delivery/people-sync`, { method: "POST" });
+  return r.job;
+}
+
+export async function searchSitePeople(
+  workspaceId: string, opts: { q?: string; type?: "contact" | "user"; limit?: number } = {},
+): Promise<SitePerson[]> {
+  return (await searchSitePeoplePage(workspaceId, opts)).people;
+}
+
+/** People from the local People Store, plus how many Contacts and Users it
+ *  holds (from the same read, so tab counts always match what a search can
+ *  return). `truncated` means a very large directory: narrow the search. */
+export async function searchSitePeoplePage(
+  workspaceId: string, opts: { q?: string; type?: "contact" | "user"; limit?: number } = {},
+): Promise<{ people: SitePerson[]; counts: SitePeopleCounts; truncated: boolean }> {
+  const qs = new URLSearchParams();
+  if (opts.q) qs.set("q", opts.q);
+  if (opts.type) qs.set("type", opts.type);
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const r = await request<{ people: SitePerson[]; counts?: SitePeopleCounts; truncated?: boolean }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/people${qs.toString() ? `?${qs}` : ""}`);
+  return { people: r.people, counts: r.counts || { contacts: 0, users: 0 },
+           truncated: r.truncated === true };
+}
+
+/** The MinuteX contact a synced Salesforce person is used as — found or
+ *  created once, server-side. Every "choose a person" sheet resolves a
+ *  Salesforce pick through this and then carries on as for any contact. */
+export async function contactForSitePerson(workspaceId: string, personKey: string): Promise<ApiContact> {
+  const r = await request<{ contact: ApiContact }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/people/contact`,
+    { method: "POST", body: { person_key: personKey } });
+  return r.contact;
+}
+
+/** The meeting's Salesforce relationship. `relation` is null when the
+ *  workspace has no Salesforce connection. */
+export async function getSiteMeetingRelation(
+  workspaceId: string, meetingKey: string,
+): Promise<SiteSfMeetingRelation | null> {
+  const r = await request<{ relation: SiteSfMeetingRelation | null; meeting_record?: SiteSfMeetingRecord | null }>(
+    `${siteSf(workspaceId)}/meeting-relation?meeting_key=${encodeURIComponent(meetingKey)}`);
+  return r.relation ? { ...r.relation, meeting_record: r.meeting_record ?? null } : null;
+}
+
+/** Change the meeting's relationship: a synced Contact (`person_key`), a
+ *  record of a discovered object ("Change Salesforce record"), or `reset` to
+ *  go back to the tagged Contact. Needs edit access to the meeting. */
+export async function setSiteMeetingRelation(
+  workspaceId: string, meetingKey: string,
+  change: { person_key: string }
+    | { object_api_name: string; record_id: string; record_name: string }
+    | { reset: "who" | "what" | "all" },
+): Promise<SiteSfMeetingRelation> {
+  const r = await request<{ relation: SiteSfMeetingRelation }>(`${siteSf(workspaceId)}/meeting-relation`, {
+    method: "PUT", body: { meeting_key: meetingKey, ...change },
+  });
+  return r.relation;
 }

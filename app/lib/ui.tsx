@@ -166,27 +166,32 @@ export function SectionRule({
 // ---- Button ------------------------------------------------------------------
 export function Button({
   label, onPress, variant = "primary", loading, disabled, style, icon,
+  accessibilityLabel,
 }: {
   label: string;
   onPress?: () => void;
-  variant?: "primary" | "secondary" | "danger" | "ghost";
+  /** "destructive" is the design-system name; "danger" is kept as its alias
+   *  for the existing call sites. */
+  variant?: "primary" | "secondary" | "danger" | "destructive" | "ghost";
   loading?: boolean;
   disabled?: boolean;
   style?: ViewStyle;
   icon?: React.ReactNode;
+  accessibilityLabel?: string;
 }) {
   const { C } = useTheme();
   const isOff = disabled || loading;
+  const v = variant === "destructive" ? "danger" : variant;
 
-  const bg =
-    variant === "primary" ? C.primary :
-    variant === "danger" ? C.danger :
-    variant === "secondary" ? C.surface2 : "transparent";
+  const bg = (pressed: boolean) =>
+    v === "primary" ? (pressed ? C.primaryPressed : C.primary) :
+    v === "danger" ? C.danger :
+    v === "secondary" ? C.surface2 : "transparent";
   const txtColor =
-    variant === "primary" || variant === "danger" ? C.textOnPrimary :
-    variant === "ghost" ? C.primary : C.text;
+    v === "primary" || v === "danger" ? C.textOnPrimary :
+    v === "ghost" ? C.primary : C.text;
   const border =
-    variant === "secondary" ? { borderWidth: 1, borderColor: C.border } : null;
+    v === "secondary" ? { borderWidth: 1, borderColor: C.border } : null;
 
   const content = loading ? (
     <ActivityIndicator color={txtColor} />
@@ -208,12 +213,17 @@ export function Button({
     <Pressable
       onPress={onPress}
       disabled={isOff}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityState={{ disabled: !!isOff, busy: !!loading }}
       style={({ pressed }) => [
         btn.btn,
-        { backgroundColor: bg },
+        { backgroundColor: bg(pressed) },
         border,
-        variant === "ghost" && { paddingVertical: S.sm },
-        { opacity: isOff ? 0.45 : pressed ? 0.85 : 1 },
+        v === "ghost" && { paddingVertical: S.sm },
+        // Primary presses to its own darker token; the others have no
+        // pressed colour, so they dim instead.
+        { opacity: isOff ? 0.45 : pressed && v !== "primary" ? 0.8 : 1 },
         style,
       ]}
     >
@@ -222,9 +232,12 @@ export function Button({
   );
 }
 const btn = StyleSheet.create({
-  btn: { borderRadius: R.pill, paddingVertical: 15, paddingHorizontal: S.lg, alignItems: "center", justifyContent: "center" },
+  btn: {
+    borderRadius: R.pill, paddingVertical: 14, paddingHorizontal: S.lg,
+    minHeight: 48, alignItems: "center", justifyContent: "center",
+  },
   inner: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: S.sm },
-  txt: { fontFamily: FONT.bold, fontSize: 14.5 },
+  txt: { fontFamily: FONT.semibold, fontSize: 15, lineHeight: 20 },
 });
 
 // ---- StatusPill --------------------------------------------------------------
@@ -631,12 +644,15 @@ export function Avatar({
 
 // ---- SegmentedTabs: animated pill underline, matching the reference --------
 export function SegmentedTabs({
-  tabs, value, onChange, style,
+  tabs, value, onChange, style, fill,
 }: {
   tabs: { key: string; label: string; icon?: string }[];
   value: string;
   onChange: (key: string) => void;
   style?: ViewStyle;
+  /** Share the width evenly instead of sizing each tab to its label. The
+   *  indicator still follows MEASURED widths, so it stays correct either way. */
+  fill?: boolean;
 }) {
   const { C } = useTheme();
   const activeIndex = Math.max(0, tabs.findIndex((t) => t.key === value));
@@ -666,10 +682,13 @@ export function SegmentedTabs({
   });
 
   return (
-    <View style={[{
-      flexDirection: "row", position: "relative",
-      borderBottomWidth: 1.5, borderBottomColor: C.border,
-    }, style]}>
+    <View
+      accessibilityRole="tablist"
+      style={[{
+        flexDirection: "row", position: "relative",
+        borderBottomWidth: 1.5, borderBottomColor: C.border,
+      }, style]}
+    >
       <Animated.View style={{
         position: "absolute", left, width, bottom: -1.5, height: 2.5,
         backgroundColor: C.primary, borderRadius: 2,
@@ -689,7 +708,11 @@ export function SegmentedTabs({
             // paddingTop balances the existing paddingBottom to clear the
             // 44pt touch floor. The underline is positioned from `bottom`
             // and sized from measured WIDTH, so added height cannot move it.
-            style={{ paddingTop: 10, paddingBottom: 11, paddingHorizontal: S.lg, justifyContent: "center" }}
+            style={{
+              paddingTop: 10, paddingBottom: 11, justifyContent: "center",
+              paddingHorizontal: fill ? S.xs : S.lg,
+              ...(fill ? { flex: 1, alignItems: "center" as const } : null),
+            }}
           >
             <Text
               style={{
@@ -742,28 +765,46 @@ export function SkeletonCard({ style }: { style?: ViewStyle }) {
 
 // ---- SearchBar: rounded pill search field --------------------------------------
 export function SearchBar({
-  value, onChangeText, placeholder = "Search", style,
-}: { value: string; onChangeText: (t: string) => void; placeholder?: string; style?: ViewStyle }) {
+  value, onChangeText, placeholder = "Search", style, onSubmitEditing, autoFocus,
+}: {
+  value: string; onChangeText: (t: string) => void; placeholder?: string; style?: ViewStyle;
+  onSubmitEditing?: () => void; autoFocus?: boolean;
+}) {
   const { C } = useTheme();
+  // Focus is shown as a border, not a colour change of the fill: the field
+  // must stay readable against the same background either way, and a 1px
+  // ring is present-but-transparent at rest so focusing never shifts layout.
+  const [focused, setFocused] = useState(false);
   return (
     <View style={[{
       flexDirection: "row", alignItems: "center", gap: S.sm,
       backgroundColor: C.surface2, borderRadius: R.pill,
-      paddingHorizontal: S.md, paddingVertical: 11,
+      borderWidth: 1, borderColor: focused ? C.primary : "transparent",
+      paddingHorizontal: S.md, minHeight: 44,
     }, style]}>
-      <Icon name="magnifyingglass" tintColor={C.textFaint} size={18} />
+      <Icon name="magnifyingglass" tintColor={focused ? C.primary : C.textFaint} size={18} />
       <TextInput
-        style={{ flex: 1, fontFamily: FONT.regular, fontSize: 15, color: C.text, paddingVertical: 0 }}
+        style={{ flex: 1, fontFamily: FONT.regular, fontSize: 15, color: C.text, paddingVertical: 10 }}
         placeholder={placeholder}
         placeholderTextColor={C.textFaint}
         value={value}
         onChangeText={onChangeText}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        onSubmitEditing={onSubmitEditing}
+        autoFocus={autoFocus}
         autoCapitalize="none"
         autoCorrect={false}
         returnKeyType="search"
+        accessibilityLabel={placeholder}
       />
       {value ? (
-        <Pressable onPress={() => onChangeText("")} hitSlop={8} accessibilityLabel="Clear search">
+        <Pressable
+          onPress={() => onChangeText("")}
+          hitSlop={12}
+          accessibilityRole="button"
+          accessibilityLabel="Clear search"
+        >
           <Icon name="xmark.circle.fill" tintColor={C.textFaint} size={18} />
         </Pressable>
       ) : null}

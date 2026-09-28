@@ -40,6 +40,14 @@ export type ThemeMode = "dark" | "light";
 export type ColorScale = {
   bg: string; surface: string; surface2: string; surfaceRaised: string; border: string; borderStrong: string;
   primary: string; primarySoft: string; primaryStrong: string;
+  /** Pressed / active fill for a primary control. */
+  primaryPressed: string;
+  /** Live-capture red. Distinct from `danger` in intent even where the hue
+   * matches: danger means "this will destroy something", recording means
+   * "audio is being captured right now". */
+  recording: string; recordingSoft: string;
+  /** Scrim behind a bottom sheet or modal. */
+  overlay: string;
   // Kept for API compatibility with call sites that still use <Gradient>.
   gradient: [string, string];
   accent: string; accentSoft: string;
@@ -63,6 +71,10 @@ const LIGHT: ColorScale = {
   primary: "#3E6BFF",     // confident blue — every primary action & active state
   primarySoft: "#EAF0FF",
   primaryStrong: "#2E52D6",
+  primaryPressed: "#2E52D6",
+  recording: "#E5484D",
+  recordingSoft: "#FDECEC",
+  overlay: "rgba(10,12,20,0.45)",
   gradient: ["#3E6BFF", "#7C5CFF"],
   accent: "#7C5CFF",      // violet — AI / assistant accent, pairs with primary
   accentSoft: "#F1EEFF",
@@ -92,6 +104,12 @@ const DARK: ColorScale = {
   primary: "#5C86FF",
   primarySoft: "#1A2340",
   primaryStrong: "#7C9EFF",
+  // Dark mode presses DARKER, not lighter: a lighter fill on a dark ground
+  // reads as hover-glow, a darker one reads as the button going down.
+  primaryPressed: "#4A70E0",
+  recording: "#FF6B6E",
+  recordingSoft: "#2E1A1C",
+  overlay: "rgba(0,0,0,0.6)",
   gradient: ["#5C86FF", "#9B82FF"],
   accent: "#9B82FF",
   accentSoft: "#231C3D",
@@ -113,13 +131,26 @@ const DARK: ColorScale = {
 
 // Radii: soft, app-native cards. `pill` is a real pill now (badges, chips,
 // segmented control, FAB).
-export const R = { sm: 8, md: 12, card: 16, lg: 20, xl: 28, pill: 999 };
+// `circle` is for true circles (record button, avatars) where the value is
+// never meant to be read as "a very round pill".
+export const R = { sm: 8, md: 12, card: 16, lg: 20, xl: 28, pill: 999, circle: 9999 };
 
-// Spacing scale (4pt grid) — prefer S.md over magic numbers.
-export const S = { xs: 4, sm: 8, md: 12, lg: 16, xl: 24, xxl: 32 };
+// Spacing scale (4pt base, 8pt rhythm) — prefer S.md over magic numbers.
+// 4 / 8 / 12 / 16 / 24 / 32 / 40 / 48.
+export const S = { xs: 4, sm: 8, md: 12, lg: 16, xl: 24, xxl: 32, x3: 40, x4: 48 };
 
-// Soft elevation — cards float gently above the page. Use with C.shadow.
+// Screen gutter — the one horizontal inset every page uses.
+export const GUTTER = 20;
+
+// The platform touch-target floor (HIG 44pt / Material 48dp → 44 is the
+// common minimum both accept).
+export const HIT = 44;
+
+// Soft elevation — used sparingly. Grouped surfaces (settings, brief lists)
+// take `none` + a hairline border; only things that genuinely float over
+// content (sheets, the record button, toasts) get `md`/`lg`.
 export const ELEV = {
+  none: { shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0, shadowRadius: 0, elevation: 0 },
   sm: { shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.06, shadowRadius: 3, elevation: 1 },
   md: { shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 12, elevation: 3 },
   lg: { shadowOffset: { width: 0, height: 10 }, shadowOpacity: 0.12, shadowRadius: 24, elevation: 8 },
@@ -130,6 +161,33 @@ export const TABULAR: { fontFamily: string; fontVariant: ["tabular-nums"] } = {
   fontFamily: FONT.mono,
   fontVariant: ["tabular-nums"],
 };
+
+// ---------------------------------------------------------------------------
+// STUDIO — the recorder's own ground, identical in light and dark theme.
+//
+// Recording is a state, not a surface: the dark field is what makes "live"
+// legible at a glance from across a table, and it must not flip to white when
+// the phone is in light mode. This is the ONE sanctioned fixed palette; it
+// replaces the two hand-copied INK constants record.tsx and record-phone.tsx
+// used to carry (which had already drifted — different warn colours).
+// ---------------------------------------------------------------------------
+export const STUDIO = {
+  bg: "#0E1016",
+  surface: "#171A22",
+  surfaceRaised: "#1F232D",
+  border: "#2A2F3B",
+  text: "#F3F4F8",
+  textDim: "#A9AEBE",
+  textFaint: "#6E7486",
+  primary: "#4F7BFF",
+  primaryPressed: "#3E66E0",
+  recording: "#FF5A5F",
+  recordingPressed: "#E0484D",
+  warn: "#F2B04A",
+  ok: "#46C993",
+  // Waveform bars once recording has paused: present, but plainly not live.
+  waveIdle: "#3A4050",
+} as const;
 
 // Caps micro-label — section headings and metadata labels.
 export const CAPS = {
@@ -161,6 +219,28 @@ function buildTypeScale(C: ColorScale) {
     label: { ...CAPS, color: C.textDim },
     labelDim: { ...CAPS, color: C.textFaint },
     caption: { fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint },
+
+    // ---- Named roles (the redesign's scale) --------------------------------
+    // New screens use these; the keys above stay for existing call sites.
+    // Hierarchy is carried by size + weight, so a screen should never need an
+    // icon or a card just to say "this is a heading".
+    /** Screen title in an AppHeader ("Settings", "MinuteX"). */
+    title: { fontFamily: FONT.bold, fontSize: 24, lineHeight: 30, color: C.text, letterSpacing: -0.3 },
+    /** Group / section heading ("Recent briefs", "Account"). */
+    section: { fontFamily: FONT.semibold, fontSize: 15, lineHeight: 20, color: C.text },
+    /** Row / card primary line. */
+    rowTitle: { fontFamily: FONT.semibold, fontSize: 15, lineHeight: 20, color: C.text },
+    /** Secondary copy under a row title, descriptions, previews. */
+    bodySmall: { fontFamily: FONT.regular, fontSize: 13, lineHeight: 18, color: C.textDim },
+    /** Button label. */
+    button: { fontFamily: FONT.semibold, fontSize: 15, lineHeight: 20 },
+    /** Dates, durations, counts on a row. */
+    meta: { fontFamily: FONT.medium, fontSize: 12.5, lineHeight: 16, color: C.textFaint },
+    /** The recorder's elapsed-time readout. Tabular so digits don't jitter. */
+    timer: {
+      fontFamily: FONT.bold, fontSize: 64, lineHeight: 72, color: C.text,
+      fontVariant: ["tabular-nums"] as ["tabular-nums"], letterSpacing: -1,
+    },
   };
 }
 

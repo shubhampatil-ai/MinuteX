@@ -544,13 +544,20 @@ export function GmailShareSheet({
  * to the surface, not to this component.
  */
 export function GmailShareRow({
-  usable, needsReauth, onPress, mode = "prompt", style,
+  usable, needsReauth, onPress, mode = "prompt", style, onPrompt,
 }: {
   usable: boolean;
   needsReauth: boolean;
   onPress: () => void;
   mode?: "prompt" | "hidden";
   style?: any;
+  /**
+   * Replaces the prompt's own navigation to the Gmail screen. A row rendered
+   * inside a Modal (the meeting-actions sheet) must close that Modal before
+   * navigating, or the Modal stays on top of the screen it just opened.
+   * Receives the navigation to run once the caller is ready.
+   */
+  onPrompt?: (go: () => void) => void;
 }) {
   const { C } = useTheme();
   const router = useRouter();
@@ -561,7 +568,10 @@ export function GmailShareRow({
   if (!usable) {
     return (
       <Pressable
-        onPress={() => router.push("/integrations/gmail" as any)}
+        onPress={() => {
+          const go = () => router.push("/integrations/gmail" as any);
+          if (onPrompt) onPrompt(go); else go();
+        }}
         style={({ pressed }) => [st.row, { opacity: pressed ? 0.6 : 0.75 }, style]}
         accessibilityRole="button"
         accessibilityLabel={needsReauth

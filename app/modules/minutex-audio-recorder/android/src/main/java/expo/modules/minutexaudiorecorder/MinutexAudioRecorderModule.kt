@@ -74,6 +74,9 @@ class MinutexAudioRecorderModule : Module() {
       "durationSeconds" to totalDuration(),
       "sizeBytes" to (totalPcmBytes() + WAV_HEADER_BYTES),
       "level" to (rec?.level() ?: 0f),
+      // RMS of the last buffer, for the live waveform only. Additive: JS
+      // treats its absence (an older build) as "use `level` instead".
+      "rms" to (rec?.rms() ?: 0f),
       // Sustained digital silence at the capture layer — the only reliable
       // Android signal that a call has taken the mic, since read() keeps
       // succeeding with zero-filled buffers. See RecorderConfig.zeroRunMillis.

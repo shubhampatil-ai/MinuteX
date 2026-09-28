@@ -20,6 +20,7 @@ import { onProfileNameSaved } from "../../lib/profile-gate";
 import { IntegrationsProvider } from "../../lib/integrations";
 import { NotificationsProvider } from "../../lib/notification-center";
 import { recoverUploads } from "../../lib/uploads";
+import { PushBridge } from "../../lib/push-bridge";
 
 // Root error boundary — a crash anywhere in the tree lands here instead of a
 // red screen (prod: a white screen). Styled with static colors on purpose:
@@ -262,6 +263,14 @@ function RootContent() {
     void recoverUploads().catch(() => { /* the upload banners report per-job */ });
   }, [checked, authed]);
 
+  // PUSH TAPS may navigate only once the user is signed in, past the name
+  // gate, AND out of the public/onboarding routes. Without the segment check a
+  // cold-start tap would open the brief a moment before the gate above
+  // replaces the stack with "/", losing it. See lib/push-bridge.tsx.
+  const pushReady = authed && needsName === false
+    && !PUBLIC_SEGMENTS.includes(segments[0] as string)
+    && segments[0] !== ONBOARDING_SEGMENT;
+
   // Status-bar icons follow the live theme (light icons on dark surfaces).
   const statusBar = <StatusBar style={mode === "dark" ? "light" : "dark"} />;
 
@@ -293,6 +302,9 @@ function RootContent() {
           the recording banner disagree with the list it was started from.
           UI state only — the backend re-resolves membership every request. */}
       <WorkspaceProvider>
+      {/* OS push: tap routing, foreground rule, registration refresh. Inside
+          NotificationsProvider so a tapped push marks its in-app row read. */}
+      <PushBridge ready={pushReady} />
       {statusBar}
       <Stack
         screenOptions={{
@@ -320,20 +332,14 @@ function RootContent() {
         <Stack.Screen name="upload" options={{ title: "Upload audio", presentation: "modal" }} />
         <Stack.Screen name="settings" options={{ title: "Settings" }} />
         <Stack.Screen name="trash" options={{ title: "Trash" }} />
-        <Stack.Screen name="salesforce" options={{ title: "Salesforce" }} />
-        {/* The OAuth redirect landing route. headerShown:false because it is a
-            transient hop, not a place — see crm-connected.tsx for why a route
-            must exist at all (the OS delivers the deep link to the app, so
-            expo-router tries to route it). */}
-        <Stack.Screen name="crm-connected" options={{ headerShown: false }} />
-        <Stack.Screen name="salesforce-config" options={{ title: "Salesforce mapping" }} />
         {/* Integrations — the central place external applications are
             connected. index is the card list; one screen per provider that
             has something to manage (Gmail today). */}
         <Stack.Screen name="integrations/index" options={{ title: "" }} />
         <Stack.Screen name="integrations/gmail" options={{ title: "" }} />
-        {/* The generic OAuth redirect landing route, for every provider —
-            same transient-hop reasoning as crm-connected above. */}
+        {/* The generic OAuth redirect landing route, for every provider.
+            headerShown:false because it is a transient hop, not a place (the
+            OS delivers the deep link to the app, so expo-router routes it). */}
         <Stack.Screen name="integrations-connected" options={{ headerShown: false }} />
         {/* Your device — reached from MinuteX's top-left status pill (and
             from You › Your device). It was a bottom tab until the bar went

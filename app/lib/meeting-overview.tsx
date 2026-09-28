@@ -26,6 +26,7 @@ import { FONT, S, useTheme, ColorScale } from "./theme";
 import { Card, SectionRule } from "./ui";
 import { Icon } from "./icons";
 import type { MeetingOverview, OverviewSection } from "./api";
+import { substituteSpeakerNames } from "./sources";
 
 // Prose longer than this collapses behind "Read more". Matches the old
 // summary card's clamp so a long section reads the same as a long summary did.
@@ -67,13 +68,25 @@ function hasContent(s: OverviewSection): boolean {
 // One section. Prose collapses; bullets don't (a list is already scannable,
 // and clamping it would hide the very items that make it useful).
 // ===========================================================================
-function OverviewSectionCard({ section }: { section: OverviewSection }) {
+function OverviewSectionCard({
+  section,
+  speakerNames,
+}: {
+  section: OverviewSection;
+  speakerNames?: Record<string, string> | null;
+}) {
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
   const [expanded, setExpanded] = useState(false);
 
-  const text = (section.content ?? "").trim();
-  const items = (section.items ?? []).map((i) => (i ?? "").trim()).filter(Boolean);
+  // "Speaker 0" -> the name the user gave that speaker. Done HERE, at the top,
+  // so the clamped preview, the expanded body and the share sheet all carry
+  // the same names — and so the stored prose stays canonical, letting the next
+  // rename resolve from the label again instead of from the old name.
+  const text = substituteSpeakerNames((section.content ?? "").trim(), speakerNames);
+  const items = (section.items ?? [])
+    .map((i) => substituteSpeakerNames((i ?? "").trim(), speakerNames))
+    .filter(Boolean);
 
   // Kind follows the CONTENT, not the label — the backend coerces this the
   // same way, so the two agree, and a mislabelled section still renders as
@@ -159,8 +172,10 @@ function OverviewSectionCard({ section }: { section: OverviewSection }) {
 // ===========================================================================
 export function MeetingOverviewView({
   overview,
+  speakerNames,
 }: {
   overview?: MeetingOverview | null;
+  speakerNames?: Record<string, string> | null;
 }) {
   const sections = (overview?.sections ?? []).filter(hasContent);
   if (!sections.length) return null;
@@ -171,7 +186,11 @@ export function MeetingOverviewView({
         // Keyed on the backend's stable id, falling back to position for a row
         // written before ids existed. Never on the title: two sections can
         // share one, and a duplicate React key drops a card silently.
-        <OverviewSectionCard key={section.id || `section_${i}`} section={section} />
+        <OverviewSectionCard
+          key={section.id || `section_${i}`}
+          section={section}
+          speakerNames={speakerNames}
+        />
       ))}
     </View>
   );

@@ -56,7 +56,7 @@ function viewFor(integrations, provider, loading = false) {
 /** The card's status wording — mirrored from statusLabel in
  *  src/app/integrations/index.tsx. */
 function statusLabel(integration) {
-  if (!integration.available && !integration.managed_elsewhere) {
+  if (!integration.available) {
     return "Coming soon";
   }
   switch (integration.status) {
@@ -70,7 +70,7 @@ function statusLabel(integration) {
 function integration(over = {}) {
   return {
     provider: "gmail", name: "Gmail", category: "communication",
-    description: "", available: true, managed_elsewhere: false,
+    description: "", available: true,
     status: "NOT_CONNECTED", connected: false, account_identifier: "",
     account_name: "", scopes: [], connected_at: "", updated_at: "",
     message: "", ...over,
@@ -147,16 +147,6 @@ describe("integration card status wording", () => {
     assert.equal(
       statusLabel(integration({ provider: "whatsapp", available: false })),
       "Coming soon");
-  });
-
-  it("does not say Coming soon for Salesforce, which really works", () => {
-    // It is connected through its own screen, not this flow — dressing it as
-    // "Coming soon" would be a lie to anyone who already linked an org.
-    assert.equal(
-      statusLabel(integration({
-        provider: "salesforce", available: false, managed_elsewhere: true,
-        status: "NOT_CONNECTED" })),
-      "Not connected");
   });
 
   it("reports each connected state distinctly", () => {

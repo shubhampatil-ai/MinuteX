@@ -1,42 +1,24 @@
-// lib/__tests__/org-salesforce-integration.test.mjs — Phase 2D.2: the
-// Organisation Salesforce card in the Integrations screen, and the RBAC/
-// scope rules that govern it.
+// lib/__tests__/org-integrations.test.mjs — the Integrations screen's
+// Organisation view and the capability/scope rules behind it.
 //
-// Run:  node --test lib/__tests__/org-salesforce-integration.test.mjs
+// Run:  node --test lib/__tests__/org-integrations.test.mjs
 //
-// SAME TWO-LEVEL APPROACH gmail-integration.test.mjs uses, for the same
-// reason: the modules under test are TSX (no transpile step here), so the
-// pure logic is mirrored and tested directly, and cross-cutting rules that
-// matter more as an invariant than as one call site's behaviour are checked
-// by reading the sources.
+// SAME TWO-LEVEL APPROACH gmail-integration.test.mjs uses: the modules under
+// test are TSX (no transpile step here), so the pure logic is mirrored and
+// tested directly, and cross-cutting rules are checked by reading the sources.
 //
 //   1. LOGIC.
-//      - The Organisation Salesforce card's status wording/colour rule
-//        (mirrored from OrgSalesforceCard in src/app/integrations/index.tsx).
 //      - useWorkspace().can() — reads the server's own `capabilities` map
-//        rather than re-deriving anything from `role`, so a capability
-//        rename on the backend needs no matching change on the client.
+//        rather than re-deriving anything from `role`.
 //      - The Organisation Integrations Gmail card's status wording
-//        (mirrored from OrgGmailCard) — same underlying per-user
-//        Integration the Personal catalog already reads, never a second
-//        connection.
+//        (mirrored from OrgGmailCard) — the same per-user Integration the
+//        Personal catalog reads, never a second connection.
 //
 //   2. SOURCE-LEVEL LINT.
-//      - Organisation Salesforce management (connect/disconnect/config save)
-//        is called ONLY from the org-scoped screens — never from anywhere
-//        that could apply it against the wrong workspace.
-//      - Personal Salesforce's own screens/calls are untouched by any
-//        Organisation-scoped code path (the hard regression requirement).
-//      - No source reads a refresh token, access token or client secret
-//        (same invariant gmail-integration.test.mjs already pins, checked
-//        again here because this phase added a second OAuth-adjacent
-//        surface that could just as easily have leaked one).
+//      - No source reads a refresh token, access token or client secret.
 //      - The /integrations screen renders Personal and Organisation as two
-//        DISJOINT views: Organisation mode never shows the Personal
-//        Salesforce card, Personal mode never shows the Organisation
-//        Salesforce card, and Gmail is read from the SAME useGmail()/
-//        useIntegrations() catalog in both — no second Gmail fetch, no
-//        OrgGmailConnections-shaped type anywhere.
+//        DISJOINT views, and Gmail is read from the SAME useGmail()/
+//        useIntegrations() catalog in both.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -44,16 +26,6 @@ import { join, relative } from "node:path";
 
 const ROOT = new URL("../../", import.meta.url).pathname
   .replace(/^\/([A-Za-z]:)/, "$1");
-
-// --- mirrored from src/app/integrations/index.tsx (OrgSalesforceCard) ------
-
-function orgSalesforceCardView(status, loading) {
-  const connected = status?.connected === true;
-  const label = loading ? "Checking…" : connected ? "Connected" : "Not connected";
-  const colorToken = loading ? "textFaint" : connected ? "success" : "textFaint";
-  const actionLabel = connected ? "Manage" : "Connect Salesforce";
-  return { connected, label, colorToken, actionLabel };
-}
 
 // --- mirrored from lib/workspace-context.tsx (the `can` derivation) --------
 
@@ -76,43 +48,6 @@ function orgGmailCardView(integration, loading) {
   const actionLabel = connected ? "Manage" : needsReauth ? "Reconnect Gmail" : "Connect Gmail";
   return { connected, needsReauth, label, actionLabel };
 }
-
-describe("Organisation Salesforce card status derivation", () => {
-  it("reports Not connected with no status yet", () => {
-    const v = orgSalesforceCardView(null, false);
-    assert.equal(v.connected, false);
-    assert.equal(v.label, "Not connected");
-    assert.equal(v.actionLabel, "Connect Salesforce");
-  });
-
-  it("reports Checking while the status request is in flight", () => {
-    const v = orgSalesforceCardView(null, true);
-    assert.equal(v.label, "Checking…");
-  });
-
-  it("reports Connected once the workspace has a connection", () => {
-    const v = orgSalesforceCardView({ connected: true }, false);
-    assert.equal(v.connected, true);
-    assert.equal(v.label, "Connected");
-    assert.equal(v.colorToken, "success");
-    assert.equal(v.actionLabel, "Manage");
-  });
-
-  it("never reports Connected while still loading, even with a stale status", () => {
-    // Guards against a stale previous fetch's status leaking through the
-    // loading state of a NEW workspace's fetch after a workspace switch.
-    const v = orgSalesforceCardView({ connected: true }, true);
-    assert.equal(v.label, "Checking…");
-  });
-
-  it("Loading and Not-connected use the same neutral colour, Connected does not", () => {
-    const loading = orgSalesforceCardView(null, true);
-    const notConnected = orgSalesforceCardView(null, false);
-    const connected = orgSalesforceCardView({ connected: true }, false);
-    assert.equal(loading.colorToken, notConnected.colorToken);
-    assert.notEqual(connected.colorToken, notConnected.colorToken);
-  });
-});
 
 describe("workspace capability check (`can`)", () => {
   it("is false with no capabilities map at all", () => {
@@ -185,65 +120,7 @@ function sources() {
                    text: readFileSync(f, "utf8") }));
 }
 
-describe("Organisation Salesforce scope isolation (source-level)", () => {
-  it("getOrgSalesforceAuthorizeUrl is called only from the org-scoped connect flow", () => {
-    const offenders = sources()
-      .filter((f) => f.path !== "lib/api.ts" && f.path !== "src/app/org-salesforce.tsx")
-      .filter((f) => /\bgetOrgSalesforceAuthorizeUrl\s*\(/.test(f.text))
-      .map((f) => f.path);
-    assert.deepEqual(offenders, []);
-  });
-
-  it("disconnectOrgSalesforce is called only from the org-scoped manage screen", () => {
-    const offenders = sources()
-      .filter((f) => f.path !== "lib/api.ts" && f.path !== "src/app/org-salesforce.tsx")
-      .filter((f) => /\bdisconnectOrgSalesforce\s*\(/.test(f.text))
-      .map((f) => f.path);
-    assert.deepEqual(offenders, []);
-  });
-
-  it("saveOrgSalesforceConfig is called only from the org-scoped config screen", () => {
-    const offenders = sources()
-      .filter((f) => f.path !== "lib/api.ts" && f.path !== "src/app/org-salesforce-config.tsx")
-      .filter((f) => /\bsaveOrgSalesforceConfig\s*\(/.test(f.text))
-      .map((f) => f.path);
-    assert.deepEqual(offenders, []);
-  });
-
-  it("Personal Salesforce's own screen never calls an Organisation-scoped function", () => {
-    // The hard regression requirement, enforced structurally: salesforce.tsx
-    // and salesforce-config.tsx (Personal, Phase 1) must not have grown any
-    // reference to the Organisation-scoped API surface added in Phase 2D.
-    const ORG_SCOPED = /\b(getOrgSalesforce\w+|saveOrgSalesforceConfig|disconnectOrgSalesforce)\s*\(/;
-    for (const path of ["src/app/salesforce.tsx", "src/app/salesforce-config.tsx"]) {
-      const text = readFileSync(join(ROOT, path), "utf8");
-      assert.doesNotMatch(text, ORG_SCOPED,
-        `${path} must not call any Organisation-scoped Salesforce function`);
-    }
-  });
-
-  it("the org-scoped screens never call a Personal-only Salesforce function", () => {
-    // The inverse check: the workspace-scoped screens must not accidentally
-    // fall back to reading/writing the PERSONAL connection.
-    const PERSONAL_ONLY =
-      /\b(getSalesforceStatus|getSalesforceConfig|saveSalesforceConfig|disconnectSalesforce|getSalesforceAuthorizeUrl|getSalesforceObjects|getSalesforceFields)\s*\(/;
-    for (const path of ["src/app/org-salesforce.tsx", "src/app/org-salesforce-config.tsx"]) {
-      const text = readFileSync(join(ROOT, path), "utf8");
-      assert.doesNotMatch(text, PERSONAL_ONLY,
-        `${path} must not call any Personal-only Salesforce function`);
-    }
-  });
-
-  it("the org-scoped screens gate mutating actions on a capability check", () => {
-    // RBAC must be visible in the source as a real branch, not just present
-    // in a comment — display gating only, but it must actually exist.
-    for (const path of ["src/app/org-salesforce.tsx", "src/app/org-salesforce-config.tsx"]) {
-      const text = readFileSync(join(ROOT, path), "utf8");
-      assert.match(text, /can\(\s*["']manage_integrations["']\s*\)/,
-        `${path} must gate on the manage_integrations capability`);
-    }
-  });
-
+describe("credential hygiene (source-level)", () => {
   it("no source reads a refresh token, access token or client secret", () => {
     const FORBIDDEN = /\b(refresh_token|access_token|client_secret)\b/;
     const offenders = sources()
@@ -256,10 +133,7 @@ describe("Organisation Salesforce scope isolation (source-level)", () => {
 // ---------------------------------------------------------------------------
 // Connected Apps (Personal) vs Organisation Integrations: two disjoint
 // views on ONE screen (src/app/integrations/index.tsx), not two copies of
-// the same catalog. See that file's own module comment for the full
-// rationale — showing Personal Salesforce and Organisation Salesforce
-// together (as this screen briefly did) was itself the confusion being
-// fixed here, and Gmail must never grow an organisation-scoped twin.
+// the same catalog. Gmail must never grow an organisation-scoped twin.
 // ---------------------------------------------------------------------------
 describe("Connected Apps vs Organisation Integrations scope split (source-level)", () => {
   const screen = () => readFileSync(join(ROOT, "src/app/integrations/index.tsx"), "utf8");
@@ -300,21 +174,20 @@ describe("Connected Apps vs Organisation Integrations scope split (source-level)
     assert.doesNotMatch(orgBlock, /SECTIONS\.map/,
       "Organisation mode must not render the Personal per-category catalog loop");
   });
-
-  it("Organisation mode renders exactly one OrgSalesforceCard and one OrgGmailCard, nothing else provider-shaped", () => {
+  it("Organisation mode renders the Gmail card, and Salesforce only as the gated Site entry", () => {
     const { orgBlock } = splitBranches();
-    assert.match(orgBlock, /<OrgSalesforceCard/);
     assert.match(orgBlock, /<OrgGmailCard/);
     assert.doesNotMatch(orgBlock, /<IntegrationCard/,
       "Organisation mode must not render the generic Personal IntegrationCard");
+    assert.match(orgBlock, /SITE_SALESFORCE_ENABLED \? \([\s\S]*?<SiteSalesforceEntry/);
   });
 
   it("the Personal (non-organisation) branch still maps every catalog category, unchanged", () => {
     const { personalBlock } = splitBranches();
     assert.match(personalBlock, /SECTIONS\.map/);
     assert.match(personalBlock, /<IntegrationCard/);
-    assert.doesNotMatch(personalBlock, /<OrgSalesforceCard|<OrgGmailCard/,
-      "Personal mode must not render either Organisation-scoped card");
+    assert.doesNotMatch(personalBlock, /<OrgGmailCard/,
+      "Personal mode must not render the Organisation-scoped card");
   });
 
   it("OrgGmailCard reads useGmail()/useIntegration, never a second Gmail fetch", () => {
@@ -344,12 +217,6 @@ describe("Connected Apps vs Organisation Integrations scope split (source-level)
     assert.deepEqual(offenders, []);
   });
 
-  it("Organisation Salesforce card copy says organisation-owned, not personal", () => {
-    const text = screen();
-    assert.match(text, /Organisation connection/);
-    assert.match(text, /Managed by organisation/);
-  });
-
   it("Organisation Gmail card copy makes clear it is the user's own account", () => {
     const text = screen();
     assert.match(text, /Your Gmail account/);
@@ -374,14 +241,5 @@ describe("logo fallback (integration-logos.tsx registry)", () => {
     const text = readFileSync(join(ROOT, "lib/integration-logos.tsx"), "utf8");
     assert.match(text, /if \(!Logo\)/,
       "IntegrationLogo must branch on a missing registry entry");
-  });
-});
-
-describe("the Organisation Salesforce status shape never carries a credential", () => {
-  it("OrgSalesforceStatus type declares no token field", () => {
-    const text = readFileSync(join(ROOT, "lib/api.ts"), "utf8");
-    const typeMatch = text.match(/export type OrgSalesforceStatus = \{([\s\S]*?)\n\};/);
-    assert.ok(typeMatch, "OrgSalesforceStatus type not found");
-    assert.doesNotMatch(typeMatch[1], /token/i);
   });
 });

@@ -1,50 +1,84 @@
-// src/app/(tabs)/index.tsx — MinuteX: every brief, newest first, all sources.
+// src/app/(tabs)/index.tsx — the Desk: find a brief, see what's recent, record.
 //
-// "Workspace" edition. MinuteX is a stack of soft, shadowed cards on a light
-// gray canvas: a masthead, a stat strip, then meeting cards with a rounded
-// source-icon bubble, a bold headline, a quiet summary, and a blue accent
-// reserved for the single primary action per row. Recordings from every source
-// (MinuteX device, phone, uploaded file) appear together. Every state is
-// designed: skeletons while loading, a stated empty state, error with retry,
-// pull-to-refresh, and a background poll while anything is still being
-// written up.
+// The hierarchy is deliberate and short:
+//
+//   MinuteX                            tasks · notifications · you
+//   [ Search briefs ]                        ┐ pinned, never scroll away
+//   [ All | Filed | In the works ]  Filter   ┘
+//   Today
+//     brief
+//     brief
+//   Yesterday …
+//                                     (record button in the tab bar)
+//
+// What it is NOT is a dashboard. It is a brief INBOX: the list is the
+// content, and everything above it exists to find something in it. The row of
+// Tasks / Calendar / People cards is gone from here — Tasks (the one that is
+// only reachable from this screen) is a badged icon in the header; Calendar
+// stays one tap inside Tasks; People stays under You › Contacts. The stat
+// strip and the row of equal-weight icon tiles are gone, as are the decorative waveform on every row (it was
+// drawn from a hash of the key, not the audio) and the progress bar that was
+// always 62% full whatever the backend said. A brief in the works now shows
+// the stage it is actually at.
+//
+// Every state is designed: skeletons while loading, a stated empty state,
+// error with retry, pull-to-refresh, and a background poll while anything is
+// still being written up. Recordings from every source (MinuteX device, phone,
+// uploaded file) appear together.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert, Animated, Easing, Pressable, RefreshControl, ScrollView, SectionList,
+  Alert, Pressable, RefreshControl, ScrollView, SectionList,
   StyleSheet, Text, View,
-  type LayoutChangeEvent, type NativeScrollEvent, type NativeSyntheticEvent,
 } from "react-native";
+import Reanimated, {
+  cancelAnimation, Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming,
+} from "react-native-reanimated";
 import { useFocusEffect, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Icon, type IconName } from "../../../lib/icons";
-import { S, R, ELEV, CAPS, FONT, TABULAR, useTheme, ColorScale } from "../../../lib/theme";
+import { Icon } from "../../../lib/icons";
+import { S, R, FONT, GUTTER, useTheme, ColorScale } from "../../../lib/theme";
+import { PulseDot } from "../../../lib/motion";
 import { NotificationBell } from "../../../lib/notification-bell";
 import {
-  Avatar, Button, Chip, EmptyState, ErrorText, IconCircle, SearchBar,
-  SkeletonCard,
+  Avatar, Button, EmptyState, ErrorText, SearchBar, SkeletonCard,
 } from "../../../lib/ui";
-import { Waveform } from "../../../lib/waveform";
+import {
+  AppHeader, BottomSheet, BriefCard, IconButton, SegmentedControl, SectionHeader,
+  SheetAction, type GroupPosition,
+} from "../../../lib/kit";
 import { useDevice } from "../../../lib/device-context";
+import { useRecorder } from "../../../lib/use-recorder";
+import { isPaused } from "../../../lib/rec-store";
 import {
   getRecordings, clearToken, trashRecording, isStillUploading,
   RecordingSummary, ApiError, getAllTasks, getWorkspaceMembers, getMe,
-  ApiMember,
+  ApiMember, UserProfile,
 } from "../../../lib/api";
 import { useWorkspace } from "../../../lib/workspace-context";
 import { fmtDuration, sourceMeta, statusMeta } from "../../../lib/sources";
+import { stageLabel } from "../../../lib/processing";
+import { offerBriefReadyPrompt } from "../../../lib/push";
 import {
   useUploads, dismissUpload, retryUpload, abandonUpload,
 } from "../../../lib/uploads";
 
 type Filter = "all" | "ready" | "processing";
-type Section = { title: string; data: RecordingSummary[] };
 
-// "Monday, 3 August" — the masthead dateline.
-function fmtToday() {
-  return new Date().toLocaleDateString(undefined, {
-    weekday: "long", day: "numeric", month: "long",
-  });
-}
+// One source for the status tabs, so the width measurement below measures
+// exactly the labels the control renders.
+const STATUS_OPTIONS: { key: Filter; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "ready", label: "Filed" },
+  { key: "processing", label: "In the works" },
+];
+
+// SegmentedControl geometry (lib/kit.tsx): 2pt track padding each side, and
+// each segment pads its label by S.xs each side. BREATHING is the minimum
+// clear space either side of the longest label so it never kisses the thumb.
+const SEG_TRACK_PAD = 4;
+const SEG_LABEL_PAD = 8;
+const SEG_BREATHING = 8;
+type Section = { title: string; data: RecordingSummary[] };
 
 function fmtTime(iso: string) {
   if (!iso) return "";
@@ -75,17 +109,6 @@ function dayLabel(iso: string): string {
   return fmtDay(d);
 }
 
-// The per-row stamp: "14:32" for today, "Yesterday · 14:32", and a real date
-// once the brief is older than that. Rows carry their own day so the stamp
-// still reads correctly away from its section header.
-function fmtWhen(iso: string) {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
-  const day = dayLabel(iso);
-  return day === "Today" ? fmtTime(iso) : `${day} · ${fmtTime(iso)}`;
-}
-
 // Group recordings into one section per day, newest first. Days older than
 // yesterday are titled with their real date rather than pooled into a vague
 // "This week" / "Earlier" bucket.
@@ -101,53 +124,42 @@ function groupByDate(items: RecordingSummary[]): Section[] {
   return sections;
 }
 
-// Total captured time this week, rendered "4h 12m" for the masthead.
-// duration arrives as number | string | null — DynamoDB Decimals serialize as
-// strings — so coerce before summing.
-function weekCaptured(items: RecordingSummary[]) {
-  const since = Date.now() - 7 * 864e5;
-  const secs = items.reduce((acc, r) => {
-    const t = new Date(r.created_at).getTime();
-    if (isNaN(t) || t < since) return acc;
-    const d = Number(r.duration);
-    return acc + (isFinite(d) ? d : 0);
-  }, 0);
-  if (!secs) return null;
-  const h = Math.floor(secs / 3600);
-  const m = Math.round((secs % 3600) / 60);
-  return h ? `${h}h ${m}m` : `${m}m`;
+function positionIn(index: number, count: number): GroupPosition {
+  if (count === 1) return "single";
+  if (index === 0) return "first";
+  if (index === count - 1) return "last";
+  return "middle";
 }
 
-// Indeterminate progress — a hairline sweeping while the device uploads.
-// Square ends, ink-weight: a rule that happens to move, not a candy bar.
+// Indeterminate progress — a hairline sweeping while bytes move and the
+// uploader cannot report a total. It claims only "something is moving".
 function SweepBar({ color, track }: { color: string; track: string }) {
-  const x = useRef(new Animated.Value(0)).current;
+  const x = useSharedValue(0);
   const [w, setW] = useState(0);
   useEffect(() => {
-    const loop = Animated.loop(
-      Animated.timing(x, { toValue: 1, duration: 1300, easing: Easing.inOut(Easing.ease), useNativeDriver: true })
-    );
-    loop.start();
-    return () => loop.stop();
+    x.set(withRepeat(withTiming(1, { duration: 1300, easing: Easing.inOut(Easing.ease) }), -1, false));
+    return () => cancelAnimation(x);
   }, [x]);
-  const translateX = x.interpolate({ inputRange: [0, 1], outputRange: [-80, Math.max(w, 80)] });
+  const sweep = useAnimatedStyle(() => ({
+    transform: [{ translateX: -80 + x.get() * (Math.max(w, 80) + 80) }],
+  }));
   return (
     <View
-      style={{ height: 3, backgroundColor: track, overflow: "hidden", marginTop: 10 }}
+      style={{ height: 3, backgroundColor: track, overflow: "hidden", marginTop: 10, borderRadius: 2 }}
       onLayout={(e) => setW(e.nativeEvent.layout.width)}
     >
-      <Animated.View style={{ width: 80, height: 3, backgroundColor: color, transform: [{ translateX }] }} />
+      <Reanimated.View style={[{ width: 80, height: 3, backgroundColor: color }, sweep]} />
     </View>
   );
 }
 
-// Determinate progress — real bytes on the wire, reported by the native
-// uploader. Same 3px rule as SweepBar so the two are interchangeable; this
-// one just knows how far along it is.
+// Determinate progress — REAL bytes on the wire, reported by the native
+// uploader. The only bar on this screen that shows a fraction, because it is
+// the only thing here that genuinely knows one.
 function ProgressBar({ value, color, track }: { value: number; color: string; track: string }) {
   const pct = Math.max(0, Math.min(1, value));
   return (
-    <View style={{ height: 3, backgroundColor: track, overflow: "hidden", marginTop: 10 }}>
+    <View style={{ height: 3, backgroundColor: track, overflow: "hidden", marginTop: 10, borderRadius: 2 }}>
       <View style={{ width: `${pct * 100}%`, height: 3, backgroundColor: color }} />
     </View>
   );
@@ -161,394 +173,77 @@ function fmtBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-// One cell of the stat strip under the masthead.
-function Stat({
-  value, label, tint, last, C,
-}: { value: string; label: string; tint?: string; last?: boolean; C: ColorScale }) {
-  return (
-    <View style={{
-      flex: 1, paddingHorizontal: 14, paddingVertical: 12,
-      borderRightWidth: last ? 0 : 1, borderRightColor: C.border,
-    }}>
-      {/* TABULAR carries fontFamily (mono) — spread it FIRST so the sans
-          family below wins. Stat figures are extrabold with tabular figures,
-          not mono; mono is reserved for timecodes. */}
-      <Text style={{ ...TABULAR, fontFamily: FONT.extrabold, fontSize: 20, color: tint ?? C.text }}>
-        {value}
-      </Text>
-      <Text style={{ ...CAPS, fontSize: 10, letterSpacing: 1.2, color: C.textFaint, marginTop: 2 }}>
-        {label}
-      </Text>
-    </View>
-  );
-}
-
-type WorkspaceTile = {
-  key: string; label: string; icon: IconName; path: string; badge?: string;
-};
-
-// The four workspace destinations, in one place. Both the full row and the
-// collapsed strip in the sticky bar render from this, so the two can never
-// drift apart on destinations, icons, or the open-task badge.
-function workspaceTiles(openTasks: number | null): WorkspaceTile[] {
-  return [
-    {
-      key: "tasks", label: "Tasks", icon: "checklist", path: "/tasks",
-      // Capped at 99+: the badge is a glanceable "how much", and a real
-      // account already carries 61 open tasks, so three digits would either
-      // overflow the circle or shrink the type past legibility.
-      badge: openTasks != null && openTasks > 0
-        ? (openTasks > 99 ? "99+" : String(openTasks))
-        : undefined,
-    },
-    { key: "calendar", label: "Calendar", icon: "calendar", path: "/calendar" },
-    { key: "contacts", label: "People", icon: "person.2.fill", path: "/contacts" },
-  ];
-}
-
-// The collapsed workspace strip — four icons that live in the sticky control
-// bar once the full row has scrolled away. Icon-only, sized to sit beside the
-// search field without out-shouting it; the labels are gone but the badge
-// stays, because "4 open tasks" is the reason to tap.
-function WorkspaceStrip({
-  st, C, openTasks, onPress,
-}: {
-  st: ReturnType<typeof buildStyles>;
-  C: ColorScale;
-  openTasks: number | null;
-  onPress: (path: string) => void;
-}) {
-  return (
-    <View style={st.wsStrip}>
-      {workspaceTiles(openTasks).map((t) => (
-        <Pressable
-          key={t.key}
-          onPress={() => onPress(t.path)}
-          hitSlop={4}
-          style={({ pressed }) => [st.wsStripBtn, pressed && { opacity: 0.6 }]}
-          accessibilityRole="button"
-          accessibilityLabel={t.badge ? `${t.label}, ${t.badge} open` : t.label}
-        >
-          <View style={st.wsIconWrap}>
-            <Icon name={t.icon} tintColor={C.textDim} size={18} />
-            {t.badge ? (
-              <View style={st.wsStripBadge}>
-                <Text style={st.wsStripBadgeTxt}>{t.badge}</Text>
-              </View>
-            ) : null}
-          </View>
-        </Pressable>
-      ))}
-    </View>
-  );
-}
-
-// The Workspace row — Tasks / Calendar / Folders / People, directly on
-// MinuteX.
-//
-// These were briefly buried under You › Organize, which was wrong: they are
-// places you WORK, not preferences you set once. Tasks especially — "what do
-// I owe" is a daily question, and it does not belong behind two taps in a
-// settings list.
-//
-// Tasks leads and carries a live count, so the row reports state rather than
-// just offering navigation. The count is omitted (not shown as 0) when it
+// The open-task count on the header's Tasks button. Capped at 99+ (a real
+// account already carries 61 open tasks), and omitted — never "0" — when it
 // could not be fetched, because a wrong 0 reads as "nothing to do".
-//
-// This full row scrolls away with the masthead; WorkspaceStrip above keeps
-// the same four destinations reachable from the sticky bar once it has gone.
-function WorkspaceRow({
-  st, C, openTasks, onPress,
-}: {
-  st: ReturnType<typeof buildStyles>;
-  C: ColorScale;
-  openTasks: number | null;
-  onPress: (path: string) => void;
-}) {
-  const tiles = workspaceTiles(openTasks);
-  return (
-    <View style={st.wsRow}>
-      {tiles.map((t, i) => (
-        <Pressable
-          key={t.key}
-          onPress={() => onPress(t.path)}
-          style={({ pressed }) => [
-            st.wsTile,
-            i < tiles.length - 1 && {
-              borderRightWidth: 1, borderRightColor: C.border,
-            },
-            pressed && { opacity: 0.6 },
-          ]}
-          accessibilityRole="button"
-          accessibilityLabel={
-            t.badge ? `${t.label}, ${t.badge} open` : t.label
-          }
-        >
-          <View style={st.wsIconWrap}>
-            <Icon name={t.icon} tintColor={C.primary} size={19} />
-            {t.badge ? (
-              <View style={st.wsBadge}>
-                <Text style={st.wsBadgeTxt}>{t.badge}</Text>
-              </View>
-            ) : null}
-          </View>
-          <Text style={st.wsLabel}>{t.label}</Text>
-        </Pressable>
-      ))}
-    </View>
-  );
+function tasksBadge(openTasks: number | null): string | undefined {
+  if (openTasks == null || openTasks <= 0) return undefined;
+  return openTasks > 99 ? "99+" : String(openTasks);
 }
 
-// MinuteX's top-left device pill — the hardware's entry point since the
-// bottom bar went to three tabs (Desk · Record · You). It reports the live
-// link in one glance and taps through to /devices for the full dashboard.
-//
-// Four states, because "connected or not" isn't the whole truth: mid-connect
-// is its own state (the user just tapped Reconnect and deserves to see it),
-// and never-paired is different from paired-but-away — the first needs a
-// pairing trip, the second just needs the device switched on. Recording
-// outranks all of them: if the hardware is capturing, that's the headline.
-function DevicePill({
-  st, C,
-}: { st: ReturnType<typeof buildStyles>; C: ColorScale }) {
-  const router = useRouter();
-  const { device, status, connState } = useDevice();
-  const connected = connState === "connected";
-  const linking = connState === "connecting" || connState === "reconnecting";
-  const recording = connected && status?.isRecording === true;
-
-  // Danger red is reserved for recording — an idle-but-offline device is not
-  // an error, so it gets the neutral faint treatment rather than a red alarm.
-  const { tint, label } =
-    recording ? { tint: C.danger, label: "Recording" }
-      : connected ? { tint: C.success, label: device?.name ?? "Device" }
-        : linking ? { tint: C.warn, label: "Connecting" }
-          : device ? { tint: C.textFaint, label: "Device off" }
-            : { tint: C.textFaint, label: "No device" };
-
-  // Tinted background only when there's something to say; an absent or
-  // sleeping device sits on the plain inset surface.
-  const live = recording || connected || linking;
-
-  return (
-    <View style={st.deviceRow}>
-      <Pressable
-        onPress={() => router.push("/devices")}
-        style={({ pressed }) => [
-          st.devicePill,
-          {
-            backgroundColor: live ? tint + "1A" : C.surface2,
-            borderColor: live ? tint + "40" : C.border,
-          },
-          pressed && { opacity: 0.7 },
-        ]}
-        accessibilityRole="button"
-        accessibilityLabel={`Device: ${label}. Open device settings`}
-      >
-        <View style={[st.deviceDot, { backgroundColor: tint }]} />
-        <Icon name="cpu.fill" tintColor={live ? tint : C.textFaint} size={13} />
-        <Text style={[st.deviceLabel, { color: live ? tint : C.textDim }]} numberOfLines={1}>
-          {label}
-        </Text>
-      </Pressable>
-    </View>
-  );
-}
-
-function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
+function buildStyles(C: ColorScale) {
   return StyleSheet.create({
-    // No horizontal padding here any more. The list is full-bleed so the
-    // sticky control layer can span edge to edge and paint an opaque band
-    // across the whole width; the 20px gutter now sits on each block inside
-    // (dashboard, controls, section heads, cards) via `gutter`.
     container: { flex: 1, backgroundColor: C.bg },
-    gutter: { paddingHorizontal: 20 },
-    // The pinned bar: search, plus the workspace icons once they collapse.
-    // Sits above the list as a sibling, so it never scrolls. Opaque and
-    // hairline-separated, because cards scroll beneath its lower edge.
-    bar: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: S.sm,
-      paddingHorizontal: 20, paddingTop: S.sm, paddingBottom: S.md,
-      backgroundColor: C.bg,
+    // The pinned header: title + actions, then search. Opaque and hairline-
+    // separated, because the list scrolls beneath its lower edge.
+    pinned: {
+      paddingHorizontal: GUTTER, paddingBottom: S.md, backgroundColor: C.bg,
       borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.border,
     },
-    hidden: { display: "none" as const },
-    // The collapsed workspace strip. Icon-only and tucked against the search
-    // field: it must be reachable at a glance without competing with it.
-    wsStrip: { flexDirection: "row" as const, alignItems: "center" as const, gap: 2 },
-    wsStripBtn: { paddingHorizontal: 6, paddingVertical: 6 },
-    // Smaller than the full row's badge (17px) to suit an 18px icon, and
-    // bordered in the page background so it reads as sitting ON the icon
-    // rather than colliding with the neighbouring one.
-    wsStripBadge: {
-      position: "absolute" as const, top: -5, right: -8,
-      minWidth: 14, height: 14, borderRadius: 7, paddingHorizontal: 3,
-      backgroundColor: C.primary, alignItems: "center" as const,
-      justifyContent: "center" as const,
-      borderWidth: 1.5, borderColor: C.bg,
+    // Search, then the filters, both pinned: finding a brief never needs a
+    // scroll back to the top.
+    filterRow: { flexDirection: "row", alignItems: "center", gap: S.sm, marginTop: S.sm },
+    searchRow: { flexDirection: "row", alignItems: "center", gap: S.sm, marginTop: S.sm },
+    // Off-screen, invisible copies of the tab labels — measured, never seen.
+    // A fixed wide box so each label lays out at its natural single-line
+    // width; alignSelf on each Text stops the column stretching it.
+    measure: { position: "absolute", opacity: 0, left: 0, top: 0, width: 1000 },
+    // The people filter's entry point. Deliberately small: it is a
+    // refinement, and must not read as a fourth segment.
+    filterBtn: {
+      flexDirection: "row", alignItems: "center", gap: 6, flexShrink: 0,
+      minHeight: 40, maxWidth: 124, paddingHorizontal: S.md, borderRadius: R.pill,
+      borderWidth: StyleSheet.hairlineWidth,
     },
-    wsStripBadgeTxt: {
-      ...TABULAR, fontFamily: FONT.bold, fontSize: 8.5,
-      color: C.textOnPrimary,
-    },
-    // Error / skeletons / empty state, under the sticky controls.
-    listState: { paddingHorizontal: 20 },
-    // Masthead: dateline over a bold display title, no rule — the page
-    // background does the separating, cards carry their own edges.
-    masthead: {
-      flexDirection: "row" as const, alignItems: "flex-end" as const,
-      justifyContent: "space-between" as const,
-      paddingBottom: 4,
-    },
-    // Device pill — top-left of the page, above the dateline. This is where
-    // the hardware lives now that the bottom bar is three tabs: connectivity
-    // is a status you glance at, so it states the link and only then offers
-    // the trip to /devices. Sized as a chip, not a button: it must not
-    // out-shout "MinuteX" directly beneath it.
-    deviceRow: {
-      flexDirection: "row" as const, alignItems: "center" as const,
-      marginBottom: 10,
-    },
-    devicePill: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 7,
-      alignSelf: "flex-start" as const,
-      paddingLeft: 9, paddingRight: 11, paddingVertical: 7,
-      borderRadius: R.pill, borderWidth: 1,
-    },
-    // The state itself: a dot, coloured by link state, doing the work a
-    // second line of text would otherwise do.
-    deviceDot: { width: 7, height: 7, borderRadius: 4 },
-    deviceLabel: {
-      ...CAPS, fontFamily: FONT.bold, fontSize: 10, letterSpacing: 1.1,
-    },
-    dateline: { ...CAPS, fontSize: 11, color: C.textFaint },
-    title: { ...T.display, marginTop: 6 },
-    weekFig: { ...TABULAR, fontFamily: FONT.extrabold, fontSize: 22, lineHeight: 22, color: C.primary },
-    weekLabel: { ...CAPS, fontSize: 10, letterSpacing: 1.4, color: C.textFaint },
-    statStrip: {
-      flexDirection: "row" as const, marginTop: 18,
-      backgroundColor: C.surface, borderRadius: R.card, overflow: "hidden" as const,
-      shadowColor: C.shadow, ...ELEV.sm,
-    },
-    // Workspace row: same card stock and hairline dividers as the stat strip
-    // directly above it, so the two read as one block of "where things are"
-    // rather than two competing widgets.
-    wsRow: {
-      flexDirection: "row" as const, marginTop: S.sm,
-      backgroundColor: C.surface, borderRadius: R.card,
-      overflow: "hidden" as const, shadowColor: C.shadow, ...ELEV.sm,
-    },
-    wsTile: {
-      flex: 1, alignItems: "center" as const, justifyContent: "center" as const,
-      paddingVertical: 13, gap: 6,
-    },
-    wsIconWrap: { position: "relative" as const },
-    wsLabel: {
-      ...CAPS, fontFamily: FONT.bold, fontSize: 9.5, letterSpacing: 1.1,
-      color: C.textDim,
-    },
-    // Count badge on the Tasks tile. Sits on the icon rather than beside the
-    // label so the three tiles keep identical text metrics.
-    wsBadge: {
-      position: "absolute" as const, top: -5, right: -11,
-      minWidth: 17, height: 17, borderRadius: 9, paddingHorizontal: 4,
-      backgroundColor: C.primary, alignItems: "center" as const,
-      justifyContent: "center" as const,
-    },
-    wsBadgeTxt: {
-      ...TABULAR, fontFamily: FONT.bold, fontSize: 10,
-      color: C.textOnPrimary,
-    },
-    // Live bar: blue-accented card, the one thing on the page happening now.
+    filterTxt: { fontFamily: FONT.semibold, fontSize: 13.5, flexShrink: 1 },
+    gutter: { paddingHorizontal: GUTTER },
+    listState: { paddingHorizontal: GUTTER },
+
+    // A live state that outranks the list: something is being recorded now.
     liveBar: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 10,
-      marginTop: S.lg, backgroundColor: C.primary, borderRadius: R.card,
-      paddingHorizontal: 16, paddingVertical: 14,
-      shadowColor: C.shadow, ...ELEV.md,
+      flexDirection: "row", alignItems: "center", gap: S.md,
+      marginTop: S.lg, backgroundColor: C.surface, borderRadius: R.card,
+      borderWidth: 1, borderColor: C.recording,
+      paddingHorizontal: S.lg, minHeight: 56,
     },
-    liveDot: { width: 8, height: 8, borderRadius: 5, backgroundColor: C.textOnPrimary },
-    liveTitle: { fontFamily: FONT.bold, fontSize: 13, color: C.textOnPrimary },
-    liveSub: { fontFamily: FONT.regular, fontSize: 11, color: "rgba(255,255,255,0.8)", marginTop: 1 },
-    // Transfer / upload notices — soft shadowed cards, matching the rest.
+    liveTitle: { fontFamily: FONT.semibold, fontSize: 14.5, color: C.text },
+    liveSub: { fontFamily: FONT.regular, fontSize: 12.5, color: C.textDim, marginTop: 1 },
+
+    // Transfer / upload notices — flat, bordered, one per job.
     notice: {
-      marginTop: S.md, backgroundColor: C.surface, borderRadius: R.card, padding: 14,
-      shadowColor: C.shadow, ...ELEV.sm,
+      marginTop: S.md, backgroundColor: C.surface, borderRadius: R.card, padding: S.lg,
+      borderWidth: StyleSheet.hairlineWidth, borderColor: C.border,
     },
-    noticeTitle: { fontFamily: FONT.semibold, fontSize: 13.5, color: C.text },
-    noticeSub: { ...T.caption, marginTop: 2 },
-    filters: { flexDirection: "row" as const, gap: 7, marginTop: S.lg, marginBottom: 2 },
-    // The "whose meetings" row. Gap matches `filters` so the two read as one
-    // filter block; the padding is on the contentContainer because the row
-    // scrolls horizontally.
-    whoseRow: { flexDirection: "row" as const, gap: 7, marginTop: 9, paddingRight: S.lg },
-    // "Recorded by" on another person's brief. Sits under the headline, at
-    // caption weight — it is provenance, not the point of the card.
-    recordedBy: {
-      flexDirection: "row" as const, alignItems: "center" as const,
-      gap: 6, marginTop: 7,
-    },
-    recordedByText: {
-      fontFamily: FONT.medium, fontSize: 11.5, color: C.textDim, flexShrink: 1,
-    },
-    // Day header. Sticky now (RN sticks all section headers or none), so it
-    // keeps its opaque background and carries the gutter itself. marginTop
-    // became paddingTop: a sticky header's margin sits outside the pinned
-    // box, which would leave a transparent strip above it with cards
-    // visible through the gap.
-    sectionHead: {
-      flexDirection: "row" as const, alignItems: "baseline" as const,
-      justifyContent: "space-between" as const,
-      paddingHorizontal: 20,
-      paddingTop: 16, paddingBottom: 8, marginBottom: 10,
-      backgroundColor: C.bg,
-    },
-    // A brief card: rounded, shadowed surface — the primary visual unit.
-    // Design unchanged; the 20px gutter it used to inherit from `container`
-    // is now marginHorizontal, since the list itself is full-bleed.
-    brief: {
-      backgroundColor: C.surface, borderRadius: R.card, padding: S.lg,
-      marginHorizontal: 20,
-      marginBottom: S.md, shadowColor: C.shadow, ...ELEV.sm,
-    },
-    briefTop: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: S.md },
-    // The kicker line wraps rather than overflowing. Source labels are
-    // translated/variable ("UPLOADED FILE", "MINUTEX DEVICE") and the
-    // timecode beside them is a fixed-width run, so on a narrow phone the
-    // two genuinely cannot share one line — `wrap` lets the timecode drop
-    // to its own line instead of being pushed out of the card.
-    kickerRow: {
-      flexDirection: "row" as const, alignItems: "center" as const,
-      flexWrap: "wrap" as const, columnGap: 8, rowGap: 2,
-    },
-    // flexShrink so a long source label yields before it can push the
-    // timecode off the card; the label still ellipsizes rather than clip.
-    kicker: {
-      ...CAPS, fontFamily: FONT.bold, fontSize: 10, letterSpacing: 1.4,
-      flexShrink: 1,
-    },
-    // Time + duration is a timecode — mono, per the type system's third job.
-    // flexShrink: 0 — a timecode that ellipsizes tells you nothing, so the
-    // label above yields first and this stays whole (or wraps to its own row).
-    briefMeta: { ...TABULAR, fontSize: 11, color: C.textFaint, flexShrink: 0 },
-    headline: { ...T.headlineSm, marginTop: 5 },
-    summary: { ...T.bodyDim, marginTop: 7 },
-    metaRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 14, marginTop: 11 },
-    inlineRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 5 },
-    actionsTxt: { fontFamily: FONT.semibold, fontSize: 11.5, color: C.text },
-    // Still-writing rows show progress instead of a summary.
-    progressRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8, marginTop: 9 },
-    progressTrack: { flex: 1, height: 4, backgroundColor: C.surface2, borderRadius: 2, overflow: "hidden" as const },
-    progressFill: { width: "62%", height: "100%", backgroundColor: C.primary, borderRadius: 2 },
-    progressTxt: { fontFamily: FONT.semibold, fontSize: 11, color: C.primary },
+    noticeTitle: { fontFamily: FONT.semibold, fontSize: 14, color: C.text },
+    noticeSub: { fontFamily: FONT.regular, fontSize: 12.5, lineHeight: 17, color: C.textDim, marginTop: 2 },
+
+    recordedBy: { flexDirection: "row", alignItems: "center", gap: 6 },
+    recordedByText: { fontFamily: FONT.medium, fontSize: 12, color: C.textDim, flexShrink: 1 },
+
+    // Day header. Sticky (RN sticks all section headers or none), so it keeps
+    // an opaque background and carries the gutter itself.
+    sectionHead: { paddingHorizontal: GUTTER, paddingTop: S.lg, backgroundColor: C.bg },
+    itemWrap: { paddingHorizontal: GUTTER },
   });
 }
 
 export default function DeskScreen() {
   const router = useRouter();
-  const { C, T } = useTheme();
+  const { C } = useTheme();
   const insets = useSafeAreaInsets();
-  const st = useMemo(() => buildStyles(C, T), [C, T]);
+  const st = useMemo(() => buildStyles(C), [C]);
   const { device, status, connState } = useDevice();
+  const phone = useRecorder();
   const [items, setItems] = useState<RecordingSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -575,44 +270,26 @@ export default function DeskScreen() {
   const canSeeEveryones = !!active?.capabilities?.view_all_meetings;
   const [whose, setWhose] = useState("");
   const [members, setMembers] = useState<ApiMember[]>([]);
-  const [myUserId, setMyUserId] = useState("");
-  // Open-task count for the Workspace row. A number is what makes that row
-  // worth a place on MinuteX rather than being pure navigation chrome —
-  // "3 open" is a reason to tap; a bare "Tasks" label is not.
+  const [me, setMe] = useState<UserProfile | null>(null);
+  const myUserId = me?.user_id ?? "";
   const [openTasks, setOpenTasks] = useState<number | null>(null);
-  // Whether the workspace tiles have collapsed into the pinned bar.
+
+  // The people filter lives in a sheet rather than a permanent chip row.
+  const [whoseOpen, setWhoseOpen] = useState(false);
+
+  // RESPONSIVE FILTER PLACEMENT — measured, not a breakpoint.
   //
-  // The tiles are NAVIGATION, not decoration: reaching Tasks or Calendar must
-  // never require scrolling a long list back to offset 0. So the full row
-  // scrolls away with the masthead and a compact icon strip takes its place
-  // in the pinned bar.
-  //
-  // The threshold is MEASURED, never guessed. An earlier attempt hardcoded
-  // 120px; the row actually clears the top around 300, so between the two the
-  // full row and the strip were both on screen — the same four destinations
-  // and the same badge, duplicated. `wsBottom` is the row's own bottom edge
-  // reported by onLayout, so the strip can only appear once the row it
-  // replaces has genuinely gone.
-  const [collapsed, setCollapsed] = useState(false);
-  const wsBottom = useRef(0);
-  const onWorkspaceLayout = useCallback((e: LayoutChangeEvent) => {
-    const { y, height } = e.nativeEvent.layout;
-    // `y` is relative to the dashboard (the ListHeaderComponent), whose own
-    // top sits at contentContainerStyle.paddingTop in scroll coordinates —
-    // so add it to compare against contentOffset.y.
-    wsBottom.current = S.lg + y + height;
-  }, []);
-  const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
-    const y = e.nativeEvent.contentOffset.y;
-    // Until onLayout has reported, collapse nothing — showing both is the
-    // one outcome worth avoiding.
-    const edge = wsBottom.current;
-    if (!edge) return;
-    // A 24px dead band: the strip appears once the row is fully past, and
-    // only goes away again once the row is properly back, so a scroll resting
-    // on the boundary cannot flicker between the two.
-    setCollapsed((prev) => (prev ? y > edge - 24 : y > edge));
-  }, []);
+  // The status tabs and the Filter control share one row only when the tabs
+  // still get enough width for their LONGEST label in full. At 360pt that is
+  // not the case (each segment would get ~68pt for "In the works", which needs
+  // ~80pt), so there the Filter control moves up beside Search and the tabs
+  // take the full width. Measuring the real rendered widths (rather than
+  // assuming a font size) keeps this right under the OS text-size setting too.
+  // Until everything is measured, the safe placement (beside Search) is used,
+  // so the first frame can never truncate a tab.
+  const [rowW, setRowW] = useState(0);
+  const [labelW, setLabelW] = useState<Record<string, number>>({});
+  const [filterW, setFilterW] = useState(0);
 
   const load = useCallback(async () => {
     setError("");
@@ -631,23 +308,20 @@ export default function DeskScreen() {
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
-  // Who the caller IS — so their own meetings are not labelled with their own
-  // name on every row. One read, cached for the session by getMe's caller.
+  // Who the caller IS — for the header avatar, and so their own meetings are
+  // not labelled with their own name on every row.
   useEffect(() => {
     let alive = true;
     getMe()
-      .then((u) => { if (alive) setMyUserId(u.user_id); })
-      .catch(() => { /* attribution just shows on every row; not fatal */ });
+      .then((u) => { if (alive) setMe(u); })
+      .catch(() => { /* initials fall back; attribution shows on every row */ });
     return () => { alive = false; };
   }, []);
 
-  // The people to offer in the "whose meetings" filter.
-  //
-  // Skipped entirely unless the caller may actually see everyone's meetings:
-  // fetching a roster to populate a control a MEMBER never sees would be a
-  // request per Desk visit for nothing. `whose` is cleared on the way out so
-  // a demotion (or a workspace switch) cannot leave a stale filter pinned to
-  // someone the caller can no longer query.
+  // The people to offer in the "whose meetings" filter. Skipped entirely
+  // unless the caller may actually see everyone's meetings; `whose` is cleared
+  // on the way out so a demotion (or a workspace switch) cannot leave a stale
+  // filter pinned to someone the caller can no longer query.
   useEffect(() => {
     if (!isOrganisation || !activeId || !canSeeEveryones) {
       setMembers([]);
@@ -662,8 +336,8 @@ export default function DeskScreen() {
   }, [isOrganisation, activeId, canSeeEveryones]);
 
   // The task count rides in its OWN request, deliberately not inside load():
-  // MinuteX's job is to show briefs, and a task-service hiccup must not blank
-  // the page or surface an error over it. A failure just leaves the badge off.
+  // the Desk's job is to show briefs, and a task-service hiccup must not blank
+  // the page or surface an error over it. A failure just leaves the count off.
   useFocusEffect(useCallback(() => {
     let alive = true;
     getAllTasks({ status: "Open", limit: 200 })
@@ -672,16 +346,8 @@ export default function DeskScreen() {
     return () => { alive = false; };
   }, []));
 
-  // Long-press a brief to move it to Trash. The gesture is the deliberate
-  // choice here: react-native-gesture-handler is a dependency but has never
-  // been mounted (there is no GestureHandlerRootView in the root layout), so
-  // swipe-to-delete would mean introducing a whole gesture stack for one
-  // row action. Long-press needs nothing the app isn't already doing, and
-  // it can't be triggered by a scroll the way a swipe can.
-  //
-  // Nothing here destroys anything: the brief goes to Trash, where it can be
-  // restored or permanently deleted. That is what makes clearing MinuteX in
-  // a few presses safe — a mis-tap costs a trip to Trash, not a recording.
+  // Long-press a brief to move it to Trash. Nothing here destroys anything:
+  // the brief goes to Trash, where it can be restored or permanently deleted.
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
 
   const confirmDelete = useCallback((item: RecordingSummary) => {
@@ -700,9 +366,7 @@ export default function DeskScreen() {
           onPress: async () => {
             const key = item.audio_s3_key;
             setDeletingKey(key);
-            // Optimistic: drop the row immediately so a list of failures
-            // clears at the speed the user taps, not the speed of the
-            // network. A failure below puts it straight back via load().
+            // Optimistic: drop the row immediately; a failure puts it back.
             setItems((prev) => prev.filter((r) => r.audio_s3_key !== key));
             try {
               await trashRecording(key);
@@ -726,8 +390,7 @@ export default function DeskScreen() {
   }, [load]);
 
   // In-flight phone/upload jobs from the shared UploadManager. Refresh the
-  // list whenever a job lands so its row flips from "Uploading" without a
-  // manual pull-to-refresh.
+  // list whenever a job lands so its row flips from "Uploading" on its own.
   const uploads = useUploads();
   const seenDone = useRef(new Set<string>());
   useEffect(() => {
@@ -735,6 +398,9 @@ export default function DeskScreen() {
       if (j.phase === "done" && !seenDone.current.has(j.id)) {
         seenDone.current.add(j.id);
         load();
+        // A recording just uploaded and its brief is minutes away — the one
+        // moment a "notify me" offer makes sense. Shown once ever (push.ts).
+        void offerBriefReadyPrompt().catch(() => { /* never block the Desk */ });
       }
     }
   }, [uploads, load]);
@@ -766,109 +432,100 @@ export default function DeskScreen() {
   }, [items, query, filter]);
 
   const connected = connState === "connected";
-  const isRecording = connected && status?.isRecording === true;
-  const uploading = connected && !isRecording && (status?.pendingUploads ?? 0) > 0;
+  const deviceRecording = connected && status?.isRecording === true;
+  const deviceUploading = connected && !deviceRecording && (status?.pendingUploads ?? 0) > 0;
+  // A phone recording keeps running when the user leaves the recorder; the
+  // Desk is where they land, so it has to say so and offer the way back.
+  const phoneLive = phone.state === "RECORDING" || isPaused(phone.state);
+  const filtering = !!query || filter !== "all" || !!whose;
+  // The per-person filter exists only where the server would honour it: an
+  // organisation, a caller with view_all_meetings, and more than one person to
+  // choose between. Anywhere else there is no Filter control at all.
+  const canFilterWhose = isOrganisation && canSeeEveryones && members.length > 1;
+  const whoseLabel = (userId: string) => {
+    if (!userId) return "Everyone";
+    if (userId === myUserId) return "You";
+    const m = members.find((x) => x.user_id === userId);
+    // Already a display name server-side (chosen -> derived -> email).
+    return m?.name || m?.email || "Filter";
+  };
+  const taskCount = tasksBadge(openTasks);
 
-  // Stat strip. "Pending" counts briefs still being written — the Actions
-  // tab that owns overdue promises isn't built yet, so the third cell reports
-  // what this screen actually knows.
-  const pendingCount = items.filter((r) => statusMeta(r.status).kind === "processing").length;
-  const captured = weekCaptured(items);
-  const filtering = !!query || filter !== "all";
+  const longestLabel = Math.max(0, ...STATUS_OPTIONS.map((o) => labelW[o.key] ?? 0));
+  const measured = rowW > 0 && filterW > 0
+    && STATUS_OPTIONS.every((o) => (labelW[o.key] ?? 0) > 0);
+  const tabsNeed = SEG_TRACK_PAD
+    + STATUS_OPTIONS.length * (longestLabel + SEG_LABEL_PAD + 2 * SEG_BREATHING);
+  const filterInline = canFilterWhose && measured && tabsNeed + S.sm + filterW <= rowW;
 
-  // The collapsing dashboard. This is the list's ListHeaderComponent rather
-  // than a sibling View: as a sibling it permanently consumed ~450px of a
-  // ~780px viewport, so the list it sat above could only ever show one and a
-  // half cards. Inside the list it scrolls away under the sticky controls and
-  // comes back on the way down — ordinary SectionList scrolling, with nothing
-  // interpolated and nothing to snap.
-  //
-  // Only the masthead and stats truly leave: they are decoration, read on
-  // arrival. The workspace tiles are navigation, so they reappear in the
-  // sticky bar as WorkspaceStrip rather than making you scroll a long list
-  // back to offset 0 to reach Tasks.
-  const dashboard = (
+  const filterButton = canFilterWhose ? (
+    <Pressable
+      onPress={() => setWhoseOpen(true)}
+      onLayout={(e) => setFilterW(Math.ceil(e.nativeEvent.layout.width))}
+      accessibilityRole="button"
+      accessibilityLabel={`Filter by person. Showing ${whoseLabel(whose)}`}
+      style={({ pressed }) => [
+        st.filterBtn,
+        whose
+          ? { backgroundColor: C.primarySoft, borderColor: C.primary }
+          : { backgroundColor: C.surface, borderColor: C.border },
+        pressed && { opacity: 0.75 },
+      ]}
+    >
+      <Icon name="slider.horizontal.3" tintColor={whose ? C.primary : C.textDim} size={15} />
+      <Text style={[st.filterTxt, { color: whose ? C.primary : C.text }]} numberOfLines={1}>
+        {whose ? whoseLabel(whose) : "Filter"}
+      </Text>
+    </Pressable>
+  ) : null;
+
+  const header = (
     <View style={st.gutter}>
-      {/* Device connectivity — top-left, above the masthead. Replaces the
-          Device bottom tab. */}
-      <DevicePill st={st} C={C} />
-
-      {/* Masthead — today's date, the title, and the week's captured time */}
-      <View style={st.masthead}>
-        <View style={{ flex: 1 }}>
-          <Text style={st.dateline}>{fmtToday()}</Text>
-          <Text style={st.title}>MinuteX</Text>
-        </View>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: S.sm }}>
-          {captured ? (
-            <View style={{ alignItems: "flex-end", gap: 3 }}>
-              <Text style={st.weekFig}>{captured}</Text>
-              <Text style={st.weekLabel}>captured this week</Text>
-            </View>
-          ) : null}
-          {/* The notification centre's entry point. Reads its count from the
-              shared context, so it stays in step with the centre itself. */}
-          <NotificationBell />
-        </View>
-      </View>
-
-      {/* Stat strip */}
-      <View style={st.statStrip}>
-        <Stat C={C} value={String(items.length)} label="Briefs" />
-        <Stat C={C} value={device && status?.batteryLevel != null ? `${status.batteryLevel}%` : "—"} label="Device" />
-        <Stat
-          C={C}
-          value={String(pendingCount)}
-          label="In the works"
-          tint={pendingCount ? C.primary : undefined}
-          last
-        />
-      </View>
-
-      {/* Workspace — Tasks / Calendar / Folders / People. On MinuteX itself,
-          because these are daily destinations, not settings. onLayout reports
-          where this row ends so the pinned strip knows exactly when it has
-          scrolled past — see `collapsed`. */}
-      <View onLayout={onWorkspaceLayout}>
-        <WorkspaceRow
-          st={st}
-          C={C}
-          openTasks={openTasks}
-          onPress={(path) => router.push(path as any)}
-        />
-      </View>
-
-      {/* Live recording bar */}
-      {isRecording ? (
-        <Pressable style={({ pressed }) => [st.liveBar, pressed && { opacity: 0.85 }]}
-          onPress={() => router.navigate("/record")}>
-          <View style={st.liveDot} />
-          <View style={{ flex: 1 }}>
-            <Text style={st.liveTitle}>On the record now</Text>
-            <Text style={st.liveSub}>Your device is capturing — tap to view</Text>
+      {/* A recording in progress outranks everything below it. */}
+      {phoneLive ? (
+        <Pressable
+          style={({ pressed }) => [st.liveBar, pressed && { opacity: 0.85 }]}
+          onPress={() => router.navigate("/record-phone")}
+          accessibilityRole="button"
+          accessibilityLabel={phone.state === "RECORDING" ? "Recording on this phone. Open recorder" : "Recording paused. Open recorder"}
+        >
+          <PulseDot active={phone.state === "RECORDING"} color={phone.state === "RECORDING" ? C.recording : C.warn} size={9} />
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={st.liveTitle}>{phone.state === "RECORDING" ? "Recording on this phone" : "Recording paused"}</Text>
+            <Text style={st.liveSub} numberOfLines={1}>Tap to return to the recorder</Text>
           </View>
-          <Icon name="arrow.right" tintColor={C.textOnPrimary} size={18} />
+          <Icon name="chevron.right" tintColor={C.textFaint} size={16} />
+        </Pressable>
+      ) : null}
+      {deviceRecording ? (
+        <Pressable
+          style={({ pressed }) => [st.liveBar, pressed && { opacity: 0.85 }]}
+          onPress={() => router.navigate("/record")}
+          accessibilityRole="button"
+          accessibilityLabel="Your device is recording. Open"
+        >
+          <PulseDot active color={C.recording} size={9} />
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={st.liveTitle}>Your device is recording</Text>
+            <Text style={st.liveSub} numberOfLines={1}>Tap to view or stop</Text>
+          </View>
+          <Icon name="chevron.right" tintColor={C.textFaint} size={16} />
         </Pressable>
       ) : null}
 
-      {/* Transfer notice — the device is pushing recordings up over Wi-Fi */}
-      {uploading ? (
+      {/* The device pushing recordings up over Wi-Fi. It reports a count, not
+          bytes, so the bar is the indeterminate sweep. */}
+      {deviceUploading ? (
         <View style={st.notice}>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: S.md }}>
-            <Icon name="tray.and.arrow.up.fill" tintColor={C.primary} size={18} />
-            <View style={{ flex: 1 }}>
-              <Text style={st.noticeTitle}>
-                Transferring {status!.pendingUploads} recording{(status!.pendingUploads ?? 0) > 1 ? "s" : ""}…
-              </Text>
-              <Text style={st.noticeSub}>They'll land on MinuteX once written up</Text>
-            </View>
-          </View>
+          <Text style={st.noticeTitle}>
+            Transferring {status!.pendingUploads} recording{(status!.pendingUploads ?? 0) > 1 ? "s" : ""} from your device
+          </Text>
+          <Text style={st.noticeSub}>They&apos;ll appear here once written up.</Text>
           <SweepBar color={C.primary} track={C.border} />
         </View>
       ) : null}
 
-      {/* Phone/upload jobs from the shared UploadManager — mirrors the
-          transfer notice above so every source reports the same way */}
+      {/* Phone/upload jobs from the shared UploadManager. */}
       {uploads.map((j) => (
         <View key={j.id} style={st.notice}>
           <View style={{ flexDirection: "row", alignItems: "center", gap: S.md }}>
@@ -886,59 +543,45 @@ export default function DeskScreen() {
                     : C.primary}
               size={18}
             />
-            <View style={{ flex: 1 }}>
+            <View style={{ flex: 1, minWidth: 0 }}>
               <Text style={st.noticeTitle} numberOfLines={1}>
                 {j.phase === "failed" ? "Upload failed"
                   : j.phase === "done" ? "Uploaded"
                     : j.phase === "waiting" ? "Waiting to upload"
-                      : `Uploading “${j.title}”…`}
+                      : `Uploading “${j.title}”`}
               </Text>
               <Text style={st.noticeSub} numberOfLines={2}>
                 {j.phase === "failed" ? (j.error || "Something went wrong.")
-                  : j.phase === "done" ? "Writing it up now"
+                  : j.phase === "done" ? "Transcribing and writing the brief now"
                     // Say plainly that the audio is safe. This banner is what a
                     // user sees after recording a meeting offline, and the one
                     // thing they need to know is that they haven't lost it.
                     : j.phase === "waiting" ? "Saved on this phone — it'll upload when you're back online"
                       : j.phase === "finalizing" ? "Finishing up…"
-                        // Real byte counts while the transfer is live — a big file
-                        // on a slow link should look busy, not stuck.
+                        // Real byte counts while the transfer is live.
                         : j.progress != null && j.totalBytes
                           ? `${fmtBytes(j.bytesSent ?? 0)} of ${fmtBytes(j.totalBytes)}`
                           : j.source === "MOBILE" ? "Phone recording" : "Audio file"}
               </Text>
             </View>
-            {/* Percentage sits opposite the title, in mono, so it lines up
-                across stacked jobs. */}
-            {j.phase === "uploading" && j.progress != null ? (
-              <Text style={{ ...TABULAR, fontSize: 11.5, color: C.primary }}>
-                {Math.round(j.progress * 100)}%
-              </Text>
-            ) : null}
             {/* Retry before dismiss: a failed upload is usually a dropped
-                connection, and the file is still on disk. Only offered when
-                the job kept its input (see retryUpload). */}
+                connection, and the file is still on disk. */}
             {j.phase === "failed" || j.phase === "waiting" ? (
-              <Pressable onPress={() => retryUpload(j.id)} accessibilityLabel="Retry upload"
-                hitSlop={6}
-                style={({ pressed }) => [
-                  { flexDirection: "row", alignItems: "center", gap: 5 },
-                  pressed && { opacity: 0.6 },
-                ]}>
-                <Icon name="arrow.clockwise" tintColor={C.primary} size={14} />
-                <Text style={{ fontFamily: FONT.bold, fontSize: 12.5, color: C.primary }}>
-                  {j.phase === "waiting" ? "Now" : "Retry"}
+              <Pressable
+                onPress={() => retryUpload(j.id)}
+                accessibilityRole="button"
+                accessibilityLabel={j.phase === "waiting" ? "Upload now" : "Retry upload"}
+                hitSlop={10}
+                style={({ pressed }) => [{ minHeight: 44, justifyContent: "center", paddingHorizontal: S.xs }, pressed && { opacity: 0.6 }]}
+              >
+                <Text style={{ fontFamily: FONT.semibold, fontSize: 13.5, color: C.primary }}>
+                  {j.phase === "waiting" ? "Upload now" : "Retry"}
                 </Text>
               </Pressable>
             ) : null}
-            {/* Dismiss only hides the banner — it never deletes audio. A
-                recording that genuinely can't be uploaded is removed through
-                the explicit Discard action below, never by tidying a banner. */}
+            {/* Dismiss only hides the banner — it never deletes audio. */}
             {j.phase === "failed" || j.phase === "done" ? (
-              <Pressable onPress={() => dismissUpload(j.id)} accessibilityLabel="Dismiss"
-                style={({ pressed }) => pressed && { opacity: 0.6 }}>
-                <Icon name="xmark" tintColor={C.textDim} size={16} />
-              </Pressable>
+              <IconButton icon="xmark" iconSize={16} size={36} onPress={() => dismissUpload(j.id)} accessibilityLabel="Dismiss" />
             ) : null}
           </View>
           {/* Determinate whenever the uploader knows the total; the sweep is
@@ -950,8 +593,7 @@ export default function DeskScreen() {
               : <SweepBar color={C.primary} track={C.border} />
           ) : null}
           {/* The only path that deletes a local recording, and only for one
-              that has genuinely failed. Kept behind a confirm because the
-              audio is unrecoverable afterwards. */}
+              that has genuinely failed. Behind a confirm: it is unrecoverable. */}
           {j.phase === "failed" ? (
             <Pressable
               onPress={() => Alert.alert(
@@ -962,85 +604,117 @@ export default function DeskScreen() {
                   { text: "Discard", style: "destructive", onPress: () => abandonUpload(j.id) },
                 ]
               )}
+              accessibilityRole="button"
               accessibilityLabel="Discard recording"
-              style={({ pressed }) => [{ marginTop: S.sm }, pressed && { opacity: 0.6 }]}
+              style={({ pressed }) => [{ marginTop: S.sm, minHeight: 32, justifyContent: "center" }, pressed && { opacity: 0.6 }]}
             >
-              <Text style={{ fontFamily: FONT.semibold, fontSize: 12, color: C.textDim }}>
-                Discard recording
-              </Text>
+              <Text style={{ fontFamily: FONT.semibold, fontSize: 12.5, color: C.textDim }}>Discard recording</Text>
             </Pressable>
           ) : null}
         </View>
       ))}
 
-      {/* Filters. These scroll away with the dashboard rather than joining
-          the pinned bar: a filter is set occasionally and then left alone,
-          so it does not earn ~50px of permanent height the way search and
-          navigation do. */}
-      <View style={st.filters}>
-        <Chip label="All" active={filter === "all"} onPress={() => setFilter("all")} />
-        <Chip label="Filed" active={filter === "ready"} onPress={() => setFilter("ready")} />
-        <Chip label="In the works" active={filter === "processing"} onPress={() => setFilter("processing")} />
-      </View>
-
-      {/* WHOSE meetings. Organisation only, and only once there is more than
-          one person to choose between — a filter with a single option is
-          chrome, not a control. Horizontally scrollable because an
-          organisation can have more members than fit a row.
-
-          A MEMBER sees this too, deliberately: the server intersects the
-          filter with what they may already read, so for them it narrows
-          their own + shared meetings rather than exposing anyone. */}
-      {isOrganisation && canSeeEveryones && members.length > 1 ? (
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          // This screen has a search field, so without persistTaps the first
-          // tap on a person chip while the keyboard is up would be swallowed
-          // dismissing it instead of applying the filter.
-          keyboardShouldPersistTaps="handled"
-          contentContainerStyle={st.whoseRow}
-        >
-          <Chip
-            label="Everyone"
-            active={whose === ""}
-            onPress={() => setWhose("")}
-          />
-          {members.map((m) => (
-            <Chip
-              key={m.user_id}
-              // Already a display name server-side (chosen -> derived ->
-              // email), so this is never a raw uuid.
-              label={m.user_id === myUserId ? "You" : (m.name || m.email || "")}
-              active={whose === m.user_id}
-              onPress={() => setWhose(
-                whose === m.user_id ? "" : m.user_id)}
-            />
-          ))}
-        </ScrollView>
-      ) : null}
     </View>
   );
 
   return (
     <View style={[st.container, { paddingTop: insets.top }]}>
-      {/* THE PINNED BAR — a sibling ABOVE the list, not inside it.
-
-          It was briefly a sticky section header, which does not work: RN
-          sticky headers are "the next header pushes the previous one off", so
-          every date header displaced the search bar as it arrived and the
-          controls vanished a screen or two down. Outside the list it simply
-          never moves. One fixed bar plus one list is not a nested scroll
-          view — the list below is still the only thing that scrolls. */}
-      <View style={st.bar}>
-        <SearchBar value={query} onChangeText={setQuery} placeholder="Search briefs"
-          style={{ flex: 1 }} />
-        {/* The workspace icons, revealed only once the full row has scrolled
-            past. Hidden with `display: none` rather than unmounted so the
-            bar's height never changes as it appears. */}
-        <View style={collapsed ? undefined : st.hidden} pointerEvents={collapsed ? "auto" : "none"}>
-          <WorkspaceStrip st={st} C={C} openTasks={openTasks}
-            onPress={(path) => router.push(path as any)} />
+      {/* THE PINNED BAR — a sibling ABOVE the list, not inside it, so it never
+          scrolls away (a sticky section header would be displaced by the next
+          date header). */}
+      <View style={st.pinned}>
+        <AppHeader
+          title="MinuteX"
+          safeTop={false}
+          style={{ paddingHorizontal: 0, paddingTop: S.xs, paddingBottom: 0 }}
+          right={
+            <>
+              {/* Device status, only when there is a device to report on. It
+                  is a status you glance at, so it states the link and then
+                  offers the trip to /devices; with no device it says nothing
+                  (pairing lives in You › Your device and in the recorder's
+                  source sheet). */}
+              {device ? (
+                <IconButton
+                  icon="cpu.fill"
+                  iconSize={19}
+                  onPress={() => router.push("/devices")}
+                  tint={deviceRecording ? C.recording : connected ? C.success : C.textFaint}
+                  accessibilityLabel={
+                    deviceRecording ? "Device recording. Open device"
+                      : connected ? `Device connected${status?.batteryLevel != null ? `, ${status.batteryLevel}% battery` : ""}. Open device`
+                        : "Device not connected. Open device"
+                  }
+                />
+              ) : null}
+              {/* Tasks is the one workspace destination reachable only from
+                  here, so it keeps a place in the header — as a badged icon
+                  with the REAL open count, not a card. Calendar is one tap
+                  inside Tasks; People lives under You › Contacts. */}
+              <IconButton
+                icon="checklist"
+                iconSize={20}
+                onPress={() => router.push("/tasks")}
+                badge={taskCount}
+                accessibilityLabel={taskCount ? `Tasks, ${taskCount} open` : "Tasks"}
+              />
+              {/* Real unread count from the notification centre — see
+                  lib/notification-bell.tsx. No badge when there is none. */}
+              <NotificationBell />
+              <Pressable
+                onPress={() => router.navigate("/profile")}
+                accessibilityRole="button"
+                accessibilityLabel="You — profile and settings"
+                hitSlop={6}
+                style={({ pressed }) => [{ width: 44, height: 44, alignItems: "center", justifyContent: "center" }, pressed && { opacity: 0.7 }]}
+              >
+                <Avatar name={me?.name || me?.email || ""} photoUri={me?.avatar_view_url} size={32} />
+              </Pressable>
+            </>
+          }
+        />
+        <View style={st.searchRow}>
+          <SearchBar
+            value={query}
+            onChangeText={setQuery}
+            placeholder="Search briefs"
+            style={{ flex: 1 }}
+          />
+          {filterInline ? null : filterButton}
+        </View>
+        <View
+          style={st.filterRow}
+          onLayout={(e) => setRowW(Math.floor(e.nativeEvent.layout.width))}
+        >
+          <SegmentedControl<Filter>
+            style={{ flex: 1 }}
+            value={filter}
+            onChange={setFilter}
+            options={STATUS_OPTIONS}
+          />
+          {filterInline ? filterButton : null}
+          {/* The measuring copies. Same font as the ACTIVE label (semibold,
+              the wider of the two weights the control uses). */}
+          <View
+            style={st.measure}
+            pointerEvents="none"
+            accessibilityElementsHidden
+            importantForAccessibility="no-hide-descendants"
+          >
+            {STATUS_OPTIONS.map((o) => (
+              <Text
+                key={o.key}
+                numberOfLines={1}
+                style={{ fontFamily: FONT.semibold, fontSize: 13.5, alignSelf: "flex-start" }}
+                onLayout={(e) => {
+                  const w = Math.ceil(e.nativeEvent.layout.width);
+                  setLabelW((prev) => (prev[o.key] === w ? prev : { ...prev, [o.key]: w }));
+                }}
+              >
+                {o.label}
+              </Text>
+            ))}
+          </View>
         </View>
       </View>
 
@@ -1048,39 +722,27 @@ export default function DeskScreen() {
         sections={sections}
         keyExtractor={(i) => i.audio_s3_key}
         showsVerticalScrollIndicator={false}
-        // Date headers stick within the list, so the day you are reading
-        // stays labelled until the next one arrives.
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
         stickySectionHeadersEnabled
-        // Drives the workspace collapse only. 64ms keeps the swap attached to
-        // the gesture without re-rendering on every frame — and since
-        // `collapsed` is a boolean behind a dead band, most of these events
-        // change no state at all.
-        onScroll={onScroll}
-        scrollEventThrottle={64}
-        ListHeaderComponent={dashboard}
-        // paddingBottom clears the absolutely-positioned tab bar and the
-        // floating record button, exactly as before.
-        // Clearance derived from the real tab bar rather than guessed:
-        // (tabs)/_layout sizes it 60 + max(inset, 8), and the extra 40
-        // clears the raised record FAB, which overhangs the bar by 26. A
-        // flat 100 fell short on a large-inset phone, cutting the last card.
-        contentContainerStyle={{
-          paddingTop: S.lg,
-          paddingBottom: 60 + Math.max(insets.bottom, 8) + 40,
-        }}
+        ListHeaderComponent={header}
+        // Clearance derived from the real tab bar: (tabs)/_layout sizes it
+        // 60 + max(inset, 8), and the extra 40 clears the raised record
+        // button, which overhangs the bar.
+        contentContainerStyle={{ paddingBottom: 60 + Math.max(insets.bottom, 8) + 40 }}
         refreshControl={
           <RefreshControl refreshing={refreshing}
             onRefresh={() => { setRefreshing(true); load(); }} tintColor={C.primary} />
         }
         ListEmptyComponent={
           loading ? (
-            <View style={st.listState}>
+            <View style={[st.listState, { marginTop: S.lg }]}>
               <SkeletonCard />
               <SkeletonCard />
               <SkeletonCard />
             </View>
           ) : error ? (
-            <View style={st.listState}>
+            <View style={[st.listState, { marginTop: S.xl }]}>
               <ErrorText>{error}</ErrorText>
               <Button label="Try again" variant="secondary" onPress={() => { setLoading(true); load(); }}
                 style={{ marginTop: S.md, alignSelf: "flex-start", paddingHorizontal: S.xl }} />
@@ -1088,10 +750,10 @@ export default function DeskScreen() {
           ) : (
             <View style={st.listState}>
               <EmptyState
-                title={filtering ? "Nothing matches that" : "Nothing on MinuteX yet"}
+                title={filtering ? "Nothing matches that" : "No briefs yet"}
                 subtitle={filtering
                   ? "Try a different search or filter."
-                  : "Record your next conversation and the first brief lands here in a couple of minutes."}
+                  : "Record your next conversation and the first brief lands here a few minutes after it uploads."}
                 action={filtering ? undefined : (
                   <Button label="Start recording" onPress={() => router.push("/new-recording")} />
                 )}
@@ -1103,156 +765,95 @@ export default function DeskScreen() {
           const s = section as Section;
           return (
             <View style={st.sectionHead}>
-              <Text style={T.label}>{s.title}</Text>
-              <Text style={{ ...T.caption }}>
-                {s.data.length} brief{s.data.length === 1 ? "" : "s"}
-              </Text>
+              <SectionHeader
+                title={s.title}
+                detail={`${s.data.length} brief${s.data.length === 1 ? "" : "s"}`}
+              />
             </View>
           );
         }}
-        renderItem={({ item }) => {
-          const status = statusMeta(item.status);
-          const ready = status.kind === "ready";
-          const failed = status.kind === "failed";
+        renderItem={({ item, index, section }) => {
+          const meta = statusMeta(item.status);
+          const failed = meta.kind === "failed";
+          const processing = meta.kind === "processing";
           const deleting = deletingKey === item.audio_s3_key;
-          const source = sourceMeta(item);
           const duration = fmtDuration(item.duration);
-          // Danger only for a genuinely failed brief; blue for the source
-          // icon otherwise — "ready" gets a quiet success check, not a
-          // loud color, since most rows are ready most of the time.
-          const kickerColor = failed ? C.danger : C.textFaint;
+          const when = fmtTime(item.created_at);
+          const byline = item.recorded_by_name && item.recorded_by !== myUserId ? (
+            // WHO recorded it. Organisation only, and only for someone ELSE's
+            // meeting: the server omits these fields in a personal workspace.
+            <View style={st.recordedBy}>
+              <Avatar name={item.recorded_by_name} photoUri={item.recorded_by_avatar} size={16} fontSize={8} />
+              <Text style={st.recordedByText} numberOfLines={1}>{item.recorded_by_name}</Text>
+            </View>
+          ) : undefined;
           return (
-            <Pressable
-              style={({ pressed }) => [
-                st.brief,
-                pressed && { opacity: 0.7 },
-                deleting && { opacity: 0.4 },
-              ]}
-              onPress={() => router.push({ pathname: "/recording/[key]", params: { key: item.audio_s3_key } })}
-              onLongPress={() => confirmDelete(item)}
-              delayLongPress={400}
-              accessibilityHint="Long press to move this brief to Trash"
-            >
-              <View style={st.briefTop}>
-                <IconCircle
-                  name={failed ? "exclamationmark.triangle.fill" : source.icon}
-                  tint={failed ? C.danger : C.primary}
-                  bg={failed ? C.dangerSoft : C.primarySoft}
-                  size={40}
-                />
-                {/* minWidth: 0 is what actually lets the children ellipsize.
-                    A flex child's default minWidth is auto, which means "at
-                    least my content" — so without this a long title widens
-                    the column and pushes the status icon off the card no
-                    matter what numberOfLines says. */}
-                <View style={{ flex: 1, minWidth: 0 }}>
-                  {/* Kicker line: what kind of meeting, when, how long. */}
-                  <View style={st.kickerRow}>
-                    <Text
-                      style={[st.kicker, { color: kickerColor }]}
-                      numberOfLines={1}
-                    >
-                      {failed ? "Couldn't finish" : source.label}
-                    </Text>
-                    <Text style={st.briefMeta} numberOfLines={1}>
-                      {fmtWhen(item.created_at)}{duration ? ` · ${duration}` : ""}
-                    </Text>
-                  </View>
-
-                  {/* The headline is what the AI wrote */}
-                  <Text style={st.headline} numberOfLines={3}>
-                    {item.title || "Untitled meeting"}
-                  </Text>
-
-                  {/* WHO recorded it. Organisation only, and only for
-                      someone ELSE's meeting: the server omits these fields
-                      in a personal workspace, and "Recorded by you" on your
-                      own row is noise on every row you own. */}
-                  {item.recorded_by_name
-                    && item.recorded_by !== myUserId ? (
-                    <View style={st.recordedBy}>
-                      <Avatar
-                        name={item.recorded_by_name}
-                        photoUri={item.recorded_by_avatar}
-                        size={16}
-                        fontSize={8}
-                      />
-                      <Text style={st.recordedByText} numberOfLines={1}>
-                        {item.recorded_by_name}
-                      </Text>
-                    </View>
-                  ) : null}
-                </View>
-                {/* The status tick never shrinks and never wraps — it is
-                    18px of fixed intent. marginTop nudges it onto the
-                    kicker's optical line rather than the title's, so it
-                    reads as status for the row, not for the headline. */}
-                {ready ? (
-                  <View style={{ flexShrink: 0, marginTop: 2 }}>
-                    <Icon name="checkmark.circle.fill" tintColor={C.success} size={18} />
-                  </View>
-                ) : null}
-              </View>
-
-              {ready ? (
-                <>
-                  {item.summary ? (
-                    <Text style={st.summary} numberOfLines={3}>{item.summary}</Text>
-                  ) : null}
-                  {/* The list endpoint returns no participant data — that
-                      only comes back on the detail fetch — so speaker
-                      avatars live on the brief screen, not here. */}
-                  <View style={st.metaRow}>
-                    {item.language ? (
-                      <Text style={{ ...T.caption, flexShrink: 0 }} numberOfLines={1}>
-                        {item.language.toUpperCase()}
-                      </Text>
-                    ) : null}
-                    {/* The waveform is decoration, so it yields the space:
-                        minWidth 0 lets it compress on a narrow phone rather
-                        than forcing the row wider than the card. */}
-                    <View style={{ flex: 1, minWidth: 0, alignItems: "flex-end" }}>
-                      <Waveform seed={item.audio_s3_key} bars={28} height={16}
-                        color={C.border} dimColor={C.border} />
-                    </View>
-                  </View>
-                </>
-              ) : failed ? (
-                <>
-                  <Text style={st.summary} numberOfLines={2}>
-                    We stopped rather than guess. Open it to see why.
-                  </Text>
-                  {/* Visible on failed rows only. Long-press covers every
-                      brief, but it is invisible until someone discovers
-                      it — and a desk full of failures is exactly when a
-                      user needs the way out to be obvious. */}
+            <View style={st.itemWrap}>
+              <BriefCard
+                title={item.title || "Untitled meeting"}
+                meta={[when, duration, sourceMeta(item).label]}
+                // A ready brief previews its summary; a failed one says why in
+                // one line; one in the works shows nothing it doesn't have.
+                preview={failed ? "We stopped rather than guess. Open it to see why." : processing ? undefined : item.summary || undefined}
+                status={
+                  failed ? { label: stageLabel(item.status), tone: "danger" }
+                    : processing ? { label: stageLabel(item.status), tone: "info" }
+                      : undefined
+                }
+                byline={byline}
+                position={positionIn(index, (section as Section).data.length)}
+                dimmed={deleting}
+                onPress={() => router.push({ pathname: "/recording/[key]", params: { key: item.audio_s3_key } })}
+                onLongPress={() => confirmDelete(item)}
+                accessibilityHint="Long press to move this brief to Trash"
+                footer={failed ? (
+                  // Visible on failed rows only: long-press covers every brief,
+                  // but a desk full of failures is exactly when the way out
+                  // needs to be obvious.
                   <Pressable
                     onPress={() => confirmDelete(item)}
                     disabled={deleting}
-                    hitSlop={8}
+                    accessibilityRole="button"
                     accessibilityLabel="Move this brief to Trash"
-                    style={({ pressed }) => [
-                      { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 12 },
-                      pressed && { opacity: 0.6 },
-                    ]}
+                    style={({ pressed }) => [{ flexDirection: "row", alignItems: "center", gap: 6, minHeight: 32 }, pressed && { opacity: 0.6 }]}
                   >
                     <Icon name="trash" tintColor={C.danger} size={14} />
-                    <Text style={{ fontFamily: FONT.bold, fontSize: 12.5, color: C.danger }}>
+                    <Text style={{ fontFamily: FONT.semibold, fontSize: 13, color: C.danger }}>
                       {deleting ? "Moving…" : "Move to Trash"}
                     </Text>
                   </Pressable>
-                </>
-              ) : (
-                // Still being written — show the pipeline, not a summary.
-                <View style={st.progressRow}>
-                  <View style={st.progressTrack}><View style={st.progressFill} /></View>
-                  <Text style={st.progressTxt}>{status.label}…</Text>
-                </View>
-              )}
-            </Pressable>
+                ) : undefined}
+              />
+            </View>
           );
         }}
       />
+
+      {/* WHOSE meetings — the same filter the chip row used to offer, in a
+          sheet. Scrolls, because an organisation can have more members than
+          fit on screen. Choosing reloads through the same getRecordings
+          ?user_id= path as before. */}
+      <BottomSheet
+        visible={whoseOpen}
+        onClose={() => setWhoseOpen(false)}
+        title="Show meetings from"
+      >
+        <ScrollView style={{ maxHeight: 380 }} keyboardShouldPersistTaps="handled">
+          <SheetAction
+            label="Everyone"
+            selected={whose === ""}
+            onPress={() => { setWhose(""); setWhoseOpen(false); }}
+          />
+          {members.map((m) => (
+            <SheetAction
+              key={m.user_id}
+              label={whoseLabel(m.user_id)}
+              selected={whose === m.user_id}
+              onPress={() => { setWhose(m.user_id); setWhoseOpen(false); }}
+            />
+          ))}
+        </ScrollView>
+      </BottomSheet>
     </View>
   );
 }

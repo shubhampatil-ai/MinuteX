@@ -136,6 +136,18 @@ class WavRecorder(
   @Volatile private var peakLevel: Float = 0f
 
   /**
+   * RMS of the most recent buffer, normalised 0..1 (1 = full-scale).
+   *
+   * Display only — it feeds the recorder's live waveform and nothing else.
+   * Peak answers "did anything at all reach the mic", which is what the
+   * silence detector needs; RMS answers "how loud is it", which is what a
+   * waveform should show (a single click spikes the peak but barely moves the
+   * RMS). Computed right after the peak scan, over the frames already in
+   * hand — one extra linear pass per buffer, no allocation (see [rmsOf]).
+   */
+  @Volatile private var rmsLevel: Float = 0f
+
+  /**
    * Bytes of consecutive digital silence seen so far, and whether that run has
    * crossed [RecorderConfig.zeroRunMillis].
    *
@@ -178,6 +190,7 @@ class WavRecorder(
   fun currentState(): CaptureState = state
   fun bytesWritten(): Long = pcmBytes
   fun level(): Float = peakLevel
+  fun rms(): Float = rmsLevel
   fun error(): String? = lastError
   fun durationSeconds(): Double = format.durationOf(pcmBytes)
 
@@ -293,6 +306,7 @@ class WavRecorder(
       out = stream
       pcmBytes = 0L
       peakLevel = 0f
+      rmsLevel = 0f
       lastError = null
       // A fresh recorder starts with a clean slate: this instance has its own
       // mic and its own file, so nothing observed before it can be evidence
@@ -457,6 +471,7 @@ class WavRecorder(
 
           val peakSample = peakSampleOf(buffer, n)
           peakLevel = peakSample / 32768f
+          rmsLevel = rmsOf(buffer, n)
 
           // Zero-run tracking. The frames are already in hand and scanned, so
           // this costs one comparison and one add — cheap enough to do on every
@@ -558,6 +573,30 @@ class WavRecorder(
       i += 2
     }
     return peak
+  }
+
+  /**
+   * Root-mean-square of a 16-bit LE buffer, normalised to 0..1.
+   *
+   * A separate pass rather than folded into [peakSampleOf], deliberately: the
+   * peak scan feeds mic-theft detection and is pinned by exact-integer
+   * reasoning in its doc comment, so it stays untouched. A capture buffer is a
+   * few thousand samples; a second linear pass over it is negligible.
+   */
+  private fun rmsOf(buffer: ByteArray, length: Int): Float {
+    var sumSq = 0.0
+    var count = 0
+    var i = 0
+    while (i + 1 < length) {
+      val lo = buffer[i].toInt() and 0xFF
+      val hi = buffer[i + 1].toInt() and 0xFF
+      val sample = ((hi shl 8) or lo).toShort().toInt()
+      sumSq += (sample * sample).toDouble()
+      count++
+      i += 2
+    }
+    if (count == 0) return 0f
+    return (Math.sqrt(sumSq / count) / 32768.0).toFloat()
   }
 
   private companion object {

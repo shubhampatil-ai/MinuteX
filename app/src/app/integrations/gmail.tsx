@@ -2,11 +2,8 @@
 //
 // Settings -> Integrations -> Gmail -> Manage.
 //
-// Deliberately mirrors src/app/salesforce.tsx, the other "one linked external
-// thing" screen: hero with status, spec rows, then the management action
-// guarded by an Alert that explains the consequence. Following that shape
-// rather than inventing a new one means a user who has connected Salesforce
-// already knows how this screen works.
+// Shape: hero with status, spec rows, then the management action guarded by
+// an Alert that explains the consequence.
 //
 // WHAT THIS SCREEN MUST BE HONEST ABOUT, because the whole feature's
 // trustworthiness rests on it:

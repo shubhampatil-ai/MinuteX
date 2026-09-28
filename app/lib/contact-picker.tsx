@@ -15,6 +15,15 @@
 // exists comes back as a 409 with candidates, and this sheet then asks the
 // user to pick one or confirm it is a different person. It never silently
 // merges two people, and never silently creates a duplicate.
+//
+// SALESFORCE. When the workspace has synced Salesforce people (the Site
+// People Store), a "From Salesforce" tier offers them too — Contacts (people
+// you meet) and Users (colleagues). Picking one resolves it server-side to
+// its MinuteX contact (found or created once, linked to the Salesforce
+// record) and then goes through onPick like any other contact, so every
+// caller — speaker tagging, attendance, task assignment — works unchanged.
+// Tagging a Salesforce Contact this way is what relates the meeting to it.
+// People already shown as a linked contact are not listed twice.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "expo-router";
 import {
@@ -27,9 +36,13 @@ import {
   TextField,
 } from "./ui";
 import {
-  ApiContact, ApiError, ambiguousCandidates, createContact, getContacts,
-  getMe, isAmbiguousContact,
+  ApiContact, ApiError, SitePerson, ambiguousCandidates, contactForSitePerson, createContact,
+  getContacts, getMe, isAmbiguousContact, searchSitePeoplePage,
 } from "./api";
+import { useWorkspace } from "./workspace-context";
+import { SITE_SALESFORCE_ENABLED, useSiteSalesforceVersion } from "./site-salesforce-ui";
+import { salesforceBadge } from "./site-salesforce-flow";
+import { invalidateSiteSalesforce } from "./site-salesforce-events";
 import {
   ContactPickResult, requestContactsPermissionDetailed, searchPhoneContacts,
 } from "./contacts";
@@ -41,7 +54,8 @@ const PAGE_SIZE = 50;
 
 type Section =
   | { kind: "heading"; label: string; hint?: string }
-  | { kind: "contact"; contact: ApiContact };
+  | { kind: "contact"; contact: ApiContact }
+  | { kind: "person"; person: SitePerson };
 
 // One row per PERSON, keeping first appearance. Callers pass speaker→contact
 // mappings, where the same person legitimately appears more than once (one
@@ -78,12 +92,18 @@ export type ContactPickerProps = {
    * depends on it) silently never happened.
    */
   allowSelf?: boolean;
+  /**
+   * The workspace whose synced Salesforce people to offer (a meeting's own
+   * workspace). Defaults to the active workspace; a workspace without a
+   * Salesforce People Store simply shows no Salesforce tier.
+   */
+  salesforceWorkspaceId?: string;
 };
 
 export function ContactPicker({
   visible, onClose, onPick, meetingContacts = [],
   title = "Select Contact", onClear,
-  allowSelf = false,
+  allowSelf = false, salesforceWorkspaceId,
 }: ContactPickerProps) {
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C, T), [C, T]);
@@ -96,6 +116,13 @@ export function ContactPicker({
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
+
+  // Synced Salesforce people matching the same search.
+  const { activeId } = useWorkspace();
+  const sfWorkspace = salesforceWorkspaceId || activeId;
+  const [sfPeople, setSfPeople] = useState<SitePerson[]>([]);
+  const [resolving, setResolving] = useState("");
+  const peopleVersion = useSiteSalesforceVersion("people", "connection");
 
   // Create-new state.
   const [creating, setCreating] = useState(false);
@@ -194,6 +221,35 @@ export function ContactPicker({
     if (visible) load(debounced);
   }, [visible, debounced, load]);
 
+  // Salesforce tier: the local People Store only (no Salesforce call). A
+  // failure or a workspace without Salesforce just means no tier.
+  useEffect(() => {
+    if (!visible || !SITE_SALESFORCE_ENABLED || !sfWorkspace) { setSfPeople([]); return; }
+    let alive = true;
+    searchSitePeoplePage(sfWorkspace, { q: debounced, limit: debounced ? 20 : 15 })
+      .then((r) => { if (alive) setSfPeople(r.people); })
+      .catch(() => { if (alive) setSfPeople([]); });
+    return () => { alive = false; };
+  }, [visible, debounced, sfWorkspace, peopleVersion]);
+
+  /** A Salesforce person -> their MinuteX contact -> the ordinary onPick. */
+  const pickSalesforcePerson = useCallback(async (p: SitePerson) => {
+    if (!sfWorkspace || resolving) return;
+    setResolving(p.person_key);
+    setCreateError("");
+    try {
+      const contact = await contactForSitePerson(sfWorkspace, p.person_key);
+      onPick(contact);
+      onClose();
+      // A tagged Salesforce Contact is what relates a meeting to Salesforce.
+      invalidateSiteSalesforce("relation");
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Could not use that Salesforce person.");
+    } finally {
+      setResolving("");
+    }
+  }, [sfWorkspace, resolving, onPick, onClose]);
+
   // Reset the create form each time the sheet opens, so a half-typed contact
   // from a previous open never reappears attached to a different speaker.
   useEffect(() => {
@@ -281,6 +337,19 @@ export function ContactPicker({
     // empty and the list looks exactly as it did before.
     const colleagues = rest.filter((c) => !!c.workspace_role);
     const others = rest.filter((c) => !c.workspace_role);
+
+    // Salesforce people not already on screen as their linked contact.
+    const shownIds = new Set([...seen, ...rest.map((c) => c.id)]);
+    const sfTier: Section[] = sfPeople
+      .filter((p) => !p.linked_contact_id || !shownIds.has(p.linked_contact_id))
+      .map((p) => ({ kind: "person" as const, person: p }));
+    const sfHeading: Section = {
+      kind: "heading", label: "From Salesforce", hint: "Synced Contacts & Users",
+    };
+    // Searching: Salesforce matches right after this meeting's people, so a
+    // typed name finds its Salesforce Contact without scrolling. Browsing:
+    // they come last, after the address book.
+    if (needle && sfTier.length) out.push(sfHeading, ...sfTier);
     if (colleagues.length) {
       out.push({
         kind: "heading", label: "Your organisation",
@@ -296,8 +365,9 @@ export function ContactPicker({
       });
       others.forEach((c) => out.push({ kind: "contact", contact: c }));
     }
+    if (!needle && sfTier.length) out.push(sfHeading, ...sfTier);
     return out;
-  }, [all, meetingContacts, debounced]);
+  }, [all, meetingContacts, debounced, sfPeople]);
 
   const submitNew = useCallback(
     async (force: boolean) => {
@@ -482,6 +552,35 @@ export function ContactPicker({
         </View>
       );
     }
+    if (item.kind === "person") {
+      const p = item.person;
+      const busy = resolving === p.person_key;
+      return (
+        <Pressable
+          style={st.row}
+          onPress={() => { void pickSalesforcePerson(p); }}
+          disabled={!!resolving}
+          accessibilityRole="button"
+          accessibilityLabel={`Select ${p.name}, Salesforce ${p.type === "user" ? "User" : "Contact"}`}
+        >
+          <Avatar name={p.name} size={36} fontSize={13} />
+          <View style={{ flex: 1 }}>
+            <View style={st.nameRow}>
+              <Text style={st.name} numberOfLines={1}>{p.name}</Text>
+              <View style={st.roleTag}>
+                <Text style={st.roleTagTxt}>{p.type === "user" ? "SF USER" : "SF CONTACT"}</Text>
+              </View>
+            </View>
+            {!!(p.email || p.company) && (
+              <Text style={st.sub} numberOfLines={1}>
+                {[p.email, p.company].filter(Boolean).join(" · ")}
+              </Text>
+            )}
+          </View>
+          {busy ? <ActivityIndicator color={C.accent} /> : null}
+        </Pressable>
+      );
+    }
     const c = item.contact;
     const sub = c.email || c.phone || c.company || "";
     return (
@@ -506,6 +605,13 @@ export function ContactPicker({
               <View style={st.roleTag}>
                 <Text style={st.roleTagTxt}>
                   {roleLabel(c.workspace_role)}
+                </Text>
+              </View>
+            )}
+            {!c.workspace_role && !!salesforceBadge(c) && (
+              <View style={st.roleTag}>
+                <Text style={st.roleTagTxt}>
+                  {c.people_type === "user" ? "SF USER" : "SF CONTACT"}
                 </Text>
               </View>
             )}
@@ -745,7 +851,9 @@ export function ContactPicker({
                     style={{ flexShrink: 1, minHeight: 0 }}
                     data={sections}
                     keyExtractor={(item, i) =>
-                      item.kind === "heading" ? `h-${item.label}-${i}` : item.contact.id
+                      item.kind === "heading" ? `h-${item.label}-${i}`
+                        : item.kind === "person" ? `sf-${item.person.person_key}`
+                          : item.contact.id
                     }
                     renderItem={({ item }) => renderRow(item)}
                     onEndReached={loadMore}

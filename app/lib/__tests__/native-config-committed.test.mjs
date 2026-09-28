@@ -44,7 +44,9 @@ const ROOT = new URL("../../", import.meta.url).pathname.replace(/^\/([A-Za-z]:)
 // modules/**        -> local native modules (Kotlin/Swift).
 // plugins/**        -> config plugins, which rewrite native project files.
 // package.json      -> a new native dependency needs a rebuild to be linked.
-const NATIVE_PATHS = ["app.json", "modules", "plugins", "package.json"];
+// app.config.js too: it injects android.googleServicesFile (FCM), so an
+// uncommitted edit to it silently changes nothing in an EAS build.
+const NATIVE_PATHS = ["app.json", "app.config.js", "modules", "plugins", "package.json"];
 
 function git(args) {
   try {

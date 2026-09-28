@@ -38,6 +38,9 @@ import { speakerName } from "../../../../lib/sources";
 import { useMeeting } from "../../../../lib/meeting-context";
 import { useWorkspace } from "../../../../lib/workspace-context";
 import { avatarColorFor, initialsOf } from "../../../../lib/task-model";
+// Tagging a synced Salesforce Contact relates the meeting to it: tell the
+// meeting's Salesforce card (and the push screen) to reload.
+import { invalidateSiteSalesforce } from "../../../../lib/site-salesforce-events";
 
 export default function ParticipantsScreen() {
   const { C, T } = useTheme();
@@ -149,6 +152,7 @@ export default function ParticipantsScreen() {
       setError("");
       try {
         await tagAttendee(recordingKey, contact.id);
+        invalidateSiteSalesforce("relation");
         await load();
         setToast(`${contact.name} marked as a participant`);
         setTimeout(() => setToast(""), 3200);
@@ -170,6 +174,7 @@ export default function ParticipantsScreen() {
       setAttendeeBusy(true);
       try {
         await setParticipant(recordingKey, p.speaker_id, null);
+        invalidateSiteSalesforce("relation");
         await load();
       } catch (e) {
         setError(
@@ -194,6 +199,7 @@ export default function ParticipantsScreen() {
           undefined,
           identityRole
         );
+        invalidateSiteSalesforce("relation");
         await load();
         // The write changed speaker_names; pull it into the context so the
         // transcript and summary follow immediately rather than on remount.
@@ -514,6 +520,7 @@ export default function ParticipantsScreen() {
         // the link to your account, which is what every task notification
         // depends on.
         allowSelf
+        salesforceWorkspaceId={rec?.workspace_id}
         title={pickerFor
           ? `Who is ${speakerName(pickerFor, speakerNames)}?`
           : "Select Contact"}
@@ -530,6 +537,7 @@ export default function ParticipantsScreen() {
         onClose={() => setAttendeePicker(false)}
         onPick={addAttendee}
         allowSelf
+        salesforceWorkspaceId={rec?.workspace_id}
         title="Who was in this meeting?"
       />
 

@@ -48,6 +48,10 @@ import secrets
 from datetime import datetime, timezone
 
 import mom_schema
+# The ONE definition of speaker identity. A stdlib-only leaf that imports
+# nothing from this package, so it cannot create a cycle — the same reason
+# mom_schema and prompts both import it directly.
+import speaker_identity
 
 # 32 bytes -> 43 URL-safe characters, 256 bits of entropy. Sized so that an
 # attacker with the whole internet's bandwidth is not meaningfully closer to a
@@ -435,15 +439,27 @@ def _overview_sections(item, share):
     governed by `summary_enabled`, the toggle a user reads as "the AI's
     written notes". Turning that off therefore hides everything unrecognised
     rather than leaking it.
+
+    Speaker labels in the prose ("Speaker 0") resolve to the owner's current
+    names, the same substitution mom_schema._build_overview and the app's
+    Overview tab apply — a recipient should never be shown a raw diarization
+    label the owner has already put a name to. Only the rendered text changes;
+    the stored prose stays canonical.
     """
     sections = ((item.get("overview") or {}).get("sections") or [])
+    names = item.get("speaker_names") or {}
     out = []
     for sec in sections:
         if not isinstance(sec, dict):
             continue
         title = (sec.get("title") or "").strip()
-        content = (sec.get("content") or "").strip()
-        items = [str(i).strip() for i in (sec.get("items") or []) if str(i).strip()]
+        content = speaker_identity.substitute_speaker_names(
+            sec.get("content"), names).strip()
+        items = [
+            speaker_identity.substitute_speaker_names(i, names).strip()
+            for i in (sec.get("items") or [])
+            if str(i).strip()
+        ]
         if not title or not (content or items):
             continue
         if not share.get(_toggle_for_title(title)):

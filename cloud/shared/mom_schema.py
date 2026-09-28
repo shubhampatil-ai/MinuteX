@@ -710,7 +710,7 @@ def _overview_sections(item):
     return sections if isinstance(sections, list) else []
 
 
-def _build_overview(item):
+def _build_overview(item, speaker_names=None):
     """The meeting's own AI sections, carried into the MoM as MoM sections.
 
     This replaced the fixed Summary + Highlights pair. Those two were the MoM's
@@ -727,6 +727,13 @@ def _build_overview(item):
 
     Returns a LIST (unlike the other builders, which return one section or
     None), because how many sections a meeting yields is now the AI's call.
+
+    `speaker_names` resolves any "Speaker N" the model wrote into the prose to
+    that speaker's CURRENT name, exactly as the sibling builders resolve their
+    stored ids. This was the one section that ignored the rename map, so a
+    renamed speaker kept showing as "Speaker 0" here while every other surface
+    updated (see speaker_identity.substitute_speaker_names). The stored text is
+    left canonical; only what renders is substituted.
     """
     out = []
     for section in _overview_sections(item):
@@ -739,8 +746,15 @@ def _build_overview(item):
         # for a section that somehow lacks one.
         role = f"{ROLE_OVERVIEW}:{section.get('id') or len(out)}"
         raw_items = section.get("items")
-        items = _items(role, raw_items if isinstance(raw_items, list) else [])
-        text = _s(section.get("content"), MAX_TEXT_CHARS)
+        # Names resolved BEFORE truncation, so a substitution cannot be cut in
+        # half by the character cap — and before _items assigns ids, which are
+        # positional and unaffected by the text changing length.
+        items = _items(role, [
+            speaker_identity.substitute_speaker_names(t, speaker_names)
+            for t in (raw_items if isinstance(raw_items, list) else [])
+        ])
+        text = _s(speaker_identity.substitute_speaker_names(
+            section.get("content"), speaker_names), MAX_TEXT_CHARS)
         if items and not text:
             out.append(_section(role, KIND_LIST, title, items=items))
         elif text:
@@ -980,7 +994,7 @@ def build_sections(item, tasks=None, speaker_names=None, meta=None,
     # shipped still has the old attributes and renders exactly as it always
     # did. Preferring the overview when present is what stops a reprocessed
     # meeting showing its content twice under two sets of headings.
-    prose = _build_overview(item)
+    prose = _build_overview(item, speaker_names)
     if not prose:
         prose = [s for s in (_build_legacy_summary(item),
                              _build_legacy_highlights(item)) if s]

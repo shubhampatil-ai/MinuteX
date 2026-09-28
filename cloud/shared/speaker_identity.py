@@ -278,3 +278,70 @@ def speaker_roster_ids(timestamps=None, speaker_names=None, participants=None):
         if isinstance(row, dict):
             _add(row.get("speaker_id") or row.get("speaker"))
     return out
+
+
+# ---------------------------------------------------------------------------
+# PROSE. The one surface where identity cannot be stored as an id.
+#
+# Every other output holds a speaker as a canonical id and resolves the name
+# when it renders, which is why a rename reaches all of them for free. AI
+# prose cannot: "Speaker 0 raised the timeline" is a STRING, and the id in it
+# is spelled out rather than referenced. Stored verbatim, it freezes — the
+# exact failure ai_schema._resolve_task_speakers documents for tasks, where a
+# name written into an id field could never be moved by a later rename.
+#
+# Tasks were fixed by coercing the model's answer to an id at ingest. Prose
+# has no id field to coerce INTO, so the join has to happen the other way
+# round: find the label inside the text and swap in the current name at render
+# time. That keeps the stored prose canonical ("Speaker 0" always), so the
+# same row re-renders correctly after every rename, with nothing regenerated.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO. It does not rewrite a NAME the model
+# wrote into prose. If the model emitted "Rahul raised the timeline", there is
+# no label to find, and guessing which speaker "Rahul" was would re-introduce
+# the misattribution resolve_legacy_speaker_reference refuses to risk. Such a
+# row keeps the name it was written with; the prompt is what prevents it.
+# ---------------------------------------------------------------------------
+
+# A speaker label as it appears INSIDE prose: "Speaker 0", "speaker_12".
+#
+# Only the numeric form is matched. A word label ("agent") is a bare English
+# word once its prefix is gone — substituting every occurrence of "agent" in a
+# sentence would corrupt prose that simply used the word, so those are left
+# alone. `fallback_display_name` shows them unprefixed anyway, meaning there is
+# no "Speaker agent" in the text to find.
+#
+# The trailing (?!\w) stops "Speaker 1" from matching inside "Speaker 12":
+# without it the longer label would be rewritten as the shorter one's name
+# followed by a stray digit.
+_PROSE_LABEL_RE = re.compile(r"\bspeaker[\s_-]*(\d+)(?!\w)", re.IGNORECASE)
+
+
+def substitute_speaker_names(text, speaker_names):
+    """Prose with every "Speaker N" replaced by that speaker's current name.
+
+        "Speaker 0 raised the timeline"  + {"0": "Rahul"} -> "Rahul raised…"
+        "Speaker 0 raised the timeline"  + {}             -> unchanged
+        "Speaker 12 agreed"              + {"1": "Amit"}  -> unchanged
+
+    A label with no name is left exactly as written, so an unnamed speaker
+    still reads "Speaker 0" — the same string the transcript beside it shows,
+    and the same fallback every other surface uses.
+
+    Idempotent in the way that matters: the output contains a real name where
+    one exists, and re-running finds no label to replace. Because only the
+    stored (canonical) prose is ever the input, a rename always re-resolves
+    from "Speaker 0" rather than from the previous name.
+    """
+    body = str(text or "")
+    if not body:
+        return ""
+    names = normalize_speaker_names(speaker_names)
+    if not names:
+        return body
+
+    def _swap(match):
+        name = names.get(match.group(1))
+        return str(name).strip() if name and str(name).strip() else match.group(0)
+
+    return _PROSE_LABEL_RE.sub(_swap, body)

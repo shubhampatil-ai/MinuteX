@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 CHANNEL_IN_APP = "IN_APP"
 CHANNEL_EMAIL = "EMAIL"        # not implemented in Phase 1
 CHANNEL_WHATSAPP = "WHATSAPP"  # not implemented in Phase 1
-CHANNEL_PUSH = "PUSH"          # not implemented in Phase 1
+CHANNEL_PUSH = "PUSH"          # OS push — shared/push_delivery.py (brief ready only)
 
 # The only channel this phase delivers on. Every notification is written with
 # exactly this, so the day a second channel ships, the rows already say which

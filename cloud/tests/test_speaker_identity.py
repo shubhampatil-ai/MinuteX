@@ -419,5 +419,118 @@ class TaskDisplayPrecedenceTests(unittest.TestCase):
         self.assertEqual(row["assignee_speaker_id"], "0")
 
 
+class ProseSubstitution(unittest.TestCase):
+    """"Speaker 0" inside AI prose follows a rename.
+
+    THE GAP THIS CLOSES. Every other surface stores a speaker as an id and
+    resolves the name when it renders, so a rename reaches it for free. The
+    dynamic Overview is prose the model wrote: the id is spelled out inside a
+    sentence rather than referenced, so nothing could re-resolve it and a
+    renamed speaker kept reading "Speaker 0" there while the transcript,
+    participants, decisions and task owners all updated.
+    """
+    sub = staticmethod(si.substitute_speaker_names)
+
+    def test_a_named_speaker_is_replaced(self):
+        self.assertEqual(
+            self.sub("Speaker 0 raised the timeline", {"0": "Rahul"}),
+            "Rahul raised the timeline")
+
+    def test_an_unnamed_speaker_keeps_the_label(self):
+        # The same string the transcript beside it shows.
+        self.assertEqual(self.sub("Speaker 3 agreed", {"0": "Rahul"}),
+                         "Speaker 3 agreed")
+
+    def test_every_occurrence_and_every_speaker(self):
+        self.assertEqual(
+            self.sub("Speaker 0 proposed it; Speaker 1 agreed with Speaker 0.",
+                     {"0": "Rahul", "1": "Amit"}),
+            "Rahul proposed it; Amit agreed with Rahul.")
+
+    def test_the_spellings_the_model_actually_emits(self):
+        for written in ("Speaker 0", "speaker 0", "speaker_0", "Speaker-0",
+                        "SPEAKER 0"):
+            self.assertEqual(self.sub(f"{written} spoke", {"0": "Rahul"}),
+                             "Rahul spoke", written)
+
+    def test_a_two_digit_label_is_not_matched_by_a_one_digit_speaker(self):
+        # THE BOUNDARY BUG. Without the trailing guard, "Speaker 1" matches
+        # inside "Speaker 12" and the text becomes "Amit2 agreed" — one
+        # person's words handed to another, plus a stray digit.
+        self.assertEqual(self.sub("Speaker 12 agreed", {"1": "Amit"}),
+                         "Speaker 12 agreed")
+        self.assertEqual(self.sub("Speaker 12 agreed", {"12": "Neha"}),
+                         "Neha agreed")
+
+    def test_a_word_label_is_left_alone(self):
+        # "agent" renders unprefixed, so there is no "Speaker agent" to find —
+        # and substituting the bare word would corrupt prose that used it.
+        self.assertEqual(
+            self.sub("The agent escalated it", {"agent": "Rahul"}),
+            "The agent escalated it")
+
+    def test_a_name_in_the_prose_is_never_rewritten(self):
+        # The model sometimes writes the NAME it read (transcript_store
+        # substitutes names into the lines it sees). There is no label to find,
+        # and guessing which speaker "Rahul" meant would risk the exact
+        # misattribution resolve_legacy_speaker_reference refuses to make.
+        self.assertEqual(self.sub("Rahul raised the timeline", {"0": "Amit"}),
+                         "Rahul raised the timeline")
+
+    def test_a_rename_re_resolves_from_the_label_not_the_old_name(self):
+        # Why the STORED prose must stay canonical: each render starts from
+        # "Speaker 0", so renaming twice lands on the second name rather than
+        # freezing on the first.
+        stored = "Speaker 0 owns the rollout"
+        self.assertEqual(self.sub(stored, {"0": "Rahul"}),
+                         "Rahul owns the rollout")
+        self.assertEqual(self.sub(stored, {"0": "Amit"}),
+                         "Amit owns the rollout")
+
+    def test_a_legacy_display_form_key_still_resolves(self):
+        # A map written before the API canonicalized keys on write.
+        self.assertEqual(self.sub("Speaker 0 spoke", {"Speaker 0": "Rahul"}),
+                         "Rahul spoke")
+
+    def test_empty_and_missing_inputs(self):
+        self.assertEqual(self.sub("", {"0": "Rahul"}), "")
+        self.assertEqual(self.sub(None, {"0": "Rahul"}), "")
+        self.assertEqual(self.sub("Speaker 0 spoke", None), "Speaker 0 spoke")
+        self.assertEqual(self.sub("Speaker 0 spoke", {}), "Speaker 0 spoke")
+
+
+class OverviewFollowsARename(unittest.TestCase):
+    """The MoM's Overview sections resolve names like every sibling builder."""
+
+    def _item(self, content="Speaker 0 raised the timeline", items=None):
+        return {"overview": {"sections": [
+            {"id": "s-1", "title": "Timeline", "content": content,
+             "items": items or []}]}}
+
+    def test_prose_follows_the_map(self):
+        secs = mom_schema.build_sections(self._item(), [], {"0": "Rahul"})
+        text = next(s["text"] for s in secs if s["role"].startswith("overview:"))
+        self.assertIn("Rahul raised the timeline", text)
+        self.assertNotIn("Speaker 0", text)
+
+    def test_list_items_follow_the_map_too(self):
+        secs = mom_schema.build_sections(
+            self._item(content="", items=["Speaker 0 owns it"]), [],
+            {"0": "Rahul"})
+        sec = next(s for s in secs if s["role"].startswith("overview:"))
+        self.assertEqual([i["text"] for i in sec["items"]], ["Rahul owns it"])
+
+    def test_an_unnamed_speaker_still_reads_speaker_0(self):
+        secs = mom_schema.build_sections(self._item(), [], {})
+        text = next(s["text"] for s in secs if s["role"].startswith("overview:"))
+        self.assertIn("Speaker 0", text)
+
+    def test_the_stored_row_is_never_rewritten(self):
+        item = self._item()
+        mom_schema.build_sections(item, [], {"0": "Rahul"})
+        self.assertEqual(item["overview"]["sections"][0]["content"],
+                         "Speaker 0 raised the timeline")
+
+
 if __name__ == "__main__":
     unittest.main()

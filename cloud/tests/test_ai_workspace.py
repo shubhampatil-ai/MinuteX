@@ -240,9 +240,16 @@ class AiTestCase(unittest.TestCase):
             return {}
 
         self.table.update_item.side_effect = _update_item
+        # MeetingAccess (participant grants): empty, so paths that touch it —
+        # permanent delete dropping a meeting's grants — never reach real AWS.
+        self.p_access = mock.patch.object(api, "_meeting_access")
+        self.access = self.p_access.start()
+        self.access.query.return_value = {"Items": []}
+        self.access.get_item.return_value = {}
         self.addCleanup(self.p_auth.stop)
         self.addCleanup(self.p_devices.stop)
         self.addCleanup(self.p_table.stop)
+        self.addCleanup(self.p_access.stop)
 
     def stub_groq(self, text="## Minutes\n\n- Approved the revised quote"):
         """Patch the shared client's completion call; return the mock so tests
@@ -321,9 +328,17 @@ class TestPrompts(unittest.TestCase):
     def test_summary_prompt_asks_for_exactly_the_schema_fields(self):
         """The prompt's declared field list and the coercer's shape must not
         drift: a field asked for but not coerced is silently discarded, and a
-        field coerced but not asked for is always empty."""
+        field coerced but not asked for is always empty.
+
+        `tasks` is the exception: it stays in the analysis shape but is filled
+        by the SEPARATE task call, so the analysis prompt must NOT ask for it
+        (asking twice is how the two drift) and the task prompt must."""
         for field in ai_schema.empty_analysis():
+            if field == "tasks":
+                continue
             self.assertIn(f'"{field}"', prompts.SUMMARY_SYSTEM, field)
+        self.assertNotIn('"tasks"', prompts.SUMMARY_SYSTEM)
+        self.assertIn('"tasks"', prompts.TASKS_SYSTEM)
 
     def test_summary_prompt_does_not_ask_for_a_removed_field(self):
         """agenda/key_points/decisions/pending_discussions/action_items were
@@ -345,7 +360,12 @@ class TestPrompts(unittest.TestCase):
         still declared the removed fields would reintroduce them on exactly the
         long meetings where the analysis matters most."""
         for field in ai_schema.empty_analysis():
+            if field == "tasks":
+                continue
             self.assertIn(f'"{field}"', prompts.SUMMARY_REDUCE_SYSTEM, field)
+        # Tasks overflow through their OWN reduce (see TASKS_SYSTEM).
+        self.assertNotIn('"tasks"', prompts.SUMMARY_REDUCE_SYSTEM)
+        self.assertIn('"tasks"', prompts.TASKS_REDUCE_SYSTEM)
         for gone in ('"agenda"', '"key_points"', '"pending_discussions"',
                      '"decisions":', '"action_items":'):
             self.assertNotIn(gone, prompts.SUMMARY_REDUCE_SYSTEM, gone)
@@ -357,7 +377,6 @@ class TestPrompts(unittest.TestCase):
         its conclusions. With the overview dynamic there is no single length to
         cap, so the rule is stated per section: dense AND short."""
         self.assertIn("information-dense", prompts.SUMMARY_SYSTEM)
-        self.assertIn("did not attend", prompts.SUMMARY_SYSTEM)
         self.assertNotIn("AT MOST 5", prompts.SUMMARY_SYSTEM)
         self.assertIn("SHORT + INFORMATION-DENSE + FACTUAL + CONTEXTUAL",
                       prompts.SUMMARY_SYSTEM)
@@ -510,9 +529,9 @@ class TestPrompts(unittest.TestCase):
                       prompts.SUMMARY_SYSTEM)
         self.assertIn("could have guessed WITHOUT the meeting",
                       prompts.SUMMARY_SYSTEM)
-        # It must sit AFTER the field list and the two rule blocks.
+        # It must sit AFTER the field list and the participants rule block.
         self.assertGreater(prompts.SUMMARY_SYSTEM.index("BEFORE YOU ANSWER"),
-                           prompts.SUMMARY_SYSTEM.index("TASK ASSIGNMENT RULE"))
+                           prompts.SUMMARY_SYSTEM.index("PARTICIPANTS RULE"))
 
     def test_specificity_is_taught_by_weak_vs_better_examples(self):
         """A rule alone ("be specific") produced topic labels; the paired
@@ -525,10 +544,15 @@ class TestPrompts(unittest.TestCase):
 
     def test_participants_and_task_assignees_are_independent(self):
         """The semantic correction: a name appearing only as a task owner was
-        being added to participants, inventing an attendee from a mention."""
+        being added to participants, inventing an attendee from a mention.
+
+        The two rules now live in different prompts — participants in the
+        analysis, assignees in the task call — and each must still state its
+        half of the separation."""
         self.assertIn("PARTICIPANTS RULE", prompts.SUMMARY_SYSTEM)
-        self.assertIn("TASK ASSIGNMENT RULE", prompts.SUMMARY_SYSTEM)
-        self.assertIn("INDEPENDENT concepts", prompts.SUMMARY_SYSTEM)
+        self.assertIn("TASK ASSIGNMENT RULE", prompts.TASKS_SYSTEM)
+        self.assertIn("INDEPENDENT concepts", prompts.TASKS_SYSTEM)
+        self.assertIn("did not attend", prompts.TASKS_SYSTEM)
         # A participant must have evidence of attending...
         self.assertIn("direct evidence that they participated",
                       prompts.SUMMARY_SYSTEM)
@@ -539,9 +563,9 @@ class TestPrompts(unittest.TestCase):
                       prompts.SUMMARY_SYSTEM)
         # ...while an assignee need not be one at all.
         self.assertIn("does NOT need to be a participant",
-                      prompts.SUMMARY_SYSTEM)
+                      prompts.TASKS_SYSTEM)
         for entity in ("team", "department", "vendor"):
-            self.assertIn(entity, prompts.SUMMARY_SYSTEM, entity)
+            self.assertIn(entity, prompts.TASKS_SYSTEM, entity)
 
     def test_the_reduce_prompt_also_separates_participants_from_assignees(self):
         """The overflow path merges into the same schema, so it needs the same
@@ -553,8 +577,29 @@ class TestPrompts(unittest.TestCase):
     def test_tasks_must_preserve_scope(self):
         """"Test parser" is not an actionable task; the object, scope and
         constraint are what make it one."""
-        self.assertIn("preserve the SCOPE", prompts.SUMMARY_SYSTEM)
-        self.assertIn("Test parser", prompts.SUMMARY_SYSTEM)
+        self.assertIn("preserve the SCOPE", prompts.TASKS_SYSTEM)
+        self.assertIn("Test parser", prompts.TASKS_SYSTEM)
+
+    def test_the_task_call_reads_the_analysis_then_the_transcript(self):
+        """What made the task call work (measured 0-4 -> 8-13 tasks on an
+        84-minute Marathi meeting) is the English analysis placed AHEAD of the
+        transcript — while every task must still be evidenced by the
+        transcript, never by the analysis."""
+        body = prompts.tasks_user_content("MEETING TITLE: X", "[seg_0] hi")
+        self.assertLess(body.index("=== MEETING ANALYSIS"),
+                        body.index("=== TRANSCRIPT ==="))
+        self.assertIn("[seg_0] hi", body)
+        # No analysis (e.g. an empty digest) still sends the transcript.
+        self.assertNotIn("MEETING ANALYSIS",
+                         prompts.tasks_user_content("", "[seg_0] hi"))
+        self.assertIn("Every task must be supported by the TRANSCRIPT",
+                      prompts.TASKS_SYSTEM)
+        self.assertIn("never a sentence from the analysis", prompts.TASKS_SYSTEM)
+
+    def test_the_task_prompt_carries_the_speaker_roster(self):
+        system = prompts.tasks_system(["Speaker 0"], {"0": "Ravi"})
+        self.assertIn('speaker_id "0" = Ravi', system)
+        self.assertEqual(prompts.tasks_system(), prompts.TASKS_SYSTEM)
 
     def test_the_summary_prompt_keeps_its_factuality_rules(self):
         """Comprehensiveness must not have been bought with hallucination

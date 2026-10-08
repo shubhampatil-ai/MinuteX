@@ -115,6 +115,14 @@ URL_EXPIRY = int(os.environ.get("URL_EXPIRY", "900"))
 # summary stage used to get.
 GROQ_DEADLINE_SECONDS = int(os.environ.get("GROQ_DEADLINE_SECONDS", "180"))
 
+# The task call's own budget, on top of the analysis's (see extract_tasks). A
+# normal meeting's task call takes 15-25s; this leaves room for the generation
+# retries. 180 + 60 stays well inside the Lambda's 300s timeout, so even a
+# worst-case analysis cannot push the task call into killing the invocation
+# before the transcript is persisted.
+GROQ_TASKS_DEADLINE_SECONDS = int(
+    os.environ.get("GROQ_TASKS_DEADLINE_SECONDS", "60"))
+
 # --- ElevenLabs speech-to-text (Scribe) ---
 ELEVENLABS_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "scribe_v2")
@@ -566,8 +574,9 @@ def _note_partial_overview(overview, covered, total):
 
 def analyze_meeting(transcript, valid_ids=None, roster_source=None,
                     speaker_names=None):
-    """THE analysis: title, the dynamic overview, tasks, participants and the
-    structured meeting_highlights — in ONE Groq call.
+    """THE analysis: title, the dynamic overview, participants and the
+    structured meeting_highlights — in ONE Groq call. (Tasks are a second call,
+    extract_tasks(), which reads this analysis.)
 
     Replaces stages that each re-sent the same transcript:
         summarize()               title/summary/highlights/tasks/participants
@@ -670,12 +679,53 @@ def analyze_meeting(transcript, valid_ids=None, roster_source=None,
           f"title={analysis['title']!r}, "
           f"{len(sections)} overview section(s) "
           f"{[s.get('title') for s in sections]}, "
-          f"{len(analysis['tasks'])} tasks, "
           f"{len(analysis['participants'])} participants, "
           + ", ".join(f"{len(hl.get(k, []))} {k}"
                       for k in ai_schema.HIGHLIGHT_SECTIONS)
           + f" (model={groq_client.GROQ_MODEL})")
     return analysis
+
+
+def extract_tasks(transcript, analysis, valid_ids=None, roster_source=None,
+                  speaker_names=None, language=None, duration=None):
+    """THE TASK CALL: the meeting's committed work, as `analysis["tasks"]`.
+
+    A second Groq call, made after analyze_meeting(), with tasks as its ONLY
+    output and the analysis that call just wrote — in English — placed ahead of
+    the transcript. Why both matter is in prompts.TASKS_SYSTEM.
+
+    Returns the coerced task list. Raises on failure; the caller decides what a
+    failure means (it stores no tasks rather than failing the meeting).
+    """
+    roster = ai_schema.speaker_roster(
+        roster_source if roster_source is not None else transcript)
+    # The same digest the meeting chat reads (prompts.analysis_context), built
+    # from what analyze_meeting just produced rather than from the row, which
+    # has not been written yet.
+    analysis_text = prompts.analysis_context(
+        {"title": analysis.get("title"),
+         "overview": analysis.get("overview"),
+         "participants": analysis.get("participants"),
+         "speaker_names": speaker_names or {},
+         "language": language or "",
+         "duration": duration},
+        analysis.get("meeting_highlights"))
+    result, covered, total = groq_client.analyze(
+        prompts.tasks_user_content(analysis_text, transcript),
+        map_prompt=prompts.tasks_system(roster, speaker_names),
+        reduce_prompt=prompts.TASKS_REDUCE_SYSTEM,
+        merge=ai_schema.merge_tasks,
+        coerce=lambda obj: ai_schema.coerce_task_reply(
+            obj, roster, valid_ids, speaker_names),
+        deadline_seconds=GROQ_TASKS_DEADLINE_SECONDS,
+        label="tasks",
+        # No is_usable: an empty list is a legitimate answer (a meeting that
+        # agreed nothing), not a failed generation to retry.
+    )
+    tasks = (result or {}).get("tasks") or []
+    print(f"[groq] tasks ok ({covered}/{total} segments): {len(tasks)} tasks "
+          f"(model={groq_client.GROQ_MODEL})")
+    return tasks
 
 
 # ---------------------------------------------------------------------------
@@ -987,8 +1037,8 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     # Step 2: analyze with Groq — ONE call over the full transcript producing
-    # EVERYTHING: title, the dynamic overview, tasks, participants and the
-    # structured meeting_highlights.
+    # title, the dynamic overview, participants and the structured
+    # meeting_highlights; then the TASK call (extract_tasks), fed that analysis.
     # Failure here is non-fatal — we still keep the transcript + timestamps.
     #
     # The segment ids are derived the SAME way the read path derives them
@@ -1002,8 +1052,8 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # both the rendered transcript and the participant matcher can use it. A
     # rename made after this point simply is not reflected in this analysis —
     # same as any other row edit made mid-run.
-    speaker_names = (_table.get_item(Key={"audio_s3_key": key})
-                     .get("Item", {}).get("speaker_names")) or {}
+    prior_row = _table.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+    speaker_names = prior_row.get("speaker_names") or {}
     # The allow-list of real segment ids, and the transcript rendered WITH those
     # ids on each line. Both come from transcript_store so the input the model
     # reads and the validator's allow-list can never disagree about what a valid
@@ -1039,6 +1089,20 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
         print(f"[groq] FAILED for {key} — persisting transcript only: {err}")
         analysis = ai_schema.empty_unified()
         status = "transcribed"
+
+    # Step 2b: the TASK call. Only after a usable analysis: it reads that
+    # analysis, and a "transcribed" row is already the degraded state a
+    # reprocess repairs as a whole. A task-call failure costs the tasks, never
+    # the meeting — the overview the user is waiting for is already in hand.
+    if status == "complete":
+        try:
+            analysis["tasks"] = extract_tasks(
+                labelled, analysis, valid_ids, roster_source=transcript,
+                speaker_names=speaker_names, language=language,
+                duration=prior_row.get("duration"))
+        except Exception as err:  # noqa: BLE001
+            print(f"[groq] task call FAILED for {key} — storing no tasks: {err}")
+            analysis["tasks"] = []
 
     # The outputs now arrive TOGETHER, so they no longer degrade independently —
     # there is one call to fail, not several. That trade is deliberate and it is

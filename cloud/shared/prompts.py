@@ -110,7 +110,9 @@ def _prose_system(body):
 # ===========================================================================
 # STAGE 1 — the whole meeting analysis, from the FULL transcript, in ONE call.
 #
-# Four fields: title, overview, tasks, participants. That is the entire schema.
+# Three fields: title, overview, participants. That is the entire schema. Tasks
+# are NOT extracted here any more — TASKS_SYSTEM (a second call, fed this call's
+# English overview) owns them; see _TASK_FIELD for why.
 #
 # THE DYNAMIC OVERVIEW replaced the fixed `summary` + `highlights` pair. The
 # reason is a product one: every meeting was being poured into the same mould,
@@ -156,6 +158,229 @@ def _prose_system(body):
 # scoped accordingly: a MENTIONED name is usable as an owner, an unmentioned one
 # never is.
 # ===========================================================================
+# THE TASK RULES — shared by TASKS_SYSTEM (the dedicated task call) and nothing
+# else. They used to live INSIDE SUMMARY_SYSTEM, so tasks were extracted in the
+# same breath as the title, overview, participants and highlights. Measured on
+# an 84-minute Marathi meeting (2026-10-08): that one call returned 0 tasks in
+# production and 0-4 vague ones ("Fix the issue") on re-runs, while the SAME
+# model given the call's own ENGLISH overview plus the transcript, with tasks as
+# its only job, returned 8-13 specific ones. Long code-switched transcripts are
+# where it matters most: the overview tolerates half-understood lines, a task
+# needs the exact sentence. See TASKS_SYSTEM below.
+_TASK_FIELD = (
+    '- "tasks": array of objects, each EXACTLY {"task": string, "assignee": '
+    'string, "assignee_speaker_id": string, "due_date": string, '
+    '"priority": string, "confidence": string, "evidence": string, '
+    '"evidence_segment_ids": array of strings}. Only real agreed work — '
+    "never a discussion, suggestion, recommendation, possibility or question. "
+    "Only create a task when the transcript indicates actual responsibility or "
+    "commitment.\n"
+    # OWNERSHIP IS NOT PART OF QUALIFICATION. Stated HERE, adjacent to the
+    # qualification bar, and not only in TASK ASSIGNMENT RULE ~110 lines below.
+    # Production evidence (finish_reason=stop, 3878/16000 completion tokens, so
+    # not truncation): a 59-minute process-definition meeting returned 6
+    # overview sections, 3 decisions, 2 deadlines and 4 open_questions but
+    # 0 tasks. Every commitment in it was a process obligation with no named
+    # owner ("every document shared with a customer must include the logo").
+    # Reading "requires actual responsibility or commitment" next to the field
+    # and "an empty assignee is correct" far away, the model collapsed "no
+    # owner" into "not a task" — exactly the inference TASK ASSIGNMENT RULE
+    # forbids. The two tests must be adjacent because they are independent:
+    # qualification asks WHETHER work was committed, ownership asks WHO holds
+    # it. Keep the positive example: "General discussion -> no task" was the
+    # nearest worked case to an unowned commitment and it taught rejection.
+    "  QUALIFICATION AND OWNERSHIP ARE SEPARATE TESTS. The question \"was "
+    "this work actually committed to?\" is decided WITHOUT reference to "
+    "whether anyone was named. A task that was clearly agreed, committed or "
+    "planned MUST be extracted even when NO owner is identifiable anywhere in "
+    "the transcript — set assignee \"\" and assignee_speaker_id \"\" and emit "
+    "the task. Never drop a genuine commitment because you could not "
+    "attribute it; an unowned task is a normal, expected result, and omitting "
+    "it loses work the meeting actually agreed to.\n"
+    '  - Committed, no owner named: "Every document shared with a customer '
+    'must include the company logo." -> task "Include the company logo on '
+    'every document shared with a customer", assignee "", '
+    'assignee_speaker_id "". A collective or process obligation with no '
+    "named owner is still a task.\n"
+    "  This does NOT lower the qualification bar. A question, suggestion, "
+    "recommendation, possibility, option under consideration, general "
+    "discussion or a standing fact stated for information is STILL not a "
+    'task, with or without an owner: "Should someone check the API limit?" '
+    'and "We should probably send the proposal" remain no task. What changes '
+    "is only that a real commitment no longer needs an owner to be recorded.\n"
+    # DIRECTIVES AND CODE-SWITCHED SPEECH. The bar above was written around
+    # English self-commitments, and on a Hinglish/Marathi team sync the model
+    # missed the two most common shapes of work there: a manager TELLING
+    # someone to do it ("Isha, Gulshan ke saath baith ke Viceroy ka plan bana
+    # lo"), and a follow-up meeting with a named person and agenda. Neither is
+    # a suggestion, and neither needs the assignee to answer "okay". The
+    # follow-up case is bounded deliberately — "let's catch up sometime" must
+    # stay out, or every pleasantry becomes a task.
+    "  WHAT COUNTS AS COMMITTED WORK. Any of these is a task:\n"
+    "  - A self-commitment: a speaker says they will do it.\n"
+    "  - A DIRECTIVE: someone tells a named person or team to do it. It counts "
+    "without an explicit \"okay\", unless it is refused or withdrawn.\n"
+    "  - A group decision that names a next step.\n"
+    "  - A follow-up meeting or sync, ONLY when it has an owner, a date or a "
+    'stated agenda. "Sync with Amit on Thursday about the listing plan" is a '
+    'task; "We should catch up sometime" is not.\n'
+    "  Work already completed or shown in a demo is NOT a task.\n"
+    "  CODE-SWITCHED SPEECH. Meetings often mix English, Hindi and Marathi, "
+    "sometimes in Devanagari. A directive or commitment counts in ANY of these "
+    'languages: "kar do", "kar lena", "karna padega", "bhej dena", "dekh lo", '
+    '"baith ke plan banao", "tu bagh", "pathav", "kar ghe" assign work exactly '
+    'as "please do it" does. Write the task text in English. Write names in '
+    "Latin script EXACTLY as spoken - never translate, correct or anglicise a "
+    "name. \"evidence\" stays VERBATIM in the original language and script.\n"
+    '  - "[seg_7] Speaker 0: Isha, Gulshan aur Siddharth ke saath baith ke '
+    'Viceroy ka next action plan bana lo." -> task "Prepare the next action '
+    'plan for Viceroy with Gulshan and Siddharth", assignee "Isha", '
+    'assignee_speaker_id "", evidence copied as spoken.\n'
+    # The four fields below were MISSING from this contract while ai_schema's
+    # TASK_SPEC, the Tasks table and the assignment gate all expected them.
+    # The prompt said EXACTLY {task, assignee, due_date, priority}, so the
+    # model complied and every extracted task arrived with no speaker id, no
+    # confidence and no evidence. Measured against a real 11-speaker meeting
+    # AND a 3-speaker single-pass transcript before the fix. Adding a field to
+    # TASK_SPEC without adding it HERE is silently a no-op: the two must
+    # always change together.
+    '  "assignee_speaker_id" links a task to WHO SAID IT, so the app can '
+    "attach a real identity once the user says who each speaker is. It must "
+    "contain a speaker label EXACTLY as the transcript writes it (e.g. "
+    '"Speaker 0") - never a person\'s name, never a team, never a guess.\n'
+    '  - Self-commitment: "Speaker 0: I\'ll send the proposal tomorrow." -> '
+    'assignee_speaker_id "Speaker 0", assignee "" (no name was spoken).\n'
+    '  - Assignment to someone else: "Speaker 0: Rahul, send the proposal." '
+    '-> assignee "Rahul", assignee_speaker_id "" - the speaker is the one '
+    "ASSIGNING, not the one responsible.\n"
+    '  - Use "" for assignee_speaker_id whenever the owner is not identifiable '
+    "as a specific speaker label. An empty value is correct and expected; a "
+    "wrong label assigns work to the wrong person.\n"
+    '  NEVER put a speaker label ("Speaker 2") into "assignee" - that field is '
+    "for a NAME actually spoken in the transcript. When only the speaker is "
+    'known, set assignee_speaker_id and leave assignee "".\n'
+    '  "confidence" is EXACTLY one of "high" | "medium" | "low": high = the '
+    "work is explicit AND the owner is unambiguous; medium = the work is clear "
+    "but the owner needs context; low = the work or its owner is genuinely "
+    "ambiguous. Judge only what the transcript supports; do not inflate it.\n"
+    '  "evidence" is the VERBATIM sentence from the transcript that created '
+    "the task - copied, not paraphrased. It is what lets a reader check the "
+    'task against what was actually said. Use "" only if no single sentence '
+    'carries it. "evidence_segment_ids" holds the ids of the segment(s) that '
+    "sentence came from.\n"
+    "  EVERY transcript line you are given begins with its own segment id in "
+    'square brackets, like "[seg_12] Speaker 0: ...". To fill '
+    'evidence_segment_ids, copy the id from the START of the line (or lines) '
+    "your evidence quote came from - character for character, including the "
+    '"seg_" prefix.\n'
+    '  Example - given the line "[seg_2] Speaker 1: I\'ll send the proposal '
+    'tomorrow.", a task extracted from it has evidence "I\'ll send the '
+    'proposal tomorrow." and evidence_segment_ids ["seg_2"].\n'
+    "  Use SEVERAL ids only when the evidence genuinely spans several lines. "
+    "Usually it is one.\n"
+    '  Use [] when no single line supports the task. NEVER invent, guess, '
+    "renumber or extrapolate an id, and never use a SPEAKER label "
+    '("Speaker 1") or a number ("2") as a segment id - they are different '
+    "things. An id you did not read at the start of a line is discarded "
+    "anyway, so a guess only loses the reference.\n"
+    "  task text must preserve the SCOPE of the work, not just name it. "
+    'Prefer "Test the open-source PDF-to-Markdown parser against property '
+    'brochures and quotation sheets containing complex tables and pricing '
+    'information" over "Test parser". Include what needs to be done, the '
+    "object/document/system involved, the scope and any important constraint, "
+    "whenever the transcript supports them.\n"
+    # A Hindi/Marathi relative date is translated, not copied: spoken_dates
+    # resolves only English phrases, so "kal" stored as-is never becomes a due
+    # date. "kal" also means "yesterday", hence the guard.
+    "  due_date is what was stated EXACTLY as spoken (e.g. \"Friday\", "
+    '"15th March") — use "" when no date was mentioned, NEVER invent one. '
+    "When the timing was spoken in Hindi or Marathi, write its plain English "
+    'equivalent ("kal" -> "tomorrow", "parso" -> "day after tomorrow", '
+    '"agle hafte" -> "next week"); "kal" can also mean yesterday, which is '
+    "never a deadline. "
+    'priority is one of "Low" | "Medium" | "High" ONLY when urgency was '
+    'actually stated or implied by a named deadline — use "" when there is no '
+    "signal, never guess from your own sense of importance, and never default "
+    'to "Medium". No duplicate tasks '
+    "(the same commitment mentioned twice is ONE task). If a later turn "
+    "changes the owner or date, keep only the final version; a task that was "
+    "explicitly cancelled is not returned. [] if none.\n"
+)
+
+_TASK_RULES = (
+    "TASK ASSIGNMENT RULE:\n"
+    "A task may be assigned to any person, team, department, company, vendor, "
+    "customer, or external party explicitly identified in the meeting as "
+    "responsible for the work.\n"
+    "The assignee does NOT need to be a participant or speaker in the meeting.\n"
+    "Examples:\n"
+    '- "I\'ll do it." -> assign the task to that speaker.\n'
+    '- "Rahul will prepare the quotation." -> assign to Rahul even if Rahul did '
+    "not attend the meeting.\n"
+    '- "The marketing team will update the campaign." -> assign to Marketing '
+    "Team.\n"
+    '- "Finance will verify the numbers." -> assign to Finance.\n'
+    '- "The vendor will provide the documents." -> assign to Vendor.\n'
+    '- "Send this to Priya." -> only treat Priya as the assignee if the '
+    "transcript explicitly establishes that Priya is responsible for an "
+    "action.\n"
+    # ONE owner per task: TASK_SPEC, the Tasks table and Salesforce's Task
+    # OwnerId all hold a single assignee, and a "collaborators" field would be
+    # dropped by obj_list. The co-workers are kept in the task TEXT instead,
+    # which every consumer already shows. Picking a lead the meeting did not
+    # name is the role-based inference the rule below forbids.
+    "- Several people given the same work: the assignee is the person the "
+    'directive was ADDRESSED to ("Isha, you sit with Gulshan and Siddharth" '
+    '-> assignee "Isha"); name the others IN the task text ("... with Gulshan '
+    'and Siddharth"). When several were named equally and nobody was '
+    'addressed or designated as lead, use "" for assignee and name all of them '
+    "in the task text. Never pick a lead yourself.\n"
+    "Use the assignee EXACTLY as identified in the transcript. Never infer an "
+    "assignee merely because someone is likely responsible based on their role, "
+    'department or context. If responsibility is not explicitly assigned, use '
+    '"" for assignee.\n'
+    "A person's presence in participants and responsibility for a task are "
+    "INDEPENDENT concepts.\n"
+    "\n"
+    "SPEAKER-ID, EVIDENCE AND CONFIDENCE:\n"
+    '"assignee_speaker_id" links a task to WHO SAID IT, so the app can '
+    "attach a real identity once the user says who each speaker is. It "
+    "must contain a speaker label EXACTLY as the transcript writes it "
+    '(e.g. "Speaker 0") — never a person\'s name, never a team, '
+    "never a guess.\n"
+    '- Self-commitment: "Speaker 0: I\'ll send the proposal tomorrow." -> '
+    'assignee_speaker_id "Speaker 0", assignee "" (no name spoken).\n'
+    '- Explicit assignment to someone else: "Speaker 0: Rahul, send '
+    'the proposal." -> assignee "Rahul", assignee_speaker_id "" — the '
+    "speaker is the one ASSIGNING, not the one responsible. Only set "
+    "assignee_speaker_id when the responsible person is themselves a "
+    "speaker and the transcript makes that identification explicit.\n"
+    '- General discussion: "We should send the proposal." -> no task.\n'
+    'Use "" for assignee_speaker_id whenever the owner is not '
+    "identifiable as a specific speaker label. An empty value is correct "
+    "and expected; a wrong label assigns work to the wrong person.\n"
+    '"evidence" is the VERBATIM sentence from the transcript that '
+    "created the task — copied, not paraphrased, not summarized, and "
+    "not stitched together from separate turns. It is what lets a reader "
+    "check the task against what was actually said. Use \"\" only if no "
+    "single sentence carries it.\n"
+    '"evidence_segment_ids" is WHERE that sentence sits: the ids of the '
+    "segment(s) it came from, copied EXACTLY as the transcript shows "
+    'them (they look like "seg_12"). Usually one id. Use [] when the '
+    "transcript shows no segment ids. NEVER invent, guess or renumber an "
+    "id — a wrong one points the reader at the wrong moment of the "
+    "meeting, and is discarded anyway.\n"
+    '"confidence" is EXACTLY one of "high" | "medium" | "low":\n'
+    "- high: the work is explicit AND the owner is unambiguous.\n"
+    "- medium: the work is clear, but the owner needs context to pin "
+    "down.\n"
+    "- low: the work or its owner is genuinely ambiguous.\n"
+    "Judge only what the transcript supports; do not inflate "
+    "confidence.\n"
+    "\n"
+)
+
+
 SUMMARY_SYSTEM = _json_system(
     "Your job is NOT to summarize the transcript line by line. Reconstruct the "
     "meeting as if you attended it. You are given the COMPLETE transcript and "
@@ -319,105 +544,6 @@ SUMMARY_SYSTEM = _json_system(
     "internal identifier as a segment id, and it must never appear in "
     "\"title\", \"content\" or \"items\". Never drop a decision, a commitment "
     "or an owner just to avoid naming someone.\n"
-    '- "tasks": array of objects, each EXACTLY {"task": string, "assignee": '
-    'string, "assignee_speaker_id": string, "due_date": string, '
-    '"priority": string, "confidence": string, "evidence": string, '
-    '"evidence_segment_ids": array of strings}. Only real agreed work — '
-    "never a discussion, suggestion, recommendation, possibility or question. "
-    "Only create a task when the transcript indicates actual responsibility or "
-    "commitment.\n"
-    # OWNERSHIP IS NOT PART OF QUALIFICATION. Stated HERE, adjacent to the
-    # qualification bar, and not only in TASK ASSIGNMENT RULE ~110 lines below.
-    # Production evidence (finish_reason=stop, 3878/16000 completion tokens, so
-    # not truncation): a 59-minute process-definition meeting returned 6
-    # overview sections, 3 decisions, 2 deadlines and 4 open_questions but
-    # 0 tasks. Every commitment in it was a process obligation with no named
-    # owner ("every document shared with a customer must include the logo").
-    # Reading "requires actual responsibility or commitment" next to the field
-    # and "an empty assignee is correct" far away, the model collapsed "no
-    # owner" into "not a task" — exactly the inference TASK ASSIGNMENT RULE
-    # forbids. The two tests must be adjacent because they are independent:
-    # qualification asks WHETHER work was committed, ownership asks WHO holds
-    # it. Keep the positive example: "General discussion -> no task" was the
-    # nearest worked case to an unowned commitment and it taught rejection.
-    "  QUALIFICATION AND OWNERSHIP ARE SEPARATE TESTS. The question \"was "
-    "this work actually committed to?\" is decided WITHOUT reference to "
-    "whether anyone was named. A task that was clearly agreed, committed or "
-    "planned MUST be extracted even when NO owner is identifiable anywhere in "
-    "the transcript — set assignee \"\" and assignee_speaker_id \"\" and emit "
-    "the task. Never drop a genuine commitment because you could not "
-    "attribute it; an unowned task is a normal, expected result, and omitting "
-    "it loses work the meeting actually agreed to.\n"
-    '  - Committed, no owner named: "Every document shared with a customer '
-    'must include the company logo." -> task "Include the company logo on '
-    'every document shared with a customer", assignee "", '
-    'assignee_speaker_id "". A collective or process obligation with no '
-    "named owner is still a task.\n"
-    "  This does NOT lower the qualification bar. A question, suggestion, "
-    "recommendation, possibility, option under consideration, general "
-    "discussion or a standing fact stated for information is STILL not a "
-    'task, with or without an owner: "Should someone check the API limit?" '
-    'and "We should probably send the proposal" remain no task. What changes '
-    "is only that a real commitment no longer needs an owner to be recorded.\n"
-    # The four fields below were MISSING from this contract while ai_schema's
-    # TASK_SPEC, the Tasks table and the assignment gate all expected them.
-    # The prompt said EXACTLY {task, assignee, due_date, priority}, so the
-    # model complied and every extracted task arrived with no speaker id, no
-    # confidence and no evidence. Measured against a real 11-speaker meeting
-    # AND a 3-speaker single-pass transcript before the fix. Adding a field to
-    # TASK_SPEC without adding it HERE is silently a no-op: the two must
-    # always change together.
-    '  "assignee_speaker_id" links a task to WHO SAID IT, so the app can '
-    "attach a real identity once the user says who each speaker is. It must "
-    "contain a speaker label EXACTLY as the transcript writes it (e.g. "
-    '"Speaker 0") - never a person\'s name, never a team, never a guess.\n'
-    '  - Self-commitment: "Speaker 0: I\'ll send the proposal tomorrow." -> '
-    'assignee_speaker_id "Speaker 0", assignee "" (no name was spoken).\n'
-    '  - Assignment to someone else: "Speaker 0: Rahul, send the proposal." '
-    '-> assignee "Rahul", assignee_speaker_id "" - the speaker is the one '
-    "ASSIGNING, not the one responsible.\n"
-    '  - Use "" for assignee_speaker_id whenever the owner is not identifiable '
-    "as a specific speaker label. An empty value is correct and expected; a "
-    "wrong label assigns work to the wrong person.\n"
-    '  NEVER put a speaker label ("Speaker 2") into "assignee" - that field is '
-    "for a NAME actually spoken in the transcript. When only the speaker is "
-    'known, set assignee_speaker_id and leave assignee "".\n'
-    '  "confidence" is EXACTLY one of "high" | "medium" | "low": high = the '
-    "work is explicit AND the owner is unambiguous; medium = the work is clear "
-    "but the owner needs context; low = the work or its owner is genuinely "
-    "ambiguous. Judge only what the transcript supports; do not inflate it.\n"
-    '  "evidence" is the VERBATIM sentence from the transcript that created '
-    "the task - copied, not paraphrased. It is what lets a reader check the "
-    'task against what was actually said. Use "" only if no single sentence '
-    'carries it. "evidence_segment_ids" holds the ids of the segment(s) that '
-    "sentence came from.\n"
-    "  EVERY transcript line you are given begins with its own segment id in "
-    'square brackets, like "[seg_12] Speaker 0: ...". To fill '
-    'evidence_segment_ids, copy the id from the START of the line (or lines) '
-    "your evidence quote came from - character for character, including the "
-    '"seg_" prefix.\n'
-    '  Example - given the line "[seg_2] Speaker 1: I\'ll send the proposal '
-    'tomorrow.", a task extracted from it has evidence "I\'ll send the '
-    'proposal tomorrow." and evidence_segment_ids ["seg_2"].\n'
-    "  Use SEVERAL ids only when the evidence genuinely spans several lines. "
-    "Usually it is one.\n"
-    '  Use [] when no single line supports the task. NEVER invent, guess, '
-    "renumber or extrapolate an id, and never use a SPEAKER label "
-    '("Speaker 1") or a number ("2") as a segment id - they are different '
-    "things. An id you did not read at the start of a line is discarded "
-    "anyway, so a guess only loses the reference.\n"
-    "  task text must preserve the SCOPE of the work, not just name it. "
-    'Prefer "Test the open-source PDF-to-Markdown parser against property '
-    'brochures and quotation sheets containing complex tables and pricing '
-    'information" over "Test parser". Include what needs to be done, the '
-    "object/document/system involved, the scope and any important constraint, "
-    "whenever the transcript supports them.\n"
-    "  due_date is what was stated EXACTLY as spoken (e.g. \"Friday\", "
-    '"15th March") — use "" when no date was mentioned, NEVER invent one. '
-    'priority is one of "Low" | "Medium" | "High" ONLY when urgency was '
-    'actually stated or implied by a named deadline — use "" when there is no '
-    "signal, never guess from your own sense of importance. No duplicate tasks "
-    "(the same commitment mentioned twice is ONE task). [] if none.\n"
     '- "participants": array of objects, each EXACTLY {"speaker": string, '
     '"summary": string}. summary is a one-line description of what that person '
     "contributed. [] if not identifiable. See the PARTICIPANTS RULE below for "
@@ -452,65 +578,6 @@ SUMMARY_SYSTEM = _json_system(
     "must NOT appear in participants unless the transcript separately shows "
     "that Rahul participated.\n"
     "Do not invent participant roles or descriptions.\n"
-    "\n"
-    "TASK ASSIGNMENT RULE:\n"
-    "A task may be assigned to any person, team, department, company, vendor, "
-    "customer, or external party explicitly identified in the meeting as "
-    "responsible for the work.\n"
-    "The assignee does NOT need to be a participant or speaker in the meeting.\n"
-    "Examples:\n"
-    '- "I\'ll do it." -> assign the task to that speaker.\n'
-    '- "Rahul will prepare the quotation." -> assign to Rahul even if Rahul did '
-    "not attend the meeting.\n"
-    '- "The marketing team will update the campaign." -> assign to Marketing '
-    "Team.\n"
-    '- "Finance will verify the numbers." -> assign to Finance.\n'
-    '- "The vendor will provide the documents." -> assign to Vendor.\n'
-    '- "Send this to Priya." -> only treat Priya as the assignee if the '
-    "transcript explicitly establishes that Priya is responsible for an "
-    "action.\n"
-    "Use the assignee EXACTLY as identified in the transcript. Never infer an "
-    "assignee merely because someone is likely responsible based on their role, "
-    'department or context. If responsibility is not explicitly assigned, use '
-    '"" for assignee.\n'
-    "A person's presence in participants and responsibility for a task are "
-    "INDEPENDENT concepts.\n"
-    "\n"
-    "SPEAKER-ID, EVIDENCE AND CONFIDENCE:\n"
-    '"assignee_speaker_id" links a task to WHO SAID IT, so the app can '
-    "attach a real identity once the user says who each speaker is. It "
-    "must contain a speaker label EXACTLY as the transcript writes it "
-    '(e.g. "Speaker 0") — never a person\'s name, never a team, '
-    "never a guess.\n"
-    '- Self-commitment: "Speaker 0: I\'ll send the proposal tomorrow." -> '
-    'assignee_speaker_id "Speaker 0", assignee "" (no name spoken).\n'
-    '- Explicit assignment to someone else: "Speaker 0: Rahul, send '
-    'the proposal." -> assignee "Rahul", assignee_speaker_id "" — the '
-    "speaker is the one ASSIGNING, not the one responsible. Only set "
-    "assignee_speaker_id when the responsible person is themselves a "
-    "speaker and the transcript makes that identification explicit.\n"
-    '- General discussion: "We should send the proposal." -> no task.\n'
-    'Use "" for assignee_speaker_id whenever the owner is not '
-    "identifiable as a specific speaker label. An empty value is correct "
-    "and expected; a wrong label assigns work to the wrong person.\n"
-    '"evidence" is the VERBATIM sentence from the transcript that '
-    "created the task — copied, not paraphrased, not summarized, and "
-    "not stitched together from separate turns. It is what lets a reader "
-    "check the task against what was actually said. Use \"\" only if no "
-    "single sentence carries it.\n"
-    '"evidence_segment_ids" is WHERE that sentence sits: the ids of the '
-    "segment(s) it came from, copied EXACTLY as the transcript shows "
-    'them (they look like "seg_12"). Usually one id. Use [] when the '
-    "transcript shows no segment ids. NEVER invent, guess or renumber an "
-    "id — a wrong one points the reader at the wrong moment of the "
-    "meeting, and is discarded anyway.\n"
-    '"confidence" is EXACTLY one of "high" | "medium" | "low":\n'
-    "- high: the work is explicit AND the owner is unambiguous.\n"
-    "- medium: the work is clear, but the owner needs context to pin "
-    "down.\n"
-    "- low: the work or its owner is genuinely ambiguous.\n"
-    "Judge only what the transcript supports; do not inflate "
-    "confidence.\n"
     "\n"
     # LAST, and deliberately so. Measured on a 45k-char code-switched
     # transcript: the specificity rules above are stated correctly but get
@@ -667,27 +734,112 @@ SUMMARY_REDUCE_SYSTEM = _json_system(
     "`content` is a JSON STRING: separate paragraphs with the two characters "
     "\\n, never with a real line break. Carry through the segment ids the "
     "segments themselves gave; never renumber or invent one.\n"
-    "- \"tasks\" merges duplicate commitments across segments into one task "
-    "each, keeping whichever segment named an assignee/assignee_speaker_id/"
-    "due_date/priority/confidence/evidence/evidence_segment_ids if any did — "
-    "never invent one that no segment stated. Keep the FULLER task "
-    "text when two segments describe the same work at different levels of "
-    "detail: the scope (what, on which document/system, under what constraint) "
-    "is the part worth keeping. An assignee may be a person who never spoke, a "
-    "team, a department or an external party — do not drop one for not being a "
-    "participant.\n"
     "- \"participants\" is one entry per person who actually PARTICIPATED, "
     "using only the labels the segments contain. A name that appears merely as "
     "a task owner or a mention is NOT a participant — participants and task "
     "assignees are independent.\n"
     "\n"
-    "Return EXACTLY these four fields, with the same shapes as the input: "
+    "Return EXACTLY these three fields, with the same shapes as the input: "
     '"title" (string, 4-10 words, naming the actual subject of the meeting), '
     '"overview" ({"sections": [...]}, covering the WHOLE meeting, never '
-    'empty), "tasks" (array of {"task","assignee","assignee_speaker_id",'
-    '"due_date","priority","confidence","evidence","evidence_segment_ids"}), '
-    'and "participants" (array of {"speaker","summary"}). Do NOT emit any '
-    "other field."
+    'empty), and "participants" (array of {"speaker","summary"}). Do NOT emit '
+    "any other field."
+)
+
+
+# ===========================================================================
+# STAGE 1b — TASKS. A SECOND call, made after the analysis above, whose only
+# job is the work the meeting committed to.
+#
+# WHY A SEPARATE CALL, AND WHY IT READS THE ANALYSIS. See _TASK_FIELD for the
+# measurement. Two things changed the result, and this call keeps both:
+#   * tasks are the ONLY output, so they no longer compete with the overview,
+#     highlights and participants for the model's attention;
+#   * the call is handed the analysis the first call just wrote — in ENGLISH —
+#     ahead of the transcript (prompts.tasks_user_content). That is the same
+#     input the meeting chat gets, which is why "what are the tasks?" in chat
+#     answered well while the analysis returned none.
+# Every task must still come FROM THE TRANSCRIPT: the evidence quote and its
+# segment ids are verbatim and validated, exactly as before. The analysis is a
+# reading aid, never a source.
+# ===========================================================================
+TASKS_SYSTEM = _json_system(
+    "Your ONLY job is to find EVERY piece of work this meeting committed to. "
+    "Output ONLY a single valid JSON object with EXACTLY one field, "
+    '"tasks".\n'
+    "\n"
+    "You are given two things, in this order:\n"
+    "1. MEETING ANALYSIS — an English overview, decisions and deadlines already "
+    "written for this meeting. Read it FIRST to understand what the meeting "
+    "was about, who was involved and what was agreed. It is a reading aid.\n"
+    "2. TRANSCRIPT — what was actually said, one segment per line, possibly in "
+    "Hindi, Marathi or a mix. Every task must be supported by the TRANSCRIPT: "
+    "its evidence is a verbatim line from it, never a sentence from the "
+    "analysis. Use the analysis to understand and locate commitments, then "
+    "confirm each one in the transcript.\n"
+    "\n"
+    + _TASK_FIELD
+    + "\n"
+    + _TASK_RULES
+    + "BEFORE YOU ANSWER — THE TASK CHECK. Walk the transcript from start to "
+    "end and check every directive and commitment, in any language and "
+    "including those given to several people at once, against the rules "
+    "above; add any you missed. Then remove any task that was only discussed "
+    "or suggested, and clear any assignee, due_date or priority you inferred "
+    "rather than heard.\n"
+    "\n"
+    'If the meeting committed to no work, return {"tasks": []}. Do NOT include '
+    "the transcript, timestamps, or any field other than \"tasks\"."
+)
+
+
+def tasks_system(roster=(), speaker_names=None):
+    """TASKS_SYSTEM plus the speaker_id -> name table (see
+    speaker_roster_block), which assignee_speaker_id is answered from.
+    Unchanged TASKS_SYSTEM for a transcript with no speaker labels."""
+    return TASKS_SYSTEM + speaker_roster_block(roster, speaker_names)
+
+
+def tasks_user_content(analysis_text, transcript):
+    """The task call's user message: the English analysis, then the transcript.
+
+    In that order on purpose — the model reads top-down, and understanding the
+    meeting from the analysis first is what made the difference (see
+    TASKS_SYSTEM). The headers are the same ones build_context uses for chat.
+    """
+    blocks = []
+    if (analysis_text or "").strip():
+        blocks.append("=== MEETING ANALYSIS (already generated) ===\n"
+                      + analysis_text.strip())
+    blocks.append("=== TRANSCRIPT ===\n" + (transcript or ""))
+    return "\n\n".join(blocks)
+
+
+# OVERFLOW ONLY — a transcript too long for one task call (see
+# groq_client.analyze). The rules are the ones SUMMARY_REDUCE_SYSTEM used for
+# tasks before they moved here.
+TASKS_REDUCE_SYSTEM = _json_system(
+    "You are given task lists extracted from CONSECUTIVE SEGMENTS of a SINGLE "
+    "meeting, in order. Combine them into ONE task list for the whole meeting. "
+    "Output ONLY a single valid JSON object.\n"
+    "\n"
+    "RULES:\n"
+    "- Merge duplicate commitments across segments into one task each, keeping "
+    "whichever segment named an assignee/assignee_speaker_id/due_date/priority/"
+    "confidence/evidence/evidence_segment_ids if any did — never invent one "
+    "that no segment stated.\n"
+    "- Keep the FULLER task text when two segments describe the same work at "
+    "different levels of detail: the scope (what, on which document/system, "
+    "under what constraint) is the part worth keeping.\n"
+    "- If a later segment changes the owner or date, keep only the final "
+    "version; drop a task a later segment explicitly cancelled.\n"
+    "- An assignee may be a person who never spoke, a team, a department or an "
+    "external party — do not drop one for not being a participant.\n"
+    "- Never invent a task absent from the segments.\n"
+    "\n"
+    'Return EXACTLY one field, "tasks" (array of {"task","assignee",'
+    '"assignee_speaker_id","due_date","priority","confidence","evidence",'
+    '"evidence_segment_ids"}).'
 )
 
 # The structured-extraction field specs, shared VERBATIM between
@@ -796,9 +948,10 @@ def unified_analysis_system(roster=(), speaker_names=None):
     twice over, for outputs that read the same source text.
 
     COMPOSED from the existing prompts rather than rewritten:
-        summary_system(roster)      title / overview / tasks / participants —
+        summary_system(roster)      title / overview / participants —
                                     including every specificity and
                                     participants-vs-assignees rule
+                                    (tasks: a separate call, TASKS_SYSTEM)
         _HIGHLIGHTS_FIELDS          the four structured meeting_highlights
                                     sections
     Each of those texts encodes production regressions that were fixed by exact

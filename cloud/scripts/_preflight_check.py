@@ -71,6 +71,18 @@ def main():
     check("prompt states that sections are the model's choice",
           "There is NO predefined list of sections" in plain)
 
+    # Tasks are a SEPARATE call (transcribe's extract_tasks): the analysis must
+    # not ask for them, and the task call's prompt, reduce and coercers must
+    # all ship in the same package.
+    check("analysis prompt no longer asks for tasks", '"tasks"' not in plain)
+    task_prompt = prompts.tasks_system(("Speaker 0", "Speaker 1"))
+    check("task prompt carries the task rules",
+          "TASK ASSIGNMENT RULE" in task_prompt and '"tasks"' in task_prompt)
+    check("task reduce prompt exists", '"tasks"' in prompts.TASKS_REDUCE_SYSTEM)
+    check("task coercers exist",
+          callable(ai_schema.coerce_task_reply)
+          and callable(ai_schema.merge_tasks))
+
     # The coercer, including the roster rule that keeps a merely-mentioned name
     # out of the attendee list.
     roster = ai_schema.speaker_roster("Speaker 0: hi\n\nSpeaker 1: hello")

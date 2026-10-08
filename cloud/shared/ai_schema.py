@@ -620,6 +620,48 @@ def _dedupe_tasks(tasks):
     return out
 
 
+def coerce_tasks(raw, roster=None, valid_ids=None, speaker_names=None):
+    """Strict coerce a model's task array into TASK_SPEC rows.
+
+    The one place task rows are validated, whichever call produced them (the
+    dedicated task call, prompts.TASKS_SYSTEM, or an older analysis reply).
+
+    Note tasks are deliberately NOT roster-filtered — an assignee may be a
+    non-attendee, a team or an external party. Participation and responsibility
+    are independent (see prompts._TASK_RULES' TASK ASSIGNMENT RULE).
+    """
+    tasks = obj_list(raw, TASK_SPEC, required=("task",))
+    if valid_ids is not None:
+        # Re-check what TASK_SPEC could only shape-check: obj_list has no
+        # access to the transcript. A task NEVER fails over a bad reference —
+        # the reference is dropped and the commitment is kept.
+        for t in tasks:
+            t["evidence_segment_ids"] = _evidence_ids(
+                t.get("evidence_segment_ids"), valid_ids)
+    _resolve_task_speakers(tasks, roster, speaker_names)
+    return _dedupe_tasks(tasks)
+
+
+def coerce_task_reply(obj, roster=None, valid_ids=None, speaker_names=None):
+    """One task-call reply -> {"tasks": [...]}. A non-dict reply is no tasks."""
+    raw = obj.get("tasks") if isinstance(obj, dict) else None
+    return {"tasks": coerce_tasks(raw, roster, valid_ids, speaker_names)}
+
+
+def merge_tasks(partials):
+    """Fold per-chunk task replies into one — the task call's OVERFLOW path.
+
+    Collected RAW and de-duplicated once, for the reason merge_analyses gives:
+    _dedupe_tasks fills a later chunk's assignee/due_date onto an earlier
+    chunk's bare mention, which a keep-first pre-filter would throw away.
+    """
+    tasks = []
+    for p in partials:
+        if isinstance(p, dict):
+            tasks.extend(p.get("tasks") or [])
+    return {"tasks": _dedupe_tasks(tasks)}
+
+
 def empty_analysis():
     """Fresh dict with every field; never shares mutable lists."""
     return {
@@ -659,21 +701,17 @@ def coerce_analysis(obj, roster=None, valid_ids=None, speaker_names=None):
             **empty_analysis(),
             "participants": _roster_filtered([], roster, speaker_names),
         }
-    tasks = obj_list(obj.get("tasks"), TASK_SPEC, required=("task",))
-    if valid_ids is not None:
-        # Re-check what TASK_SPEC could only shape-check: obj_list has no
-        # access to the transcript. A task NEVER fails over a bad reference —
-        # the reference is dropped and the commitment is kept.
-        for t in tasks:
-            t["evidence_segment_ids"] = _evidence_ids(
-                t.get("evidence_segment_ids"), valid_ids)
-    _resolve_task_speakers(tasks, roster, speaker_names)
     participants = obj_list(obj.get("participants"), PARTICIPANT_SPEC,
                             required=("speaker",))
     return {
         "title": s(obj.get("title")),
         "overview": coerce_overview(obj.get("overview"), valid_ids),
-        "tasks": _dedupe_tasks(tasks),
+        # The analysis prompt no longer asks for tasks (prompts.TASKS_SYSTEM
+        # owns them), so this is [] for a current reply. Still coerced, not
+        # dropped, so an older caller that hands in a reply WITH tasks keeps
+        # getting them.
+        "tasks": coerce_tasks(obj.get("tasks"), roster, valid_ids,
+                              speaker_names),
         "participants": _roster_filtered(participants, roster or [],
                                          speaker_names),
     }

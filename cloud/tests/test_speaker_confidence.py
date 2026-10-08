@@ -524,8 +524,10 @@ class LivePromptContractTests(unittest.TestCase):
 
     def _prompts(self):
         import prompts
-        return (prompts.unified_analysis_system(["Speaker 0", "Speaker 1"]),
-                prompts.unified_reduce_system())
+        # Tasks are their OWN call now (extract_tasks), so the live task
+        # prompt is tasks_system, not the analysis prompt.
+        return (prompts.tasks_system(["Speaker 0", "Speaker 1"]),
+                prompts.TASKS_REDUCE_SYSTEM)
 
     def test_the_live_prompt_requests_every_field_the_schema_reads(self):
         live, _ = self._prompts()

@@ -312,7 +312,7 @@ class TestPromptContract(unittest.TestCase):
         import prompts
         for field in ai_schema.TASK_SPEC:
             with self.subTest(field=field):
-                self.assertIn(field, prompts.SUMMARY_SYSTEM)
+                self.assertIn(field, prompts.TASKS_SYSTEM)
 
     def test_reduce_prompt_requests_every_spec_field(self):
         """The map-reduce OVERFLOW path returns tasks too; a schema that
@@ -321,11 +321,11 @@ class TestPromptContract(unittest.TestCase):
         import prompts
         for field in ai_schema.TASK_SPEC:
             with self.subTest(field=field):
-                self.assertIn(field, prompts.SUMMARY_REDUCE_SYSTEM)
+                self.assertIn(field, prompts.TASKS_REDUCE_SYSTEM)
 
     def test_prompt_states_the_speaker_id_rules(self):
         import prompts
-        text = prompts.SUMMARY_SYSTEM
+        text = prompts.TASKS_SYSTEM
         self.assertIn("SPEAKER-ID, EVIDENCE AND CONFIDENCE", text)
         # The three cases that decide who gets assigned the work.
         self.assertIn("Self-commitment", text)
@@ -344,7 +344,7 @@ class TestPromptContract(unittest.TestCase):
         stated where the qualification bar is stated.
         """
         import prompts
-        text = prompts.SUMMARY_SYSTEM
+        text = prompts.TASKS_SYSTEM
         self.assertIn("QUALIFICATION AND OWNERSHIP ARE SEPARATE TESTS", text)
         self.assertIn("MUST be extracted even when NO owner is identifiable",
                       text)
@@ -358,7 +358,7 @@ class TestPromptContract(unittest.TestCase):
         must fall between the qualification sentence and the next field's spec.
         """
         import prompts
-        text = prompts.SUMMARY_SYSTEM
+        text = prompts.TASKS_SYSTEM
         bar = text.index("Only create a task when the transcript indicates")
         rule = text.index("QUALIFICATION AND OWNERSHIP ARE SEPARATE TESTS")
         speaker_id = text.index('"assignee_speaker_id" links a task to')
@@ -374,7 +374,7 @@ class TestPromptContract(unittest.TestCase):
         the exact categories the extraction has always refused.
         """
         import prompts
-        text = prompts.SUMMARY_SYSTEM
+        text = prompts.TASKS_SYSTEM
         self.assertIn("This does NOT lower the qualification bar", text)
         for category in ("question", "suggestion", "recommendation",
                          "possibility", "general "):
@@ -389,10 +389,42 @@ class TestPromptContract(unittest.TestCase):
         contradicts it — here "General discussion -> no task", which was the
         closest case to an unowned commitment and taught rejection."""
         import prompts
-        text = prompts.SUMMARY_SYSTEM
+        text = prompts.TASKS_SYSTEM
         self.assertIn("Committed, no owner named", text)
         self.assertIn("must include the company logo", text)
         self.assertIn('assignee ""', text)
+
+    def test_prompt_counts_directives_and_code_switched_speech(self):
+        """On a Hinglish/Marathi team sync, work a manager TOLD someone to do
+        and follow-ups with a named person were being dropped. Both shapes,
+        and the language rule, must be stated, with a worked example."""
+        import prompts
+        text = prompts.TASKS_SYSTEM
+        self.assertIn("WHAT COUNTS AS COMMITTED WORK", text)
+        self.assertIn("A DIRECTIVE", text)
+        self.assertIn("CODE-SWITCHED SPEECH", text)
+        self.assertIn("baith ke plan banao", text)
+        self.assertIn('assignee "Isha"', text)
+        # The follow-up allowance stays bounded.
+        self.assertIn("We should catch up sometime", text)
+        # And none of it may sit between the bar and the ownership rule,
+        # which test_ownerless_rule_sits_beside_the_qualification_bar needs.
+        self.assertGreater(text.index("WHAT COUNTS AS COMMITTED WORK"),
+                           text.index("QUALIFICATION AND OWNERSHIP"))
+
+    def test_prompt_keeps_one_owner_and_no_collaborators_field(self):
+        """TASK_SPEC holds one assignee and obj_list drops unknown keys, so a
+        "collaborators" field would cost output tokens and be thrown away. The
+        co-workers belong in the task text, and no lead may be picked."""
+        import prompts
+        text = prompts.TASKS_SYSTEM
+        self.assertNotIn('"collaborators"', text)
+        self.assertNotIn("collaborators", ai_schema.TASK_SPEC)
+        self.assertIn("Never pick a lead yourself", text)
+
+    def test_prompt_never_defaults_priority(self):
+        import prompts
+        self.assertIn('never default to "Medium"', prompts.TASKS_SYSTEM)
 
 
 # ===========================================================================

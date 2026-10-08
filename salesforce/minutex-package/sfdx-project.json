@@ -1,0 +1,15 @@
+{
+  "packageDirectories": [
+    {
+      "path": "force-app",
+      "default": true,
+      "package": "MinuteX",
+      "versionName": "Beta",
+      "versionNumber": "0.1.0.NEXT"
+    }
+  ],
+  "name": "minutex-package",
+  "namespace": "",
+  "sfdcLoginUrl": "https://login.salesforce.com",
+  "sourceApiVersion": "62.0"
+}

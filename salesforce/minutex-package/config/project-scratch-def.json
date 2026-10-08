@@ -1,0 +1,8 @@
+{
+  "orgName": "MinuteX Package Test",
+  "edition": "Developer",
+  "features": [],
+  "settings": {
+    "lightningExperienceSettings": { "enableS1DesktopEnabled": true }
+  }
+}

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomPermission xmlns="http://soap.sforce.com/2006/04/metadata">
+    <description>The MinuteX integration user: may set up MinuteX's signing secret in this org (MinuteXReceiver setup/secret). Given only by the MinuteX Integration permission set.</description>
+    <isLicensed>false</isLicensed>
+    <label>MinuteX Integration</label>
+</CustomPermission>

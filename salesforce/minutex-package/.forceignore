@@ -1,0 +1,5 @@
+# Salesforce DX
+.sfdx/
+.sf/
+**/jsconfig.json
+**/.eslintrc.json

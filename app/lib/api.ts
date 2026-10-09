@@ -15,6 +15,15 @@
 // with lib/theme.tsx (light/dark preference) so both go through one proven
 // fallback instead of duplicating it.
 import { store } from "./storage";
+import { googleSignOut } from "./google-signin";
+import {
+  CALL_COUNTER_WINDOW_MS, CircuitBreaker, REQUEST_TIMEOUT_MS, isOverloadStatus, retryAfterMs,
+  routeKey, summarizeCalls,
+} from "./request-guard";
+import type {
+  WebhookConfiguration, WebhookContext, WebhookEarlierRecord, WebhookEndpoint, WebhookJob, WebhookMode,
+  WebhookRecord, WebhookTest,
+} from "./webhook-flow";
 
 // The HTTP API base URL (same gateway as the upload endpoint).
 // Migrated eu-north-1 -> ap-south-1 on 2026-08-01; the JWT secret was copied
@@ -297,9 +306,21 @@ export type RecordingDetail = RecordingSummary & {
   // made before workspaces existed. The meeting screen passes it to the
   // Salesforce (Site) block, whose connection is per workspace.
   workspace_id?: string;
+  // CLIENT-ONLY, never sent by the server: set on the copy saved on the phone
+  // (offline-cache-rules offlineMeetingCopy), which leaves the transcript
+  // out. True = a transcript exists, it just isn't on this phone.
+  transcript_withheld?: boolean;
 };
 
 export type LoginResult = { token: string; user_id: string; email: string; name?: string };
+
+export type GoogleSignInResult = LoginResult & {
+  /** True when this sign-in created the account. */
+  created: boolean;
+  /** True when linking Google turned off a password whose email had never
+   *  been verified (pre-account-takeover guard) — tell the user. */
+  password_disabled: boolean;
+};
 
 export type UserProfile = {
   user_id: string;
@@ -321,6 +342,9 @@ export type UserProfile = {
    * This is the one to render. "" means no photo — fall back to initials. */
   avatar_view_url: string;
   created_at: string;
+  /** Sign-in methods. A Google-only account has no password to "change". */
+  has_password?: boolean;
+  google_linked?: boolean;
 };
 
 export type DeviceStatus = "UNPAIRED" | "PAIRING" | "PAIRED";
@@ -345,14 +369,38 @@ export type DeviceInfo = {
 // ---------------------------------------------------------------------------
 export async function saveToken(token: string): Promise<void> {
   await store.setItemAsync(TOKEN_KEY, token);
+  // Providers mounted above the auth gate (integrations, notifications) load
+  // here: before this point they have no token and must not call the API.
+  for (const fn of signInHandlers) {
+    try { await fn(); } catch { /* one provider's failure must not block sign-in */ }
+  }
+}
+
+// Run after every sign-in (every saveToken). See onSignOut for the mirror.
+const signInHandlers = new Set<() => unknown>();
+export function onSignIn(fn: () => unknown): () => void {
+  signInHandlers.add(fn);
+  return () => { signInHandlers.delete(fn); };
 }
 
 export async function getToken(): Promise<string | null> {
   return store.getItemAsync(TOKEN_KEY);
 }
 
+// Run on every sign-out (all clearToken() paths). The on-device cache
+// registers here (lib/query-client.tsx) so the next account on this phone
+// never sees the previous one's data — without api.ts importing it.
+const signOutHandlers = new Set<() => unknown>();
+export function onSignOut(fn: () => unknown): () => void {
+  signOutHandlers.add(fn);
+  return () => { signOutHandlers.delete(fn); };
+}
+
 export async function clearToken(): Promise<void> {
   await store.deleteItemAsync(TOKEN_KEY);
+  for (const fn of signOutHandlers) {
+    try { await fn(); } catch { /* a failed wipe must not block signing out */ }
+  }
   // Drop the ACTIVE pointer, not the per-account memory. Signing out must
   // not leave the next account pointed at the previous one's organisation
   // (the server would 404 it, and the first screen after login would render
@@ -363,6 +411,9 @@ export async function clearToken(): Promise<void> {
   // restoreWorkspaceFor). This clears only the live pointer; the owning
   // account's memory survives and is restored on their next login.
   await setActiveWorkspace(null);
+  // Forget the Google account too, or the next "Continue with Google"
+  // silently reuses it and a different person on this phone cannot switch.
+  await googleSignOut();
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +540,32 @@ export async function restoreWorkspaceFor(
 // HTTP helper. Adds the Bearer token when we have one; throws ApiError with a
 // useful message on non-2xx so screens can show it.
 // ---------------------------------------------------------------------------
+
+// One breaker for the app, keyed per route (lib/request-guard.ts).
+const breaker = new CircuitBreaker();
+
+// DEVELOPMENT-ONLY call counter: every CALL_COUNTER_WINDOW_MS, one log line of
+// the calls per route, and a warning naming any route called often enough to
+// be a loop. This is what identified the push-token flood; kept so the next
+// one is caught on a developer's desk, not in CloudWatch. Compiled out of
+// release builds (__DEV__ is false there), and `typeof` keeps node tests safe.
+const COUNT_CALLS = typeof __DEV__ !== "undefined" && __DEV__;
+const callCounts = new Map<string, number>();
+let callFlush: ReturnType<typeof setTimeout> | null = null;
+
+function countCall(route: string): void {
+  if (!COUNT_CALLS) return;
+  callCounts.set(route, (callCounts.get(route) ?? 0) + 1);
+  if (callFlush) return;
+  callFlush = setTimeout(() => {
+    callFlush = null;
+    const { line, hot } = summarizeCalls(callCounts);
+    callCounts.clear();
+    console.log("[api-calls/10s]", line);
+    if (hot.length) console.warn("[api-calls] probable request loop:", hot.join(" | "));
+  }, CALL_COUNTER_WINDOW_MS);
+}
+
 export class ApiError extends Error {
   status: number;
   // A stable machine-readable identifier the backend attaches to errors that
@@ -517,10 +594,18 @@ async function request<T>(
   } = {}
 ): Promise<T> {
   const { method = "GET", body, auth = true, sessionExpiryOn401 = true } = opts;
+  const route = routeKey(method, path);
+  countCall(route);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (auth) {
     const token = await getToken();
-    if (token) headers["Authorization"] = `Bearer ${token}`;
+    // NO SESSION, NO CALL. An authenticated route without a token can only
+    // 401 — and that 401 used to run clearToken(), i.e. every sign-out handler,
+    // for a user who was never signed in. Refused here, before the network,
+    // and WITHOUT clearToken: there is no session to end. Same status, so
+    // screens that send a 401 to /login behave as before.
+    if (!token) throw new ApiError(401, "You're signed out. Please sign in again.", "no_session");
+    headers["Authorization"] = `Bearer ${token}`;
     // ACTIVE WORKSPACE — a HINT, never a credential.
     //
     // Attached at the same single choke point the Bearer token is, so no
@@ -537,19 +622,45 @@ async function request<T>(
     if (ws) headers[WORKSPACE_HEADER] = ws;
   }
 
+  // CIRCUIT BREAKER (lib/request-guard.ts): a route that keeps answering
+  // "overloaded" is refused here for a while, without touching the network,
+  // so a loop anywhere in the app cannot keep a throttled API down.
+  const gate = breaker.check(route, Date.now());
+  if (gate.open) {
+    throw new ApiError(503, "MinuteX is busy right now. Try again in a moment.", "circuit_open");
+  }
+
+  // TIMEOUT: covers the response body too, so a stalled stream also ends.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let resp: Response;
+  let text: string;
   try {
     resp = await fetch(`${API_BASE}${path}`, {
       method,
       headers,
       body: body != null ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
     });
-  } catch (e: any) {
-    // Network failure (offline, DNS, etc.) — surface a clean message.
+    text = await resp.text();
+  } catch {
+    if (controller.signal.aborted) {
+      breaker.record(route, Date.now(), "overload");
+      throw new ApiError(408, "The server took too long to answer. Try again.", "timeout");
+    }
+    // Network failure (offline, DNS, etc.) — surface a clean message. Says
+    // nothing about the server's health, so the breaker ignores it.
+    breaker.record(route, Date.now(), "neutral");
     throw new ApiError(0, "Network error — check your connection.");
+  } finally {
+    clearTimeout(timer);
   }
+  breaker.record(
+    route, Date.now(),
+    isOverloadStatus(resp.status) ? "overload" : resp.status >= 500 ? "neutral" : "ok",
+    retryAfterMs(resp.headers.get("retry-after"), Date.now()),
+  );
 
-  const text = await resp.text();
   let data: any = null;
   try {
     data = text ? JSON.parse(text) : null;
@@ -595,6 +706,56 @@ export async function signup(
   const res = await request<LoginResult>("/signup", {
     method: "POST",
     body: { email, password, name },
+    auth: false,
+  });
+  await saveToken(res.token);
+  return res;
+}
+
+// ---- Continue with Google ----
+export const AUTH_ERR_USE_GOOGLE = "use_google_sign_in";
+export const AUTH_ERR_NO_PASSWORD = "no_password_set";
+export const GOOGLE_ERR_UNAVAILABLE = "google_sign_in_unavailable";
+
+/** Exchanges a Google ID token for a MinuteX session: signs in, links an
+ *  existing account with the same email, or creates one. */
+export async function googleSignIn(idToken: string): Promise<GoogleSignInResult> {
+  const res = await request<GoogleSignInResult>("/auth/google", {
+    method: "POST",
+    body: { id_token: idToken },
+    auth: false,
+  });
+  await saveToken(res.token);
+  return res;
+}
+
+// ---- Password reset (signed out) ----
+//
+// Error codes the reset screen branches on (ApiError.code).
+export const RESET_ERR_INVALID = "reset_code_invalid";
+export const RESET_ERR_LOCKED = "reset_code_locked";
+export const RESET_ERR_UNAVAILABLE = "password_reset_unavailable";
+
+/** Emails a 6-digit code. Answers the same whether or not the account
+ *  exists, so the caller must not claim the email "was found". */
+export async function requestPasswordReset(
+  email: string
+): Promise<{ sent: boolean; expires_in: number;
+            /** TEST MODE only (backend PASSWORD_RESET_DEV_EMAILS): the code,
+             *  returned instead of emailed. Absent in normal operation. */
+            dev_code?: string }> {
+  return request("/password/forgot", { method: "POST", body: { email }, auth: false });
+}
+
+/** Exchanges the emailed code for a new password, and signs the user in. */
+export async function resetPassword(
+  email: string,
+  code: string,
+  new_password: string
+): Promise<LoginResult> {
+  const res = await request<LoginResult>("/password/reset", {
+    method: "POST",
+    body: { email, code, new_password },
     auth: false,
   });
   await saveToken(res.token);
@@ -2045,6 +2206,21 @@ export type ApiParticipant = {
    * parses. An attendance row is never a speaker: it is not in speaker_names,
    * no generated document names it as one, and it never resolves an AI task. */
   attendance_only?: boolean;
+  /** This person's access to the meeting, set by the RECORDER. `null` when
+   * the contact has no MinuteX account ("Not on MinuteX") or is the recorder
+   * themselves. Keyed by user, so a speaker who is also an attendee carries
+   * the same value on both rows. Absent on an older backend. */
+  access?: ParticipantAccess | null;
+};
+
+/** What a tagged MinuteX user may see, on the read-only shared view only.
+ *  "full" is read-only notes + transcript + audio — never a write permission;
+ *  the recorder keeps every owner permission regardless of this value. */
+export type MeetingAccessLevel = "none" | "notes" | "full";
+
+export type ParticipantAccess = {
+  user_id: string;
+  level: MeetingAccessLevel;
 };
 
 /** Returned as a 409 when a contact name matches people we already know
@@ -2123,7 +2299,7 @@ export type ApiContact = {
    *  Salesforce user). Empty for an ordinary contact. The external record id
    *  never reaches the app. */
   people_provider?: string;
-  people_type?: "contact" | "user" | "";
+  people_type?: "contact" | "lead" | "user" | "";
   /** True when this entry IS an organisation member. Their name and photo
    * come from their own MinuteX profile, so Edit and Delete must be hidden —
    * the API answers 409 `contact_is_member` for both. */
@@ -2293,6 +2469,34 @@ export async function tagAttendee(
   });
 }
 
+/** Recorder-only: set one tagged person's access. The backend 404s for
+ * anyone but the recorder, and for a user who is not tagged on the meeting. */
+export async function setMeetingAccess(
+  key: string,
+  userId: string,
+  level: MeetingAccessLevel
+): Promise<ParticipantAccess> {
+  const res = await request<{ access: ParticipantAccess }>(
+    `/recordings/access/${encodeURIComponent(key)}`,
+    { method: "PUT", body: { user_id: userId, level } }
+  );
+  return res.access;
+}
+
+/** A meeting another recorder gave the caller access to. Opens the READ-ONLY
+ *  /meeting/[key]/shared screen, never /recording/[key]. */
+export type SharedRecordingSummary = RecordingSummary & {
+  access_level: Exclude<MeetingAccessLevel, "none">;
+};
+
+/** Every meeting shared with the caller, across all workspaces. */
+export async function getSharedWithMe(): Promise<SharedRecordingSummary[]> {
+  const res = await request<{ recordings: SharedRecordingSummary[] }>(
+    "/recordings/shared-with-me"
+  );
+  return res.recordings ?? [];
+}
+
 // -- Cross-meeting tasks ----------------------------------------------------
 export type TaskFilters = {
   status?: TaskStatusV2;
@@ -2437,20 +2641,44 @@ export type SharedMeeting = {
   /** The MoM structure. Populated ONLY when `overview` is empty, so the same
    *  content can never render twice under two sets of headings. */
   sections: SharedMeetingSection[];
-  /** Always null on this route. Present in the type because the payload is
-   *  the share assembler's, and pinning them as null documents that the
-   *  absence is the CONTRACT rather than a backend that happened to omit
-   *  them — a future non-null here is a bug, not a feature. */
-  transcript: null;
-  audio_url: null;
-  speaker_blocks: never[];
+  /** Null unless the viewer has FULL participant access. The server decides:
+   *  at "notes" these never enter the payload and no audio URL is minted. */
+  transcript: string | null;
+  audio_url: string | null;
+  speaker_blocks: SharedSpeakerBlock[];
   expires_at: string | null;
+};
+
+export type SharedSpeakerBlock = {
+  speaker: string;
+  /** Index into the transcript view's speaker palette (first-appearance). */
+  colour: number;
+  start: number;
+  text: string;
+};
+
+/** Why the caller can read this meeting on the shared view.
+ *  "participant" — the recorder tagged them and gave them access;
+ *  "assignee"    — they hold a task from it (notes only);
+ *  "owner" / "organisation" — they can also open the full screen. */
+export type SharedMeetingAccess =
+  | "owner"
+  | "organisation"
+  | "participant"
+  | "assignee";
+
+export type SharedMeetingResponse = {
+  meeting: SharedMeeting;
+  access: SharedMeetingAccess;
+  /** Absent on an older backend, which only ever served notes. */
+  level?: "notes" | "full";
+  shared_by_name?: string;
 };
 
 export async function getSharedMeeting(
   key: string
-): Promise<{ meeting: SharedMeeting; access: "owner" | "assignee" }> {
-  return request<{ meeting: SharedMeeting; access: "owner" | "assignee" }>(
+): Promise<SharedMeetingResponse> {
+  return request<SharedMeetingResponse>(
     `/recordings/shared-with-me/${encodeURIComponent(key)}`
   );
 }
@@ -2677,7 +2905,8 @@ export type NotificationType =
   | "TASK_DUE_TODAY"
   | "TASK_OVERDUE"
   | "MEETING_DOCUMENT_READY"
-  | "MEETING_OUTPUT_SHARED";
+  | "MEETING_OUTPUT_SHARED"
+  | "MEETING_ACCESS_GRANTED";
 
 export type NotificationPriority = "LOW" | "NORMAL" | "HIGH";
 
@@ -2941,7 +3170,7 @@ export type SitePerson = {
   /** Opaque handle, sent back to choose this person. Never displayed. */
   person_key: string;
   provider: string;
-  type: "contact" | "user";
+  type: "contact" | "lead" | "user";
   external_id: string;
   name: string;
   email: string;
@@ -2952,6 +3181,8 @@ export type SitePerson = {
   last_synced_at?: string;
   /** The MinuteX contact this person was already used as, if any. */
   linked_contact_id?: string;
+  /** Why they're suggested ("Contact at Sharma Family"); related people only. */
+  relation?: string;
 };
 
 export type SitePeopleCounts = { contacts: number; users: number };
@@ -2978,6 +3209,30 @@ export type SiteSfMeetingRecord = {
   /** Opens the record in Salesforce; "" when the receiver did not send one. */
   url: string;
   delivered_at: string;
+  /** The customer record this push updated ("Site Visit" / "Mumbai Tower A"),
+   *  when the meeting was pushed to a destination. */
+  destination?: {
+    destination_id: string; name: string; record_name: string; url: string;
+    updated_fields: string[]; truncated_fields: string[];
+    skipped: { field: string; reason: string }[];
+  } | null;
+};
+
+/** Where meetings can be pushed, as the org's Salesforce admin configured
+ *  it and this person's Salesforce access allows. */
+export type SiteSfDestination = {
+  /** Opaque handle, sent back to choose it. Never displayed. */
+  destination_id: string;
+  name: string;
+  object_label: string;
+  /** Salesforce lets Tasks be attached to its records. */
+  task_supported: boolean;
+  /** update_record: the person picks an existing record to update.
+   *  meeting_record: Salesforce keeps one record per meeting, created on the
+   *  first push and updated after — nothing to pick. */
+  write_mode?: "update_record" | "meeting_record";
+  /** The fields a push writes (labels). */
+  fields: string[];
 };
 
 export type SiteSfMeetingRelation = {
@@ -2992,6 +3247,8 @@ export type SiteSfMeetingRelation = {
   problems: string[];
   /** The meeting's Salesforce record, once pushed; Tasks are attached to it. */
   meeting_record?: SiteSfMeetingRecord | null;
+  /** The chosen destination and record, or null. */
+  destination?: { destination_id: string; name: string; object_label: string; record_name: string } | null;
 };
 
 export type SiteJob = {
@@ -3168,7 +3425,7 @@ export async function getSiteDelivery(workspaceId: string): Promise<SiteEndpoint
  *  ("none" for development); the app never sends a shared secret, so an
  *  endpoint already set to a signed mode keeps the secret stored server-side. */
 export async function saveSiteDelivery(
-  workspaceId: string, body: { url: string; auth_mode: string; enabled: boolean },
+  workspaceId: string, body: { url: string; auth_mode: string; enabled: boolean; shared_secret?: string },
 ): Promise<{ endpoint: SiteEndpoint; warnings: string[] }> {
   return request(siteDelivery(workspaceId), { method: "PUT", body });
 }
@@ -3240,11 +3497,43 @@ export async function searchSitePeoplePage(
 /** The MinuteX contact a synced Salesforce person is used as — found or
  *  created once, server-side. Every "choose a person" sheet resolves a
  *  Salesforce pick through this and then carries on as for any contact. */
-export async function contactForSitePerson(workspaceId: string, personKey: string): Promise<ApiContact> {
+export async function contactForSitePerson(
+  workspaceId: string, personKey: string, livePerson?: SitePerson,
+): Promise<ApiContact> {
+  // A person from LIVE search isn't in the People Store yet: sending it
+  // lets this pick save that one person (and nobody else).
   const r = await request<{ contact: ApiContact }>(
     `/workspaces/${encodeURIComponent(workspaceId)}/people/contact`,
-    { method: "POST", body: { person_key: personKey } });
+    { method: "POST", body: livePerson ? { person_key: personKey, person: livePerson }
+                                       : { person_key: personKey } });
   return r.contact;
+}
+
+/** The people on the Salesforce record(s) this meeting is linked to,
+ *  suggested before anyone types. Empty when the meeting isn't linked to a
+ *  record. Throws ApiError code "people_related_unsupported" when the org's
+ *  receiver can't suggest people yet. */
+export async function getRelatedPeople(meetingKey: string): Promise<SitePerson[]> {
+  const r = await request<{ people: SitePerson[] }>(
+    `/recordings/webhook-people/${encodeURIComponent(meetingKey)}`);
+  return r.people;
+}
+
+/** LIVE search of the customer's Salesforce people (Contacts, Leads, Users)
+ *  for speaker tagging. Nothing is copied: the customer's org answers.
+ *  Needs at least 2 characters. Throws ApiError code
+ *  "people_search_unsupported" when the org's receiver doesn't have live
+ *  search yet. */
+export async function searchLivePeople(
+  workspaceId: string, q: string,
+  opts: { types?: Array<"contact" | "lead" | "user">; limit?: number } = {},
+): Promise<SitePerson[]> {
+  const qs = new URLSearchParams({ q });
+  if (opts.types?.length) qs.set("types", opts.types.join(","));
+  if (opts.limit) qs.set("limit", String(opts.limit));
+  const r = await request<{ people: SitePerson[] }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/webhook/people?${qs}`);
+  return r.people;
 }
 
 /** The meeting's Salesforce relationship. `relation` is null when the
@@ -3255,6 +3544,75 @@ export async function getSiteMeetingRelation(
   const r = await request<{ relation: SiteSfMeetingRelation | null; meeting_record?: SiteSfMeetingRecord | null }>(
     `${siteSf(workspaceId)}/meeting-relation?meeting_key=${encodeURIComponent(meetingKey)}`);
   return r.relation ? { ...r.relation, meeting_record: r.meeting_record ?? null } : null;
+}
+
+/** "Install MinuteX in Salesforce": where the in-app install stands.
+ *  waiting = the install page and a setup code were issued; installed = the
+ *  org's MinuteX Setup tab sent the code back and MinuteX verified the org;
+ *  connected = finished. The setup code is shown to owners/managers only. */
+export type SiteSfInstall = {
+  status: "none" | "waiting" | "installed" | "connected" | "expired";
+  setup_code?: string;
+  /** Opened in the browser; never displayed. */
+  install_url?: string;
+  org_name?: string;
+  expires_at?: string;
+  sandbox?: boolean;
+};
+
+export async function startSiteSalesforceInstall(workspaceId: string, sandbox: boolean): Promise<SiteSfInstall> {
+  const r = await request<{ install: SiteSfInstall }>(`${siteSf(workspaceId)}/install`, {
+    method: "POST", body: { sandbox },
+  });
+  return r.install;
+}
+
+export async function getSiteSalesforceInstall(workspaceId: string): Promise<SiteSfInstall> {
+  const r = await request<{ install: SiteSfInstall }>(`${siteSf(workspaceId)}/install`);
+  return r.install;
+}
+
+/** Finish the install: connect the verified org. 409 org_mismatch when the
+ *  workspace is on another org (ask, then pass allowOrgChange). */
+export async function finishSiteSalesforceInstall(
+  workspaceId: string, allowOrgChange = false,
+): Promise<SiteSfConnection> {
+  const r = await request<{ connection: SiteSfConnection }>(`${siteSf(workspaceId)}/install/connect`, {
+    method: "POST", body: { allow_org_change: allowOrgChange },
+  });
+  return r.connection;
+}
+
+/** Where THIS person may push meetings. `supported: false`: the org's
+ *  MinuteX receiver predates destinations. */
+export async function listSiteSalesforceDestinations(
+  workspaceId: string,
+): Promise<{ destinations: SiteSfDestination[]; supported: boolean }> {
+  const r = await request<{ destinations: SiteSfDestination[]; supported?: boolean }>(
+    `${siteSf(workspaceId)}/destinations`);
+  return { destinations: r.destinations, supported: r.supported !== false };
+}
+
+/** Existing records of a destination this person can see. */
+export async function searchSiteDestinationRecords(
+  workspaceId: string, destinationId: string, q: string,
+): Promise<{ id: string; name: string }[]> {
+  const r = await request<{ records: { id: string; name: string }[] }>(
+    `${siteSf(workspaceId)}/destinations/${encodeURIComponent(destinationId)}/records`
+    + `?q=${encodeURIComponent(q)}`);
+  return r.records;
+}
+
+/** "Push this meeting to <destination> -> <record>", or clear it. */
+export async function setSiteMeetingDestination(
+  workspaceId: string, meetingKey: string,
+  change: { destination_id: string; record_id?: string; record_name?: string } | { clear: true },
+): Promise<SiteSfMeetingRelation> {
+  const r = await request<{ relation: SiteSfMeetingRelation; meeting_record?: SiteSfMeetingRecord | null }>(
+    `${siteSf(workspaceId)}/meeting-destination`, {
+      method: "PUT", body: { meeting_key: meetingKey, ...change },
+    });
+  return { ...r.relation, meeting_record: r.meeting_record ?? null };
 }
 
 /** Change the meeting's relationship: a synced Contact (`person_key`), a
@@ -3270,4 +3628,220 @@ export async function setSiteMeetingRelation(
     method: "PUT", body: { meeting_key: meetingKey, ...change },
   });
   return r.relation;
+}
+
+// ===========================================================================
+// Salesforce WEBHOOK (Webhook Contract v2, delivery_type = "webhook") — a
+// separate path from the MinuteX Salesforce package above. See
+// docs/webhook-contract-v2.md and lib/webhook-flow.ts. Every third-party
+// failure arrives as a 409 with a `code`, never a 401.
+// ===========================================================================
+
+const webhookBase = (workspaceId: string) =>
+  `/workspaces/${encodeURIComponent(workspaceId)}/webhook`;
+
+export async function getWebhook(
+  workspaceId: string,
+): Promise<{ mode: WebhookMode; endpoint: WebhookEndpoint }> {
+  return request(webhookBase(workspaceId));
+}
+
+/** Saves the webhook address. The FIRST save returns the signing secret —
+ *  the only time it is ever sent to the app. Keep it in memory only. */
+export async function saveWebhook(
+  workspaceId: string, body: { url: string; enabled?: boolean; replace_site?: boolean },
+): Promise<{ endpoint: WebhookEndpoint; secret?: string }> {
+  return request(webhookBase(workspaceId), { method: "PUT", body });
+}
+
+export async function deleteWebhook(workspaceId: string): Promise<void> {
+  await request(webhookBase(workspaceId), { method: "DELETE" });
+}
+
+/** A new signing secret, returned once. The old one keeps working for 24h. */
+export async function rotateWebhookSecret(
+  workspaceId: string,
+): Promise<{ endpoint: WebhookEndpoint; secret: string }> {
+  return request(`${webhookBase(workspaceId)}/secret`, { method: "POST" });
+}
+
+export async function testWebhook(
+  workspaceId: string,
+): Promise<{ test: WebhookTest; configuration: WebhookConfiguration }> {
+  return request(`${webhookBase(workspaceId)}/test`, { method: "POST" });
+}
+
+export async function getWebhookConfiguration(workspaceId: string): Promise<WebhookConfiguration> {
+  const r = await request<{ configuration: WebhookConfiguration }>(
+    `${webhookBase(workspaceId)}/configuration`);
+  return r.configuration;
+}
+
+export async function refreshWebhookConfiguration(
+  workspaceId: string,
+): Promise<{ configuration: WebhookConfiguration; rate_limited: boolean }> {
+  return request(`${webhookBase(workspaceId)}/configuration/refresh`, { method: "POST" });
+}
+
+export async function searchWebhookRecords(
+  workspaceId: string, meetingTypeId: string, q: string,
+): Promise<{ records: WebhookRecord[]; next_cursor: string }> {
+  const qs = `meeting_type_id=${encodeURIComponent(meetingTypeId)}&q=${encodeURIComponent(q)}`;
+  return request(`${webhookBase(workspaceId)}/records?${qs}`);
+}
+
+export async function getWebhookMeeting(meetingKey: string): Promise<{
+  mode: WebhookMode;
+  endpoint: { configured: boolean; enabled: boolean };
+  job: WebhookJob | null;
+  context: WebhookContext;
+  configuration: WebhookConfiguration | null;
+  /** A meeting the retired package sent: read-only history. */
+  earlier_record?: WebhookEarlierRecord | null;
+  /** The records this meeting is linked to (Contract v3), or null. */
+  links?: StoredMeetingLinks | null;
+}> {
+  return request(`/recordings/webhook/${encodeURIComponent(meetingKey)}`);
+}
+
+// ---- Salesforce login (integration user) ----------------------------------
+
+export type SalesforceOrgConnection = {
+  connected: boolean;
+  /** "connected" | "reconnect_needed" | "not_connected" */
+  status: string;
+  org_id?: string;
+  instance_host?: string;
+  integration_user_id?: string;
+  connected_at?: string;
+  connected_by?: string;
+  status_message?: string;
+};
+
+export async function getSalesforceOrgConnection(workspaceId: string): Promise<SalesforceOrgConnection> {
+  const r = await request<{ connection: SalesforceOrgConnection }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/salesforce/connection`);
+  return r.connection;
+}
+
+/** The Salesforce sign-in page to open (the backend signs the state and
+ *  holds the PKCE verifier). */
+export async function startSalesforceOrgConnect(
+  workspaceId: string, environment: "production" | "sandbox" | "my_domain", myDomain = "",
+): Promise<string> {
+  const r = await request<{ authorize_url: string }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/salesforce/connect`,
+    { method: "POST", body: { environment, my_domain: myDomain } });
+  return r.authorize_url;
+}
+
+export async function disconnectSalesforceOrg(workspaceId: string): Promise<void> {
+  await request(`/workspaces/${encodeURIComponent(workspaceId)}/salesforce/connection`,
+    { method: "DELETE" });
+}
+
+// ---- Linking a meeting to records (Contract v3) ---------------------------
+
+export type LinkOutputName =
+  | "overview" | "mom" | "tasks" | "participants" | "participant_contributions"
+  | "transcript" | "recording" | "documents";
+
+export type StoredMeetingLinks = {
+  links: { object: string; id: string; name: string; primary: boolean }[];
+  included_outputs: LinkOutputName[];
+  task_relations: Record<string, { object: string; id: string }>;
+  selected_at: string;
+  /** Only from getMeetingLinks: generated documents whose PDF is missing or
+   *  was made from older text (empty unless Documents is included). */
+  stale_documents?: string[];
+};
+
+export type ApiLinkConfig = {
+  /** False when the customer's Salesforce doesn't support linking yet. */
+  supported: boolean;
+  /** Records per meeting; set in ONE place on the backend. */
+  max_links: number;
+  objects: {
+    object: string; label: string; can_be_primary: boolean;
+    outputs_allowed: LinkOutputName[]; outputs_default_on: LinkOutputName[];
+    outputs_user_can_change: LinkOutputName[];
+  }[];
+};
+
+export async function getLinkConfig(workspaceId: string): Promise<ApiLinkConfig> {
+  return request(`/workspaces/${encodeURIComponent(workspaceId)}/webhook/link-config`);
+}
+
+/** Search every linkable object at once, as this user. Needs 2 characters. */
+export async function searchLinkRecords(
+  workspaceId: string, q: string,
+): Promise<{ object: string; id: string; name: string; secondary?: string }[]> {
+  const r = await request<{ records: { id: string; display_name: string; secondary_text: string;
+                                       object_type: string }[] }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/webhook/link-records?${new URLSearchParams({ q })}`);
+  return r.records.map((x) => ({ object: x.object_type, id: x.id, name: x.display_name,
+                                 secondary: x.secondary_text || undefined }));
+}
+
+/** Upload the MoM PDF the app rendered, so it goes to Salesforce with the
+ *  MoM output (the server has no PDF renderer). At most 2 MB. */
+export async function uploadMeetingMomPdf(
+  meetingKey: string, contentBase64: string, filename: string,
+): Promise<void> {
+  await request(`/recordings/webhook-mom-pdf/${encodeURIComponent(meetingKey)}`,
+    { method: "PUT", body: { content_base64: contentBase64, filename } });
+}
+
+/** Upload one generated document as the PDF the app rendered. The server
+ *  ignores it when it already has a PDF of the document's current text. */
+export async function uploadMeetingDocumentPdf(
+  meetingKey: string, docType: string, contentBase64: string, filename: string,
+): Promise<void> {
+  await request(`/recordings/webhook-doc-pdf/${encodeURIComponent(meetingKey)}`,
+    { method: "PUT", body: { doc_type: docType, content_base64: contentBase64, filename } });
+}
+
+/** The records this meeting is linked to and what goes with them (null =
+ *  not linked). */
+export async function getMeetingLinks(meetingKey: string): Promise<StoredMeetingLinks | null> {
+  const r = await request<{ links: StoredMeetingLinks | null }>(
+    `/recordings/webhook-links/${encodeURIComponent(meetingKey)}`);
+  return r.links ?? null;
+}
+
+/** Save which records the meeting is linked to and what goes with them.
+ *  The backend re-checks everything against the admin's settings. */
+export async function setMeetingLinks(
+  meetingKey: string,
+  body: {
+    links: { object: string; id: string; name: string; primary: boolean }[];
+    included_outputs: LinkOutputName[];
+    task_relations: Record<string, { object: string; id: string }>;
+  },
+): Promise<StoredMeetingLinks> {
+  const r = await request<{ links: StoredMeetingLinks }>(
+    `/recordings/webhook-links/${encodeURIComponent(meetingKey)}`, { method: "PUT", body });
+  return r.links;
+}
+
+export async function setWebhookContext(
+  meetingKey: string,
+  body: { meeting_type_id: string | null;
+          record: { id: string; display_name: string; secondary_text?: string } | null },
+): Promise<WebhookContext> {
+  const r = await request<{ context: WebhookContext }>(
+    `/recordings/webhook-context/${encodeURIComponent(meetingKey)}`, { method: "PUT", body });
+  return r.context;
+}
+
+export async function pushWebhookMeeting(meetingKey: string): Promise<WebhookJob> {
+  const r = await request<{ job: WebhookJob }>(
+    `/recordings/webhook/${encodeURIComponent(meetingKey)}`, { method: "POST" });
+  return r.job;
+}
+
+export async function retryWebhookMeeting(meetingKey: string): Promise<WebhookJob> {
+  const r = await request<{ job: WebhookJob }>(
+    `/recordings/webhook-retry/${encodeURIComponent(meetingKey)}`, { method: "POST" });
+  return r.job;
 }

@@ -151,3 +151,87 @@ export class PendingTap {
     return this.target;
   }
 }
+
+/** How often the silent app-start refresh may re-register an UNCHANGED
+ *  token. The refresh exists for token rotation and last_seen_at; once a
+ *  few hours is plenty. A changed token, or the Settings switch, always goes
+ *  through. */
+export const REGISTRATION_REFRESH_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Re-register this installation now?
+ *
+ * WHY THIS EXISTS. On iOS, fetching the token makes the OS report it again,
+ * which fires addPushTokenListener, which refreshed the registration, which
+ * fetched the token again — about 200 POST /me/push-tokens a second for as
+ * long as the app was open (it throttled the whole API). So: the Settings
+ * switch (explicit) always registers; otherwise only a NEW token, or the
+ * same token after REGISTRATION_REFRESH_MS, does.
+ */
+export function shouldRegister(s: {
+  explicit: boolean;
+  token: string;
+  last: { token: string; at: number } | null;
+  now: number;
+}): boolean {
+  if (s.explicit) return true;
+  if (!s.last || s.last.token !== s.token) return true;
+  return s.now - s.last.at >= REGISTRATION_REFRESH_MS;
+}
+
+/** The first wait after a failed registration, and the longest. */
+export const REGISTRATION_BACKOFF_BASE_MS = 60 * 1000;
+export const REGISTRATION_BACKOFF_MAX_MS = REGISTRATION_REFRESH_MS;
+
+/** A failed silent registration, remembered so the next try waits. */
+export type RegistrationFailure = { failures: number; retryAt: number };
+
+/**
+ * How long to wait after the `failures`-th failure in a row: 1 min, 2, 4, 8…
+ * capped at REGISTRATION_BACKOFF_MAX_MS, with "equal jitter" — half the wait
+ * fixed, half random — so phones that failed together (a throttled API) do
+ * not all come back in the same second. `random` is in [0, 1).
+ *
+ * WHY. shouldRegister only remembers SUCCESSES. When the POST itself failed —
+ * a 503 because the API was throttled — nothing was remembered, so the next
+ * token event POSTed again at once: the throttling fed the loop.
+ */
+export function registrationBackoffMs(failures: number, random: number): number {
+  const n = Math.max(1, Math.floor(failures));
+  const full = Math.min(REGISTRATION_BACKOFF_BASE_MS * 2 ** Math.min(n - 1, 30), REGISTRATION_BACKOFF_MAX_MS);
+  const r = Math.min(Math.max(random, 0), 1);
+  return Math.round(full / 2 + (full / 2) * r);
+}
+
+/** The failure record after one more failure at `now`. */
+export function nextRegistrationFailure(
+  prev: RegistrationFailure | null, now: number, random: number,
+): RegistrationFailure {
+  const failures = (prev?.failures ?? 0) + 1;
+  return { failures, retryAt: now + registrationBackoffMs(failures, random) };
+}
+
+/** May a SILENT sync run now? The Settings switch (explicit) always may —
+ *  the user is waiting for the answer and sees the error. */
+export function registrationAllowed(s: {
+  explicit: boolean; failure: RegistrationFailure | null; now: number;
+}): boolean {
+  if (s.explicit || !s.failure) return true;
+  // A clock moved far backwards would otherwise block for that long.
+  if (s.failure.retryAt - s.now > REGISTRATION_BACKOFF_MAX_MS) return true;
+  return s.now >= s.failure.retryAt;
+}
+
+/**
+ * Should a token event from addPushTokenListener start a sync?
+ *
+ * Only for a token this run has not seen yet. On iOS, fetching the Expo token
+ * makes the OS report the SAME device token again; treating that report as
+ * news is what started the loop. A genuinely rotated token is different, so
+ * it still goes through. An unreadable token is treated as news (safe: the
+ * sync is still rate-limited by shouldRegister and the backoff).
+ */
+export function isNewDeviceToken(lastSeen: string, reported: unknown): boolean {
+  const t = typeof reported === "string" ? reported : "";
+  return !t || t !== lastSeen;
+}

@@ -19,12 +19,13 @@ import { Alert, Platform } from "react-native";
 import Constants from "expo-constants";
 import * as Device from "expo-device";
 import { requireOptionalNativeModule } from "expo-modules-core";
-import { registerPushToken, unregisterPushToken, type PushTokenState } from "./api";
+import { ApiError, onSignOut, registerPushToken, unregisterPushToken, type PushTokenState } from "./api";
 import { APP_VERSION } from "./app-info";
 import { store } from "./storage";
 import {
-  ANDROID_CHANNEL_ID, classifyPermission, foregroundPresentation, shouldOfferPrompt,
-  type PushPermission,
+  ANDROID_CHANNEL_ID, classifyPermission, foregroundPresentation, isNewDeviceToken,
+  nextRegistrationFailure, registrationAllowed, shouldOfferPrompt, shouldRegister,
+  type PushPermission, type RegistrationFailure,
 } from "./push-logic";
 
 type NotificationsModule = typeof import("expo-notifications");
@@ -45,6 +46,8 @@ export const Notifications: NotificationsModule | null = load();
 const INSTALLATION_KEY = "minutex.push.installationId";
 const ENABLED_KEY = "minutex.push.briefReady";          // cached server value
 const PROMPTED_KEY = "minutex.push.promptOffered";      // contextual prompt, once
+const REGISTERED_KEY = "minutex.push.lastRegistered";   // {token, at}: see shouldRegister
+const FAILED_KEY = "minutex.push.lastFailure";          // {failures, retryAt}: see registrationBackoffMs
 
 /** Why push cannot work here, or null when it can. Shown in Settings. */
 export function pushUnavailableReason(): string | null {
@@ -186,19 +189,112 @@ async function cacheEnabled(v: boolean) {
  * app-start refresh catches and ignores.
  */
 export async function syncThisDevice(opts: { enabled?: boolean } = {}): Promise<PushTokenState | null> {
+  // ONE sync at a time: a silent refresh arriving while one is running joins
+  // it. The Settings switch (an explicit `enabled`) waits for it, then runs.
+  if (opts.enabled === undefined && syncInFlight) return syncInFlight;
+  if (syncInFlight) { try { await syncInFlight; } catch { /* its own caller saw it */ } }
+  const run = syncOnce(opts);
+  syncInFlight = run;
+  try { return await run; } finally { if (syncInFlight === run) syncInFlight = null; }
+}
+
+let syncInFlight: Promise<PushTokenState | null> | null = null;
+
+// EVERY sign-out (also a 401's clearToken, which skips unregisterThisDevice):
+// the next account on this phone must register even with the same token, and
+// must not inherit the previous account's backoff.
+onSignOut(async () => {
+  failureMemo = null;
+  lastDeviceToken = "";
+  try { await store.deleteItemAsync(REGISTERED_KEY); } catch { /* best-effort */ }
+  try { await store.deleteItemAsync(FAILED_KEY); } catch { /* best-effort */ }
+});
+
+async function lastRegistered(): Promise<{ token: string; at: number } | null> {
+  try {
+    const v = JSON.parse((await store.getItemAsync(REGISTERED_KEY)) || "null");
+    return v && typeof v.token === "string" && typeof v.at === "number" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// The backoff lives in memory AND in the store: memory so it holds even when
+// the store is unavailable (lib/storage.ts), the store so a relaunch does not
+// start the count again.
+let failureMemo: RegistrationFailure | null = null;
+
+async function lastFailure(): Promise<RegistrationFailure | null> {
+  if (failureMemo) return failureMemo;
+  try {
+    const v = JSON.parse((await store.getItemAsync(FAILED_KEY)) || "null");
+    failureMemo = v && typeof v.failures === "number" && typeof v.retryAt === "number" ? v : null;
+  } catch {
+    failureMemo = null;
+  }
+  return failureMemo;
+}
+
+async function recordFailure(): Promise<void> {
+  failureMemo = nextRegistrationFailure(await lastFailure(), Date.now(), Math.random());
+  try { await store.setItemAsync(FAILED_KEY, JSON.stringify(failureMemo)); } catch { /* memory still holds */ }
+}
+
+async function clearFailure(): Promise<void> {
+  failureMemo = null;
+  try { await store.deleteItemAsync(FAILED_KEY); } catch { /* best-effort */ }
+}
+
+async function syncOnce(opts: { enabled?: boolean }): Promise<PushTokenState | null> {
   if (!Notifications || pushUnavailableReason()) return null;
   if ((await getPushPermission()) !== "granted") return null;
-  await ensureAndroidChannel();
-  const { data: token } = await Notifications.getExpoPushTokenAsync({ projectId: projectId() });
-  const state = await registerPushToken({
-    token,
-    installation_id: await installationId(),
-    platform: Platform.OS === "ios" ? "ios" : "android",
-    app_version: APP_VERSION,
-    ...(opts.enabled === undefined ? {} : { enabled: opts.enabled }),
-  });
+  const explicit = opts.enabled !== undefined;
+  // Checked BEFORE the token fetch: while backing off, a silent sync does
+  // nothing at all — no Expo token call (which is itself a network call, and
+  // on iOS re-fires the token listener), no POST.
+  if (!registrationAllowed({ explicit, failure: await lastFailure(), now: Date.now() })) return null;
+  let state: PushTokenState;
+  let token: string;
+  try {
+    await ensureAndroidChannel();
+    token = (await Notifications.getExpoPushTokenAsync({ projectId: projectId() })).data;
+    // Fetching the token above can itself fire addPushTokenListener on iOS;
+    // without this check that re-entered here forever (see shouldRegister).
+    if (!shouldRegister({ explicit, token, last: await lastRegistered(), now: Date.now() })) {
+      return null;
+    }
+    state = await registerPushToken({
+      token,
+      installation_id: await installationId(),
+      platform: Platform.OS === "ios" ? "ios" : "android",
+      app_version: APP_VERSION,
+      ...(opts.enabled === undefined ? {} : { enabled: opts.enabled }),
+    });
+  } catch (e) {
+    // A 401 has already signed the user out (request() → clearToken), which
+    // wiped this state; recording a failure now would hand the backoff to
+    // whoever signs in next.
+    if (!(e instanceof ApiError && e.status === 401)) await recordFailure();
+    throw e;
+  }
+  await clearFailure();
   await cacheEnabled(state.enabled);
+  try { await store.setItemAsync(REGISTERED_KEY, JSON.stringify({ token, at: Date.now() })); } catch { /* best-effort */ }
   return state;
+}
+
+// The device token the OS last reported to the listener in this run.
+let lastDeviceToken = "";
+
+/**
+ * addPushTokenListener's handler. Syncs only for a token not seen before in
+ * this run (see isNewDeviceToken): the OS re-reporting the SAME token after
+ * our own getExpoPushTokenAsync is not news, and acting on it was the loop.
+ */
+export function onDevicePushToken(reported: unknown): Promise<PushTokenState | null> {
+  if (!isNewDeviceToken(lastDeviceToken, reported)) return Promise.resolve(null);
+  if (typeof reported === "string") lastDeviceToken = reported;
+  return syncThisDevice();
 }
 
 /**
@@ -224,6 +320,8 @@ export async function unregisterThisDevice(): Promise<void> {
     /* see above */
   }
   try { await store.deleteItemAsync(ENABLED_KEY); } catch { /* best-effort */ }
+  // The next account on this phone must register even with the same token.
+  try { await store.deleteItemAsync(REGISTERED_KEY); } catch { /* best-effort */ }
 }
 
 // ---------------------------------------------------------------------------

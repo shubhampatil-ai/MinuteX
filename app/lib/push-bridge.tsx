@@ -24,7 +24,7 @@
 import { useCallback, useEffect, useRef } from "react";
 import { usePathname, useRootNavigationState, useRouter } from "expo-router";
 import { useNotifications } from "./notification-center";
-import { Notifications, configureForegroundHandler, syncThisDevice } from "./push";
+import { Notifications, configureForegroundHandler, onDevicePushToken, syncThisDevice } from "./push";
 import { PendingTap, briefHref } from "./push-logic";
 
 export function PushBridge({ ready }: { ready: boolean }) {
@@ -91,9 +91,11 @@ export function PushBridge({ ready }: { ready: boolean }) {
   // (4) registration refresh on entry, and whenever the OS rotates the token.
   useEffect(() => {
     if (!ready || !Notifications) return;
-    void syncThisDevice().catch(() => { /* offline or server down: next start */ });
-    const sub = Notifications.addPushTokenListener(() => {
-      void syncThisDevice().catch(() => { /* same */ });
+    void syncThisDevice().catch(() => { /* offline or server down: backed off (push.ts) */ });
+    // Only a token not seen before syncs: iOS re-reports the SAME token after
+    // every fetch, and reacting to that was the registration loop.
+    const sub = Notifications.addPushTokenListener((t) => {
+      void onDevicePushToken(t?.data).catch(() => { /* same */ });
     });
     return () => sub.remove();
   }, [ready]);

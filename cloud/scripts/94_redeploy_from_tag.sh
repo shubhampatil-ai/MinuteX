@@ -83,7 +83,8 @@ git -C "$REPO_ROOT" archive --format=tar "$COMMIT" cloud/functions cloud/shared 
 BUILD="$WORK/zips"
 declare -A BUILT_SHA
 while read -r fn sha; do
-  BUILT_SHA["$fn"]="$sha"
+  # Python on Windows ends lines with CRLF and `read` keeps the CR.
+  BUILT_SHA["$fn"]="${sha%$'\r'}"
 done < <(python "$(winpath "$SCRIPT_DIR/_package_release.py")" build \
            "$(winpath "$WORK/cloud")" "$(winpath "$BUILD")")
 
@@ -129,7 +130,7 @@ for t in "${TARGETS[@]}"; do
   aws lambda wait function-updated-v2 --function-name "$name"
 
   live="$(aws lambda get-function-configuration --function-name "$name" \
-            --query CodeSha256 --output text)"
+            --query CodeSha256 --output text | tr -d '\r')"
   if [[ "$live" != "${BUILT_SHA[$fn]}" ]]; then
     echo "ERROR: $name reports CodeSha256 $live, expected ${BUILT_SHA[$fn]}." >&2
     echo "       Deployed so far: ${DONE[*]:-none}. Roll back with the commands below." >&2

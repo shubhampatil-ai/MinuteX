@@ -3,3 +3,8 @@
 .sf/
 **/jsconfig.json
 **/.eslintrc.json
+
+# The login app's consumer key/secret and org policies stay in the Dev Hub
+# (minutex-target); they can't be packaged and must never be committed.
+**/extlClntAppGlobalOauthSets/**
+**/extlClntAppOauthPolicies/**

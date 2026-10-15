@@ -1,6 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
-    <description>See MinuteX meetings: the MinuteX Meetings tab, and the "MinuteX Meetings" related list on Leads, Contacts, Accounts and Opportunities (read only).</description>
+    <applicationVisibilities>
+        <application>MinuteX</application>
+        <visible>true</visible>
+    </applicationVisibilities>
+    <classAccesses>
+        <apexClass>MinuteXRecordMeetings</apexClass>
+        <enabled>true</enabled>
+    </classAccesses>
+    <description>For sales users: the MinuteX app, the MinuteX Meetings tab, and the meetings on their records (the MinuteX Meetings component on any record page, and the related list on Leads, Contacts, Accounts and Opportunities). Read only.</description>
     <fieldPermissions>
         <editable>false</editable>
         <field>MinuteX_Meeting__c.Audio_URL__c</field>
@@ -23,22 +31,7 @@
     </fieldPermissions>
     <fieldPermissions>
         <editable>false</editable>
-        <field>MinuteX_Meeting__c.Meeting_Type_Id__c</field>
-        <readable>true</readable>
-    </fieldPermissions>
-    <fieldPermissions>
-        <editable>false</editable>
-        <field>MinuteX_Meeting__c.Meeting_Type_Name__c</field>
-        <readable>true</readable>
-    </fieldPermissions>
-    <fieldPermissions>
-        <editable>false</editable>
         <field>MinuteX_Meeting__c.MinuteX_Sequence__c</field>
-        <readable>true</readable>
-    </fieldPermissions>
-    <fieldPermissions>
-        <editable>false</editable>
-        <field>MinuteX_Meeting__c.Minutes__c</field>
         <readable>true</readable>
     </fieldPermissions>
     <fieldPermissions>
@@ -184,6 +177,15 @@
         <allowEdit>false</allowEdit>
         <allowRead>true</allowRead>
         <modifyAllRecords>false</modifyAllRecords>
+        <object>MinuteX_Meeting_Link__c</object>
+        <viewAllRecords>false</viewAllRecords>
+    </objectPermissions>
+    <objectPermissions>
+        <allowCreate>false</allowCreate>
+        <allowDelete>false</allowDelete>
+        <allowEdit>false</allowEdit>
+        <allowRead>true</allowRead>
+        <modifyAllRecords>false</modifyAllRecords>
         <object>MinuteX_Meeting__c</object>
         <viewAllRecords>false</viewAllRecords>
     </objectPermissions>
@@ -194,15 +196,6 @@
         <allowRead>true</allowRead>
         <modifyAllRecords>false</modifyAllRecords>
         <object>MinuteX_Participant__c</object>
-        <viewAllRecords>false</viewAllRecords>
-    </objectPermissions>
-    <objectPermissions>
-        <allowCreate>false</allowCreate>
-        <allowDelete>false</allowDelete>
-        <allowEdit>false</allowEdit>
-        <allowRead>true</allowRead>
-        <modifyAllRecords>false</modifyAllRecords>
-        <object>MinuteX_Meeting_Link__c</object>
         <viewAllRecords>false</viewAllRecords>
     </objectPermissions>
     <tabSettings>

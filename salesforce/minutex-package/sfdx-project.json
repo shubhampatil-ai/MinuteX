@@ -5,11 +5,21 @@
       "default": true,
       "package": "MinuteX",
       "versionName": "Beta",
-      "versionNumber": "0.1.0.NEXT"
+      "versionNumber": "0.1.0.NEXT",
+      "versionDescription": "Links recorded meetings to Salesforce records: meetings, tasks and files appear on the records; MinuteX never changes them."
     }
   ],
   "name": "minutex-package",
-  "namespace": "",
+  "namespace": "DevMinuteX",
   "sfdcLoginUrl": "https://login.salesforce.com",
-  "sourceApiVersion": "62.0"
+  "sourceApiVersion": "62.0",
+  "packageAliases": {
+    "MinuteX": "0HogL0000004iTtSAI",
+    "MinuteX@0.1.0-1": "04tgL000000Z5EXQA0",
+    "MinuteX@0.1.0-2": "04tgL000000Z5HlQAK",
+    "MinuteX@0.1.0-3": "04tgL000000Z5MbQAK",
+    "MinuteX@0.1.0-4": "04tgL000000Z5UfQAK",
+    "MinuteX@0.1.0-5": "04tgL000000ZV2XQAW",
+    "MinuteX@0.1.0-6": "04tgL000000ZVfFQAW"
+  }
 }

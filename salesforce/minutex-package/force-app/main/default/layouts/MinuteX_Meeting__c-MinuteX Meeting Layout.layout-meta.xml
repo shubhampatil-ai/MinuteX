@@ -28,14 +28,6 @@
             </layoutItems>
             <layoutItems>
                 <behavior>Edit</behavior>
-                <field>Meeting_Type_Id__c</field>
-            </layoutItems>
-            <layoutItems>
-                <behavior>Edit</behavior>
-                <field>Meeting_Type_Name__c</field>
-            </layoutItems>
-            <layoutItems>
-                <behavior>Edit</behavior>
                 <field>Record_Id__c</field>
             </layoutItems>
             <layoutItems>
@@ -49,10 +41,6 @@
             <layoutItems>
                 <behavior>Edit</behavior>
                 <field>Summary__c</field>
-            </layoutItems>
-            <layoutItems>
-                <behavior>Edit</behavior>
-                <field>Minutes__c</field>
             </layoutItems>
             <layoutItems>
                 <behavior>Edit</behavior>
@@ -124,6 +112,16 @@
         <fields>Object__c</fields>
         <fields>Primary__c</fields>
         <relatedList>MinuteX_Meeting_Link__c.MinuteX_Meeting__c</relatedList>
+    </relatedLists>
+    <relatedLists>
+        <fields>NAME</fields>
+        <fields>Kind__c</fields>
+        <fields>Status__c</fields>
+        <fields>Received_At__c</fields>
+        <fields>Error_Code__c</fields>
+        <relatedList>MinuteX_Delivery_Log__c.MinuteX_Meeting__c</relatedList>
+        <sortField>Received_At__c</sortField>
+        <sortOrder>Desc</sortOrder>
     </relatedLists>
     <showEmailCheckbox>false</showEmailCheckbox>
     <showHighlightsPanel>false</showHighlightsPanel>

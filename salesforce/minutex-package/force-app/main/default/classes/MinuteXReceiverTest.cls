@@ -12,12 +12,6 @@ private class MinuteXReceiverTest {
         MinuteXReceiver.settingsOverride = new MinuteX_Webhook_Settings__c(
             Enabled__c = true, Shared_Secret__c = SECRET);
         MinuteXReceiver.nowOverride = NOW;
-        // A search type on Account, which exists in every org.
-        MinuteXReceiver.typesOverride = new List<MinuteXReceiver.MeetingType>{
-            MinuteXReceiver.plain('general_meeting', 'General Meeting'),
-            MinuteXReceiver.withRecord(MinuteXReceiver.plain('account_call', 'Account Call'), true,
-                'Account', 'Search accounts…', 'Account', 'Name', '{Name}', '{Phone}')
-        };
     }
 
     static RestResponse post(String route, Map<String, Object> body, String secret) {
@@ -240,6 +234,34 @@ private class MinuteXReceiverTest {
     }
 
     @IsTest
+    static void deliveriesAreLoggedButForgedCallsAreNot() {
+        setUp();
+        post('events', envelope(1), SECRET);
+        post('events', envelope(1), 'mxwhsec_' + 'z'.repeat(43));       // forged
+        List<MinuteX_Delivery_Log__c> logs = [SELECT Kind__c, Status__c, Http_Status__c, Sequence__c,
+                                              MinuteX_Meeting__c FROM MinuteX_Delivery_Log__c];
+        System.assertEquals(1, logs.size(), 'the forged call left no row');
+        System.assertEquals('meeting.created', logs[0].Kind__c);
+        System.assertEquals('Delivered', logs[0].Status__c);
+        System.assertEquals(1, logs[0].Sequence__c);
+        System.assertNotEquals(null, logs[0].MinuteX_Meeting__c);
+        post('events', envelope(1), SECRET);                               // a replay
+        System.assertEquals(1, [SELECT COUNT() FROM MinuteX_Delivery_Log__c WHERE Status__c = 'Duplicate']);
+    }
+
+    @IsTest
+    static void aFailedDeliveryIsLoggedWithItsError() {
+        setUp();
+        Map<String, Object> bad = envelope(1);
+        bad.put('event', 'meeting.exploded');
+        System.assertEquals(400, post('events', bad, SECRET).statusCode);
+        MinuteX_Delivery_Log__c l = [SELECT Status__c, Error_Code__c, Http_Status__c FROM MinuteX_Delivery_Log__c];
+        System.assertEquals('Failed', l.Status__c);
+        System.assertEquals('invalid_event', l.Error_Code__c);
+        System.assertEquals(400, l.Http_Status__c);
+    }
+
+    @IsTest
     static void aSignedEventIsSaved() {
         setUp();
         RestResponse res = post('events', envelope(1), SECRET);
@@ -275,61 +297,6 @@ private class MinuteXReceiverTest {
     }
 
     @IsTest
-    static void configurationListsTheMeetingTypesAndTheirRecordRules() {
-        setUp();
-        Map<String, Object> body = bodyOf(post('configuration', new Map<String, Object>{
-            'type' => 'configuration.request', 'contract_version' => '2.0'}, SECRET));
-        List<Object> types = (List<Object>) body.get('meeting_types');
-        System.assertEquals(2, types.size());
-        Map<String, Object> sel = (Map<String, Object>) ((Map<String, Object>) types[1]).get('record_selection');
-        System.assertEquals(true, sel.get('enabled'));
-        System.assertEquals(true, sel.get('required'));
-        System.assertEquals('Account', sel.get('label'));
-        System.assert(String.isNotBlank((String) body.get('configuration_version')));
-    }
-
-    @IsTest
-    static void theShippedMeetingTypesAreValid() {
-        MinuteXReceiver.typesOverride = null;
-        Set<String> ids = new Set<String>();
-        for (MinuteXReceiver.MeetingType t : MinuteXReceiver.meetingTypes()) {
-            System.assert(Pattern.matches('[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}', t.typeId), t.typeId);
-            System.assert(ids.add(t.typeId), 'duplicate id ' + t.typeId);
-        }
-    }
-
-    @IsTest
-    static void recordSearchReturnsDisplayTextOnly() {
-        setUp();
-        insert new List<Account>{new Account(Name = 'Mumbai Heights Pvt', Phone = '022 555'),
-                                 new Account(Name = 'Pune Greens')};
-        Map<String, Object> req = new Map<String, Object>{
-            'type' => 'records.search', 'contract_version' => '2.0',
-            'meeting_type_id' => 'account_call', 'query' => 'Mumbai', 'limit' => 10};
-        List<Object> records = (List<Object>) bodyOf(post('records/search', req, SECRET)).get('records');
-        System.assertEquals(1, records.size());
-        Map<String, Object> r = (Map<String, Object>) records[0];
-        System.assertEquals('Mumbai Heights Pvt', r.get('display_name'));
-        System.assertEquals('022 555', r.get('secondary_text'));
-
-        req.put('query', '\' OR Name != \'');  // an injection attempt finds nothing
-        System.assertEquals(0, ((List<Object>) bodyOf(post('records/search', req, SECRET)).get('records')).size());
-        req.put('meeting_type_id', 'general_meeting');
-        System.assertEquals(422, post('records/search', req, SECRET).statusCode);
-    }
-
-    @IsTest
-    static void aMisconfiguredSearchIsReported() {
-        setUp();
-        MinuteXReceiver.typesOverride.add(MinuteXReceiver.withRecord(
-            MinuteXReceiver.plain('broken', 'Broken'), false, 'X', '', 'No_Such_Object__c', 'Name', '{Name}', ''));
-        RestResponse res = post('records/search', new Map<String, Object>{
-            'type' => 'records.search', 'contract_version' => '2.0',
-            'meeting_type_id' => 'broken', 'query' => 'x'}, SECRET);
-        System.assertEquals(500, res.statusCode);
-    }
-
-    @IsTest
     static void peopleSendsContactsThenUsers() {
         setUp();
         insert new Contact(LastName = 'Smith', Email = 'john@example.com');
@@ -351,7 +318,5 @@ private class MinuteXReceiverTest {
         System.assert(MinuteXReceiver.sameText('abc', 'abc'));
         System.assert(!MinuteXReceiver.sameText('abc', 'abd'));
         System.assertNotEquals(null, MinuteXReceiver.namespacePrefix());
-        System.assertEquals('Mumbai', MinuteXReceiver.render('{Name} —', new Account(Name = 'Mumbai'),
-            new Map<String, String>{'Name' => 'Name'}));
     }
 }

@@ -235,6 +235,14 @@ private class MinuteXMeetingSyncTest {
     }
 
     @IsTest
+    static void everyLookupOnTheLinkGivesARelatedList() {
+        Map<String, Schema.SObjectField> f = MinuteXMeetingSync.lookupFields();
+        System.assert(f.keySet().containsAll(new Set<String>{'Lead', 'Contact', 'Account', 'Opportunity'}), f.keySet());
+        System.assert(!f.containsKey(MinuteX_Meeting__c.SObjectType.getDescribe().getName()),
+                      'the meeting itself is not a linked record');
+    }
+
+    @IsTest
     static void meetingDates() {
         System.assertEquals(Datetime.newInstanceGmt(2026, 10, 8, 5, 12, 0),
                             MinuteXMeetingSync.meetingDate('2026-10-08T05:12:00.123Z'));
@@ -290,7 +298,7 @@ private class MinuteXMeetingSyncTest {
         Map<String, Object> out = MinuteXMeetingSync.apply(envelope('meeting.created', 1, 'a0P000000000001', people, tasks));
         System.assertEquals(false, out.get('duplicate'));
 
-        MinuteX_Meeting__c m = [SELECT Id, Contact__c, Record_Id__c, Meeting_Type_Id__c FROM MinuteX_Meeting__c];
+        MinuteX_Meeting__c m = [SELECT Id, Contact__c, Record_Id__c FROM MinuteX_Meeting__c];
         System.assertEquals(john.Id, m.Contact__c);
         System.assertEquals('a0P000000000001', m.Record_Id__c);
 

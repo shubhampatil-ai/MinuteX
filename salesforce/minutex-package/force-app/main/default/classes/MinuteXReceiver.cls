@@ -5,8 +5,9 @@
  *
  *   POST .../minutex/v2/events          -> MinuteXMeetingSync (meeting,
  *                                          participants, contacts, tasks)
- *   POST .../minutex/v2/configuration   -> the meeting types in meetingTypes()
- *   POST .../minutex/v2/records/search  -> records for a type that uses one
+ *   POST .../minutex/v2/configuration   -> the records meetings can link to,
+ *                                          and their outputs (MinuteX Setup tab)
+ *   POST .../minutex/v2/records/search  -> records of those objects
  *   POST .../minutex/v2/people          -> Contacts and Users, for tagging
  *   POST .../minutex/v2/people/search   -> live search of Contacts, Leads
  *                                          and Users as a MinuteX user types
@@ -30,39 +31,6 @@
 @RestResource(urlMapping='/minutex/v2/*')
 global without sharing class MinuteXReceiver {
     static final Integer MAX_SKEW_SECONDS = 300;
-    static final Pattern TOKEN = Pattern.compile('\\{([A-Za-z0-9_]+)\\}');
-
-    /** One meeting type MinuteX users choose from. */
-    public class MeetingType {
-        public String typeId;
-        public String name;
-        public Boolean recordEnabled = false;
-        public Boolean recordRequired = false;
-        public String recordLabel = '';
-        public String placeholder = '';
-        public String searchObject;
-        public String searchFields;
-        public String displayFormat;
-        public String secondaryFormat;
-    }
-
-    // THE MEETING TYPES. Edit this list to change what MinuteX offers.
-    //   plain(id, name)                    -> no Salesforce record to pick
-    //   withRecord(plain(...), required, label, placeholder, object,
-    //              search fields, display, second line)
-    //                                      -> MinuteX shows a record search
-    // The id is permanent (letters, digits, _ . : -): never change it once
-    // used. Object and field names are API names, without any namespace.
-    public static List<MeetingType> meetingTypes() {
-        if (typesOverride != null) {
-            return typesOverride;
-        }
-        // The package ships no customer-specific types (no custom objects).
-        return new List<MeetingType>{
-            plain('general_meeting', 'General Meeting'),
-            plain('client_meeting', 'Client Meeting')
-        };
-    }
 
     /** One kind of record MinuteX users can link a meeting to. */
     public class LinkableObject {
@@ -77,19 +45,29 @@ global without sharing class MinuteXReceiver {
     // Every output MinuteX can send for a linked meeting. The transcript
     // goes as text, in the meeting's Transcript field; it's allowed but off by default.
     // 'documents': the meeting's generated documents, each as a PDF File.
-    static final List<String> LINK_OUTPUTS = new List<String>{
+    public static final List<String> LINK_OUTPUTS = new List<String>{
         'overview', 'mom', 'tasks', 'participants', 'participant_contributions', 'transcript', 'recording',
         'documents'};
-    static final List<String> LINK_DEFAULTS = new List<String>{'overview', 'mom', 'tasks', 'participants', 'documents'};
+    public static final List<String> LINK_DEFAULTS = new List<String>{'overview', 'mom', 'tasks', 'participants', 'documents'};
 
     /**
-     * EDIT HERE: the records MinuteX users can link a meeting to, and what
-     * each gets. An object that doesn't exist in this org is skipped.
+     * The records MinuteX users can link a meeting to, and what each gets:
+     * what the admin saved on the MinuteX Setup tab, else these defaults.
+     * An object that doesn't exist in this org is skipped.
      */
     public static List<LinkableObject> linkableObjects() {
         if (linkableOverride != null) {
             return linkableOverride;
         }
+        List<LinkableObject> saved = MinuteXSetupController.configuredObjects();
+        if (!saved.isEmpty()) {
+            return saved;
+        }
+        return defaultObjects();
+    }
+
+    /** The objects offered until the admin saves the MinuteX Setup tab. */
+    public static List<LinkableObject> defaultObjects() {
         return new List<LinkableObject>{
             linkable('Lead', true), linkable('Contact', true), linkable('Account', true),
             linkable('Opportunity', true)
@@ -111,31 +89,9 @@ global without sharing class MinuteXReceiver {
     static List<LinkableObject> linkableOverride;
 
     @TestVisible
-    static List<MeetingType> typesOverride;
-    @TestVisible
     static Long nowOverride;
     @TestVisible
     static MinuteX_Webhook_Settings__c settingsOverride;
-
-    public static MeetingType plain(String typeId, String name) {
-        MeetingType t = new MeetingType();
-        t.typeId = typeId;
-        t.name = name;
-        return t;
-    }
-
-    public static MeetingType withRecord(MeetingType t, Boolean required, String label, String placeholder,
-                                         String objectName, String fields, String display, String secondary) {
-        t.recordEnabled = true;
-        t.recordRequired = required;
-        t.recordLabel = label;
-        t.placeholder = placeholder;
-        t.searchObject = objectName;
-        t.searchFields = fields;
-        t.displayFormat = display;
-        t.secondaryFormat = secondary;
-        return t;
-    }
 
     public class ReceiverException extends Exception {
         public Integer status = 400;
@@ -155,10 +111,12 @@ global without sharing class MinuteXReceiver {
         RestResponse res = RestContext.response;
         Integer status = 200;
         Map<String, Object> body;
+        String raw = '';
+        String route = '';
         Savepoint sp = Database.setSavepoint();
         try {
-            String raw = req.requestBody == null ? '' : req.requestBody.toString();
-            String route = routeOf(req.requestURI);
+            raw = req.requestBody == null ? '' : req.requestBody.toString();
+            route = routeOf(req.requestURI);
             if (route == 'setup/secret') {
                 body = setupSecret(raw);   // NOT signed: see setupSecret
             } else {
@@ -179,6 +137,11 @@ global without sharing class MinuteXReceiver {
             status = 500;  // MinuteX retries
             body = error('receiver_failed', e.getTypeName() + ': ' + e.getMessage().left(300));
         }
+        // After any rollback, so a failure is logged too. Never for a request
+        // that failed the signature: a forged call must not fill the log.
+        if ((route == 'events' || route == 'files') && status != 401 && status != 403) {
+            MinuteXDeliveryLog.record(route, raw, status, body);
+        }
         res.statusCode = status;
         res.addHeader('Content-Type', 'application/json');
         res.addHeader('Cache-Control', 'no-store');
@@ -198,9 +161,6 @@ global without sharing class MinuteXReceiver {
                    && env.get('objects') instanceof List<Object>) {
             return linkSearch(str(env.get('query')).left(100), stringsOf(env.get('objects'), 50),
                               intOf(env.get('limit'), 10));
-        } else if (route == 'records/search' && bodyType == 'records.search') {
-            return search(str(env.get('meeting_type_id')), str(env.get('query')).left(100),
-                          intOf(env.get('limit'), 10));
         } else if (route == 'people' && bodyType == 'people.sync') {
             return people(str(env.get('cursor')), intOf(env.get('page_size'), 200));
         } else if (route == 'people/related' && bodyType == 'people.related') {
@@ -305,15 +265,9 @@ global without sharing class MinuteXReceiver {
     // -- configuration -------------------------------------------------------
 
     static Map<String, Object> configuration() {
+        // Meetings are linked to records (linkable_objects); the older
+        // meeting types are not used by this package.
         List<Object> types = new List<Object>();
-        for (MeetingType t : meetingTypes()) {
-            types.add(new Map<String, Object>{
-                'id' => t.typeId, 'name' => t.name,
-                'record_selection' => new Map<String, Object>{
-                    'enabled' => t.recordEnabled, 'required' => t.recordEnabled && t.recordRequired,
-                    'label' => t.recordLabel, 'placeholder' => t.placeholder}
-            });
-        }
         List<Object> linkables = new List<Object>();
         for (LinkableObject o : linkableObjects()) {
             Schema.SObjectType objectType = objectNamed(o.objectName);
@@ -327,86 +281,12 @@ global without sharing class MinuteXReceiver {
                 'outputs_default_on' => o.outputsDefaultOn,
                 'outputs_user_can_change' => o.outputsUserCanChange});
         }
-        // Changes by itself whenever meetingTypes() or linkableObjects() change.
+        // Changes by itself whenever the linkable objects change.
         String version = EncodingUtil.convertToHex(Crypto.generateDigest('SHA-256',
             Blob.valueOf(JSON.serialize(types) + JSON.serialize(linkables)))).left(12);
         return new Map<String, Object>{
             'contract_version' => '2.0', 'configuration_version' => version, 'meeting_types' => types,
             'linkable_objects' => linkables};
-    }
-
-    // -- record search -------------------------------------------------------
-
-    /** Records of the meeting type's object whose search fields contain the
-     *  query (or whose Id is the query). Returns ONLY the display text and
-     *  the id: the fields named on the meeting type are the access list. */
-    static Map<String, Object> search(String typeId, String query, Integer limitCount) {
-        MeetingType t;
-        for (MeetingType candidate : meetingTypes()) {
-            if (candidate.typeId == typeId) {
-                t = candidate;
-            }
-        }
-        if (t == null || !t.recordEnabled) {
-            throw fail(422, 'unknown_meeting_type', 'This meeting type does not use a record.');
-        }
-        Schema.SObjectType objectType = objectNamed(t.searchObject);
-        if (objectType == null) {
-            throw fail(500, 'search_misconfigured', 'Object ' + t.searchObject + ' does not exist in this org.');
-        }
-        Schema.DescribeSObjectResult d = objectType.getDescribe();
-        Map<String, Schema.SObjectField> fields = d.fields.getMap();
-        List<String> searchable = new List<String>();
-        for (String f : t.searchFields.split(',')) {
-            Schema.SObjectField field = fieldNamed(fields, f.trim());
-            if (field == null) {
-                throw fail(500, 'search_misconfigured', 'Field ' + f.trim() + ' does not exist on ' + t.searchObject + '.');
-            }
-            searchable.add(field.getDescribe().getName());
-        }
-        Set<String> selected = new Set<String>{'Id'};
-        selected.addAll(searchable);
-        Map<String, String> tokenField = new Map<String, String>();
-        for (String fmt : new List<String>{t.displayFormat, t.secondaryFormat}) {
-            Matcher m = TOKEN.matcher(fmt == null ? '' : fmt);
-            while (m.find()) {
-                Schema.SObjectField field = fieldNamed(fields, m.group(1));
-                if (field != null) {
-                    tokenField.put(m.group(1), field.getDescribe().getName());
-                    selected.add(field.getDescribe().getName());
-                }
-            }
-        }
-        Integer lim = Math.max(1, Math.min(25, limitCount));
-        Map<String, Object> binds = new Map<String, Object>{'lim' => lim};
-        String whereClause = '';
-        String q = query == null ? '' : query.trim();
-        if (q != '') {
-            List<String> ors = new List<String>();
-            binds.put('q', '%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%');
-            for (String f : searchable) {
-                ors.add(f + ' LIKE :q');
-            }
-            if (q.isAlphanumeric() && (q.length() == 15 || q.length() == 18)) {
-                binds.put('qid', q);
-                ors.add('Id = :qid');
-            }
-            whereClause = ' WHERE (' + String.join(ors, ' OR ') + ')';
-        }
-        String soql = 'SELECT ' + String.join(new List<String>(selected), ', ') + ' FROM ' + d.getName()
-            + whereClause + ' ORDER BY LastModifiedDate DESC LIMIT :lim';
-        List<Object> records = new List<Object>();
-        for (SObject rec : Database.queryWithBinds(soql, binds, AccessLevel.SYSTEM_MODE)) {
-            String display = render(t.displayFormat, rec, tokenField).left(200);
-            if (String.isBlank(display)) {
-                continue;
-            }
-            records.add(new Map<String, Object>{
-                'id' => String.valueOf(rec.Id), 'display_name' => display,
-                'secondary_text' => render(t.secondaryFormat, rec, tokenField).left(200),
-                'object_type' => d.getName()});
-        }
-        return new Map<String, Object>{'records' => records, 'next_cursor' => null};
     }
 
     /** This org's namespace prefix, if any — read from this class's own name
@@ -433,29 +313,6 @@ global without sharing class MinuteXReceiver {
             }
         }
         return found;
-    }
-
-    static Schema.SObjectField fieldNamed(Map<String, Schema.SObjectField> fields, String name) {
-        Schema.SObjectField found = fields.get(name);
-        if (found == null && namespacePrefix() != '') {
-            found = fields.get(namespacePrefix() + '__' + name);
-        }
-        return found;
-    }
-
-    @TestVisible
-    static String render(String format, SObject rec, Map<String, String> tokenField) {
-        if (String.isBlank(format)) {
-            return '';
-        }
-        String out = format;
-        Matcher m = TOKEN.matcher(format);
-        while (m.find()) {
-            String apiName = tokenField.get(m.group(1));
-            Object v = apiName == null ? null : rec.get(apiName);
-            out = out.replace(m.group(0), v == null ? '' : String.valueOf(v));
-        }
-        return out.trim().removeEnd('—').removeEnd('-').trim();
     }
 
     // -- people --------------------------------------------------------------

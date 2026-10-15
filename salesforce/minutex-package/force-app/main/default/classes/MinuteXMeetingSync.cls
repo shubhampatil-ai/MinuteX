@@ -90,7 +90,6 @@ public without sharing class MinuteXMeetingSync {
         }
         Map<String, Object> data = asMap(env.get('data'));
         Map<String, Object> meeting = asMap(data.get('meeting'));
-        Map<String, Object> meetingType = asMap(env.get('meeting_type'));
         Map<String, Object> record = asMap(env.get('record_context'));
         // A meeting linked to several records (MinuteX contract 3.0): this
         // starter keeps the MAIN record in the same fields as a single record.
@@ -107,8 +106,6 @@ public without sharing class MinuteXMeetingSync {
             MinuteX_Meeting_Id__c = meetingId,
             MinuteX_Sequence__c = seq,
             Last_Event_Id__c = str(env.get('event_id')).left(40),
-            Meeting_Type_Id__c = blankToNull(str(meetingType.get('id')).left(64)),
-            Meeting_Type_Name__c = blankToNull(str(meetingType.get('name')).left(80)),
             // The business record (optional) and the people are SEPARATE:
             // clearing one never touches the other.
             Record_Id__c = blankToNull(str(record.get('record_id')).left(64)),
@@ -126,7 +123,6 @@ public without sharing class MinuteXMeetingSync {
             rec.Lifecycle__c = String.isBlank(str(meeting.get('lifecycle'))) ? 'active' : str(meeting.get('lifecycle')).left(20);
             rec.Started_At__c = str(meeting.get('started_at')).left(40);
             rec.Summary__c = str(asMap(data.get('summary')).get('text')).left(32768);
-            rec.Minutes__c = str(asMap(data.get('minutes')).get('markdown')).left(131072);
             Map<String, Object> transcript = asMap(data.get('transcript'));
             List<Object> parts = asList(transcript.get('parts'));
             if (parts.isEmpty() && String.isNotBlank(str(transcript.get('text')))) {
@@ -272,17 +268,41 @@ public without sharing class MinuteXMeetingSync {
 
     // -- linked records ------------------------------------------------------
 
-    /** The linked-record objects that get a lookup (and so a related list). */
-    // Field tokens, not names: they stay right inside the package namespace.
-    static final Map<String, Schema.SObjectField> LOOKUP_FIELD = new Map<String, Schema.SObjectField>{
-        'Lead' => MinuteX_Meeting_Link__c.Lead__c, 'Contact' => MinuteX_Meeting_Link__c.Contact__c,
-        'Account' => MinuteX_Meeting_Link__c.Account__c, 'Opportunity' => MinuteX_Meeting_Link__c.Opportunity__c};
+    /**
+     * Object -> its lookup on MinuteX Meeting Link: every lookup the link
+     * has, so a lookup the admin adds to their own object (say Property)
+     * gives that object the "MinuteX Meetings" related list too. Field
+     * tokens from describe: right with or without the package namespace.
+     */
+    public static Map<String, Schema.SObjectField> lookupFields() {
+        if (lookupCache != null) {
+            return lookupCache;
+        }
+        lookupCache = new Map<String, Schema.SObjectField>();
+        for (Schema.SObjectField f : Schema.SObjectType.MinuteX_Meeting_Link__c.fields.getMap().values()) {
+            Schema.DescribeFieldResult d = f.getDescribe();
+            if (d.getType() != Schema.DisplayType.REFERENCE || !d.isCustom()) {
+                continue;
+            }
+            List<Schema.SObjectType> targets = d.getReferenceTo();
+            if (targets.size() != 1 || targets[0] == MinuteX_Meeting__c.SObjectType) {
+                continue;
+            }
+            String target = targets[0].getDescribe().getName();
+            if (!lookupCache.containsKey(target)) {
+                lookupCache.put(target, f);
+            }
+        }
+        return lookupCache;
+    }
+    static Map<String, Schema.SObjectField> lookupCache;
 
     /**
      * One MinuteX Meeting Link per linked record (MinuteX contract 3.0), and
      * the meeting's Files shared to each. A Lead, Contact, Account or
      * Opportunity gets a lookup, so the meeting appears in its "MinuteX
-     * Meetings" related list; any other object keeps the record id only.
+     * Meetings" related list; any other object keeps the record id only (the
+     * MinuteX Meetings component finds its meetings by that id).
      * A record that no longer exists here is skipped (a lookup to it would
      * fail the whole event). Unlinked records lose their row and the shares.
      */
@@ -316,7 +336,7 @@ public without sharing class MinuteXMeetingSync {
                 Primary__c = l.get('primary') == true,
                 Summary__c = blankToNull(str(meeting.Summary__c).normalizeSpace().left(255)),
                 Meeting_Date__c = meetingDate(startedAt)));
-            if (LOOKUP_FIELD.containsKey(objectName)) {
+            if (lookupFields().containsKey(objectName)) {
                 if (!idsByObject.containsKey(objectName)) {
                     idsByObject.put(objectName, new Set<Id>());
                 }
@@ -333,7 +353,7 @@ public without sharing class MinuteXMeetingSync {
         }
         List<MinuteX_Meeting_Link__c> keep = new List<MinuteX_Meeting_Link__c>();
         for (MinuteX_Meeting_Link__c row : rows.values()) {
-            Schema.SObjectField field = LOOKUP_FIELD.get(row.Object__c);
+            Schema.SObjectField field = lookupFields().get(row.Object__c);
             if (field != null) {
                 if (!live.contains(Id.valueOf(row.Record_Id__c))) {
                     continue;   // deleted, or not in this org
@@ -440,8 +460,9 @@ public without sharing class MinuteXMeetingSync {
 
     // -- tasks ---------------------------------------------------------------
 
-    /** Objects a Task's Related To can point at in this org. */
-    static Set<String> relatable() {
+    /** Objects a Task's Related To can point at in this org (the ones with
+     *  Allow Activities on). The Setup page reads it too. */
+    public static Set<String> relatable() {
         Set<String> out = new Set<String>();
         for (Schema.SObjectType t : Schema.SObjectType.Task.fields.WhatId.getReferenceTo()) {
             out.add(t.getDescribe().getName());

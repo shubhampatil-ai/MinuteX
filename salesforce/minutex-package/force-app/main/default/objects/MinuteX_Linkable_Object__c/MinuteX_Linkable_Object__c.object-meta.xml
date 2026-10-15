@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>MinuteX Linkable Object</label>
+    <pluralLabel>MinuteX Linkable Objects</pluralLabel>
+    <description>One Salesforce object MinuteX users may link meetings to, and what each output does for it. Edited on the MinuteX Setup tab; read by the MinuteX receiver.</description>
+    <deploymentStatus>Deployed</deploymentStatus>
+    <sharingModel>ReadWrite</sharingModel>
+    <externalSharingModel>Private</externalSharingModel>
+    <enableActivities>false</enableActivities>
+    <enableReports>true</enableReports>
+    <enableSearch>false</enableSearch>
+    <enableSharing>true</enableSharing>
+    <enableBulkApi>true</enableBulkApi>
+    <enableStreamingApi>true</enableStreamingApi>
+    <enableFeeds>false</enableFeeds>
+    <enableHistory>false</enableHistory>
+    <nameField>
+        <label>Object</label>
+        <type>Text</type>
+    </nameField>
+</CustomObject>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomPermission xmlns="http://soap.sforce.com/2006/04/metadata">
+    <description>May open and save the MinuteX Setup tab. Given only by the MinuteX Admin permission set.</description>
+    <isLicensed>false</isLicensed>
+    <label>MinuteX Admin</label>
+</CustomPermission>

@@ -1,0 +1,127 @@
+<template>
+    <lightning-card title="MinuteX Setup" icon-name="standard:event">
+        <div class="slds-p-horizontal_medium slds-p-bottom_medium">
+            <template lwc:if={loading}>
+                <div class="slds-is-relative slds-p-around_large"><lightning-spinner alternative-text="Loading MinuteX settings"></lightning-spinner></div>
+            </template>
+            <template lwc:if={error}>
+                <div class="slds-notify slds-notify_alert slds-alert_error slds-m-bottom_medium" role="alert">{error}</div>
+            </template>
+
+            <template lwc:if={ready}>
+                <div class="slds-box slds-theme_shade slds-m-bottom_medium">
+                    <p class="slds-text-title_caps slds-m-bottom_xx-small">Connection</p>
+                    <p>{connectionText}</p>
+                </div>
+
+                <!-- ============ The list: one line per object ============ -->
+                <template lwc:if={showList}>
+                    <p class="slds-text-heading_small slds-m-bottom_xx-small">Records meetings can be linked to</p>
+                    <p class="slds-text-color_weak slds-m-bottom_medium">
+                        MinuteX users link a meeting to these records. Edit one to choose what it receives.
+                    </p>
+                    <template lwc:if={notSaved}>
+                        <p class="slds-text-color_weak slds-m-bottom_small">These are the defaults. Save to keep your own choices.</p>
+                    </template>
+                    <template lwc:if={noRows}>
+                        <p class="slds-box slds-text-color_weak slds-m-bottom_small">No objects yet. Add one below.</p>
+                    </template>
+
+                    <ul class="slds-has-dividers_around-space">
+                        <template for:each={rows} for:item="row">
+                            <li key={row.objectName} class="slds-item slds-m-bottom_small">
+                                <div class="slds-grid slds-grid_vertical-align-center slds-wrap slds-gutters_x-small">
+                                    <div class="slds-col slds-grow">
+                                        <p class="slds-text-heading_small">{row.label}</p>
+                                        <p class="slds-text-body_small slds-text-color_weak">{row.mainText}</p>
+                                        <p class="slds-m-top_xx-small">{row.sendsText}</p>
+                                        <ul class="slds-m-top_xx-small">
+                                            <template for:each={row.shownChecks} for:item="c">
+                                                <li key={c.key} class="slds-grid slds-grid_vertical-align-start slds-m-top_xx-small">
+                                                    <lightning-icon icon-name={c.icon} variant={c.variant} size="xx-small"
+                                                        class="slds-m-right_x-small" alternative-text={c.status}></lightning-icon>
+                                                    <span class="slds-text-body_small">{c.text}</span>
+                                                </li>
+                                            </template>
+                                        </ul>
+                                    </div>
+                                    <div class="slds-col slds-grow-none slds-m-top_x-small">
+                                        <lightning-button label="Edit" data-object={row.objectName} onclick={handleOpen}
+                                            class="slds-m-right_x-small"></lightning-button>
+                                        <lightning-button variant="base" label="Remove" data-object={row.objectName}
+                                            onclick={handleRemove}></lightning-button>
+                                    </div>
+                                </div>
+                            </li>
+                        </template>
+                    </ul>
+
+                    <div class="slds-grid slds-grid_vertical-align-end slds-gutters_x-small slds-m-top_medium slds-wrap">
+                        <div class="slds-col">
+                            <lightning-combobox label="Add an object" placeholder="Choose an object" value={addChoice}
+                                options={addOptions} onchange={handleAddChoice}></lightning-combobox>
+                        </div>
+                        <div class="slds-col slds-grow-none">
+                            <lightning-button label="Add" onclick={handleAdd} disabled={addDisabled}></lightning-button>
+                        </div>
+                    </div>
+                </template>
+
+                <!-- ============ One object ============ -->
+                <template lwc:if={current}>
+                    <lightning-button variant="base" label="All objects" icon-name="utility:back"
+                        onclick={handleBack}></lightning-button>
+                    <p class="slds-text-heading_medium slds-m-top_small">{current.label}</p>
+                    <p class="slds-text-body_small slds-text-color_weak">{current.objectName}</p>
+                    <ul class="slds-m-top_x-small">
+                        <template for:each={current.shownChecks} for:item="c">
+                            <li key={c.key} class="slds-grid slds-grid_vertical-align-start slds-m-top_xx-small">
+                                <lightning-icon icon-name={c.icon} variant={c.variant} size="xx-small"
+                                    class="slds-m-right_x-small" alternative-text={c.status}></lightning-icon>
+                                <span class="slds-text-body_small">{c.text}</span>
+                            </li>
+                        </template>
+                    </ul>
+
+                    <div class="slds-box slds-m-top_medium">
+                        <lightning-input type="toggle" label="Can be the main record"
+                            message-toggle-active="Yes" message-toggle-inactive="No"
+                            checked={current.canBePrimary} onchange={handlePrimary}></lightning-input>
+                        <p class="slds-text-body_small slds-text-color_weak slds-m-top_x-small">
+                            The main record gets the meeting's tasks unless the user picks another record for a task.
+                        </p>
+                    </div>
+
+                    <p class="slds-text-heading_small slds-m-top_large">What this object receives</p>
+                    <ul class="slds-text-body_small slds-text-color_weak slds-m-vertical_x-small">
+                        <li><strong>Never</strong>: not sent.</li>
+                        <li><strong>Off</strong>: off unless the user turns it on.</li>
+                        <li><strong>On</strong>: on unless the user turns it off.</li>
+                        <li><strong>Always</strong>: always sent; the user can't turn it off.</li>
+                    </ul>
+                    <template for:each={current.cells} for:item="cell">
+                        <div key={cell.key} class="slds-grid slds-grid_vertical-align-center slds-wrap slds-p-vertical_x-small slds-border_bottom">
+                            <div class="slds-col slds-size_1-of-1 slds-medium-size_1-of-3">
+                                <p>{cell.label}</p>
+                            </div>
+                            <div class="slds-col slds-size_1-of-1 slds-medium-size_2-of-3">
+                                <lightning-radio-group type="button" name={cell.key} label={cell.label}
+                                    variant="label-hidden" options={modes} value={cell.mode}
+                                    data-output={cell.output} onchange={handleMode}></lightning-radio-group>
+                            </div>
+                        </div>
+                    </template>
+                </template>
+
+                <div class="slds-m-top_large slds-grid slds-grid_vertical-align-center slds-gutters_x-small">
+                    <div class="slds-col slds-grow-none">
+                        <lightning-button variant="brand" label="Save" onclick={handleSave} disabled={saveDisabled}></lightning-button>
+                    </div>
+                    <template lwc:if={dirty}>
+                        <p class="slds-col slds-text-color_weak">Unsaved changes</p>
+                    </template>
+                </div>
+            </template>
+        </div>
+    </lightning-card>
+</template>

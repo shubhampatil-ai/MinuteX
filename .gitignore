@@ -24,6 +24,10 @@
 # cloud/scripts/29_rotate_elevenlabs_key.sh for one-command rollback.
 .keybackup/
 
+# Live Lambda code downloaded before each release, written by
+# cloud/scripts/94_redeploy_from_tag.sh for one-command rollback.
+.deploy-backups/
+
 # Mobile signing material + service credentials. Leaking any of these means
 # someone else can ship a build as you.
 *.jks

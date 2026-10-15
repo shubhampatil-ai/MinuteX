@@ -259,14 +259,13 @@ describe("Push Meeting status", () => {
 // ===========================================================================
 const PUSH = read("src/app/site-salesforce/push-tasks.tsx");
 const INDEX = read("src/app/site-salesforce/index.tsx");
-const BLOCK = read("lib/site-salesforce-meeting.tsx");
 const MEETING = read("src/app/recording/[key]/index.tsx");
 const TAGGING = read("lib/speaker-tagging.tsx");
 const API = read("lib/api.ts");
 const SITE_API = API.slice(API.indexOf("// Salesforce Site — org connection (NEW architecture)"));
 const SITE_FILES = [
   "src/app/site-salesforce/index.tsx", "src/app/site-salesforce/push-tasks.tsx",
-  "lib/site-salesforce-meeting.tsx", "lib/site-salesforce-pickers.tsx",
+  "lib/site-salesforce-pickers.tsx",
   "lib/site-salesforce-ui.tsx", "lib/site-salesforce-flow.ts",
 ];
 const code = (src) => src.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
@@ -284,20 +283,9 @@ describe("Tasks are pushed from their meeting, not typed in again", () => {
     for (const f of SITE_FILES) assert.doesNotMatch(code(read(f)), /site-salesforce\/new-task/, f);
     assert.doesNotMatch(SITE_API, /createSiteSalesforceTask|updateSiteSalesforceTask/);
   });
-
-  it("the meeting block opens the push screen with this meeting's key, title and workspace", () => {
-    assert.match(BLOCK, /pathname: "\/site-salesforce\/push-tasks"/);
-    assert.match(BLOCK, /meeting: meetingKey, title, workspace: workspaceId/);
-    assert.match(BLOCK, /openPush\(t\.minutex_task_id \|\| undefined\)/, "tap a pushed task -> push it again");
-  });
 });
 
 describe("Push Meeting and Push tasks are separate actions", () => {
-  it("the block pushes the meeting via the meeting-delivery route only", () => {
-    assert.match(BLOCK, /pushSiteMeeting\(meetingKey\)/);
-    assert.doesNotMatch(code(BLOCK), /pushTaskToSalesforce/);
-  });
-
   it("the push screen never pushes the meeting", () => {
     assert.doesNotMatch(code(PUSH), /pushSiteMeeting|retrySiteMeeting/);
   });
@@ -310,6 +298,8 @@ describe("Meeting screen: only behind the flag, nothing else changed", () => {
     // flag, so no build setting or stale bundle can show a second Salesforce.
     const uses = MEETING.match(/<SiteSalesforceMeetingBlock/g) || [];
     assert.equal(uses.length, 0);
+    // Nothing imported it, so the component itself is gone too.
+    assert.equal(existsSync(join(ROOT, "lib/site-salesforce-meeting.tsx")), false);
   });
 
   it("carries no trace of the removed OAuth CRM blocks", () => {
@@ -351,7 +341,6 @@ describe("Buttons are disabled while an operation runs", () => {
   it("the push screen disables Push until ready and while a push is running", () => {
     assert.match(PUSH, /disabled=\{!!problem \|\| pushing \|\| inFlight\}/);
     assert.match(PUSH, /disabled=\{pushing\}/, "checkboxes lock while pushing");
-    assert.match(BLOCK, /disabled=\{busy \|\| pushing \|\| !endpointEnabled \|\| !canPush\}/);
   });
 });
 
@@ -362,11 +351,6 @@ describe("Loading and empty states", () => {
     assert.match(pickers, /No synced Salesforce Users match/);
     assert.match(pickers, /records match/);
     assert.match(pickers, /refresh them in Settings → Integrations →/);
-  });
-
-  it("the meeting block shows nothing while loading and a retry when loading fails", () => {
-    assert.match(BLOCK, /if \(!loaded\) return null;/);
-    assert.match(BLOCK, /Couldn't load Salesforce\./);
   });
 });
 
@@ -401,7 +385,7 @@ describe("Objects: grouped, labelled, no API names", () => {
     assert.equal(relationKindLabel({ task_relation: "what" }), "Record");
   });
   it("no screen or picker renders an object API name, a record id or WhoId/WhatId", () => {
-    for (const [name, src] of [["pickers", PICKERS], ["block", BLOCK], ["push", PUSH]]) {
+    for (const [name, src] of [["pickers", PICKERS], ["push", PUSH]]) {
       const ui = code(src);
       // Rendered text only: `key={o.api_name}` is a React key, not text.
       assert.doesNotMatch(ui, /(?<!=)\{\s*(o|obj|chosen)\??\.api_name\s*\}/, `${name}: API name shown`);
@@ -430,23 +414,6 @@ describe("The meeting's Salesforce relationship", () => {
     assert.match(relationSourceNote(AUTO), /tagged in this meeting/);
     assert.match(relationSourceNote({ ...AUTO, automatic: false }), /Chosen/);
     assert.match(relationSourceNote(null), /Tag a synced Salesforce Contact/);
-  });
-  it("the meeting card is Destination -> Record -> Push, with nothing technical", () => {
-    const ui = code(BLOCK);
-    assert.match(ui, />Destination</);
-    assert.match(ui, />Record</);
-    assert.match(ui, /setSiteMeetingDestination\(workspaceId, meetingKey,/);
-    assert.match(ui, /searchSiteDestinationRecords\(workspaceId, destination\.destination_id/);
-    assert.match(ui, /Search Salesforce destinations/);
-    assert.match(ui, /✓ Synced to Salesforce/);
-    assert.match(ui, /Change destination/);
-    assert.match(ui, /Open in Salesforce/);
-    for (const banned of ["always creates", "Linked to", "Chosen for this meeting", "Related To",
-                          "MinuteX Meeting", "link to an existing record", "Change linked record",
-                          "api_name", "Apex", "record_id}"]) {
-      assert.ok(!ui.includes(banned), `meeting card must not say "${banned}"`);
-    }
-    assert.doesNotMatch(ui, /<ObjectPicker/, "no object/API picker on the meeting card");
   });
   it("the push screen inherits by default and pickers appear only after Change related Salesforce record", () => {
     const ui = code(PUSH);
@@ -513,8 +480,7 @@ describe("Custom objects without activities: meetings yes, Tasks no", () => {
     assert.equal(hasRelation(taskRelationOf({ what: rel.what }).relation), false);
     assert.deepEqual(taskRelationOf(null), { relation: null, skipped: [] });
   });
-  it("the meeting card offers every object; Task pickers only Task-capable ones", () => {
-    assert.doesNotMatch(BLOCK, /<ObjectPicker/, "the meeting card uses destinations, not raw objects");
+  it("Task pickers offer only Task-capable objects", () => {
     assert.match(PUSH, /<ObjectPicker workspaceId=\{ws\} value=\{obj\} capability="task"/);
     assert.match(PICKERS, /scope: "visible", capability/);
     assert.match(PICKERS, /scope: "all", capability, q: term/);
@@ -553,8 +519,6 @@ describe("Pushing to a destination record", () => {
   it("tasks wait for the meeting unless the destination record takes Tasks", () => {
     assert.match(pushProblem({ selected: ["t1"], objectApiName: "", recordId: "", meetingPushed: false,
                                assigneeFor: () => "k" }), /Push the meeting to Salesforce first/);
-    assert.match(BLOCK, /disabled=\{!tasksReady\}/);
-    assert.match(BLOCK, /!!chosenDest\?\.task_supported \|\| !!meetingRecord/);
     assert.match(PUSH, /relation\.what\?\.tasks_supported !== false/);
     assert.match(PUSH, /Each Salesforce Task is attached to/);
   });
@@ -571,7 +535,7 @@ describe("Integrations: Salesforce is a normal card", () => {
     assert.equal((INTEGRATIONS.match(/<WebhookIntegrationCard \/>/g) || []).length, 2, "personal and organisation views");
   });
   it("installing is a few taps; nothing technical on the way", () => {
-    for (const src of [code(INTEGRATIONS), code(CONNECT), code(BLOCK)]) {
+    for (const src of [code(INTEGRATIONS), code(CONNECT)]) {
       for (const banned of ["Site URL", "Apex", "receiver", "api_name", "Org ID", "sf project"]) {
         assert.ok(!src.includes(banned), `must not show "${banned}"`);
       }
@@ -710,16 +674,6 @@ describe("The connected org's name", () => {
 });
 
 describe("One Salesforce record per meeting (destination write mode)", () => {
-  const src = code(BLOCK);
-  it("choosing a per-meeting destination saves it at once: no record to pick", () => {
-    assert.match(src, /d\.write_mode === "meeting_record"\) \{ void chooseRecord\(d, null\)/);
-    assert.match(src, /: \{ destination_id: dest\.destination_id \}\)/, "no record id is sent");
-    assert.match(BLOCK, /Salesforce keeps one \{destForRecord\.name\} for this meeting and updates it each time you push\./);
-    assert.match(src, /destForRecord\.write_mode !== "meeting_record" \? \(/, "the record list never opens for it");
-  });
-  it("after the push it counts as synced to the record Salesforce created", () => {
-    assert.match(src, /\(perMeeting \|\| placed\.record_name === chosen\?\.record_name\)/);
-  });
   it("the API allows a destination without a record", () => {
     assert.match(read("lib/api.ts"), /change: \{ destination_id: string; record_id\?: string; record_name\?: string \}/);
     assert.match(read("lib/api.ts"), /write_mode\?: "update_record" \| "meeting_record";/);

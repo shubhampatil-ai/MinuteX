@@ -30,6 +30,7 @@ import {
   isStillUploading, TrashedRecording, ApiError,
 } from "../../lib/api";
 import { fmtDuration, sourceMeta, statusMeta } from "../../lib/sources";
+import { forgetMeeting, refreshMeetingLists } from "../../lib/shared-data";
 
 // "Deleted 2 hours ago" — in Trash the useful stamp is how long ago the user
 // binned it (and, once retention ships, how long it has left), not the wall
@@ -120,6 +121,8 @@ export default function TrashScreen() {
     setItems((prev) => prev.filter((r) => r.audio_s3_key !== key));
     try {
       await restoreRecording(key);
+      // Back on the Desk: its saved list is stale now.
+      void refreshMeetingLists();
     } catch (e) {
       Alert.alert(
         "Couldn't restore",
@@ -150,6 +153,8 @@ export default function TrashScreen() {
             setBusyKey(key);
             try {
               await permanentlyDeleteRecording(key);
+              // Nothing about it stays on the phone either.
+              forgetMeeting(key);
               setItems((prev) => prev.filter((r) => r.audio_s3_key !== key));
             } catch (e) {
               Alert.alert(
@@ -243,7 +248,7 @@ export default function TrashScreen() {
                       {duration ? <Text style={st.meta}>{duration}</Text> : null}
                     </View>
                     <Text style={st.headline} numberOfLines={2}>
-                      {item.title || "Untitled conversation"}
+                      {item.title || "Untitled meeting"}
                     </Text>
                     <Text style={st.deletedAt}>{fmtAgo(item.deleted_at)}</Text>
                   </View>

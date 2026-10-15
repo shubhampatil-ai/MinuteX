@@ -9,7 +9,7 @@
 #                  slack land here with no schema change and no second table.
 #   Billing:       PAY_PER_REQUEST
 #
-# WHY NOT REUSE CrmConnections (script 22). Same key shape on purpose — that
+# WHY NOT REUSE CrmConnections (the since-removed OAuth CRM table). Same key shape on purpose — that
 # design was right and this copies it. What it does not copy is the SCOPE:
 # CrmConnections rows carry Salesforce-specific attributes (instance_url,
 # org_id, sf_username) plus the CRM field-mapping config, and every consumer

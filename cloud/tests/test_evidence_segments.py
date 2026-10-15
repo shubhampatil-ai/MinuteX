@@ -449,13 +449,21 @@ class PipelineWiringTests(unittest.TestCase):
     def test_the_prompt_tells_the_model_where_the_ids_are(self):
         """The field was in the contract for a while WITHOUT this, and the
         model returned [] every time — it had been asked for ids but never told
-        they were on the line."""
+        they were on the line.
+
+        Tasks moved to their own call (extract_tasks), and the full "where the
+        ids are" instruction moved with them; the analysis prompt still asks
+        for overview evidence ids and keeps the example and the ban."""
         import prompts
-        live = prompts.unified_analysis_system(["Speaker 0"])
+        tasks = prompts.tasks_system(["Speaker 0"])
         for phrase in ("square brackets", "[seg_12]",
                        "copy the id from the START", "NEVER invent"):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, live)
+            with self.subTest(prompt="tasks", phrase=phrase):
+                self.assertIn(phrase, tasks)
+        analysis = prompts.unified_analysis_system(["Speaker 0"])
+        for phrase in ("[seg_12]", "NEVER invent"):
+            with self.subTest(prompt="analysis", phrase=phrase):
+                self.assertIn(phrase, analysis)
 
 
 if __name__ == "__main__":

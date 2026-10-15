@@ -32,6 +32,7 @@ const MAP = {
   "folder.fill": "folder",
   "house.fill": "home",
   "doc.text.fill": "description",
+  "doc.text": "description",
   "cpu.fill": "memory",
   "person.fill": "person",
   "chevron.right": "chevron_right",
@@ -65,6 +66,7 @@ const MAP = {
 
   // Auth / account
   "envelope": "mail",
+  "envelope.fill": "mail",
   "lock": "lock",
   "lock.fill": "lock",
   "lock.shield": "security",
@@ -113,9 +115,7 @@ const MAP = {
   "photo": "photo_library",
   "camera": "photo_camera",
   "folder": "folder_open",
-  // Folder category icons (lib/folder-appearance.tsx maps stored folder
-  // tokens onto these). Small, deliberate set — a folder icon is a
-  // glanceable category hint, not a sticker library.
+  // Category / accent icons used across the app. Small, deliberate set.
   "briefcase.fill": "work",
   "flag.fill": "flag",
   "star.fill": "star",
@@ -160,8 +160,11 @@ const MAP = {
   // CRM integrations
   "cloud.fill": "cloud",                             // Salesforce connection
 
-  // Settings
+  // Settings / organisation
   "gearshape.fill": "settings",
+  "person.badge.plus": "person_add",
+  "puzzlepiece.extension.fill": "extension",
+  "arrow.left.arrow.right": "swap_horiz",
   "globe": "language",
   "sun.max.fill": "light_mode",
   "moon.fill": "dark_mode",

@@ -112,9 +112,6 @@ class PermissionHarness(unittest.TestCase):
         self.patches = [
             mock.patch.object(api, "_recordings", self.t["recordings"]),
             mock.patch.object(api, "_contacts", self.t["contacts"]),
-            mock.patch.object(api, "_folders", self.t["folders"]),
-            mock.patch.object(api, "_folder_contacts",
-                              self.t["folder_contacts"]),
             mock.patch.object(api, "_meeting_participants",
                               self.t["participants"]),
             mock.patch.object(api, "_tasks", self.t["tasks"]),
@@ -536,7 +533,7 @@ class TestDashboardVisibility(PermissionHarness):
 class TestAssigneeContext(PermissionHarness):
     """The task must not read as "Nobody is assigned" to its own assignee.
 
-    THE BUG. The related entities on GET /tasks/{id} — contact, folder,
+    THE BUG. The related entities on GET /tasks/{id} — contact,
     recording — are all resolved against the CALLER. They belong to the
     creator, so an assignee got none of them: the detail screen fell through
     to its "Nobody is assigned to this task" empty state and offered to assign
@@ -591,9 +588,8 @@ class TestAssigneeContext(PermissionHarness):
         _, body = self.get_task()
         self.assertEqual(body["recording"]["audio_s3_key"], KEY)
         self.assertEqual(body["recording"]["access"], "assignee")
-        # Unchanged: the folder is the creator's workspace, and empty
-        # speaker_names keeps _public_task_v2 on the stored assignee string.
-        self.assertEqual(body["recording"]["folder_id"], "")
+        # Unchanged: empty speaker_names keeps _public_task_v2 on the stored
+        # assignee string.
         self.assertEqual(body["recording"]["speaker_names"], {})
         self.assertNotIn("folder", body)
 
@@ -701,7 +697,7 @@ class TestProvenancePreserved(PermissionHarness):
                       "assignee_speaker_id", "resolution_status",
                       "assignee_contact_id", "assignee_user_id",
                       "assignee_name", "due_date", "due_date_normalized",
-                      "folder_id", "owner_user_id", "created_at", "title",
+                      "owner_user_id", "created_at", "title",
                       "priority", "fingerprint"):
             self.assertEqual(after.get(field), before.get(field),
                              f"{field} must survive a status change")

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Source__c</fullName>
+    <description>How the meeting was captured (device, phone, upload).</description>
+    <label>Source</label>
+    <length>40</length>
+    <required>false</required>
+    <type>Text</type>
+</CustomField>

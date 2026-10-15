@@ -32,6 +32,7 @@ import {
   ActivityIndicator, Alert, Modal, Pressable, ScrollView, Share, StyleSheet,
   Text, View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "./icons";
 import { S, R, FONT, useTheme, ColorScale } from "./theme";
 import { Button, Divider, ErrorText, scrollFormProps } from "./ui";
@@ -104,6 +105,10 @@ export function ShareMeetingSheet({
 }: ShareMeetingSheetProps) {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
+  // Each of the three sheets below ends in an action row, so the bottom
+  // padding has to clear the home indicator rather than assume no inset.
+  const insets = useSafeAreaInsets();
+  const sheetPad = { paddingBottom: Math.max(insets.bottom, 12) + S.md };
 
   const [config, setConfig] = useState<ShareConfig>({ ...DEFAULT_SHARE_CONFIG });
   const [expiryDays, setExpiryDays] = useState<number | null>(null);
@@ -238,7 +243,7 @@ export function ShareMeetingSheet({
       <Modal visible={visible} transparent animationType="slide"
         onRequestClose={onClose}>
         <Pressable style={st.backdrop} onPress={onClose}>
-          <Pressable style={st.sheet} onPress={() => { }}>
+          <Pressable style={[st.sheet, sheetPad]} onPress={() => { }}>
             <View style={st.grabber} />
             <View style={st.doneIcon}>
               <Icon name="link" tintColor={C.primary} size={22} />
@@ -284,7 +289,7 @@ export function ShareMeetingSheet({
       <Modal visible={visible} transparent animationType="slide"
         onRequestClose={() => setManageOpen(false)}>
         <Pressable style={st.backdrop} onPress={() => setManageOpen(false)}>
-          <Pressable style={st.sheet} onPress={() => { }}>
+          <Pressable style={[st.sheet, sheetPad]} onPress={() => { }}>
             <View style={st.grabber} />
             <View style={st.headerRow}>
               <Pressable onPress={() => setManageOpen(false)} hitSlop={10}
@@ -344,7 +349,7 @@ export function ShareMeetingSheet({
     <Modal visible={visible} transparent animationType="slide"
       onRequestClose={onClose}>
       <Pressable style={st.backdrop} onPress={onClose}>
-        <Pressable style={st.sheet} onPress={() => { }}>
+        <Pressable style={[st.sheet, sheetPad]} onPress={() => { }}>
           <View style={st.grabber} />
           <Text style={st.title}>Share Meeting</Text>
           <Text style={st.subtitle}>
@@ -414,6 +419,10 @@ export function ShareMeetingSheet({
             )}
           </ScrollView>
 
+          {/* The action area never shrinks — the list above is the
+              designated flexible child, so on a short phone it compresses
+              and these stay on screen. */}
+          <View style={{ flexShrink: 0 }}>
           {!!error && <ErrorText>{error}</ErrorText>}
 
           <Button
@@ -427,6 +436,7 @@ export function ShareMeetingSheet({
           )}
           <Button label="Cancel" variant="ghost" onPress={onClose}
             style={{ marginTop: S.xs }} />
+          </View>
         </Pressable>
       </Pressable>
     </Modal>
@@ -469,7 +479,13 @@ function buildStyles(C: ColorScale) {
       fontFamily: FONT.bold, fontSize: 12, color: C.textDim,
       textTransform: "uppercase", letterSpacing: 0.6, marginBottom: S.sm,
     },
-    list: { maxHeight: 380, marginBottom: S.md },
+    // flexShrink rather than a fixed maxHeight — the same principle as the
+    // Gmail share sheet. The sheet is bounded at 88% and the actions below
+    // ("Create Share Link" / "Cancel") sit OUTSIDE this ScrollView, so they
+    // should always win the space they need. A hard 380 stopped the list
+    // giving any height back, which pushed both buttons off the bottom on a
+    // short phone. The list scrolls, so it is the right thing to compress.
+    list: { flexShrink: 1, marginBottom: S.md },
     toggleRow: {
       flexDirection: "row", alignItems: "center", gap: S.md,
       paddingVertical: S.sm,

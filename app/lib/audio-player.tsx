@@ -1,6 +1,6 @@
 // lib/audio-player.tsx — recording playback, "Workspace" edition.
 //
-// An Apple-Music-style hero player: a large tap-to-seek waveform, a big
+// An Apple-Music-style hero player: a tap-to-seek track, a big
 // circular play button, mono elapsed/remaining timecodes, and skip ±15s /
 // speed controls as soft pill buttons beneath. `variant` is retained for
 // call-site compatibility — "hero" is the full player used in the meeting
@@ -28,7 +28,7 @@ import { createContext, useCallback, useContext, useMemo, useState } from "react
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { Icon } from "./icons";
 import { S, R, ELEV, TABULAR, useTheme, ColorScale } from "./theme";
-import { Waveform } from "./waveform";
+import { SeekTrack } from "./waveform";
 
 type ExpoAudioModule = {
   useAudioPlayer: (url: string) => any;
@@ -212,17 +212,23 @@ function buildStyles(C: ColorScale) {
 }
 
 export function AudioPlayer({
-  url, seed, variant = "hero",
-}: { url: string; seed?: string; variant?: "hero" | "card" }) {
+  url, variant = "hero",
+}: {
+  url: string;
+  /** No longer used — it seeded the decorative waveform the player used to
+   *  draw. Accepted so existing call sites compile unchanged. */
+  seed?: string;
+  variant?: "hero" | "card";
+}) {
   const shared = useContext(PlayerCtx);
   if (!expoAudio) return <AudioUnavailable />;
   // Inside an <AudioPlayerProvider> the player is shared (so transcript seeks
   // and the scrubber stay in sync). Standalone, it owns its own — which keeps
   // every existing call site working untouched.
   if (shared) {
-    return <PlayerBar seed={seed ?? url} variant={variant} handle={shared} />;
+    return <PlayerBar variant={variant} handle={shared} />;
   }
-  return <StandalonePlayer url={url} seed={seed ?? url} audio={expoAudio} variant={variant} />;
+  return <StandalonePlayer url={url} audio={expoAudio} variant={variant} />;
 }
 
 function AudioUnavailable() {
@@ -239,8 +245,8 @@ function AudioUnavailable() {
 }
 
 function StandalonePlayer({
-  url, seed, audio, variant,
-}: { url: string; seed: string; audio: ExpoAudioModule; variant: "hero" | "card" }) {
+  url, audio, variant,
+}: { url: string; audio: ExpoAudioModule; variant: "hero" | "card" }) {
   const player = audio.useAudioPlayer(url);
   const status = audio.useAudioPlayerStatus(player);
   const [speed, setSpeedState] = useState(1);
@@ -252,12 +258,12 @@ function StandalonePlayer({
     () => ({ player, status, setSpeed, speed }),
     [player, status, setSpeed, speed]
   );
-  return <PlayerBar seed={seed} variant={variant} handle={handle} />;
+  return <PlayerBar variant={variant} handle={handle} />;
 }
 
 function PlayerBar({
-  seed, variant, handle,
-}: { seed: string; variant: "hero" | "card"; handle: PlayerHandle }) {
+  variant, handle,
+}: { variant: "hero" | "card"; handle: PlayerHandle }) {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
   const { player, status, setSpeed, speed } = handle;
@@ -300,10 +306,7 @@ function PlayerBar({
           <Icon name={status.playing ? "pause.circle.fill" : "play.circle.fill"} tintColor={C.primary} size={34} />
         </Pressable>
         <View style={{ flex: 1 }}>
-          <Waveform
-            seed={seed} bars={40} height={22} barWidth={2.5} progress={progress}
-            color={C.primary} dimColor={C.border} onSeek={seekToRatio}
-          />
+          <SeekTrack progress={progress} onSeek={seekToRatio} />
         </View>
         <Text style={st.time}>{fmt(remaining)}</Text>
       </View>
@@ -326,18 +329,11 @@ function PlayerBar({
           )}
         </Pressable>
 
-        {/* Large tap-to-seek waveform — the hero visual for the whole player. */}
+        {/* Tap-to-seek track. A plain track, not a waveform: there is no
+            decoded amplitude data for playback, and an invented shape would
+            misrepresent the recording (see lib/waveform.tsx). */}
         <View style={{ flex: 1 }}>
-          <Waveform
-            seed={seed}
-            bars={48}
-            height={40}
-            barWidth={3}
-            progress={progress}
-            color={C.primary}
-            dimColor={C.border}
-            onSeek={seekToRatio}
-          />
+          <SeekTrack progress={progress} onSeek={seekToRatio} />
           <View style={st.timeRow}>
             <Text style={st.time}>{fmt(status.currentTime || 0)}</Text>
             <Text style={st.time}>-{fmt(remaining)}</Text>

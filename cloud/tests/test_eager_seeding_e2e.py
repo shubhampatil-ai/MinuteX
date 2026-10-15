@@ -78,14 +78,15 @@ def test_e2e_eager_pipeline():
 
     # --- run the REAL pipeline tail; the invoke is routed into userApi ---
     print("\n=== STEP 1: pipeline processes Meeting A (nobody opens it) ===")
+    # Tasks come from the SEPARATE task call (extract_tasks), not the analysis.
     analysis={"title":"Client Discussion",
         "overview":{"sections":[{"kind":"text","heading":"Summary","content":"ok"}]},
-        "tasks":[
+        "tasks":[],"participants":[],"meeting_highlights":{}}
+    extracted=[
             {"task":"Send the proposal","assignee":"","assignee_speaker_id":"0",
              "due_date":"tomorrow","confidence":"high","evidence":"I'll send the proposal tomorrow."},
             {"task":"Prepare the quotation","assignee":"Rahul","assignee_speaker_id":"",
-             "confidence":"high","evidence":"Rahul, please prepare the quotation."}],
-        "participants":[],"meeting_highlights":{}}
+             "confidence":"high","evidence":"Rahul, please prepare the quotation."}]
 
     def fake_invoke(**kw):
         # What AWS does with an async invoke: hand the payload to userApi.
@@ -94,6 +95,7 @@ def test_e2e_eager_pipeline():
 
     with mock.patch.object(tr,"_table") as table, \
          mock.patch.object(tr,"analyze_meeting",return_value=analysis), \
+         mock.patch.object(tr,"extract_tasks",return_value=extracted), \
          mock.patch.object(tr,"transcript_store") as store, \
          mock.patch.object(tr,"_upsert") as upsert, \
          mock.patch.object(tr,"_notify_processing_outcome") as notify_done, \

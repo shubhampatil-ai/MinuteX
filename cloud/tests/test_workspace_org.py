@@ -159,8 +159,6 @@ class OrgTestCase(unittest.TestCase):
             mock.patch.object(api, "USERS_TABLE", self.t["users"].name),
             mock.patch.object(api, "_recordings", self.t["recordings"]),
             mock.patch.object(api, "_contacts", self.t["contacts"]),
-            mock.patch.object(api, "_folders", self.t["folders"]),
-            mock.patch.object(api, "_folder_contacts", self.t["folder_contacts"]),
             mock.patch.object(api, "_meeting_participants", self.t["participants"]),
             mock.patch.object(api, "_tasks", self.t["tasks"]),
             mock.patch.object(api, "_users", self.t["users"]),
@@ -178,7 +176,7 @@ class OrgTestCase(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------
     def mk_contact(self, name="Rahul Sharma", email="rahul@company.com",
-                   phone="", force=False, folder_id=""):
+                   phone="", force=False):
         body = {"name": name}
         if email:
             body["email"] = email
@@ -186,14 +184,8 @@ class OrgTestCase(unittest.TestCase):
             body["phone"] = phone
         if force:
             body["force"] = True
-        if folder_id:
-            body["folder_id"] = folder_id
         return parse(call(api.create_contact,
                           event("POST", "/contacts", body=body)))
-
-    def mk_folder(self, name="Client Alpha"):
-        return parse(call(api.create_folder,
-                          event("POST", "/folders", body={"name": name})))
 
     def add_user(self, user_id, email):
         self.t["users"].put_item(Item={"user_id": user_id, "email": email})
@@ -214,7 +206,6 @@ class TestContacts(OrgTestCase):
             "GET", "/contacts/{contact_id}", path={"contact_id": cid})))
         self.assertEqual(status, 200)
         self.assertEqual(body["contact"]["id"], cid)
-        self.assertEqual(body["folders"], [])
 
     def test_name_required(self):
         status, body = parse(call(api.create_contact,
@@ -379,360 +370,6 @@ class TestContacts(OrgTestCase):
         self.assertEqual(row["title"], "Send proposal")   # work survives
 
 
-# ===========================================================================
-# FOLDERS
-# ===========================================================================
-class TestFolders(OrgTestCase):
-    def test_create_and_list(self):
-        status, body = self.mk_folder()
-        self.assertEqual(status, 201)
-        self.assertEqual(body["folder"]["name"], "Client Alpha")
-        self.assertEqual(body["folder"]["meeting_count"], 0)
-
-        status, body = parse(call(api.list_folders, event("GET", "/folders")))
-        self.assertEqual(status, 200)
-        self.assertEqual(len(body["folders"]), 1)
-        # The uniqueness-claim row must never surface as a folder.
-        self.assertNotIn("name#", json.dumps(body))
-
-    def test_color_and_icon_round_trip(self):
-        status, body = parse(call(api.create_folder, event(
-            "POST", "/folders",
-            body={"name": "Client Alpha", "color": "blue", "icon": "briefcase"})))
-        self.assertEqual(status, 201)
-        self.assertEqual(body["folder"]["color"], "blue")
-        self.assertEqual(body["folder"]["icon"], "briefcase")
-
-    def test_color_and_icon_default_when_omitted(self):
-        _, body = self.mk_folder()
-        self.assertEqual(body["folder"]["color"], api.FOLDER_COLOR_DEFAULT)
-        self.assertEqual(body["folder"]["icon"], api.FOLDER_ICON_DEFAULT)
-
-    def test_unknown_color_falls_back_rather_than_failing(self):
-        """Appearance is cosmetic. Refusing to save a folder because a newer
-        client sent a colour this deploy does not know would be worse than
-        quietly showing the default."""
-        status, body = parse(call(api.create_folder, event(
-            "POST", "/folders",
-            body={"name": "Odd", "color": "#ff00ff", "icon": "sticker"})))
-        self.assertEqual(status, 201)
-        self.assertEqual(body["folder"]["color"], api.FOLDER_COLOR_DEFAULT)
-        self.assertEqual(body["folder"]["icon"], api.FOLDER_ICON_DEFAULT)
-
-    def test_patch_color_and_icon(self):
-        _, created = self.mk_folder()
-        fid = created["folder"]["id"]
-        status, body = parse(call(api.update_folder, event(
-            "PATCH", "/folders/{folder_id}", path={"folder_id": fid},
-            body={"color": "red", "icon": "flag"})))
-        self.assertEqual(status, 200)
-        self.assertEqual(body["folder"]["color"], "red")
-        self.assertEqual(body["folder"]["icon"], "flag")
-
-    def test_patch_color_alone_is_enough_to_update(self):
-        """Colour must not require a name in the same request — the sheet lets
-        a user change just the swatch."""
-        _, created = self.mk_folder()
-        status, _ = parse(call(api.update_folder, event(
-            "PATCH", "/folders/{folder_id}",
-            path={"folder_id": created["folder"]["id"]},
-            body={"color": "teal"})))
-        self.assertEqual(status, 200)
-
-    def test_legacy_folder_without_color_reads_defaults(self):
-        """Folders created before these fields existed must still render."""
-        self.t["folders"].put_item(Item={
-            "folder_id": "f-old", "owner_user_id": USER, "name": "Old",
-            "name_lc": "old", "created_at": "2026-01-01T00:00:00Z"})
-        _, body = parse(call(api.get_folder, event(
-            "GET", "/folders/{folder_id}", path={"folder_id": "f-old"})))
-        self.assertEqual(body["folder"]["color"], api.FOLDER_COLOR_DEFAULT)
-        self.assertEqual(body["folder"]["icon"], api.FOLDER_ICON_DEFAULT)
-
-    def test_duplicate_name_rejected(self):
-        self.mk_folder("Client Alpha")
-        status, body = self.mk_folder("client  alpha")
-        self.assertEqual(status, 409)
-        status, body = parse(call(api.list_folders, event("GET", "/folders")))
-        self.assertEqual(len(body["folders"]), 1)
-
-    def test_rename(self):
-        _, created = self.mk_folder()
-        fid = created["folder"]["id"]
-        status, body = parse(call(api.update_folder, event(
-            "PATCH", "/folders/{folder_id}", path={"folder_id": fid},
-            body={"name": "Client Beta"})))
-        self.assertEqual(status, 200)
-        self.assertEqual(body["folder"]["name"], "Client Beta")
-        # The old name is free again, the new one is taken.
-        status, _ = self.mk_folder("Client Alpha")
-        self.assertEqual(status, 201)
-        status, _ = self.mk_folder("Client Beta")
-        self.assertEqual(status, 409)
-
-    def test_rename_to_taken_name_rejected(self):
-        _, a = self.mk_folder("Alpha")
-        self.mk_folder("Beta")
-        status, _ = parse(call(api.update_folder, event(
-            "PATCH", "/folders/{folder_id}",
-            path={"folder_id": a["folder"]["id"]}, body={"name": "Beta"})))
-        self.assertEqual(status, 409)
-
-    def test_move_meeting_into_folder(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        status, body = parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": fid})))
-        self.assertEqual(status, 200)
-        self.assertEqual(self.t["recordings"].items[(KEY,)]["folder_id"], fid)
-        # ONE row, not a copy.
-        self.assertEqual(len(self.t["recordings"].items), 1)
-
-    def test_move_between_folders_does_not_duplicate(self):
-        _, a = self.mk_folder("Client Alpha")
-        _, b = self.mk_folder("Product")
-        for fid in (a["folder"]["id"], b["folder"]["id"]):
-            parse(call(api.move_recording_to_folder, event(
-                "PATCH", "/recordings/folder/{key+}", key=KEY,
-                body={"folder_id": fid})))
-        self.assertEqual(len(self.t["recordings"].items), 1)
-        self.assertEqual(self.t["recordings"].items[(KEY,)]["folder_id"],
-                         b["folder"]["id"])
-
-    def test_move_to_general_removes_attribute(self):
-        _, f = self.mk_folder()
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": f["folder"]["id"]})))
-        status, _ = parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": None})))
-        self.assertEqual(status, 200)
-        # ABSENT, not "" — General has exactly one representation.
-        self.assertNotIn("folder_id", self.t["recordings"].items[(KEY,)])
-
-    def test_move_requires_folder_id_field(self):
-        status, body = parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY, body={})))
-        self.assertEqual(status, 400)
-
-    def test_cannot_move_into_another_users_folder(self):
-        self.t["folders"].put_item(Item={
-            "folder_id": "f-other", "owner_user_id": OTHER,
-            "name": "Theirs", "name_lc": "theirs",
-            "created_at": "2026-01-01T00:00:00Z"})
-        status, _ = parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": "f-other"})))
-        self.assertEqual(status, 404)
-        self.assertNotIn("folder_id", self.t["recordings"].items[(KEY,)])
-
-    def test_delete_folder_keeps_meetings_and_moves_them_to_general(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": fid})))
-
-        status, body = parse(call(api.delete_folder, event(
-            "DELETE", "/folders/{folder_id}", path={"folder_id": fid})))
-        self.assertEqual(status, 200)
-        self.assertEqual(body["meetings_moved"], 1)
-        # The MEETING survives; only its organization is gone.
-        self.assertIn((KEY,), self.t["recordings"].items)
-        self.assertNotIn("folder_id", self.t["recordings"].items[(KEY,)])
-
-    def test_delete_folder_keeps_contacts(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        _, c = self.mk_contact(folder_id=fid)
-        cid = c["contact"]["id"]
-        status, body = parse(call(api.delete_folder, event(
-            "DELETE", "/folders/{folder_id}", path={"folder_id": fid})))
-        self.assertEqual(body["contacts_unlinked"], 1)
-        # The PERSON survives.
-        self.assertIn((cid,), self.t["contacts"].items)
-
-    def test_delete_folder_unfiles_tasks_but_keeps_them(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": fid})))
-        _, t = parse(call(api.create_meeting_task, event(
-            "POST", "/recordings/ai/tasks/{key+}", key=KEY,
-            body={"task": "Keep me"})))
-        tid = t["task"]["id"]
-        self.assertEqual(self.t["tasks"].items[(tid,)]["folder_id"], fid)
-
-        status, body = parse(call(api.delete_folder, event(
-            "DELETE", "/folders/{folder_id}", path={"folder_id": fid})))
-        self.assertEqual(body["tasks_unfiled"], 1)
-        self.assertIn((tid,), self.t["tasks"].items)
-        self.assertNotIn("folder_id", self.t["tasks"].items[(tid,)])
-
-    def test_upload_request_files_recording_into_folder(self):
-        """Recording started from inside a folder is filed at PRESIGN time, so
-        it is never briefly visible in General."""
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        with mock.patch.object(api, "BUCKET_NAME", "test-bucket"),              mock.patch.object(api, "_s3") as s3:
-            s3.generate_presigned_url.return_value = "https://example.test/put"
-            status, body = parse(call(api.request_upload, event(
-                "POST", "/recordings/upload-request",
-                body={"source": "MOBILE", "format": "m4a",
-                      "folder_id": fid, "title": "In folder"})))
-        self.assertEqual(status, 200)
-        self.assertEqual(body["folder_id"], fid)
-        row = self.t["recordings"].items[(body["key"],)]
-        self.assertEqual(row["folder_id"], fid)
-        self.assertEqual(row["status"], api.STATUS_UPLOADING)
-
-    def test_upload_request_without_folder_stays_general(self):
-        with mock.patch.object(api, "BUCKET_NAME", "test-bucket"),              mock.patch.object(api, "_s3") as s3:
-            s3.generate_presigned_url.return_value = "https://example.test/put"
-            _, body = parse(call(api.request_upload, event(
-                "POST", "/recordings/upload-request",
-                body={"source": "MOBILE", "format": "m4a"})))
-        # ABSENT, not "" — General has one representation.
-        self.assertNotIn("folder_id", self.t["recordings"].items[(body["key"],)])
-
-    def test_upload_request_rejects_another_users_folder(self):
-        """Must fail outright rather than producing an unfiled recording the
-        user then has to hunt for."""
-        self.t["folders"].put_item(Item={
-            "folder_id": "f-other", "owner_user_id": OTHER, "name": "T",
-            "name_lc": "t", "created_at": "2026-01-01T00:00:00Z"})
-        before = len(self.t["recordings"].items)
-        with mock.patch.object(api, "BUCKET_NAME", "test-bucket"),              mock.patch.object(api, "_s3") as s3:
-            s3.generate_presigned_url.return_value = "https://example.test/put"
-            status, _ = parse(call(api.request_upload, event(
-                "POST", "/recordings/upload-request",
-                body={"source": "MOBILE", "format": "m4a",
-                      "folder_id": "f-other"})))
-        self.assertEqual(status, 404)
-        # Nothing was written, and no URL was handed out.
-        self.assertEqual(len(self.t["recordings"].items), before)
-
-    def test_cross_user_folder_is_404(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        with mock.patch.object(api, "_require_auth", return_value=OTHER):
-            for handler, method in ((api.get_folder, "GET"),
-                                    (api.update_folder, "PATCH"),
-                                    (api.delete_folder, "DELETE")):
-                status, _ = parse(call(handler, event(
-                    method, "/folders/{folder_id}", path={"folder_id": fid},
-                    body={"name": "Hijacked"})))
-                self.assertEqual(status, 404, handler.__name__)
-
-    def test_meeting_counts_and_general_count(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        self.t["recordings"].put_item(Item={
-            **json.loads(json.dumps(BASE_RECORDING)),
-            "audio_s3_key": KEY2, "created_at": "2026-08-05T09:15:00Z"})
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": fid})))
-        status, body = parse(call(api.list_folders, event("GET", "/folders")))
-        self.assertEqual(body["folders"][0]["meeting_count"], 1)
-        self.assertEqual(body["general_count"], 1)
-
-    def test_trashed_meetings_not_counted(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": fid})))
-        row = self.t["recordings"].items[(KEY,)]
-        row["recording_status"] = "trashed"
-        status, body = parse(call(api.list_folders, event("GET", "/folders")))
-        self.assertEqual(body["folders"][0]["meeting_count"], 0)
-
-
-# ===========================================================================
-# FOLDER <-> CONTACT
-# ===========================================================================
-class TestFolderContacts(OrgTestCase):
-    def setUp(self):
-        super().setUp()
-        _, f = self.mk_folder()
-        self.fid = f["folder"]["id"]
-        _, c = self.mk_contact()
-        self.cid = c["contact"]["id"]
-
-    def _link(self, fid=None, cid=None):
-        return parse(call(api.add_folder_contact, event(
-            "POST", "/folders/{folder_id}/contacts/{contact_id}",
-            path={"folder_id": fid or self.fid,
-                  "contact_id": cid or self.cid})))
-
-    def test_add_and_list(self):
-        status, _ = self._link()
-        self.assertEqual(status, 200)
-        status, body = parse(call(api.list_folder_contacts, event(
-            "GET", "/folders/{folder_id}/contacts",
-            path={"folder_id": self.fid})))
-        self.assertEqual(status, 200)
-        self.assertEqual(len(body["contacts"]), 1)
-
-    def test_duplicate_association_is_idempotent(self):
-        self._link()
-        self._link()
-        self.assertEqual(len(self.t["folder_contacts"].items), 1)
-
-    def test_same_contact_in_many_folders_stays_one_contact(self):
-        _, product = self.mk_folder("Product")
-        self._link()
-        self._link(fid=product["folder"]["id"])
-        self.assertEqual(len(self.t["folder_contacts"].items), 2)
-        self.assertEqual(len(self.t["contacts"].items), 1)
-
-        status, body = parse(call(api.get_contact, event(
-            "GET", "/contacts/{contact_id}", path={"contact_id": self.cid})))
-        self.assertEqual(len(body["folders"]), 2)
-
-    def test_remove_association_keeps_contact(self):
-        self._link()
-        status, _ = parse(call(api.remove_folder_contact, event(
-            "DELETE", "/folders/{folder_id}/contacts/{contact_id}",
-            path={"folder_id": self.fid, "contact_id": self.cid})))
-        self.assertEqual(status, 200)
-        self.assertEqual(len(self.t["folder_contacts"].items), 0)
-        self.assertIn((self.cid,), self.t["contacts"].items)
-
-    def test_cannot_link_another_users_contact(self):
-        self.t["contacts"].put_item(Item={
-            "contact_id": "c-other", "owner_user_id": OTHER, "name": "Theirs",
-            "created_at": "2026-01-01T00:00:00Z"})
-        status, _ = self._link(cid="c-other")
-        self.assertEqual(status, 404)
-        self.assertEqual(len(self.t["folder_contacts"].items), 0)
-
-    def test_cannot_link_into_another_users_folder(self):
-        self.t["folders"].put_item(Item={
-            "folder_id": "f-other", "owner_user_id": OTHER, "name": "Theirs",
-            "name_lc": "theirs", "created_at": "2026-01-01T00:00:00Z"})
-        status, _ = self._link(fid="f-other")
-        self.assertEqual(status, 404)
-
-    def test_create_contact_inside_folder_links_it(self):
-        _, body = self.mk_contact(name="Neha Shah", email="neha@company.com",
-                                  folder_id=self.fid)
-        self.assertEqual(body["folder_id"], self.fid)
-        status, listing = parse(call(api.list_folder_contacts, event(
-            "GET", "/folders/{folder_id}/contacts",
-            path={"folder_id": self.fid})))
-        self.assertIn("Neha Shah", [c["name"] for c in listing["contacts"]])
-
-    def test_create_contact_in_bad_folder_creates_nothing(self):
-        before = len(self.t["contacts"].items)
-        status, _ = self.mk_contact(name="Ghost", email="ghost@x.com",
-                                    folder_id="f-missing")
-        self.assertEqual(status, 404)
-        self.assertEqual(len(self.t["contacts"].items), before)
 
 
 # ===========================================================================
@@ -811,23 +448,6 @@ class TestParticipants(OrgTestCase):
             "PUT", "/recordings/participants/{key+}", key=KEY,
             body={"contact_id": self.cid})))
         self.assertEqual(status, 400)
-
-    def test_list_participants_offers_folder_contacts_first(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        parse(call(api.add_folder_contact, event(
-            "POST", "/folders/{folder_id}/contacts/{contact_id}",
-            path={"folder_id": fid, "contact_id": self.cid})))
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": fid})))
-
-        status, body = parse(call(api.list_participants, event(
-            "GET", "/recordings/participants/{key+}", key=KEY)))
-        self.assertEqual(status, 200)
-        self.assertEqual(body["speakers"], ["0", "1"])
-        self.assertEqual([c["name"] for c in body["folder_contacts"]],
-                         ["Rahul Sharma"])
 
     def test_cross_user_recording_is_404(self):
         with mock.patch.object(api, "_require_auth", return_value=OTHER):
@@ -908,16 +528,6 @@ class TestTasks(OrgTestCase):
         self.assertEqual(created["task"]["resolution_status"], "RESOLVED")
         self.assertEqual(created["task"]["assignee_name"], "Rahul Sharma")
         self.assertEqual(created["task"]["assignee_user_id"], "u-456")
-
-    def test_manual_task_inherits_the_meeting_folder(self):
-        _, f = self.mk_folder()
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": f["folder"]["id"]})))
-        _, created = parse(call(api.create_meeting_task, event(
-            "POST", "/recordings/ai/tasks/{key+}", key=KEY,
-            body={"task": "Filed manually"})))
-        self.assertEqual(created["task"]["folder_id"], f["folder"]["id"])
 
     def test_task_text_required(self):
         status, _ = parse(call(api.create_meeting_task, event(
@@ -1035,35 +645,6 @@ class TestTasks(OrgTestCase):
             body={"id": tid, "notify_channels": ["sms"]})))
         self.assertEqual(body["task"]["notified_via"], ["email", "sms"])
 
-    def test_task_inherits_meeting_folder(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": fid})))
-        _, created = parse(call(api.create_meeting_task, event(
-            "POST", "/recordings/ai/tasks/{key+}", key=KEY,
-            body={"task": "Filed task"})))
-        self.assertEqual(created["task"]["folder_id"], fid)
-
-    def test_moving_meeting_moves_its_tasks(self):
-        _, a = self.mk_folder("Client Alpha")
-        _, b = self.mk_folder("Product")
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": a["folder"]["id"]})))
-        _, created = parse(call(api.create_meeting_task, event(
-            "POST", "/recordings/ai/tasks/{key+}", key=KEY,
-            body={"task": "Follows the meeting"})))
-        tid = created["task"]["id"]
-
-        _, moved = parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": b["folder"]["id"]})))
-        self.assertEqual(moved["tasks_moved"], 1)
-        self.assertEqual(self.t["tasks"].items[(tid,)]["folder_id"],
-                         b["folder"]["id"])
-
     def test_delete_task_removes_row_and_mirror(self):
         _, created = parse(call(api.create_meeting_task, event(
             "POST", "/recordings/ai/tasks/{key+}", key=KEY,
@@ -1099,11 +680,6 @@ class TestTaskQueries(OrgTestCase):
 
     def setUp(self):
         super().setUp()
-        _, f = self.mk_folder()
-        self.fid = f["folder"]["id"]
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": self.fid})))
         _, c = self.mk_contact()
         self.cid = c["contact"]["id"]
         self.open_id = parse(call(api.create_meeting_task, event(
@@ -1124,11 +700,6 @@ class TestTaskQueries(OrgTestCase):
             "GET", "/tasks", qs={"status": "Open"})))
         self.assertEqual([t["id"] for t in body["tasks"]], [self.open_id])
 
-    def test_filter_by_folder(self):
-        _, body = parse(call(api.list_all_tasks, event(
-            "GET", "/tasks", qs={"folder_id": self.fid})))
-        self.assertEqual(body["count"], 2)
-
     def test_filter_by_assignee(self):
         _, body = parse(call(api.list_all_tasks, event(
             "GET", "/tasks", qs={"assignee_contact_id": self.cid})))
@@ -1139,22 +710,14 @@ class TestTaskQueries(OrgTestCase):
             "GET", "/tasks", qs={"overdue": "true"})))
         self.assertEqual([t["id"] for t in body["tasks"]], [self.open_id])
 
-    def test_filter_by_unowned_folder_is_404(self):
-        self.t["folders"].put_item(Item={
-            "folder_id": "f-other", "owner_user_id": OTHER, "name": "T",
-            "name_lc": "t", "created_at": "2026-01-01T00:00:00Z"})
-        status, _ = parse(call(api.list_all_tasks, event(
-            "GET", "/tasks", qs={"folder_id": "f-other"})))
-        self.assertEqual(status, 404)
-
     def test_other_users_tasks_never_listed(self):
         """Even on an index NOT keyed by owner, every row is re-checked."""
         self.t["tasks"].put_item(Item={
             "task_id": "t-other", "owner_user_id": OTHER,
             "title": "Their secret task", "status": "Open",
-            "folder_id": self.fid, "source_recording_id": KEY,
+            "source_recording_id": KEY,
             "created_at": "2026-08-01T00:00:00Z"})
-        for qs in ({}, {"folder_id": self.fid}, {"recording_key": KEY}):
+        for qs in ({}, {"recording_key": KEY}):
             _, body = parse(call(api.list_all_tasks,
                                  event("GET", "/tasks", qs=qs)))
             self.assertNotIn("Their secret task", json.dumps(body))
@@ -1200,12 +763,13 @@ class TestTaskQueries(OrgTestCase):
         for i in range(5):
             self.t["tasks"].put_item(Item={
                 "task_id": f"fp-{i}", "owner_user_id": USER,
-                "title": f"Folder paged {i}", "status": "Open",
-                "priority": "Medium", "due_date": "", "folder_id": self.fid,
+                "title": f"Assignee paged {i}", "status": "Open",
+                "priority": "Medium", "due_date": "",
+                "assignee_contact_id": self.cid,
                 "created_at": f"2026-10-{i + 1:02d}T00:00:00Z"})
         seen, cursor, pages = [], "", 0
         while pages < 12:
-            qs = {"limit": "2", "folder_id": self.fid}
+            qs = {"limit": "2", "assignee_contact_id": self.cid}
             if cursor:
                 qs["cursor"] = cursor
             _, body = parse(call(api.list_all_tasks,
@@ -1225,7 +789,6 @@ class TestTaskQueries(OrgTestCase):
             "GET", "/tasks/{task_id}", path={"task_id": self.open_id})))
         self.assertEqual(status, 200)
         self.assertEqual(body["contact"]["id"], self.cid)
-        self.assertEqual(body["folder"]["id"], self.fid)
         self.assertEqual(body["recording"]["audio_s3_key"], KEY)
 
     def test_get_task_cross_user_is_404(self):
@@ -1564,29 +1127,6 @@ class TestAmbiguityResolution(OrgTestCase):
         self.assertEqual(self.t["tasks"].items[(tid,)]["resolution_status"],
                          "UNRESOLVED")
 
-    def test_folder_members_ranked_first(self):
-        _, f = self.mk_folder()
-        fid = f["folder"]["id"]
-        _, outsider = self.mk_contact(name="Rahul", email="out@x.com")
-        _, insider = self.mk_contact(name="Rahul", email="in@x.com", force=True)
-        parse(call(api.add_folder_contact, event(
-            "POST", "/folders/{folder_id}/contacts/{contact_id}",
-            path={"folder_id": fid,
-                  "contact_id": insider["contact"]["id"]})))
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": fid})))
-
-        _, body = parse(call(api.list_meeting_tasks, event(
-            "GET", "/recordings/ai/tasks/{key+}", key=KEY)))
-        tid = body["tasks"][0]["id"]
-        _, cands = parse(call(api.suggest_task_assignees, event(
-            "GET", "/tasks/{task_id}/assignee-candidates",
-            path={"task_id": tid})))
-        self.assertEqual(cands["candidates"][0]["id"],
-                         insider["contact"]["id"])
-        self.assertTrue(cands["candidates"][0]["in_folder"])
-
     def test_resolve_assigns_chosen_contact(self):
         self.add_user("u-456", "rahul@company.com")
         _, c = self.mk_contact()
@@ -1706,15 +1246,6 @@ class TestMigration(OrgTestCase):
             body={"id": "legacy-1", "status": "Completed"})))
         self.assertEqual(status, 200)
         self.assertEqual(body["task"]["status"], "Completed")
-
-    def test_migration_then_folder_move_files_tasks(self):
-        _, f = self.mk_folder()
-        parse(call(api.list_meeting_tasks, event(
-            "GET", "/recordings/ai/tasks/{key+}", key=KEY)))
-        _, moved = parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": f["folder"]["id"]})))
-        self.assertEqual(moved["tasks_moved"], 2)
 
     def test_malformed_entries_are_skipped_not_fatal(self):
         self.t["recordings"].items[(KEY,)]["tasks"]["bad-1"] = "not a dict"
@@ -1904,17 +1435,14 @@ class TestCrossTenantIsolation(OrgTestCase):
     def setUp(self):
         super().setUp()
         # A complete parallel universe owned by OTHER, deliberately sharing the
-        # folder id / recording key with the caller's own data so that a
+        # contact id / recording key with the caller's own data so that a
         # missing owner filter leaks rather than simply missing.
-        _, f = self.mk_folder()
-        self.fid = f["folder"]["id"]
         _, c = self.mk_contact()
         self.cid = c["contact"]["id"]
         self.t["tasks"].put_item(Item={
             "task_id": "t-theirs", "owner_user_id": OTHER,
             "title": "THEIR SECRET TASK", "status": "Open",
             "priority": "Medium", "due_date": "",
-            "folder_id": self.fid,               # same folder id
             "assignee_contact_id": self.cid,     # same contact id
             "source_recording_id": KEY,          # same recording key
             "fingerprint": "fp-theirs",
@@ -1923,11 +1451,6 @@ class TestCrossTenantIsolation(OrgTestCase):
     def _assert_no_leak(self, body):
         self.assertNotIn("THEIR SECRET TASK", json.dumps(body))
         self.assertNotIn("t-theirs", json.dumps(body))
-
-    def test_no_leak_via_folder_index(self):
-        _, body = parse(call(api.list_all_tasks, event(
-            "GET", "/tasks", qs={"folder_id": self.fid})))
-        self._assert_no_leak(body)
 
     def test_no_leak_via_assignee_index(self):
         _, body = parse(call(api.list_all_tasks, event(
@@ -1979,14 +1502,6 @@ class TestCrossTenantIsolation(OrgTestCase):
         self.assertEqual(status, 404)
         self.assertIn(("t-theirs",), self.t["tasks"].items)
 
-    def test_folder_delete_does_not_touch_their_tasks(self):
-        """delete_folder walks the folder-index, which is full of their rows."""
-        parse(call(api.delete_folder, event(
-            "DELETE", "/folders/{folder_id}", path={"folder_id": self.fid})))
-        # Their task keeps its folder_id — we had no business editing it.
-        self.assertEqual(
-            self.t["tasks"].items[("t-theirs",)]["folder_id"], self.fid)
-
     def test_contact_delete_does_not_touch_their_tasks(self):
         """delete_contact walks the assignee-index, same exposure."""
         parse(call(api.delete_contact, event(
@@ -1994,15 +1509,6 @@ class TestCrossTenantIsolation(OrgTestCase):
         theirs = self.t["tasks"].items[("t-theirs",)]
         self.assertEqual(theirs["assignee_contact_id"], self.cid)
         self.assertNotIn("resolution_status", theirs)
-
-    def test_meeting_move_does_not_touch_their_tasks(self):
-        """move_recording_to_folder walks the meeting-index."""
-        _, other_folder = self.mk_folder("Elsewhere")
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": other_folder["folder"]["id"]})))
-        self.assertEqual(
-            self.t["tasks"].items[("t-theirs",)]["folder_id"], self.fid)
 
     def test_speaker_mapping_does_not_resolve_their_tasks(self):
         """_resolve_tasks_for_speaker walks the meeting-index."""
@@ -2034,30 +1540,13 @@ class TestCrossTenantIsolation(OrgTestCase):
 # ===========================================================================
 class TestEndToEnd(OrgTestCase):
     def test_full_scenario(self):
-        # 1. Folder
-        _, f = self.mk_folder("Client Alpha")
-        fid = f["folder"]["id"]
-
-        # 2. Contact + 13. MinuteX account exists
+        # 1. Contact + 13. MinuteX account exists
         self.add_user("u-456", "rahul@company.com")
         _, c = self.mk_contact("Rahul Sharma", "rahul@company.com")
         cid = c["contact"]["id"]
         self.assertEqual(c["contact"]["minutex_user_id"], "u-456")
 
-        # 3. Associate with folder
-        parse(call(api.add_folder_contact, event(
-            "POST", "/folders/{folder_id}/contacts/{contact_id}",
-            path={"folder_id": fid, "contact_id": cid})))
-
-        # 4/5. Recording exists and is initially General
-        self.assertNotIn("folder_id", self.t["recordings"].items[(KEY,)])
-
-        # 6. Move into Client Alpha
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": fid})))
-
-        # 7/8. AI detected the task, attributed to speaker_0
+        # 2/3. AI detected the task, attributed to speaker_0
         self.t["recordings"].items[(KEY,)]["ai_tasks"] = [{
             "task": "Send proposal", "assignee_speaker_id": "0",
             "due_date": "2026-08-21", "priority": "High",
@@ -2068,13 +1557,13 @@ class TestEndToEnd(OrgTestCase):
         tid = seeded["tasks"][0]["id"]
         self.assertEqual(seeded["tasks"][0]["assignee_speaker_id"], "0")
 
-        # 9/10. Map Speaker 0 -> Rahul; the chain resolves
+        # 4/5. Map Speaker 0 -> Rahul; the chain resolves
         _, mapped = parse(call(api.set_participant, event(
             "PUT", "/recordings/participants/{key+}", key=KEY,
             body={"speaker_id": "0", "contact_id": cid})))
         self.assertEqual(mapped["tasks_resolved"], 1)
 
-        # 11. The task now names a person, a folder, a meeting and a due date
+        # 6. The task now names a person, a meeting and a due date
         _, detail = parse(call(api.get_task, event(
             "GET", "/tasks/{task_id}", path={"task_id": tid})))
         task = detail["task"]
@@ -2082,39 +1571,19 @@ class TestEndToEnd(OrgTestCase):
         self.assertEqual(task["assignee_name"], "Rahul Sharma")
         self.assertEqual(task["assignee_contact_id"], cid)
         self.assertEqual(task["assignee_user_id"], "u-456")   # 13
-        self.assertEqual(task["folder_id"], fid)
         self.assertEqual(task["source_recording_id"], KEY)
         self.assertEqual(task["due"], "2026-08-21")
         self.assertEqual(task["ai_evidence"], "I'll send the proposal tomorrow.")
         self.assertEqual(detail["contact"]["email"], "rahul@company.com")
-        self.assertEqual(detail["folder"]["name"], "Client Alpha")
 
-        # 12. It appears in the dashboard queries
-        _, listing = parse(call(api.list_all_tasks, event(
-            "GET", "/tasks", qs={"folder_id": fid})))
-        self.assertIn(tid, [t["id"] for t in listing["tasks"]])
+        # 7. It appears in the dashboard queries
         _, by_assignee = parse(call(api.list_all_tasks, event(
             "GET", "/tasks", qs={"assignee_contact_id": cid})))
         self.assertIn(tid, [t["id"] for t in by_assignee["tasks"]])
 
-        # 14. Move to Product — the meeting is NOT duplicated
-        _, product = self.mk_folder("Product")
-        parse(call(api.move_recording_to_folder, event(
-            "PATCH", "/recordings/folder/{key+}", key=KEY,
-            body={"folder_id": product["folder"]["id"]})))
+        # 8. Rahul is still ONE global contact, and the meeting was never
+        #    duplicated by anything above.
         self.assertEqual(len(self.t["recordings"].items), 1)
-        self.assertEqual(self.t["recordings"].items[(KEY,)]["folder_id"],
-                         product["folder"]["id"])
-
-        # 15. Rahul is still ONE global contact
-        self.assertEqual(len(self.t["contacts"].items), 1)
-        # ...reachable from both folders' association list if linked
-        parse(call(api.add_folder_contact, event(
-            "POST", "/folders/{folder_id}/contacts/{contact_id}",
-            path={"folder_id": product["folder"]["id"], "contact_id": cid})))
-        _, contact_detail = parse(call(api.get_contact, event(
-            "GET", "/contacts/{contact_id}", path={"contact_id": cid})))
-        self.assertEqual(len(contact_detail["folders"]), 2)
         self.assertEqual(len(self.t["contacts"].items), 1)
 
         # The transcript was never touched throughout.
@@ -2127,12 +1596,6 @@ class TestEndToEnd(OrgTestCase):
 # ===========================================================================
 class TestRouter(unittest.TestCase):
     EXPECTED = [
-        ("POST", "/folders"), ("GET", "/folders"),
-        ("GET", "/folders/{folder_id}"), ("PATCH", "/folders/{folder_id}"),
-        ("DELETE", "/folders/{folder_id}"),
-        ("GET", "/folders/{folder_id}/contacts"),
-        ("POST", "/folders/{folder_id}/contacts/{contact_id}"),
-        ("DELETE", "/folders/{folder_id}/contacts/{contact_id}"),
         ("POST", "/contacts"), ("GET", "/contacts"),
         ("GET", "/contacts/{contact_id}"), ("PATCH", "/contacts/{contact_id}"),
         ("DELETE", "/contacts/{contact_id}"),
@@ -2141,7 +1604,6 @@ class TestRouter(unittest.TestCase):
         ("GET", "/tasks/{task_id}/assignee-candidates"),
         ("GET", "/recordings/participants/{key+}"),
         ("PUT", "/recordings/participants/{key+}"),
-        ("PATCH", "/recordings/folder/{key+}"),
     ]
 
     def test_every_new_route_is_registered(self):

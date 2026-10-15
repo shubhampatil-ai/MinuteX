@@ -153,21 +153,23 @@ export type RecSession = {
    * which is why every read treats undefined as "aac".
    */
   engine?: "aac" | "wav";
+  /**
+   * Where the audio came from, and the title the user typed (if any).
+   *
+   * Persisted because launch recovery has no caller to ask: without these a
+   * recovered IMPORTED file was re-presigned as source MOBILE with no title —
+   * a "Phone" row for an uploaded file. Absent on sessions written before
+   * this existed, which every read treats as MOBILE (the only source that
+   * used to create sessions).
+   */
+  source?: "MOBILE" | "UPLOAD";
+  title?: string;
   /** Best-known duration in seconds (see reconcileDuration). */
   duration: number;
   /** Bytes on disk at last check — for the low-storage + sanity checks. */
   size: number | null;
   segments: Segment[];
   interruptions: Interruption[];
-  /**
-   * The folder this recording should be filed into, when it was started from
-   * inside one. Persisted WITH the session on purpose: the presign is what
-   * files the recording, and a presign can happen minutes later (offline) or
-   * after a relaunch, by which point the screen that knew the folder is long
-   * gone. Keeping it here means the folder survives a retry, a crash, and a
-   * cold start. Absent = General.
-   */
-  folderId?: string;
   /** audio_s3_key, once the presign ticket is issued. */
   key?: string;
   /**
@@ -711,7 +713,11 @@ export function sweepOrphanAudio(): RecSession[] {
         try { entry.delete(); } catch { /* best effort */ }
         continue;
       }
-      const created = entry.lastModified ?? Date.now();
+      // The ORIGINAL creation time when the id still carries it, not the
+      // file's mtime: the upload pipeline sends createdAt as part of the
+      // idempotent presign, so a rescued session must reproduce it exactly or
+      // its retry mints a second row beside the one already created.
+      const created = sessionIdCreatedAt(id) ?? entry.lastModified ?? Date.now();
       const s: RecSession = {
         id,
         createdAt: created,
@@ -751,6 +757,19 @@ export function sweepOrphanAudio(): RecSession[] {
 
 let counter = 0;
 
+/**
+ * The epoch-ms creation time encoded in a newSessionId() id, or null for an id
+ * of any other shape. Bounded to a sane range so an arbitrary filename stem
+ * that happens to parse as base-36 is not mistaken for a timestamp.
+ */
+export function sessionIdCreatedAt(id: string): number | null {
+  const m = /^([0-9a-z]{6,10})-[0-9a-z]{2}-[0-9a-z]{1,8}$/.exec(id);
+  if (!m) return null;
+  const ms = parseInt(m[1], 36);
+  const MIN = Date.UTC(2024, 0, 1);
+  return Number.isFinite(ms) && ms >= MIN && ms <= Date.now() + 86_400_000 ? ms : null;
+}
+
 /** Collision-resistant, sortable, filename-safe. */
 export function newSessionId(): string {
   counter = (counter + 1) % 1000;
@@ -761,7 +780,7 @@ export function newSessionId(): string {
   ].join("-");
 }
 
-export function createSession(format = "m4a", folderId?: string): RecSession {
+export function createSession(format = "m4a"): RecSession {
   const s: RecSession = {
     id: newSessionId(),
     createdAt: Date.now(),
@@ -774,12 +793,9 @@ export function createSession(format = "m4a", folderId?: string): RecSession {
     segments: [],
     interruptions: [],
     attempts: 0,
-    // Only set when the recording began inside a folder. Left ABSENT rather
-    // than "" so "no folder" has one representation, matching the backend.
-    ...(folderId ? { folderId } : {}),
   };
   ensureDir();
   saveSession(s);
-  recLog("session.created", { format, folderId: folderId || undefined }, s.id);
+  recLog("session.created", { format }, s.id);
   return s;
 }

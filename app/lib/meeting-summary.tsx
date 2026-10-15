@@ -193,11 +193,22 @@ export function Participants({
               </View>
               <View style={{ flex: 1 }}>
                 <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-                  <Text style={[st.highlightTxt, { fontFamily: FONT.semibold, flex: 0 }]}>
+                  {/* flexShrink, not flex: 0. The intent here is "don't
+                      stretch, so the pencil sits right beside the name" —
+                      but flex: 0 also refuses to SHRINK, so a long renamed
+                      speaker pushed the pencil out of the card. flexShrink
+                      keeps the name snug against the icon and still lets it
+                      ellipsize when there is genuinely no room. */}
+                  <Text
+                    style={[st.highlightTxt, { fontFamily: FONT.semibold, flex: 0, flexShrink: 1 }]}
+                    numberOfLines={1}
+                  >
                     {name}
                   </Text>
                   {onRenameSpeaker && !isNamed ? (
-                    <Icon name="pencil" tintColor={C.textFaint} size={11} />
+                    <View style={{ flexShrink: 0 }}>
+                      <Icon name="pencil" tintColor={C.textFaint} size={11} />
+                    </View>
                   ) : null}
                 </View>
                 {/* The diarization LABEL and the talk time. Kept on one

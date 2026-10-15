@@ -55,6 +55,12 @@ export type EngineStatus = {
    * undefined as "no opinion", never as "the mic is fine".
    */
   micUnavailable?: boolean;
+  /**
+   * RMS input level in dBFS, for the live waveform ONLY. Never read by the
+   * silence / mic-theft detector, which is defined on `metering` (peak).
+   * null on a native build that predates the RMS field.
+   */
+  displayDb?: number | null;
 };
 
 /** Floor used when the peak is exactly zero — log10(0) is undefined. */
@@ -119,6 +125,7 @@ export class WavEngineRecorder {
       durationMillis: s.durationSeconds * 1000,
       url: this.uri,
       micUnavailable: s.micUnavailable === true,
+      displayDb: typeof s.rms === "number" ? peakToDb(s.rms) : null,
     };
   }
 

@@ -762,13 +762,36 @@ class LargeMeetingTests(ChatRetrievalTestCase):
 
 
 class ShortMeetingTests(ChatRetrievalTestCase):
-    """A meeting that FITS the budget must still be sent whole.
+    """Retrieval is the default even when the whole transcript would fit.
 
-    Retrieval could only subtract there, and answering from the complete record
-    is strictly better than answering from a chosen part of it.
+    Size alone used to decide, and on the production quota the budget is ~8
+    hours of English, so every real question resent the whole transcript.
     """
 
+    def test_a_meeting_that_fits_the_budget_still_retrieves(self):
+        """The change itself: fitting the budget no longer skips retrieval —
+        only the navigator's sections reach the model."""
+        segs = make_segments(60, text=lambda i: (
+            f"Early point {i}." if i < 24 else f"Late point {i}."))
+        transcript = self.load_meeting(segs)
+        self.assertLessEqual(
+            len(transcript), api._transcript_budget_chars(prompts.CHAT_SYSTEM))
+        tree = pageindex.build_tree(segs)
+        self.assertGreater(len(tree["nodes"]), 1)
+        self.nav_nodes = [tree["nodes"][-1]["node_id"]]
+
+        status, _, groq = self.ask("What happened at the end?")
+        self.assertEqual(status, 200)
+        self.assertEqual(len([c for c in groq.call_args_list
+                              if c[1].get("label") == "pageindex-retrieval"]), 1)
+        system = [c for c in groq.call_args_list
+                  if c[1].get("label") == "chat"][0][0][0]
+        self.assertIn("Late point 59.", system)
+        self.assertNotIn("Early point 0.", system)
+
     def test_short_meeting_sends_the_whole_transcript_and_skips_navigation(self):
+        """A one-section meeting has nothing to choose between, so it is sent
+        whole without paying for a navigation call."""
         segs = make_segments(20)
         self.load_meeting(segs)
         status, body, groq = self.ask("What was discussed?")
@@ -789,10 +812,17 @@ class ShortMeetingTests(ChatRetrievalTestCase):
         self.assertEqual(status, 200)
         self.assertIn("[seg_0]", groq.call_args_list[-1][0][0])
 
-    def test_no_index_is_built_for_a_meeting_that_does_not_need_one(self):
+    def test_a_meeting_without_timestamps_is_sent_whole(self):
+        """No segments means no index can exist; a transcript that fits is
+        still answered from all of it, not head-truncated."""
         self.load_meeting(make_segments(20))
-        self.ask("What was discussed?")
+        self.item["timestamps"] = []
+        status, _, groq = self.ask("What was discussed?")
+        self.assertEqual(status, 200)
         self.assertEqual(self.s3.put_object.call_count, 0)
+        system = groq.call_args_list[-1][0][0]
+        for i in range(20):
+            self.assertIn(f"turn number {i} about", system)
 
 
 class MomAuthorityTests(ChatRetrievalTestCase):
@@ -1033,13 +1063,19 @@ class MetricsTests(ChatRetrievalTestCase):
         self.assertNotIn("SECRET-CONTENT", lines[0])
 
     def test_mode_distinguishes_the_full_and_retrieval_paths(self):
-        self.load_meeting(make_segments(20))
-        with mock.patch("builtins.print") as p:
-            self.ask("q")
-        line = [c[0][0] for c in p.call_args_list
-                if isinstance(c[0][0], str) and c[0][0].startswith("[ai_metrics]")][0]
-        self.assertEqual(json.loads(line[len("[ai_metrics] "):])["retrieval_mode"],
-                         "full")
+        def mode_for(timestamps_present):
+            self.load_meeting(make_segments(20))
+            if not timestamps_present:
+                self.item["timestamps"] = []
+            with mock.patch("builtins.print") as p:
+                self.ask("q")
+            line = [c[0][0] for c in p.call_args_list
+                    if isinstance(c[0][0], str)
+                    and c[0][0].startswith("[ai_metrics]")][0]
+            return json.loads(line[len("[ai_metrics] "):])["retrieval_mode"]
+
+        self.assertEqual(mode_for(False), "full")
+        self.assertEqual(mode_for(True), "pageindex:single")
 
 
 # ===========================================================================

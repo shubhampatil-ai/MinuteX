@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomApplication xmlns="http://soap.sforce.com/2006/04/metadata">
+    <brand>
+        <headerColor>#2457D6</headerColor>
+        <shouldOverrideOrgTheme>false</shouldOverrideOrgTheme>
+    </brand>
+    <description>MinuteX: meetings linked to your Salesforce records, and MinuteX settings.</description>
+    <formFactors>Large</formFactors>
+    <isNavPersonalizationDisabled>false</isNavPersonalizationDisabled>
+    <label>MinuteX</label>
+    <navType>Standard</navType>
+    <tabs>MinuteX_Meeting__c</tabs>
+    <tabs>MinuteX_Setup</tabs>
+    <uiType>Lightning</uiType>
+</CustomApplication>

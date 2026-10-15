@@ -123,11 +123,17 @@ export function Masthead({
       flexDirection: "row", alignItems: "flex-end", justifyContent: "space-between",
       paddingBottom: S.md,
     }}>
-      <View style={{ flex: 1 }}>
-        {kicker ? <Text style={T.labelDim}>{kicker}</Text> : null}
-        <Text style={[T.display, { marginTop: 4 }]}>{title}</Text>
+      {/* Kickers carry workspace/org names ("Linked to <Org>"), so they
+          get two lines before truncating rather than silently losing the
+          name. The display title wraps to two lines — a long meeting or
+          organisation name should read, not ellipsize at 30pt. */}
+      <View style={{ flex: 1, minWidth: 0 }}>
+        {kicker ? <Text style={T.labelDim} numberOfLines={2}>{kicker}</Text> : null}
+        <Text style={[T.display, { marginTop: 4 }]} numberOfLines={2}>{title}</Text>
       </View>
-      {right}
+      {right ? (
+        <View style={{ flexShrink: 0, marginLeft: S.md }}>{right}</View>
+      ) : null}
     </View>
   );
 }
@@ -142,8 +148,17 @@ export function SectionRule({
       flexDirection: "row", alignItems: "center", justifyContent: "space-between",
       marginTop: S.xl, marginBottom: S.md,
     }, style]}>
-      <Text style={[T.h3, { textTransform: "none", letterSpacing: 0 }]}>{children}</Text>
-      {right}
+      {/* A section heading can carry a count or a name; it yields to the
+          trailing action rather than pushing it out of view. */}
+      <Text
+        style={[T.h3, { textTransform: "none", letterSpacing: 0, flexShrink: 1 }]}
+        numberOfLines={2}
+      >
+        {children}
+      </Text>
+      {right ? (
+        <View style={{ flexShrink: 0, marginLeft: S.md }}>{right}</View>
+      ) : null}
     </View>
   );
 }
@@ -151,34 +166,46 @@ export function SectionRule({
 // ---- Button ------------------------------------------------------------------
 export function Button({
   label, onPress, variant = "primary", loading, disabled, style, icon,
+  accessibilityLabel,
 }: {
   label: string;
   onPress?: () => void;
-  variant?: "primary" | "secondary" | "danger" | "ghost";
+  /** "destructive" is the design-system name; "danger" is kept as its alias
+   *  for the existing call sites. */
+  variant?: "primary" | "secondary" | "danger" | "destructive" | "ghost";
   loading?: boolean;
   disabled?: boolean;
   style?: ViewStyle;
   icon?: React.ReactNode;
+  accessibilityLabel?: string;
 }) {
   const { C } = useTheme();
   const isOff = disabled || loading;
+  const v = variant === "destructive" ? "danger" : variant;
 
-  const bg =
-    variant === "primary" ? C.primary :
-    variant === "danger" ? C.danger :
-    variant === "secondary" ? C.surface2 : "transparent";
+  const bg = (pressed: boolean) =>
+    v === "primary" ? (pressed ? C.primaryPressed : C.primary) :
+    v === "danger" ? C.danger :
+    v === "secondary" ? C.surface2 : "transparent";
   const txtColor =
-    variant === "primary" || variant === "danger" ? C.textOnPrimary :
-    variant === "ghost" ? C.primary : C.text;
+    v === "primary" || v === "danger" ? C.textOnPrimary :
+    v === "ghost" ? C.primary : C.text;
   const border =
-    variant === "secondary" ? { borderWidth: 1, borderColor: C.border } : null;
+    v === "secondary" ? { borderWidth: 1, borderColor: C.border } : null;
 
   const content = loading ? (
     <ActivityIndicator color={txtColor} />
   ) : (
     <View style={btn.inner}>
       {icon}
-      <Text style={[btn.txt, { color: txtColor }]}>{label}</Text>
+      {/* Two lines, then ellipsis. Labels are composed at runtime in a few
+          places ("Send to 12 people · 4 files"), and a full-width button
+          wraps rather than overflowing — but without a cap an unusually
+          long one could grow the button tall enough to push a sibling
+          action off a short sheet. */}
+      <Text style={[btn.txt, { color: txtColor, flexShrink: 1, textAlign: "center" }]} numberOfLines={2}>
+        {label}
+      </Text>
     </View>
   );
 
@@ -186,12 +213,17 @@ export function Button({
     <Pressable
       onPress={onPress}
       disabled={isOff}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityState={{ disabled: !!isOff, busy: !!loading }}
       style={({ pressed }) => [
         btn.btn,
-        { backgroundColor: bg },
+        { backgroundColor: bg(pressed) },
         border,
-        variant === "ghost" && { paddingVertical: S.sm },
-        { opacity: isOff ? 0.45 : pressed ? 0.85 : 1 },
+        v === "ghost" && { paddingVertical: S.sm },
+        // Primary presses to its own darker token; the others have no
+        // pressed colour, so they dim instead.
+        { opacity: isOff ? 0.45 : pressed && v !== "primary" ? 0.8 : 1 },
         style,
       ]}
     >
@@ -200,9 +232,12 @@ export function Button({
   );
 }
 const btn = StyleSheet.create({
-  btn: { borderRadius: R.pill, paddingVertical: 15, paddingHorizontal: S.lg, alignItems: "center", justifyContent: "center" },
+  btn: {
+    borderRadius: R.pill, paddingVertical: 14, paddingHorizontal: S.lg,
+    minHeight: 48, alignItems: "center", justifyContent: "center",
+  },
   inner: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: S.sm },
-  txt: { fontFamily: FONT.bold, fontSize: 14.5 },
+  txt: { fontFamily: FONT.semibold, fontSize: 15, lineHeight: 20 },
 });
 
 // ---- StatusPill --------------------------------------------------------------
@@ -211,12 +246,18 @@ const btn = StyleSheet.create({
 // matching soft chip so it always reads as a pill, not bare text.
 export function StatusPill({ label, color }: { label: string; color: string }) {
   return (
+    // flexShrink so a pill in a crowded row gives way rather than forcing
+    // the row wider; the label keeps to one line so the pill stays a pill.
     <View style={{
       alignSelf: "flex-start", borderRadius: R.pill,
       paddingHorizontal: 9, paddingVertical: 3.5,
       backgroundColor: withAlpha(color, 0.12),
+      flexShrink: 1,
     }}>
-      <Text style={{ fontFamily: FONT.bold, fontSize: 10.5, letterSpacing: 0.4, color }}>
+      <Text
+        style={{ fontFamily: FONT.bold, fontSize: 10.5, letterSpacing: 0.4, color }}
+        numberOfLines={1}
+      >
         {label}
       </Text>
     </View>
@@ -239,12 +280,31 @@ export function Row({ label, value, numeric }: { label: string; value: React.Rea
       flexDirection: "row", justifyContent: "space-between", alignItems: "center",
       paddingVertical: 13, borderBottomWidth: 1, borderBottomColor: C.border,
     }}>
-      <Text style={T.bodyDim}>{label}</Text>
+      {/* The label is short and known; it yields only as a last resort so
+          the VALUE (a Salesforce org host, an email, a workspace name) gets
+          the room. Both sides are constrained: without this the value grows
+          the row past the card edge — the "org name escapes its container"
+          class of bug. */}
+      <Text style={[T.bodyDim, { flexShrink: 1, marginRight: S.md }]} numberOfLines={1}>
+        {label}
+      </Text>
       {typeof value === "string" ? (
-        <Text style={numeric
-          ? { ...TABULAR, fontSize: 12.5, color: C.text }
-          : { fontFamily: FONT.semibold, fontSize: 13.5, color: C.text }}>{value}</Text>
-      ) : value}
+        <Text
+          style={[
+            numeric
+              ? { ...TABULAR, fontSize: 12.5, color: C.text }
+              : { fontFamily: FONT.semibold, fontSize: 13.5, color: C.text },
+            // flexShrink lets it ellipsize; textAlign keeps it hard right so
+            // a short value still reads as the row's answer.
+            { flexShrink: 1, textAlign: "right" },
+          ]}
+          numberOfLines={2}
+        >
+          {value}
+        </Text>
+      ) : (
+        <View style={{ flexShrink: 1, minWidth: 0, alignItems: "flex-end" }}>{value}</View>
+      )}
     </View>
   );
 }
@@ -306,6 +366,54 @@ export function ErrorText({ children }: { children: React.ReactNode }) {
       backgroundColor: C.dangerSoft, borderRadius: R.md, padding: S.md, marginTop: S.md,
     }}>
       <Text style={{ fontFamily: FONT.medium, fontSize: 13.5, lineHeight: 20, color: C.danger }}>{children}</Text>
+    </View>
+  );
+}
+
+/** An error the user can act on: the message, and the way out.
+ *
+ * WHY THIS EXISTS. `ErrorText` states a problem and stops there. Roughly a
+ * dozen screens paired it by hand with a retry button and a dozen more
+ * never did — so whether a failed load was recoverable came down to which
+ * screen you happened to be on. There was no primitive to reach for, which
+ * is exactly how the two halves drifted apart.
+ *
+ * `onRetry` is optional on purpose. Some failures genuinely cannot be
+ * retried (a dead credential, a 409 for work that is not ready), and for
+ * those a Retry button is a promise the app cannot keep — pass `action`
+ * instead to route to the real fix.
+ */
+export function ErrorBlock({
+  message, onRetry, retrying, action,
+}: {
+  message: React.ReactNode;
+  /** Re-runs the failed load. Omit when retrying cannot help. */
+  onRetry?: () => void;
+  retrying?: boolean;
+  /** An alternative way forward when a retry is not the answer. */
+  action?: React.ReactNode;
+}) {
+  const { C } = useTheme();
+  return (
+    <View style={{
+      backgroundColor: C.dangerSoft, borderRadius: R.md,
+      padding: S.lg, marginTop: S.md,
+    }}>
+      <Text style={{
+        fontFamily: FONT.medium, fontSize: 13.5, lineHeight: 20, color: C.danger,
+      }}>
+        {message}
+      </Text>
+      {onRetry ? (
+        <Button
+          label="Try again"
+          variant="secondary"
+          loading={retrying}
+          onPress={onRetry}
+          style={{ marginTop: S.md, alignSelf: "flex-start" }}
+        />
+      ) : null}
+      {action ? <View style={{ marginTop: S.md }}>{action}</View> : null}
     </View>
   );
 }
@@ -536,12 +644,15 @@ export function Avatar({
 
 // ---- SegmentedTabs: animated pill underline, matching the reference --------
 export function SegmentedTabs({
-  tabs, value, onChange, style,
+  tabs, value, onChange, style, fill,
 }: {
   tabs: { key: string; label: string; icon?: string }[];
   value: string;
   onChange: (key: string) => void;
   style?: ViewStyle;
+  /** Share the width evenly instead of sizing each tab to its label. The
+   *  indicator still follows MEASURED widths, so it stays correct either way. */
+  fill?: boolean;
 }) {
   const { C } = useTheme();
   const activeIndex = Math.max(0, tabs.findIndex((t) => t.key === value));
@@ -571,10 +682,13 @@ export function SegmentedTabs({
   });
 
   return (
-    <View style={[{
-      flexDirection: "row", position: "relative",
-      borderBottomWidth: 1.5, borderBottomColor: C.border,
-    }, style]}>
+    <View
+      accessibilityRole="tablist"
+      style={[{
+        flexDirection: "row", position: "relative",
+        borderBottomWidth: 1.5, borderBottomColor: C.border,
+      }, style]}
+    >
       <Animated.View style={{
         position: "absolute", left, width, bottom: -1.5, height: 2.5,
         backgroundColor: C.primary, borderRadius: 2,
@@ -591,12 +705,22 @@ export function SegmentedTabs({
             }}
             accessibilityRole="tab"
             accessibilityState={{ selected: active }}
-            style={{ paddingBottom: 11, paddingHorizontal: S.lg }}
+            // paddingTop balances the existing paddingBottom to clear the
+            // 44pt touch floor. The underline is positioned from `bottom`
+            // and sized from measured WIDTH, so added height cannot move it.
+            style={{
+              paddingTop: 10, paddingBottom: 11, justifyContent: "center",
+              paddingHorizontal: fill ? S.xs : S.lg,
+              ...(fill ? { flex: 1, alignItems: "center" as const } : null),
+            }}
           >
-            <Text style={{
-              fontFamily: active ? FONT.bold : FONT.semibold, fontSize: 14.5,
-              color: active ? C.primary : C.textFaint,
-            }}>{t.label}</Text>
+            <Text
+              style={{
+                fontFamily: active ? FONT.bold : FONT.semibold, fontSize: 14.5,
+                color: active ? C.primary : C.textFaint,
+              }}
+              numberOfLines={1}
+            >{t.label}</Text>
           </Pressable>
         );
       })}
@@ -641,28 +765,46 @@ export function SkeletonCard({ style }: { style?: ViewStyle }) {
 
 // ---- SearchBar: rounded pill search field --------------------------------------
 export function SearchBar({
-  value, onChangeText, placeholder = "Search", style,
-}: { value: string; onChangeText: (t: string) => void; placeholder?: string; style?: ViewStyle }) {
+  value, onChangeText, placeholder = "Search", style, onSubmitEditing, autoFocus,
+}: {
+  value: string; onChangeText: (t: string) => void; placeholder?: string; style?: ViewStyle;
+  onSubmitEditing?: () => void; autoFocus?: boolean;
+}) {
   const { C } = useTheme();
+  // Focus is shown as a border, not a colour change of the fill: the field
+  // must stay readable against the same background either way, and a 1px
+  // ring is present-but-transparent at rest so focusing never shifts layout.
+  const [focused, setFocused] = useState(false);
   return (
     <View style={[{
       flexDirection: "row", alignItems: "center", gap: S.sm,
       backgroundColor: C.surface2, borderRadius: R.pill,
-      paddingHorizontal: S.md, paddingVertical: 11,
+      borderWidth: 1, borderColor: focused ? C.primary : "transparent",
+      paddingHorizontal: S.md, minHeight: 44,
     }, style]}>
-      <Icon name="magnifyingglass" tintColor={C.textFaint} size={18} />
+      <Icon name="magnifyingglass" tintColor={focused ? C.primary : C.textFaint} size={18} />
       <TextInput
-        style={{ flex: 1, fontFamily: FONT.regular, fontSize: 15, color: C.text, paddingVertical: 0 }}
+        style={{ flex: 1, fontFamily: FONT.regular, fontSize: 15, color: C.text, paddingVertical: 10 }}
         placeholder={placeholder}
         placeholderTextColor={C.textFaint}
         value={value}
         onChangeText={onChangeText}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        onSubmitEditing={onSubmitEditing}
+        autoFocus={autoFocus}
         autoCapitalize="none"
         autoCorrect={false}
         returnKeyType="search"
+        accessibilityLabel={placeholder}
       />
       {value ? (
-        <Pressable onPress={() => onChangeText("")} hitSlop={8} accessibilityLabel="Clear search">
+        <Pressable
+          onPress={() => onChangeText("")}
+          hitSlop={12}
+          accessibilityRole="button"
+          accessibilityLabel="Clear search"
+        >
           <Icon name="xmark.circle.fill" tintColor={C.textFaint} size={18} />
         </Pressable>
       ) : null}
@@ -678,12 +820,16 @@ export function Chip({
   return (
     <Pressable
       onPress={onPress}
+      // minHeight 44 is the platform touch-target floor (HIG/Material).
+      // The chip LOOKS the same — padding is unchanged and the content is
+      // centred — but the tap area is now a full target instead of ~31pt.
+      // Fixing it here fixes every chip in the app at once.
       style={({ pressed }) => [{
-        flexDirection: "row", alignItems: "center", gap: 5,
+        flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 5,
         borderRadius: R.pill, borderWidth: 1,
         borderColor: active ? C.primary : C.border,
         backgroundColor: active ? C.primarySoft : C.surface,
-        paddingHorizontal: 12, paddingVertical: 7,
+        paddingHorizontal: 12, paddingVertical: 7, minHeight: 44,
       }, pressed && { opacity: 0.75 }, style]}
     >
       {icon ? <Icon name={icon as any} tintColor={active ? C.primary : C.textDim} size={13} /> : null}
@@ -726,13 +872,27 @@ export function ComingSoonRow({
 
 // ---- ListRow -----------------------------------------------------------------
 export function ListRow({
-  icon, label, sub, right, onPress, tint, destructive,
+  icon, label, sub, right, onPress, tint, destructive, photoUri, photoName,
 }: {
   icon: string; label: string; sub?: string; right?: React.ReactNode;
   onPress?: () => void; tint?: string; destructive?: boolean;
+  /** A PERSON's photo, when this row is about a person. Presigned
+   * `avatar_view_url` from the API — never the stored S3 key, which renders
+   * nothing. Falls back to `icon` when absent, so every existing caller is
+   * unaffected. */
+  photoUri?: string;
+  /** The name the initials fall back to when `photoUri` is empty or fails to
+   * load. Passing it (even with no photo) is what turns a generic glyph into
+   * a recognisable person. */
+  photoName?: string;
 }) {
   const { C, T } = useTheme();
   const color = destructive ? C.danger : C.text;
+  // A person gets an Avatar (photo, else coloured initials); everything else
+  // keeps the icon disc. Avatar already handles a failed/expired image URL by
+  // falling back to initials, so a stale presigned link degrades rather than
+  // leaving a hole.
+  const isPerson = !destructive && (!!photoUri || !!photoName);
   return (
     <Pressable
       onPress={onPress}
@@ -742,12 +902,36 @@ export function ListRow({
         paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: C.border,
       }, pressed && { opacity: 0.6 }]}
     >
-      <IconCircle name={icon} tint={destructive ? C.danger : (tint ?? C.primary)} bg={destructive ? C.dangerSoft : C.primarySoft} size={34} />
-      <View style={{ flex: 1 }}>
-        <Text style={{ fontFamily: FONT.semibold, fontSize: 14.5, color }}>{label}</Text>
-        {sub ? <Text style={[T.caption, { marginTop: 3 }]}>{sub}</Text> : null}
+      {isPerson ? (
+        <Avatar name={photoName || label} photoUri={photoUri} size={34} />
+      ) : (
+        <IconCircle name={icon} tint={destructive ? C.danger : (tint ?? C.primary)} bg={destructive ? C.dangerSoft : C.primarySoft} size={34} />
+      )}
+      {/* minWidth: 0 is load-bearing: a flex child defaults to minWidth
+          auto ("at least my content"), so without it a long label or sub
+          widens this column and pushes `right` off the row entirely. With
+          it, the text truncates and the trailing slot stays put.
+          Labels get 2 lines because a row's label is the thing you are
+          looking for; the sub is metadata and settles for one. */}
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text
+          style={{ fontFamily: FONT.semibold, fontSize: 14.5, color }}
+          numberOfLines={2}
+        >
+          {label}
+        </Text>
+        {sub ? (
+          <Text style={[T.caption, { marginTop: 3 }]} numberOfLines={2}>
+            {sub}
+          </Text>
+        ) : null}
       </View>
-      {right ?? (onPress ? <Icon name="chevron.right" tintColor={C.textFaint} size={16} /> : null)}
+      {/* The trailing slot never shrinks — it holds status words and
+          chevrons that are meaningless half-rendered. `maxWidth` keeps a
+          long status ("Reconnect required") from starving the label. */}
+      <View style={{ flexShrink: 0, maxWidth: "45%", alignItems: "flex-end" }}>
+        {right ?? (onPress ? <Icon name="chevron.right" tintColor={C.textFaint} size={16} /> : null)}
+      </View>
     </Pressable>
   );
 }
@@ -763,7 +947,10 @@ export function SwitchRow({
       paddingVertical: 13, gap: S.md, borderBottomWidth: 1, borderBottomColor: C.border,
       opacity: disabled ? 0.45 : 1,
     }}>
-      <View style={{ flex: 1 }}>
+      {/* minWidth: 0 so a long label wraps instead of shoving the Switch
+          past the right edge; the Switch is a fixed-size native control
+          and cannot give any width back. */}
+      <View style={{ flex: 1, minWidth: 0 }}>
         <Text style={{ fontFamily: FONT.medium, fontSize: 13.5, color: C.text }}>{label}</Text>
         {sub ? <Text style={[T.caption, { marginTop: 2 }]}>{sub}</Text> : null}
       </View>
@@ -825,30 +1012,50 @@ export function Toast({ visible, label, icon = "checkmark" }: {
         transform: [{ translateY: anim.interpolate({ inputRange: [0, 1], outputRange: [10, 0] }) }],
       }}
     >
-      <Icon name={icon as any} tintColor={C.bg} size={15} />
-      <Text style={{ fontFamily: FONT.semibold, fontSize: 13, color: C.bg }}>{label}</Text>
+      {/* The glyph holds; the message wraps to at most two lines so a long
+          toast grows a little rather than sprawling up the screen. */}
+      <View style={{ flexShrink: 0 }}>
+        <Icon name={icon as any} tintColor={C.bg} size={15} />
+      </View>
+      <Text
+        style={{
+          fontFamily: FONT.semibold, fontSize: 13, color: C.bg,
+          flexShrink: 1, lineHeight: 18,
+        }}
+        numberOfLines={2}
+      >
+        {label}
+      </Text>
     </Animated.View>
   );
 }
 
 // ---- GoogleButton ----------------------------------------------------------
-export function GoogleButton({ label, onPress, disabled }: {
-  label: string; onPress?: () => void; disabled?: boolean;
+export function GoogleButton({ label, onPress, disabled, loading }: {
+  label: string; onPress?: () => void; disabled?: boolean; loading?: boolean;
 }) {
   const { C } = useTheme();
+  const isOff = disabled || loading;
   return (
     <Pressable
       onPress={onPress}
-      disabled={disabled}
+      disabled={isOff}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityState={{ disabled: !!isOff, busy: !!loading }}
       style={({ pressed }) => [{
         flexDirection: "row", alignItems: "center", justifyContent: "center", gap: S.sm,
         borderWidth: 1, borderColor: C.border, backgroundColor: C.surface,
-        borderRadius: R.pill, paddingVertical: 14,
+        borderRadius: R.pill, paddingVertical: 14, minHeight: 48,
         opacity: disabled ? 0.4 : pressed ? 0.8 : 1,
       }]}
     >
-      <Text style={{ fontFamily: FONT.bold, fontSize: 15, color: "#4285F4" }}>G</Text>
-      <Text style={{ fontFamily: FONT.bold, fontSize: 14, color: C.text }}>{label}</Text>
+      {loading ? <ActivityIndicator color={C.text} /> : (
+        <>
+          <Text style={{ fontFamily: FONT.bold, fontSize: 15, color: "#4285F4" }}>G</Text>
+          <Text style={{ fontFamily: FONT.bold, fontSize: 14, color: C.text }}>{label}</Text>
+        </>
+      )}
     </Pressable>
   );
 }

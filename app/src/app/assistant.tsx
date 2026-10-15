@@ -144,8 +144,18 @@ function buildStyles(C: ColorScale) {
     },
     propTitle: { fontFamily: FONT.semibold, fontSize: 12.5, color: C.text },
     propChange: { flexDirection: "row", alignItems: "center", gap: 7, marginTop: 8, flexWrap: "wrap" },
-    propFrom: { fontFamily: FONT.medium, fontSize: 12, color: C.textDim, textDecorationLine: "line-through" },
-    propTo: { fontFamily: FONT.bold, fontSize: 12, color: C.text },
+    // Both shrink. This row reads "field: old -> new", and the NEW value
+    // is the thing being confirmed — without flexShrink a long old value
+    // pushed the arrow and the new value past the card edge, asking the
+    // user to approve a change they could not read. flexWrap on propChange
+    // reflows the set but cannot shrink one oversized child.
+    propFrom: {
+      fontFamily: FONT.medium, fontSize: 12, color: C.textDim,
+      textDecorationLine: "line-through", flexShrink: 1,
+    },
+    propTo: {
+      fontFamily: FONT.bold, fontSize: 12, color: C.text, flexShrink: 1,
+    },
     propField: { fontFamily: FONT.regular, fontSize: 11, color: C.textFaint },
     propReason: { fontFamily: FONT.regular, fontSize: 12, lineHeight: 17, color: C.textDim, marginTop: 8 },
     propBtnRow: { flexDirection: "row", gap: S.sm, marginTop: 11 },
@@ -377,10 +387,10 @@ function ProposalCard({ proposal, C, st, onApplied }: {
         <View key={String(f)} style={st.propChange}>
           <Text style={st.propField}>{FIELD_LABELS[String(f)] ?? String(f)}</Text>
           {proposal.current[f] ? (
-            <Text style={st.propFrom}>{proposal.current[f]}</Text>
+            <Text style={st.propFrom} numberOfLines={2}>{proposal.current[f]}</Text>
           ) : null}
           <Icon name="arrow.right" size={11} tintColor={C.textFaint} />
-          <Text style={st.propTo}>{proposal.proposed[f] || "—"}</Text>
+          <Text style={st.propTo} numberOfLines={3}>{proposal.proposed[f] || "—"}</Text>
         </View>
       ))}
 
@@ -742,7 +752,10 @@ export default function WorkspaceAssistantScreen() {
             accessibilityRole="button"
             accessibilityLabel="Close conversations"
           />
-          <View style={st.sheet}>
+          {/* This panel is anchored to top: 0 (it drops down from the
+              header action), so its own padding is what keeps the title
+              out from under the status bar. */}
+          <View style={[st.sheet, { paddingTop: insets.top + S.md }]}>
             <View style={st.sheetHead}>
               <Text style={st.sheetTitle}>Recent conversations</Text>
               <Pressable onPress={newSession} hitSlop={8}

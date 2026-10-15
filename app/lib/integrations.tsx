@@ -3,8 +3,8 @@
 //
 // TWO RESPONSIBILITIES, AND THE SECOND IS THE IMPORTANT ONE.
 //
-// 1. connectIntegration() runs the browser round-trip, exactly as
-//    lib/salesforce.ts does for Salesforce. Split from lib/api.ts on purpose:
+// 1. connectIntegration() runs the browser round-trip. Split from lib/api.ts
+//    on purpose:
 //    api.ts is pure HTTP, this owns platform behaviour worth isolating.
 //
 // 2. IntegrationsProvider / useIntegration() are the CENTRAL integration
@@ -35,7 +35,7 @@ import * as Linking from "expo-linking";
 import * as WebBrowser from "expo-web-browser";
 import {
   Integration, IntegrationStatusValue, getIntegrationAuthorizeUrl,
-  getIntegrations, disconnectIntegration,
+  getIntegrations, disconnectIntegration, getToken, onSignIn, onSignOut,
 } from "./api";
 
 // Must match INTEGRATION_RETURN_URL on the backend, because that is the URL
@@ -78,8 +78,7 @@ const REASON_COPY: Record<string, string> = {
  *
  * openAuthSessionAsync does the redirect detection itself, so there is
  * deliberately NO Linking listener here — the Expo docs warn that adding one
- * alongside an auth session causes side effects on iOS. (Same reasoning as
- * lib/salesforce.ts.)
+ * alongside an auth session causes side effects on iOS.
  */
 export async function connectIntegration(
   provider: string
@@ -158,7 +157,19 @@ export function IntegrationsProvider({ children }: { children: React.ReactNode }
     }
   }, []);
 
-  useEffect(() => { refresh(); }, [refresh]);
+  // Mounted ABOVE the auth gate, so it also exists on /login. Signed out is a
+  // state, not an error: no call without a token (it could only 401), a load
+  // on every sign-in, and nothing of the previous account kept after sign-out.
+  useEffect(() => {
+    void getToken().then((t) => { if (t) void refresh(); else if (alive.current) setLoading(false); });
+    const offIn = onSignIn(() => { void refresh(); });
+    const offOut = onSignOut(() => {
+      if (!alive.current) return;
+      setIntegrations([]);
+      setError("");
+    });
+    return () => { offIn(); offOut(); };
+  }, [refresh]);
 
   // Both mutations re-read from the server rather than patching local state.
   // The server is the source of truth for status (a connect can succeed in the

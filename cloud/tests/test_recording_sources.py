@@ -35,6 +35,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from decimal import Decimal
 from pathlib import Path
@@ -218,6 +219,63 @@ def unit_tests():
     check("re-presign of another user's key issues a NEW recording",
           body.get("key") != other_key and user_id in body.get("key", ""),
           body.get("key", ""))
+
+    # --- 2d. the FIRST presign is idempotent per on-device session ------------
+    #
+    # The client can only store the key after this handler wrote the row. An
+    # app killed in between (or a sidecar lost to a crash) came back with no
+    # key and minted a SECOND row — observed as an UPLOAD row plus, 8 s later,
+    # a MOBILE row for one imported .mp4. client_ref + recorded_at derive the
+    # key, so the repeat lands on the same row.
+    fake = FakeRecordings()
+    userapi._recordings = fake
+    ts = int(time.time()) - 30
+    ref_body = {"source": "UPLOAD", "format": "mp4",
+                "client_ref": "mfz3k2a1-01-abc123", "recorded_at": ts}
+    first = resp_body(userapi.request_upload(make_event(token, ref_body)))
+    ok = (first["key"].startswith(f"recordings/{user_id}/uploads/upload-")
+          and first["key"].endswith(f"_{ts}.mp4")
+          and first["recording_id"] == first["key"].rsplit("/", 1)[-1][:-4])
+    check("client_ref presign -> derived uploads/ key", ok, first["key"])
+    fake.items[first["key"]] = {"audio_s3_key": first["key"],
+                                "user_id": user_id,
+                                "recording_id": first["recording_id"],
+                                "status": userapi.STATUS_UPLOADING}
+    before = len(fake.updates)
+    again = resp_body(userapi.request_upload(make_event(token, ref_body)))
+    check("repeated client_ref presign returns the SAME key, no new row",
+          again["key"] == first["key"] and len(fake.updates) == before,
+          f"{first['key']} -> {again['key']}")
+
+    # An older build recovered every session as MOBILE. Same session, other
+    # source: still the existing row.
+    mob = resp_body(userapi.request_upload(make_event(
+        token, {**ref_body, "source": "MOBILE"})))
+    check("client_ref presign under the other source finds the same row",
+          mob["key"] == first["key"] and len(fake.updates) == before, mob["key"])
+
+    # Once that row is uploaded it is the pipeline's: a repeat must not hand
+    # out a PUT onto it — a fresh identity, as before.
+    fake.items[first["key"]]["status"] = userapi.STATUS_UPLOADED
+    late = resp_body(userapi.request_upload(make_event(token, ref_body)))
+    check("client_ref presign of an uploaded row issues a NEW recording",
+          late["key"] != first["key"], late["key"])
+
+    # A different session, user or timestamp never collides.
+    other = resp_body(userapi.request_upload(make_event(
+        token, {**ref_body, "client_ref": "mfz3k2a1-02-zzz999"})))
+    check("different client_ref -> different key", other["key"] != first["key"],
+          other["key"])
+
+    # Garbage refs / timestamps fall back to a random identity, not an error.
+    for bad in ({"client_ref": "../../x", "recorded_at": ts},
+                {"client_ref": "ok-ref", "recorded_at": "soon"},
+                {"client_ref": "ok-ref", "recorded_at": ts + 10 * 86400}):
+        body = resp_body(userapi.request_upload(make_event(
+            token, {"source": "UPLOAD", "format": "mp4", **bad})))
+        check(f"invalid client_ref/recorded_at falls back ({bad})",
+              body.get("key", "").startswith(f"recordings/{user_id}/uploads/upload-")
+              and not body["key"].endswith(f"_{ts}.mp4"), body.get("key", ""))
 
     # --- 3-6. validation -----------------------------------------------------
     expect_api_error(userapi.request_upload,

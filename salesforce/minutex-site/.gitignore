@@ -1,0 +1,4 @@
+# Salesforce CLI local state (per machine, per org) — never commit.
+.sf/
+.sfdx/
+.localdevserver/

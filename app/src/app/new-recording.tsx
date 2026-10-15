@@ -1,86 +1,44 @@
 // src/app/new-recording.tsx — "What are we listening to?" source chooser.
 //
-// "Workspace" edition. Three ways in, presented as rounded, shadowed list rows
-// inside a single Card — matching the app-native card system, not hairline
-// rules. The single entry point for creating a recording: phone mic, imported
-// audio file, or the MinuteX device. The device option is live only when one
-// is paired (backend) or connected (BLE); otherwise it degrades to a Pair
-// action — the hardware is an *additional* source, never a prerequisite.
+// The single entry point for creating a recording: phone mic, imported audio
+// file, or the MinuteX device. Three rows in one grouped surface (lib/kit.tsx).
+// The rows keep their icons — here, unlike a settings list, the glyph is what
+// tells a phone from a file from a device at a glance. The device option is
+// live only when one is paired (backend) or connected (BLE); otherwise it
+// degrades to a Pair action — the hardware is an *additional* source, never a
+// prerequisite.
 import { useEffect, useMemo, useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
-import { Stack, useRouter, type Href, useLocalSearchParams } from "expo-router";
+import { StyleSheet, Text, View } from "react-native";
+import { Stack, useRouter, type Href } from "expo-router";
 import { Icon } from "../../lib/icons";
-import { S, R, CAPS, FONT, ELEV, useTheme, ColorScale } from "../../lib/theme";
-import { SoonBadge, IconCircle } from "../../lib/ui";
+import { S, R, FONT, GUTTER, useTheme, ColorScale } from "../../lib/theme";
+import { SettingGroup, SettingRow, StatusBadge } from "../../lib/kit";
 import { useDevice } from "../../lib/device-context";
 import { getDevicesList } from "../../lib/api";
+import { useWorkspace, workspaceLabel } from "../../lib/workspace-context";
 
-function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
+function buildStyles(C: ColorScale) {
   return StyleSheet.create({
-    container: { flex: 1, backgroundColor: C.bg, paddingHorizontal: 20 },
-    title: { ...T.headline, fontSize: 30, lineHeight: 34, marginTop: 10 },
-    sub: { ...T.bodyDim, marginTop: 10 },
-    // A single elevated card holding all three source rows.
-    card: {
-      backgroundColor: C.surface, borderRadius: R.card,
-      borderWidth: 1, borderColor: C.border,
-      shadowColor: C.shadow, ...ELEV.sm,
-      paddingHorizontal: S.lg,
+    container: { flex: 1, backgroundColor: C.bg, paddingHorizontal: GUTTER },
+    title: { fontFamily: FONT.bold, fontSize: 28, lineHeight: 34, color: C.text, letterSpacing: -0.4, marginTop: S.sm },
+    sub: { fontFamily: FONT.regular, fontSize: 14.5, lineHeight: 21, color: C.textDim, marginTop: S.sm },
+    // "Recording in <workspace>" — a quiet strip rather than a card, so it
+    // reads as context for what follows and not as a fourth option.
+    wsBanner: {
+      flexDirection: "row", alignItems: "center", gap: S.sm,
+      marginTop: S.lg, paddingVertical: S.sm, paddingHorizontal: S.md,
+      backgroundColor: C.primarySoft, borderRadius: R.sm,
     },
-    option: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: S.md,
-      paddingVertical: 16, borderTopWidth: 1, borderTopColor: C.border,
-    },
-    optionFirst: { borderTopWidth: 0 },
-    optionTitle: { fontFamily: FONT.semibold, fontSize: 15.5, color: C.text },
-    optionSub: { fontFamily: FONT.regular, fontSize: 12.5, lineHeight: 17, color: C.textFaint, marginTop: 3 },
-    liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.success },
-    disabled: { opacity: 0.55 },
-    // "Worth knowing" — a soft tinted aside.
-    aside: {
-      backgroundColor: C.primarySoft, borderRadius: R.card, padding: 16, marginTop: 22,
-    },
-    asideLabel: { ...CAPS, fontSize: 10, color: C.primaryStrong },
-    asideBody: { ...T.bodyDim, marginTop: 8, color: C.text },
+    wsLabel: { fontFamily: FONT.regular, fontSize: 13, color: C.textDim },
+    wsName: { fontFamily: FONT.semibold, fontSize: 13, color: C.primary, flexShrink: 1 },
+    note: { fontFamily: FONT.regular, fontSize: 13, lineHeight: 19, color: C.textDim, marginTop: S.xl, marginHorizontal: S.xs },
   });
-}
-
-function Option({ n, icon, title, subtitle, onPress, disabled, soon, live, first, st, C }: {
-  n: number; icon: string; title: string; subtitle: string;
-  onPress?: () => void; disabled?: boolean; soon?: boolean; live?: boolean; first?: boolean;
-  st: ReturnType<typeof buildStyles>; C: ColorScale;
-}) {
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      style={({ pressed }) => [
-        st.option, first && st.optionFirst, disabled && st.disabled, pressed && { opacity: 0.62 },
-      ]}
-      accessibilityLabel={title}
-    >
-      <IconCircle name={icon} tint={C.primary} bg={C.primarySoft} size={40} />
-      <View style={{ flex: 1 }}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-          <Text style={st.optionTitle}>{title}</Text>
-          {live ? <View style={st.liveDot} /> : null}
-          {soon ? <SoonBadge /> : null}
-        </View>
-        <Text style={st.optionSub}>{subtitle}</Text>
-      </View>
-      <Icon name="chevron.right" tintColor={C.textFaint} size={18} />
-    </Pressable>
-  );
 }
 
 export default function NewRecordingScreen() {
   const router = useRouter();
-  // Carried through from the folder detail screen, so "Record" inside a folder
-  // files into that folder regardless of WHICH source the user then picks.
-  const { folderId: folderParam } = useLocalSearchParams<{ folderId?: string }>();
-  const folderId = String(folderParam || "");
-  const { C, T } = useTheme();
-  const st = useMemo(() => buildStyles(C, T), [C, T]);
+  const { C } = useTheme();
+  const st = useMemo(() => buildStyles(C), [C]);
   const { device, status, connState } = useDevice();
 
   // "Paired" is a backend fact (the account owns a device), independent of
@@ -96,84 +54,88 @@ export default function NewRecordingScreen() {
     return () => { cancelled = true; };
   }, []);
 
+  // The workspace this recording will belong to. Read from the SHARED
+  // provider rather than fetched here, so this banner cannot disagree with
+  // the switcher the user just used.
+  //
+  // Display only: the backend re-resolves the workspace from the membership
+  // behind the request and is the sole authority on what the row is stamped
+  // with. A tampered value produces a 404, not a misfiled meeting.
+  const { active: workspace } = useWorkspace();
+
   const connected = connState === "connected" && !!device;
   const deviceAvailable = paired === true || connected;
 
-  const go = (href: Href) => {
-    // Swap the chooser out for the destination so "back" from the recorder
-    // returns to where the user actually was, not to this sheet.
-    //
-    // The folder rides along as a query param: the phone recorder and the
-    // upload screen both file into it, so which source the user picks does not
-    // change where the meeting lands.
-    if (folderId && typeof href === "string") {
-      router.replace({ pathname: href, params: { folderId } } as never);
-      return;
-    }
-    router.replace(href);
-  };
+  // Swap the chooser out for the destination so "back" from the recorder
+  // returns to where the user actually was, not to this sheet.
+  const go = (href: Href) => router.replace(href);
 
   return (
     <View style={[st.container, { paddingTop: S.lg }]}>
       <Stack.Screen options={{ title: "New recording" }} />
 
-      <Text style={st.title}>What are we{"\n"}listening to?</Text>
-      <Text style={st.sub}>However it's captured, you get the same brief at the end.</Text>
+      <Text style={st.title} accessibilityRole="header">What are we listening to?</Text>
+      <Text style={st.sub}>However it&apos;s captured, you get the same brief at the end.</Text>
 
-      <View style={[st.card, { marginTop: 22 }]}>
-        <Option
-          n={1}
+      {/* WHERE this recording will land. Shown before any source is chosen,
+          because a recording must never be started in an ambiguous context —
+          filing a client meeting into a personal workspace by accident is not
+          something the user can easily undo. Personal renders too: "no
+          banner" would be indistinguishable from "still loading". */}
+      {workspace ? (
+        <View style={st.wsBanner} accessible accessibilityLabel={`Recording in ${workspaceLabel(workspace)}`}>
+          <Icon
+            name={workspace.is_personal ? "person.fill" : "building.2.fill"}
+            tintColor={C.primary}
+            size={15}
+          />
+          <Text style={st.wsLabel}>Recording in</Text>
+          <Text style={st.wsName} numberOfLines={1}>{workspaceLabel(workspace)}</Text>
+        </View>
+      ) : null}
+
+      <SettingGroup style={{ marginTop: S.xl }}>
+        <SettingRow
           icon="mic.fill"
           title="This phone"
-          subtitle="Best on a table, in a quiet room"
+          description="Best on a table, in a quiet room"
           onPress={() => go("/record-phone")}
-          first
-          st={st} C={C}
         />
-        <Option
-          n={2}
+        <SettingRow
           icon="doc.text.fill"
-          title="A file"
-          subtitle="wav, mp3, m4a, flac — up to 2 GB"
+          title="An audio file"
+          description="wav, mp3, m4a, flac — up to 2 GB"
           onPress={() => go("/upload")}
-          st={st} C={C}
         />
         {deviceAvailable ? (
-          <Option
-            n={3}
+          <SettingRow
             icon="dot.radiowaves.left.and.right"
-            title="Your device"
-            subtitle={
+            title="Your MinuteX device"
+            description={
               connected && status
                 ? `Connected · ${status.batteryLevel ?? "--"}% · handles rooms and corridors`
                 : connected ? "Connected · handles rooms and corridors"
-                : "Paired — connect it to start"
+                  : "Paired — connect it to start"
             }
-            live={connected}
+            trailing={connected ? <StatusBadge label="Connected" tone="success" dot /> : undefined}
+            chevron
             onPress={() => go("/record")}
-            st={st} C={C}
           />
         ) : (
-          <Option
-            n={3}
+          <SettingRow
             icon="dot.radiowaves.left.and.right"
-            title="Your device"
-            subtitle={paired === null ? "Checking…" : "Not paired yet"}
-            soon={paired !== null}
+            title="Your MinuteX device"
+            description={paired === null ? "Checking…" : "Not paired yet — tap to pair one"}
             disabled={paired === null}
             onPress={() => go("/pair")}
-            st={st} C={C}
           />
         )}
-      </View>
+      </SettingGroup>
 
-      <View style={st.aside}>
-        <Text style={st.asideLabel}>Worth knowing</Text>
-        <Text style={st.asideBody}>
-          Tell the room you're recording. It's the law in some places and good
-          manners everywhere.
-        </Text>
-      </View>
+      <Text style={st.note}>
+        Tell the room you&apos;re recording. It&apos;s the law in some places and good
+        manners everywhere.
+      </Text>
     </View>
   );
 }

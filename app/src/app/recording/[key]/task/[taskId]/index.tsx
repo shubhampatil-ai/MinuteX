@@ -16,7 +16,7 @@ import * as DocumentPicker from "expo-document-picker";
 import { FONT, R, S, useTheme, ColorScale } from "../../../../../../lib/theme";
 import { Button, KeyboardAwareSheet, StatusPill } from "../../../../../../lib/ui";
 import { Icon } from "../../../../../../lib/icons";
-import { useMeeting } from "../../../../../../lib/meeting-context";
+import { useMeeting, useSyncTasksOnFocus } from "../../../../../../lib/meeting-context";
 import { DueDatePicker, isPlottableDue } from "../../../../../../lib/due-date-picker";
 import { initialsOf, nextId, type Task, type TaskStatus } from "../../../../../../lib/task-model";
 import { Pop, PressSpring } from "../../../../../../lib/motion";
@@ -46,9 +46,24 @@ function buildStyles(C: ColorScale) {
       flexDirection: "row" as const, alignItems: "center" as const, justifyContent: "space-between" as const,
       paddingVertical: 13, borderBottomWidth: 1, borderBottomColor: C.border,
     },
-    rowLabel: { fontFamily: FONT.medium, fontSize: 14, color: C.textDim },
-    rowValue: { fontFamily: FONT.semibold, fontSize: 14, color: C.text },
-    linkChip: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
+    // flexShrink: 0 on the label, flexShrink: 1 on the value — the label is
+    // a short known word and the value is the variable one, so the value is
+    // what gives way.
+    rowLabel: {
+      fontFamily: FONT.medium, fontSize: 14, color: C.textDim, flexShrink: 0,
+    },
+    rowValue: {
+      fontFamily: FONT.semibold, fontSize: 14, color: C.text, flexShrink: 1,
+    },
+    // The chip must shrink, not just its text: without flexShrink here the
+    // chip grows to the meeting title's intrinsic width, which defeats the
+    // numberOfLines on the Text inside and pushes the chevron off-screen —
+    // making a working link look broken. minWidth: 0 lets the Text inside
+    // actually ellipsize.
+    linkChip: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: 6,
+      flexShrink: 1, minWidth: 0, marginLeft: S.md,
+    },
     stepperTrack: { flexDirection: "row" as const, alignItems: "center" as const, marginTop: S.md },
     stepDot: { width: 26, height: 26, borderRadius: 13, alignItems: "center" as const, justifyContent: "center" as const },
     stepLine: { flex: 1, height: 2 },
@@ -97,6 +112,8 @@ export default function TaskDetailScreen() {
     rec, getTask, setTaskStatus, addSubtask, toggleSubtask,
     addAttachment, removeAttachment, updateTask,
   } = useMeeting();
+  // A reassignment made on the Task dashboard or /task/[id] must show here.
+  useSyncTasksOnFocus();
 
   const task = getTask(taskId);
 
@@ -237,7 +254,11 @@ export default function TaskDetailScreen() {
               accessibilityLabel="Open meeting"
             >
               <Text style={[st.rowValue, { color: C.primary }]} numberOfLines={1}>{rec?.title || task.meetingTitle}</Text>
-              <Icon name="chevron.right" tintColor={C.primary} size={13} />
+              {/* The affordance never shrinks — a link whose chevron has
+                  been squeezed away no longer reads as a link. */}
+              <View style={{ flexShrink: 0 }}>
+                <Icon name="chevron.right" tintColor={C.primary} size={13} />
+              </View>
             </Pressable>
           </View>
 

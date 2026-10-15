@@ -9,16 +9,19 @@
 //
 //   1. In this meeting  — people already tagged in it. A task from a meeting
 //                         almost always belongs to someone who was in it.
-//   2. Folder contacts  — the rest of the folder the meeting is filed under.
-//   3. All contacts     — everyone else, paged from the server.
+//   2. Your organisation — colleagues, synced from live membership. These are
+//                         who a member assigns work to most often, and they
+//                         are the people who must be taggable in ANY
+//                         member's meeting without being typed in.
+//   3. Other contacts   — everyone else, paged from the server.
 //
 // Two properties matter as much as the order itself:
 //
 //   * Each contact appears EXACTLY ONCE, in the most specific tier it
 //     qualifies for. A duplicate makes the list look longer while offering no
 //     new choice, and lets the user "pick" two different rows for one person.
-//   * Search spans every tier. The folder is a shortcut, never a restriction —
-//     a global contact must stay reachable by typing their name.
+//   * Search spans both tiers. The meeting tier is a shortcut, never a
+//     restriction — a global contact must stay reachable by typing their name.
 //
 // The section builder is mirrored here from lib/contact-picker.tsx rather than
 // imported, because that module pulls in React, expo-router and the native
@@ -38,8 +41,7 @@ function dedupById(contacts) {
 }
 
 // --- the rule, as implemented in lib/contact-picker.tsx -------------------
-function buildSections({ meetingContacts = [], folderContacts = [], all = [], search = "" }) {
-  const folderIds = new Set(folderContacts.map((c) => c.id));
+function buildSections({ meetingContacts = [], all = [], search = "" }) {
   const needle = search.trim().toLowerCase();
   const matches = (c) =>
     !needle ||
@@ -59,30 +61,32 @@ function buildSections({ meetingContacts = [], folderContacts = [], all = [], se
     }
   }
 
-  const folderMatches = dedupById(
-    folderContacts.filter((c) => matches(c) && !seen.has(c.id))
-  );
-  if (folderMatches.length) {
-    out.push({ kind: "heading", label: "Folder Contacts" });
-    for (const c of folderMatches) {
-      seen.add(c.id);
-      out.push({ kind: "contact", contact: c });
-    }
-  }
-
   // NOTE the asymmetry, which is deliberate: `all` is NOT filtered by
   // `matches()` here. It arrives already filtered by the SERVER
   // (getContacts({search})), because the global list is paged and cannot be
   // searched on-device without breaking as soon as an account outgrows one
-  // page. The meeting/folder tiers are small in-memory arrays, so they are
-  // filtered locally. Tests therefore pass an `all` that reflects what the
-  // server would have returned for the given search.
-  const rest = dedupById(
-    all.filter((c) => !seen.has(c.id) && !folderIds.has(c.id))
-  );
-  if (rest.length) {
-    out.push({ kind: "heading", label: "All Contacts" });
-    for (const c of rest) out.push({ kind: "contact", contact: c });
+  // page. The meeting tier is a small in-memory array, so it is filtered
+  // locally. Tests therefore pass an `all` that reflects what the server
+  // would have returned for the given search.
+  const rest = dedupById(all.filter((c) => !seen.has(c.id)));
+
+  // A THIRD TIER: organisation colleagues, identified by workspace_role,
+  // which the SERVER sets only for a live member of the active organisation
+  // (never stored on the contact, so it cannot lag a role change). In a
+  // personal workspace no row carries it and the list is two tiers exactly
+  // as before.
+  const colleagues = rest.filter((c) => !!c.workspace_role);
+  const others = rest.filter((c) => !c.workspace_role);
+  if (colleagues.length) {
+    out.push({ kind: "heading", label: "Your organisation" });
+    for (const c of colleagues) out.push({ kind: "contact", contact: c });
+  }
+  if (others.length) {
+    out.push({
+      kind: "heading",
+      label: colleagues.length ? "Other Contacts" : "All Contacts",
+    });
+    for (const c of others) out.push({ kind: "contact", contact: c });
   }
   return out;
 }
@@ -94,24 +98,30 @@ const rahul = { id: "c1", name: "Rahul Sharma", email: "rahul@alpha.test" };
 const neha = { id: "c2", name: "Neha Shah", email: "neha@alpha.test" };
 const amit = { id: "c3", name: "Amit Patel", email: "amit@alpha.test" };
 const priya = { id: "c4", name: "Priya Mehta", email: "priya@other.test" };
+// Colleagues carry the role the SERVER resolved from live membership.
+const asha = {
+  id: "member-u1", name: "Asha Owner", email: "asha@abc.test",
+  workspace_role: "OWNER", is_member: true,
+};
+const manav = {
+  id: "member-u2", name: "Manav Manager", email: "manav@abc.test",
+  workspace_role: "MANAGER", is_member: true,
+};
 
-describe("three-tier ordering", () => {
-  it("puts meeting people first, then folder, then everyone", () => {
+describe("two-tier ordering", () => {
+  it("puts meeting people first, then everyone", () => {
     const secs = buildSections({
       meetingContacts: [rahul],
-      folderContacts: [rahul, amit],
       all: [rahul, amit, priya],
     });
-    assert.deepEqual(headings(secs),
-      ["In this meeting", "Folder Contacts", "All Contacts"]);
+    assert.deepEqual(headings(secs), ["In this meeting", "All Contacts"]);
     assert.deepEqual(ids(secs), ["c1", "c3", "c4"]);
   });
 
   it("lists each person exactly once, in their most specific tier", () => {
-    // Rahul is in the meeting AND the folder AND the global page.
+    // Rahul is in the meeting AND the global page.
     const secs = buildSections({
       meetingContacts: [rahul],
-      folderContacts: [rahul],
       all: [rahul],
     });
     assert.deepEqual(ids(secs), ["c1"]);
@@ -124,22 +134,19 @@ describe("three-tier ordering", () => {
   });
 
   it("works with no meeting context at all", () => {
-    // The contacts screen and folder screen pass no meetingContacts.
-    const secs = buildSections({
-      folderContacts: [amit],
-      all: [amit, priya],
-    });
-    assert.deepEqual(headings(secs), ["Folder Contacts", "All Contacts"]);
+    // The contacts screen passes no meetingContacts.
+    const secs = buildSections({ all: [amit, priya] });
+    assert.deepEqual(headings(secs), ["All Contacts"]);
     assert.deepEqual(ids(secs), ["c3", "c4"]);
   });
 
-  it("shows global contacts even when the meeting has no folder", () => {
-    // THE REPORTED BUG: a meeting with no folder has no folder contacts, so
-    // "All Contacts" is the only tier that can render. If it were ever gated
-    // on the folder, the picker would look empty on an account WITH contacts.
+  it("shows global contacts when the meeting has nobody tagged", () => {
+    // THE REPORTED BUG, in its surviving form: an untagged meeting leaves
+    // "All Contacts" as the only tier that can render. If it were ever gated
+    // on the meeting tier, the picker would look empty on an account WITH
+    // contacts.
     const secs = buildSections({
       meetingContacts: [],
-      folderContacts: [],
       all: [rahul, neha],
     });
     assert.deepEqual(headings(secs), ["All Contacts"]);
@@ -147,12 +154,11 @@ describe("three-tier ordering", () => {
   });
 });
 
-describe("search spans every tier", () => {
+describe("search spans both tiers", () => {
   it("finds a global contact by name", () => {
     // `all` is what the SERVER returned for search="priya".
     const secs = buildSections({
       meetingContacts: [rahul],
-      folderContacts: [amit],
       all: [priya],
       search: "priya",
     });
@@ -162,7 +168,6 @@ describe("search spans every tier", () => {
   it("finds a meeting person and keeps them in their own tier", () => {
     const secs = buildSections({
       meetingContacts: [rahul],
-      folderContacts: [amit],
       all: [rahul],            // server matched Rahul too
       search: "rahul",
     });
@@ -170,22 +175,22 @@ describe("search spans every tier", () => {
     assert.deepEqual(ids(secs), ["c1"], "not duplicated into All Contacts");
   });
 
-  it("matches on email as well as name in the local tiers", () => {
+  it("matches on email as well as name in the local tier", () => {
     const secs = buildSections({
-      folderContacts: [rahul, priya], all: [], search: "other.test",
+      meetingContacts: [rahul, priya], all: [], search: "other.test",
     });
     assert.deepEqual(ids(secs), ["c4"]);
   });
 
-  it("is case-insensitive in the local tiers", () => {
-    const secs = buildSections({ folderContacts: [rahul], search: "RAHUL" });
+  it("is case-insensitive in the local tier", () => {
+    const secs = buildSections({ meetingContacts: [rahul], search: "RAHUL" });
     assert.deepEqual(ids(secs), ["c1"]);
   });
 
   it("returns nothing when nothing matches", () => {
     // The server returned no global matches either.
     const secs = buildSections({
-      meetingContacts: [rahul], folderContacts: [amit], all: [],
+      meetingContacts: [rahul], all: [],
       search: "zzz-nobody",
     });
     assert.deepEqual(secs, [], "empty means the UI shows its No matches state");
@@ -238,24 +243,70 @@ describe("duplicate contacts in one tier", () => {
     assert.deepEqual(ids(secs), ["c4"]);
   });
 
-  it("emits unique keys for every tier", () => {
+  it("emits unique keys for both tiers", () => {
     const secs = buildSections({
       meetingContacts: [priya, priya, rahul],
-      folderContacts: [rahul, neha, neha],
-      all: [amit, amit, priya],
+      all: [amit, amit, priya, neha],
     });
     const keys = ids(secs);
     assert.deepEqual(keys, [...new Set(keys)], "contact keys must be unique");
-    assert.deepEqual(keys, ["c4", "c1", "c2", "c3"]);
+    assert.deepEqual(keys, ["c4", "c1", "c3", "c2"]);
   });
 
   it("keeps a duplicated contact in its most specific tier only", () => {
     const secs = buildSections({
       meetingContacts: [priya, priya],
-      folderContacts: [priya],
       all: [priya],
     });
     assert.deepEqual(ids(secs), ["c4"]);
     assert.deepEqual(headings(secs), ["In this meeting"]);
+  });
+});
+
+describe("the organisation tier", () => {
+  it("puts colleagues between the meeting and everyone else", () => {
+    const secs = buildSections({
+      meetingContacts: [rahul],
+      all: [rahul, priya, asha, manav],
+    });
+    assert.deepEqual(headings(secs), [
+      "In this meeting", "Your organisation", "Other Contacts",
+    ]);
+    assert.deepEqual(ids(secs), ["c1", "member-u1", "member-u2", "c4"]);
+  });
+
+  it("keeps the heading as 'All Contacts' when there are no colleagues", () => {
+    // A personal workspace: no row carries workspace_role, so the list must
+    // read exactly as it did before this tier existed.
+    const secs = buildSections({ all: [rahul, priya] });
+    assert.deepEqual(headings(secs), ["All Contacts"]);
+    assert.deepEqual(ids(secs), ["c1", "c4"]);
+  });
+
+  it("does not duplicate a colleague who is also in the meeting", () => {
+    // The most specific tier wins, exactly as for any other contact —
+    // otherwise tagging a colleague who spoke would offer two rows for one
+    // person.
+    const secs = buildSections({
+      meetingContacts: [asha],
+      all: [asha, manav],
+    });
+    assert.deepEqual(ids(secs), ["member-u1", "member-u2"]);
+    assert.deepEqual(headings(secs), ["In this meeting", "Your organisation"]);
+  });
+
+  it("shows only the organisation tier when every contact is a colleague", () => {
+    const secs = buildSections({ all: [asha, manav] });
+    assert.deepEqual(headings(secs), ["Your organisation"]);
+  });
+
+  it("keeps colleagues in a search result", () => {
+    // `all` is what the SERVER returned for the search (see the asymmetry
+    // note above), and the projected colleagues are filtered server-side by
+    // the same needle — so a matching colleague must still be tiered, not
+    // swept into "Other Contacts".
+    const secs = buildSections({ all: [manav], search: "manav" });
+    assert.deepEqual(headings(secs), ["Your organisation"]);
+    assert.deepEqual(ids(secs), ["member-u2"]);
   });
 });

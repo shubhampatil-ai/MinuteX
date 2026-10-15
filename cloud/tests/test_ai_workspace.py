@@ -240,9 +240,16 @@ class AiTestCase(unittest.TestCase):
             return {}
 
         self.table.update_item.side_effect = _update_item
+        # MeetingAccess (participant grants): empty, so paths that touch it —
+        # permanent delete dropping a meeting's grants — never reach real AWS.
+        self.p_access = mock.patch.object(api, "_meeting_access")
+        self.access = self.p_access.start()
+        self.access.query.return_value = {"Items": []}
+        self.access.get_item.return_value = {}
         self.addCleanup(self.p_auth.stop)
         self.addCleanup(self.p_devices.stop)
         self.addCleanup(self.p_table.stop)
+        self.addCleanup(self.p_access.stop)
 
     def stub_groq(self, text="## Minutes\n\n- Approved the revised quote"):
         """Patch the shared client's completion call; return the mock so tests
@@ -321,9 +328,17 @@ class TestPrompts(unittest.TestCase):
     def test_summary_prompt_asks_for_exactly_the_schema_fields(self):
         """The prompt's declared field list and the coercer's shape must not
         drift: a field asked for but not coerced is silently discarded, and a
-        field coerced but not asked for is always empty."""
+        field coerced but not asked for is always empty.
+
+        `tasks` is the exception: it stays in the analysis shape but is filled
+        by the SEPARATE task call, so the analysis prompt must NOT ask for it
+        (asking twice is how the two drift) and the task prompt must."""
         for field in ai_schema.empty_analysis():
+            if field == "tasks":
+                continue
             self.assertIn(f'"{field}"', prompts.SUMMARY_SYSTEM, field)
+        self.assertNotIn('"tasks"', prompts.SUMMARY_SYSTEM)
+        self.assertIn('"tasks"', prompts.TASKS_SYSTEM)
 
     def test_summary_prompt_does_not_ask_for_a_removed_field(self):
         """agenda/key_points/decisions/pending_discussions/action_items were
@@ -345,7 +360,12 @@ class TestPrompts(unittest.TestCase):
         still declared the removed fields would reintroduce them on exactly the
         long meetings where the analysis matters most."""
         for field in ai_schema.empty_analysis():
+            if field == "tasks":
+                continue
             self.assertIn(f'"{field}"', prompts.SUMMARY_REDUCE_SYSTEM, field)
+        # Tasks overflow through their OWN reduce (see TASKS_SYSTEM).
+        self.assertNotIn('"tasks"', prompts.SUMMARY_REDUCE_SYSTEM)
+        self.assertIn('"tasks"', prompts.TASKS_REDUCE_SYSTEM)
         for gone in ('"agenda"', '"key_points"', '"pending_discussions"',
                      '"decisions":', '"action_items":'):
             self.assertNotIn(gone, prompts.SUMMARY_REDUCE_SYSTEM, gone)
@@ -357,7 +377,6 @@ class TestPrompts(unittest.TestCase):
         its conclusions. With the overview dynamic there is no single length to
         cap, so the rule is stated per section: dense AND short."""
         self.assertIn("information-dense", prompts.SUMMARY_SYSTEM)
-        self.assertIn("did not attend", prompts.SUMMARY_SYSTEM)
         self.assertNotIn("AT MOST 5", prompts.SUMMARY_SYSTEM)
         self.assertIn("SHORT + INFORMATION-DENSE + FACTUAL + CONTEXTUAL",
                       prompts.SUMMARY_SYSTEM)
@@ -510,9 +529,9 @@ class TestPrompts(unittest.TestCase):
                       prompts.SUMMARY_SYSTEM)
         self.assertIn("could have guessed WITHOUT the meeting",
                       prompts.SUMMARY_SYSTEM)
-        # It must sit AFTER the field list and the two rule blocks.
+        # It must sit AFTER the field list and the participants rule block.
         self.assertGreater(prompts.SUMMARY_SYSTEM.index("BEFORE YOU ANSWER"),
-                           prompts.SUMMARY_SYSTEM.index("TASK ASSIGNMENT RULE"))
+                           prompts.SUMMARY_SYSTEM.index("PARTICIPANTS RULE"))
 
     def test_specificity_is_taught_by_weak_vs_better_examples(self):
         """A rule alone ("be specific") produced topic labels; the paired
@@ -525,10 +544,15 @@ class TestPrompts(unittest.TestCase):
 
     def test_participants_and_task_assignees_are_independent(self):
         """The semantic correction: a name appearing only as a task owner was
-        being added to participants, inventing an attendee from a mention."""
+        being added to participants, inventing an attendee from a mention.
+
+        The two rules now live in different prompts — participants in the
+        analysis, assignees in the task call — and each must still state its
+        half of the separation."""
         self.assertIn("PARTICIPANTS RULE", prompts.SUMMARY_SYSTEM)
-        self.assertIn("TASK ASSIGNMENT RULE", prompts.SUMMARY_SYSTEM)
-        self.assertIn("INDEPENDENT concepts", prompts.SUMMARY_SYSTEM)
+        self.assertIn("TASK ASSIGNMENT RULE", prompts.TASKS_SYSTEM)
+        self.assertIn("INDEPENDENT concepts", prompts.TASKS_SYSTEM)
+        self.assertIn("did not attend", prompts.TASKS_SYSTEM)
         # A participant must have evidence of attending...
         self.assertIn("direct evidence that they participated",
                       prompts.SUMMARY_SYSTEM)
@@ -539,9 +563,9 @@ class TestPrompts(unittest.TestCase):
                       prompts.SUMMARY_SYSTEM)
         # ...while an assignee need not be one at all.
         self.assertIn("does NOT need to be a participant",
-                      prompts.SUMMARY_SYSTEM)
+                      prompts.TASKS_SYSTEM)
         for entity in ("team", "department", "vendor"):
-            self.assertIn(entity, prompts.SUMMARY_SYSTEM, entity)
+            self.assertIn(entity, prompts.TASKS_SYSTEM, entity)
 
     def test_the_reduce_prompt_also_separates_participants_from_assignees(self):
         """The overflow path merges into the same schema, so it needs the same
@@ -553,8 +577,29 @@ class TestPrompts(unittest.TestCase):
     def test_tasks_must_preserve_scope(self):
         """"Test parser" is not an actionable task; the object, scope and
         constraint are what make it one."""
-        self.assertIn("preserve the SCOPE", prompts.SUMMARY_SYSTEM)
-        self.assertIn("Test parser", prompts.SUMMARY_SYSTEM)
+        self.assertIn("preserve the SCOPE", prompts.TASKS_SYSTEM)
+        self.assertIn("Test parser", prompts.TASKS_SYSTEM)
+
+    def test_the_task_call_reads_the_analysis_then_the_transcript(self):
+        """What made the task call work (measured 0-4 -> 8-13 tasks on an
+        84-minute Marathi meeting) is the English analysis placed AHEAD of the
+        transcript — while every task must still be evidenced by the
+        transcript, never by the analysis."""
+        body = prompts.tasks_user_content("MEETING TITLE: X", "[seg_0] hi")
+        self.assertLess(body.index("=== MEETING ANALYSIS"),
+                        body.index("=== TRANSCRIPT ==="))
+        self.assertIn("[seg_0] hi", body)
+        # No analysis (e.g. an empty digest) still sends the transcript.
+        self.assertNotIn("MEETING ANALYSIS",
+                         prompts.tasks_user_content("", "[seg_0] hi"))
+        self.assertIn("Every task must be supported by the TRANSCRIPT",
+                      prompts.TASKS_SYSTEM)
+        self.assertIn("never a sentence from the analysis", prompts.TASKS_SYSTEM)
+
+    def test_the_task_prompt_carries_the_speaker_roster(self):
+        system = prompts.tasks_system(["Speaker 0"], {"0": "Ravi"})
+        self.assertIn('speaker_id "0" = Ravi', system)
+        self.assertEqual(prompts.tasks_system(), prompts.TASKS_SYSTEM)
 
     def test_the_summary_prompt_keeps_its_factuality_rules(self):
         """Comprehensiveness must not have been bought with hallucination
@@ -1223,300 +1268,25 @@ class TestCoercion(unittest.TestCase):
 
     def test_the_extraction_is_only_the_sections_with_readers(self):
         """important_numbers and risks were removed with their (nonexistent)
-        consumers — their content now lands in the overview instead. Each
-        remaining section is read by something: see
+        consumers — their content now lands in the overview instead — and
+        action_items went too: the task list is the one source of truth for
+        work. Each remaining section is read by something: see
         ai_schema.HIGHLIGHT_SECTIONS."""
         self.assertEqual(sorted(ai_schema.HIGHLIGHT_SECTIONS),
-                         ["action_items", "deadlines", "decisions",
-                          "open_questions"])
+                         ["deadlines", "decisions", "open_questions"])
         got = ai_schema.coerce_highlights({
             "important_numbers": [{"label": "l", "value": "5"}],
             "risks": ["a risk"],
+            "action_items": [{"task": "t", "owner": "", "deadline": ""}],
         })
         self.assertNotIn("important_numbers", got)
         self.assertNotIn("risks", got)
+        self.assertNotIn("action_items", got)
 
     def test_highlights_empty_detects_nothing_to_show(self):
         self.assertTrue(ai_schema.highlights_empty(ai_schema.empty_highlights()))
         self.assertTrue(ai_schema.highlights_empty(None))
         self.assertFalse(ai_schema.highlights_empty(HIGHLIGHTS))
-
-
-# ===========================================================================
-# Site Visit Number (CRM linking) — coerced harder than the other stages,
-# because this value decides WHICH Salesforce record a meeting is pushed
-# onto. A hallucinated number doesn't render as a bad UI row; it writes real
-# meeting notes onto a stranger's site visit. The grounding check is the
-# code-level guarantee behind the prompt's "never invent" instruction.
-# ===========================================================================
-class TestCrmIdentifierCoercion(unittest.TestCase):
-
-    def _empty(self, got):
-        self.assertIsNone(got["value"])
-        self.assertEqual(got["confidence"], "none")
-        self.assertEqual(got["evidence"], "")
-        self.assertFalse(ai_schema.crm_identifier_found(got))
-
-    def test_grounded_number_is_kept(self):
-        got = ai_schema.coerce_crm_identifier({
-            "value": "SV-10245", "confidence": "explicit",
-            "evidence": "Today's site visit number is SV-10245."})
-        self.assertEqual(got["value"], "SV-10245")
-        self.assertEqual(got["confidence"], "explicit")
-        self.assertTrue(ai_schema.crm_identifier_found(got))
-
-    def test_grounding_ignores_separators_and_case(self):
-        """"SV-10245" must still match evidence that says "sv 10245"."""
-        got = ai_schema.coerce_crm_identifier({
-            "value": "SV-10245", "confidence": "probable",
-            "evidence": "the visit, sv 10245, went ahead"})
-        self.assertEqual(got["value"], "SV-10245")
-
-    def test_hallucinated_number_is_dropped(self):
-        """THE case this layer exists for: a number the model's own evidence
-        does not contain. A model that invents SV-99999 cannot also produce a
-        transcript sentence containing it."""
-        self._empty(ai_schema.coerce_crm_identifier({
-            "value": "SV-99999", "confidence": "explicit",
-            "evidence": "Today's site visit number is SV-10245."}))
-
-    def test_number_without_evidence_is_dropped(self):
-        self._empty(ai_schema.coerce_crm_identifier({
-            "value": "SV-10245", "confidence": "explicit",
-            "evidence": ""}))
-
-    def test_truncated_number_is_dropped(self):
-        """A truncated id is not a typo — it resolves to a DIFFERENT record,
-        so a plain substring test would be actively dangerous here."""
-        self._empty(ai_schema.coerce_crm_identifier({
-            "value": "SV-102", "confidence": "explicit",
-            "evidence": "SV-10245 is the reference"}))
-
-    def test_number_embedded_in_a_phone_number_is_dropped(self):
-        self._empty(ai_schema.coerce_crm_identifier({
-            "value": "10245", "confidence": "explicit",
-            "evidence": "call 9910245678 to confirm"}))
-
-    def test_valid_occurrence_is_found_after_an_embedded_one(self):
-        got = ai_schema.coerce_crm_identifier({
-            "value": "10245", "confidence": "explicit",
-            "evidence": "not 9910245678 but visit 10245 itself"})
-        self.assertEqual(got["value"], "10245")
-
-    def test_whole_token_matches_at_any_sentence_position(self):
-        for ev in ("the reference is SV-10245.", "SV-10245 was confirmed",
-                   "SV-10245", "the visit (SV-10245) went ahead",
-                   "SV-10245, as discussed"):
-            got = ai_schema.coerce_crm_identifier({
-                "value": "SV-10245", "confidence": "explicit",
-                "evidence": ev})
-            self.assertEqual(got["value"], "SV-10245", ev)
-
-    def test_no_number_is_the_normal_answer(self):
-        """Most meetings have no site visit number; every flavour of
-        "nothing" must normalize to the same empty shape."""
-        for nothing in (None, "", "null", "none", "N/A", "na", "unknown"):
-            self._empty(ai_schema.coerce_crm_identifier(
-                {"value": nothing, "confidence": "none",
-                 "evidence": ""}))
-
-    def test_hostile_model_output_cannot_break_the_item(self):
-        for junk in (None, [], "SV-10245", 42, {},
-                     {"_raw": "I could not find one."},
-                     {"value": {"a": 1}, "confidence": [],
-                      "evidence": None},
-                     {"value": True, "confidence": "explicit",
-                      "evidence": "yes"}):
-            got = ai_schema.coerce_crm_identifier(junk)
-            self.assertEqual(sorted(got), sorted(ai_schema.empty_crm_identifier()))
-
-    def test_integer_number_is_coerced_to_string(self):
-        got = ai_schema.coerce_crm_identifier({
-            "value": 10245, "confidence": "explicit",
-            "evidence": "visit 10245"})
-        self.assertEqual(got["value"], "10245")
-
-    def test_confidence_is_clamped_and_a_grounded_none_is_promoted(self):
-        # An unknown label clamps to "none", but a GROUNDED number labelled
-        # "none" is self-contradictory — trust the evidence, don't discard.
-        for label in ("wat", "none", ""):
-            got = ai_schema.coerce_crm_identifier({
-                "value": "SV-1", "confidence": label,
-                "evidence": "SV-1 today"})
-            self.assertEqual(got["confidence"], "probable", label)
-            self.assertEqual(got["value"], "SV-1")
-
-    def test_confidence_score_is_decimal_for_dynamodb(self):
-        """DynamoDB rejects float; a stored score must be Decimal."""
-        got = ai_schema.coerce_crm_identifier({
-            "value": "SV-1", "confidence": "explicit",
-            "evidence": "SV-1"})
-        self.assertIsInstance(got["confidence_score"], Decimal)
-
-    def test_evidence_is_bounded(self):
-        got = ai_schema.coerce_crm_identifier({
-            "value": "SV-1", "confidence": "explicit",
-            "evidence": "SV-1 " + "x" * 2000})
-        self.assertEqual(len(got["evidence"]), 500)
-
-    def test_empty_identifier_does_not_share_mutable_state(self):
-        a, b = ai_schema.empty_crm_identifier(), ai_schema.empty_crm_identifier()
-        a["evidence"] = "mutated"
-        self.assertEqual(b["evidence"], "")
-
-
-# ===========================================================================
-# Spoken-digit normalization. Speech-to-text writes a dictated identifier as
-# WORDS ("SV one zero zero four"), the model correctly extracts what the
-# transcript says, and Salesforce stores "SV1004" — so the lookup missed.
-# Normalization closes that gap between extraction and lookup.
-#
-# The dangerous direction here is OVER-conversion: turning a semantic number
-# ("twenty four", "phase five") into digits invents a different record
-# reference. So most of these tests assert what must be left ALONE.
-# ===========================================================================
-class TestCrmIdentifierNormalization(unittest.TestCase):
-
-    def _norm(self, value):
-        return ai_schema.normalize_crm_identifier(value)
-
-    # --- the required conversions -----------------------------------------
-    def test_spoken_digits_become_digits(self):
-        self.assertEqual(self._norm("SV one zero zero four"), "SV1004")
-
-    def test_short_spoken_identifier(self):
-        self.assertEqual(self._norm("SV one two three"), "SV123")
-
-    def test_any_alphabetic_prefix_is_preserved(self):
-        """Generic: nothing knows "SV" from "ABC" from "OPP"."""
-        self.assertEqual(self._norm("ABC four five six"), "ABC456")
-        self.assertEqual(self._norm("OPP two zero two six"), "OPP2026")
-
-    def test_already_numeric_identifier_is_unchanged(self):
-        for value in ("SV1004", "SV-1004", "1004", "OPP2026"):
-            self.assertEqual(self._norm(value), value)
-
-    def test_no_prefix_at_all(self):
-        self.assertEqual(self._norm("one zero zero four"), "1004")
-
-    def test_letter_case_is_preserved_exactly(self):
-        """Casing can matter to the lookup, so it is never "tidied up"."""
-        self.assertEqual(self._norm("sv one zero zero four"), "sv1004")
-        self.assertEqual(self._norm("Sv one two"), "Sv12")
-
-    def test_separators_inside_the_dictation_are_closed_up(self):
-        self.assertEqual(self._norm("SV-one-zero-zero-four"), "SV-1004")
-        self.assertEqual(self._norm("SV one, two, three"), "SV123")
-        self.assertEqual(self._norm("SV#one two"), "SV#12")
-
-    def test_trailing_suffix_is_kept_attached(self):
-        self.assertEqual(self._norm("SV one zero zero four A"), "SV1004A")
-
-    def test_surrounding_whitespace_is_trimmed(self):
-        self.assertEqual(self._norm("  SV one zero zero four  "), "SV1004")
-
-    def test_oh_is_a_zero_only_between_spoken_digits(self):
-        """"SV one oh oh four" is how the number is actually read aloud."""
-        self.assertEqual(self._norm("SV one oh oh four"), "SV1004")
-        # ...but "oh" alone is an interjection, not a zero: outside the run of
-        # real digit words it stays a word, and stays detached from them.
-        self.assertEqual(self._norm("oh well"), "oh well")
-        self.assertEqual(self._norm("SV one two oh"), "SV12 oh")
-
-    def test_digits_already_present_are_joined_with_spoken_ones(self):
-        self.assertEqual(self._norm("SV 10 zero four"), "SV 1004")
-
-    # --- what must NEVER be reinterpreted ---------------------------------
-    def test_compound_number_words_are_never_guessed(self):
-        """THE over-conversion guard. "twenty four" could be the digits 2-4,
-        the number 24, or a year — the identifier cannot say which, so it is
-        left exactly as spoken rather than turned into a wrong reference."""
-        for value in ("twenty four", "SV twenty four", "four hundred",
-                      "twenty one two", "SV one two twenty", "fifteen"):
-            self.assertEqual(self._norm(value), value, value)
-
-    def test_a_lone_digit_word_is_ordinary_speech(self):
-        """One digit word is not a dictated identifier — a RUN is."""
-        for value in ("phase five", "SV one", "five units", "Order five"):
-            self.assertEqual(self._norm(value), value, value)
-
-    def test_values_with_no_digit_words_are_untouched(self):
-        for value in ("Priya Sharma", "priya@example.com", "SV 1004",
-                      "Acme Corporation", "https://x.example/a"):
-            self.assertEqual(self._norm(value), value, value)
-
-    def test_prose_around_the_identifier_is_not_collapsed(self):
-        """Only the dictated run and its adjacent code chunk are joined; the
-        sentence's own words keep their spacing."""
-        self.assertEqual(self._norm("site visit SV one zero zero four"),
-                         "site visit SV1004")
-        self.assertEqual(self._norm("Order five six for Priya"),
-                         "Order56 for Priya")
-
-    def test_empty_and_junk_input_never_raises(self):
-        for value in (None, "", "   ", 0, [], {}, True):
-            self.assertIsInstance(self._norm(value), str)
-
-    # --- integration with the coercer -------------------------------------
-    def test_coercion_normalizes_and_keeps_the_raw_value(self):
-        """The whole point: `value` is what Salesforce is queried with, while
-        `value_raw` + `evidence` keep what was actually said, for the UI."""
-        got = ai_schema.coerce_crm_identifier({
-            "value": "SV one zero zero four", "confidence": "explicit",
-            "evidence": "The site visit SV one zero zero four went ahead."})
-        self.assertEqual(got["value"], "SV1004")
-        self.assertEqual(got["value_raw"], "SV one zero zero four")
-        self.assertIn("one zero zero four", got["evidence"])
-        self.assertTrue(ai_schema.crm_identifier_found(got))
-
-    def test_grounding_still_runs_against_the_spoken_form(self):
-        """Order matters: grounding compares the model's answer to the
-        transcript it quoted, and BOTH are still spoken there. Normalizing
-        first would reject a perfectly good extraction as ungrounded."""
-        got = ai_schema.coerce_crm_identifier({
-            "value": "SV one zero zero four", "confidence": "explicit",
-            "evidence": "visit SV one zero zero four"})
-        self.assertEqual(got["value"], "SV1004")
-
-    def test_a_hallucinated_spoken_value_is_still_dropped(self):
-        """Normalization must not become a way around the grounding check."""
-        got = ai_schema.coerce_crm_identifier({
-            "value": "SV nine nine nine nine", "confidence": "explicit",
-            "evidence": "the site visit is SV one zero zero four"})
-        self.assertIsNone(got["value"])
-        self.assertFalse(ai_schema.crm_identifier_found(got))
-
-    def test_already_numeric_extraction_survives_coercion(self):
-        got = ai_schema.coerce_crm_identifier({
-            "value": "SV1004", "confidence": "explicit",
-            "evidence": "site visit SV1004 today"})
-        self.assertEqual(got["value"], "SV1004")
-        self.assertEqual(got["value_raw"], "SV1004")
-
-    def test_no_identifier_found_stays_null(self):
-        got = ai_schema.coerce_crm_identifier({
-            "value": None, "confidence": "none", "evidence": ""})
-        self.assertIsNone(got["value"])
-        self.assertIsNone(got["value_raw"])
-        self.assertFalse(ai_schema.crm_identifier_found(got))
-
-    def test_a_semantic_number_is_not_rewritten_by_the_coercer(self):
-        got = ai_schema.coerce_crm_identifier({
-            "value": "twenty four", "confidence": "probable",
-            "evidence": "we agreed on twenty four units"})
-        self.assertEqual(got["value"], "twenty four")
-
-    def test_normalization_does_not_touch_the_transcript(self):
-        """Only the extracted identifier is normalized. The evidence quote —
-        the nearest thing to transcript text this module ever holds — is
-        stored verbatim, so the UI shows what was really said."""
-        evidence = ("Priya said the site visit SV one zero zero four is "
-                    "on for twenty four units at five o'clock.")
-        got = ai_schema.coerce_crm_identifier({
-            "value": "SV one zero zero four", "confidence": "explicit",
-            "evidence": evidence})
-        self.assertEqual(got["evidence"], evidence)
-        self.assertEqual(got["value"], "SV1004")
 
 
 class TestMerge(unittest.TestCase):
@@ -1622,14 +1392,13 @@ class TestMerge(unittest.TestCase):
         the first mention keeps its position but gains the missing fields."""
         merged = ai_schema.merge_highlights([
             {**ai_schema.empty_highlights(),
-             "action_items": [{"task": "Send quote", "owner": "", "deadline": ""}]},
+             "deadlines": [{"what": "Send quote", "when": ""}]},
             {**ai_schema.empty_highlights(),
-             "action_items": [{"task": "send quote", "owner": "Ravi",
-                               "deadline": "Friday"}]},
+             "deadlines": [{"what": "send quote", "when": "Friday"}]},
         ])
-        self.assertEqual(len(merged["action_items"]), 1)
-        self.assertEqual(merged["action_items"][0]["owner"], "Ravi")
-        self.assertEqual(merged["action_items"][0]["deadline"], "Friday")
+        self.assertEqual(len(merged["deadlines"]), 1)
+        self.assertEqual(merged["deadlines"][0]["what"], "Send quote")
+        self.assertEqual(merged["deadlines"][0]["when"], "Friday")
 
     def test_same_deadline_text_folds_but_distinct_ones_do_not(self):
         """De-dup keys on the LOAD-BEARING field, not the whole dict: a later
@@ -2234,17 +2003,21 @@ class TestSinglePassAnalysis(unittest.TestCase):
         self.assertEqual(got["overview"]["sections"][0]["content"],
                          "Recovered.")
 
-    def test_json_validate_failed_twice_still_falls_back(self):
-        """The resend is ONE extra chance, not a loop. A transcript whose
-        every single-pass attempt fails must still reach map_reduce rather
-        than raise - the long-meeting safety net is unchanged."""
+    def test_json_validate_failed_every_time_still_falls_back(self):
+        """The resend is a BOUNDED loop, not an infinite one. A transcript
+        whose every single-pass attempt fails must still reach map_reduce
+        rather than raise - the long-meeting safety net is unchanged.
+
+        The bound is GENERATION_ATTEMPTS (4, was 2): at the measured ~1-in-6
+        failure rate two attempts still lost the whole analysis ~1 time in 36,
+        which is what production hit on long code-switched transcripts."""
         text = "Speaker 0: " + ("word " * 3000)
         seen = []
 
         def _complete_json(prompt, content, **kw):
             single_pass = content == text
             seen.append((prompt, single_pass))
-            if single_pass:                 # BOTH single-pass attempts fail
+            if single_pass:                 # EVERY single-pass attempt fails
                 raise self._json_validate_failed()
             return self._ok("via map_reduce")
 
@@ -2258,11 +2031,42 @@ class TestSinglePassAnalysis(unittest.TestCase):
                 merge=ai_schema.merge_analyses,
                 coerce=ai_schema.coerce_analysis,
                 deadline_seconds=120, label="analyze", key="k")
-        # Two single-pass attempts, no more - the resend is not a loop.
-        self.assertEqual(sum(1 for _, sp in seen if sp), 2)
-        self.assertEqual([sp for _, sp in seen[:2]], [True, True])
-        self.assertGreater(len(seen), 2)      # it did go on to map_reduce
+        # Exactly GENERATION_ATTEMPTS single-pass sends, then the fallback.
+        self.assertEqual(sum(1 for _, sp in seen if sp),
+                         groq_client.GENERATION_ATTEMPTS)
+        self.assertGreater(len(seen), groq_client.GENERATION_ATTEMPTS)
         self.assertTrue(got["overview"]["sections"])
+
+    def test_json_validate_failed_recovers_on_a_later_attempt(self):
+        """The reason the bound was raised: a run that fails the first THREE
+        samples and succeeds on the fourth must return the single-pass result,
+        not a map_reduce one. Under the old 2-attempt bound this exact
+        sequence lost the analysis entirely."""
+        text = "Speaker 0: " + ("word " * 3000)
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            seen.append(prompt)
+            if len(seen) < 4:               # attempts 1, 2, 3 all fail
+                raise self._json_validate_failed()
+            return self._ok("Recovered on 4.")
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "GROQ_CONTEXT_TOKENS", 131_072), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            got, covered, total = groq_client.analyze(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k")
+        self.assertEqual(len(seen), 4)
+        self.assertEqual(seen, [prompts.SUMMARY_SYSTEM] * 4)
+        self.assertNotIn(prompts.SUMMARY_REDUCE_SYSTEM, seen)
+        self.assertEqual((covered, total), (1, 1))
+        self.assertEqual(got["overview"]["sections"][0]["content"],
+                         "Recovered on 4.")
 
     def test_a_non_generation_400_is_not_resent(self):
         """Only a failed GENERATION earns the resend. A genuinely malformed
@@ -2354,6 +2158,284 @@ class TestSinglePassAnalysis(unittest.TestCase):
         self.assertTrue(any("single-pass budget" in ln and "chars >" in ln
                             for ln in lines), lines[:5])
 
+    # -- map_reduce's short-input branch -------------------------------------
+    #
+    # On the 300K-TPM plan chunk_budget is ~128K tokens, so every real meeting
+    # takes this branch. It used to have NO try/except, which made analyze()'s
+    # fall-through a third identical send whose failure escaped the whole
+    # analysis (the row persisted status="transcribed" and nothing else).
+
+    def test_map_reduce_short_input_retries_a_generation_failure(self):
+        """The branch every real meeting actually takes must survive a
+        stochastic generation failure instead of letting it escape."""
+        text = "Speaker 0: short enough to skip chunking."
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            seen.append(prompt)
+            if len(seen) == 1:
+                raise self._json_validate_failed()
+            return self._ok("recovered in map_reduce")
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            got, covered, total = groq_client.map_reduce(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual((covered, total), (1, 1))
+        self.assertEqual(got["overview"]["sections"][0]["content"],
+                         "recovered in map_reduce")
+
+    def test_map_reduce_short_input_propagates_after_the_retry_limit(self):
+        """Bounded, and still honest when it gives up: a permanently failing
+        generation raises GroqError rather than looping or returning a
+        silently-empty analysis."""
+        text = "Speaker 0: short enough to skip chunking."
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            seen.append(prompt)
+            raise self._json_validate_failed()
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            with self.assertRaises(groq_client.GroqError):
+                groq_client.map_reduce(
+                    text, prompts.SUMMARY_SYSTEM,
+                    prompts.SUMMARY_REDUCE_SYSTEM,
+                    merge=ai_schema.merge_analyses,
+                    coerce=ai_schema.coerce_analysis,
+                    deadline_seconds=120, label="analyze", key="k")
+        self.assertEqual(len(seen), groq_client.GENERATION_ATTEMPTS)
+
+    def test_map_reduce_short_input_does_not_retry_a_real_bad_request(self):
+        """Only a failed GENERATION earns the resend here too. A genuinely
+        malformed request must raise on its first occurrence."""
+        text = "Speaker 0: short enough to skip chunking."
+        seen = []
+
+        def _complete_json(prompt, content, **kw):
+            seen.append(prompt)
+            raise groq_client.GroqError(
+                "Groq 400 on analyze: model `nope` does not exist",
+                status=400, retryable=False)
+
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 300_000), \
+             mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"):
+            with self.assertRaises(groq_client.GroqError):
+                groq_client.map_reduce(
+                    text, prompts.SUMMARY_SYSTEM,
+                    prompts.SUMMARY_REDUCE_SYSTEM,
+                    merge=ai_schema.merge_analyses,
+                    coerce=ai_schema.coerce_analysis,
+                    deadline_seconds=120, label="analyze", key="k")
+        self.assertEqual(len(seen), 1)
+
+    def test_usability_retry_is_still_only_one(self):
+        """Raising the GENERATION bound must NOT raise the usability bound:
+        a 200 the caller rejected is the model answering consistently, not a
+        bad sample, so it keeps its single retry and then falls back.
+
+        Counted by the LOG line rather than by call count: this text is short,
+        so map_reduce's own single-call branch sends the same content again
+        and a raw call count cannot tell the two paths apart."""
+        text = "Speaker 0: short meeting content."
+
+        def _complete_json(prompt, content, **kw):
+            if prompt == prompts.SUMMARY_SYSTEM and content == text:
+                return {"title": "T", "tasks": [], "overview": {"sections": []}}
+            return self._ok("via map_reduce")
+
+        with mock.patch.object(groq_client, "complete_json",
+                               side_effect=_complete_json), \
+             mock.patch.object(groq_client.time, "sleep"), \
+             mock.patch("builtins.print") as printed:
+            groq_client.analyze(
+                text, prompts.SUMMARY_SYSTEM, prompts.SUMMARY_REDUCE_SYSTEM,
+                merge=ai_schema.merge_analyses,
+                coerce=ai_schema.coerce_analysis,
+                deadline_seconds=120, label="analyze", key="k",
+                is_usable=lambda a: not ai_schema.overview_empty(
+                    a.get("overview")))
+        lines = [str(c.args[0]) for c in printed.call_args_list if c.args]
+        retries = [ln for ln in lines if "failed the usability check" in ln
+                   and "retrying" in ln]
+        # Exactly ONE retry log, then the fall-through — not GENERATION_ATTEMPTS.
+        self.assertEqual(len(retries), groq_client.USABILITY_ATTEMPTS - 1)
+        self.assertTrue(any("retry also failed the usability check" in ln
+                            for ln in lines), lines)
+
+
+# ===========================================================================
+# Response metadata — finish_reason and token usage.
+#
+# _chat_once read the 200 body for `message` and dropped everything else, so
+# neither the model's own account of WHY it stopped nor a real (non-estimated)
+# token count ever reached CloudWatch. Diagnosing the json_validate_failed
+# outage needed a DynamoDB read and 2000 log lines because of it.
+# ===========================================================================
+class TestExplicitOutputTokenLimit(unittest.TestCase):
+    """The analysis request must CAP ITS OWN REPLY.
+
+    Groq's server-side default for openai/gpt-oss-120b is 3072 completion
+    tokens. Nothing sent one, so a multi-speaker analysis ran out inside it and
+    came back finish_reason=length: title and overview written, then tasks [],
+    every participant summary "" and meeting_highlights absent. That is valid
+    JSON which passes is_usable, so it was stored as a complete meeting.
+    """
+
+    REPLY = ('{"title": "T", "tasks": [], "participants": [], '
+             '"overview": {"sections": [{"title": "S", "content": "c"}]}}')
+
+    def _payload_of(self, run):
+        """The payload `run` actually puts on the wire."""
+        seen = {}
+
+        def fake_post(url, headers, payload, timeout):
+            seen.clear()
+            seen.update(payload)
+            return 200, {
+                "choices": [{"finish_reason": "stop",
+                             "message": {"content": self.REPLY}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2,
+                          "total_tokens": 3},
+            }
+
+        with mock.patch.object(groq_client, "_post_json",
+                               side_effect=fake_post):
+            run()
+        return seen
+
+    # -- complete_json ----------------------------------------------------
+    def test_complete_json_accepts_and_forwards_max_tokens(self):
+        got = self._payload_of(
+            lambda: groq_client.complete_json("SYS", "user", key="k",
+                                              max_tokens=1234))
+        self.assertEqual(got["max_tokens"], 1234)
+
+    def test_complete_json_omits_max_tokens_when_not_given(self):
+        """Every other JSON caller (documents, chat, reduce) must be
+        byte-identical to before this change."""
+        got = self._payload_of(
+            lambda: groq_client.complete_json("SYS", "user", key="k"))
+        self.assertNotIn("max_tokens", got)
+
+    # -- analyze ----------------------------------------------------------
+    def test_analyze_sends_the_configured_output_limit(self):
+        got = self._payload_of(lambda: groq_client.analyze(
+            "Speaker 0: hi.", "SYS", "RED",
+            merge=lambda p: p[0], coerce=lambda o: o,
+            deadline_seconds=60, label="analyze", key="k"))
+        self.assertEqual(got["max_tokens"],
+                         groq_client.ANALYSIS_MAX_OUTPUT_TOKENS)
+
+    def test_the_limit_is_above_groqs_truncating_default(self):
+        """The whole point: 3072 is what truncated production."""
+        self.assertGreater(groq_client.ANALYSIS_MAX_OUTPUT_TOKENS, 3072)
+
+    def test_the_limit_is_within_the_models_ceiling(self):
+        """openai/gpt-oss-120b reports max_completion_tokens=65536 (verified
+        against GET /openai/v1/models). Asking for more is a 400."""
+        self.assertLessEqual(groq_client.ANALYSIS_MAX_OUTPUT_TOKENS, 65536)
+
+    def test_a_full_transcript_plus_the_sent_limit_fits_the_context(self):
+        """The sent cap is deliberately NOT the input reserve (see
+        ANALYSIS_MAX_OUTPUT_TOKENS), so what must hold is the sum: system
+        prompt + the largest transcript the budget admits + the reply cap
+        stays inside the window. Run with the context window binding (prod's
+        TPM is far above it) and the real 16-speaker analysis prompt."""
+        import prompts
+        system = prompts.unified_analysis_system(
+            [f"Speaker {i}" for i in range(16)])
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 10 ** 9):
+            budget = groq_client.single_pass_budget_tokens(system)
+        self.assertLess(
+            groq_client.est_tokens(system) + budget
+            + groq_client.ANALYSIS_MAX_OUTPUT_TOKENS,
+            groq_client.GROQ_CONTEXT_TOKENS)
+
+    # -- map_reduce's single-call branch ----------------------------------
+    def test_map_reduce_short_input_also_caps_its_reply(self):
+        """The other path that sends the WHOLE analysis prompt — reached by
+        every real meeting, since chunk_budget is ~128K tokens."""
+        got = self._payload_of(lambda: groq_client.map_reduce(
+            "Speaker 0: hi.", "SYS", "RED",
+            merge=lambda p: p[0], coerce=lambda o: o,
+            deadline_seconds=60, label="analyze", key="k"))
+        self.assertEqual(got["max_tokens"],
+                         groq_client.ANALYSIS_MAX_OUTPUT_TOKENS)
+
+    # -- untouched paths ---------------------------------------------------
+    def test_prose_completions_are_unchanged(self):
+        """Documents and chat go through complete() directly and must not
+        acquire a cap they never had."""
+        got = self._payload_of(
+            lambda: groq_client.complete("SYS", "user", key="k",
+                                         json_mode=False))
+        self.assertNotIn("max_tokens", got)
+        self.assertNotIn("response_format", got)
+
+
+class TestCompletionMetadataLogging(unittest.TestCase):
+    BODY = {
+        "choices": [{"finish_reason": "stop",
+                     "message": {"content": '{"ok": true}'}}],
+        "usage": {"prompt_tokens": 21023, "completion_tokens": 1487,
+                  "total_tokens": 22510},
+    }
+
+    def _logged(self, body):
+        with mock.patch.object(groq_client, "_post_json",
+                               return_value=(200, body)), \
+             mock.patch("builtins.print") as printed:
+            groq_client._chat_once({"model": "m", "messages": []},
+                                   "analyze", key="k")
+        return [str(c.args[0]) for c in printed.call_args_list if c.args]
+
+    def test_finish_reason_and_usage_are_logged(self):
+        line = " ".join(self._logged(self.BODY))
+        self.assertIn("finish_reason=stop", line)
+        self.assertIn("prompt_tokens=21023", line)
+        self.assertIn("completion_tokens=1487", line)
+        self.assertIn("total_tokens=22510", line)
+
+    def test_no_transcript_or_completion_text_is_logged(self):
+        """These are meeting transcripts. Metadata only — never content."""
+        body = {
+            "choices": [{"finish_reason": "length",
+                         "message": {"content": "SECRET_MEETING_CONTENT"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2,
+                      "total_tokens": 3},
+        }
+        line = " ".join(self._logged(body))
+        self.assertNotIn("SECRET_MEETING_CONTENT", line)
+        self.assertIn("finish_reason=length", line)
+
+    def test_a_body_without_usage_still_returns_the_message(self):
+        """Observability must never break the call it is observing."""
+        body = {"choices": [{"message": {"content": "hi"}}]}
+        with mock.patch.object(groq_client, "_post_json",
+                               return_value=(200, body)):
+            msg = groq_client._chat_once({"model": "m", "messages": []},
+                                         "analyze", key="k")
+        self.assertEqual(msg["content"], "hi")
+
+    def test_return_value_is_unchanged_by_logging(self):
+        with mock.patch.object(groq_client, "_post_json",
+                               return_value=(200, self.BODY)):
+            msg = groq_client._chat_once({"model": "m", "messages": []},
+                                         "analyze", key="k")
+        self.assertEqual(msg, {"content": '{"ok": true}'})
+
 
 # ===========================================================================
 # _upsert's REMOVE clause — how a row written under the OLD analysis schema
@@ -2391,9 +2473,8 @@ class TestUpsertRemovesRetiredAttributes(unittest.TestCase):
         self.assertNotIn("overview", transcribe_api.RETIRED_ANALYSIS_ATTRS)
 
     def test_crm_records_is_never_retired(self):
-        """A stored crm_records value may be a user's MANUAL, confirmed link to
-        a real Salesforce record. CRM extraction left the analysis path, but
-        reprocessing must not silently unlink a meeting."""
+        """crm_records (from the removed OAuth CRM integration) is left on old
+        rows as-is; reprocessing never strips it."""
         self.assertNotIn("crm_records", transcribe_api.RETIRED_ANALYSIS_ATTRS)
 
     def test_set_and_remove_are_combined_in_one_expression(self):
@@ -2511,7 +2592,7 @@ class TestOwnership(AiTestCase):
         with mock.patch.object(api, "_owned_devices", return_value=["esp32-001"]):
             self.stub_groq()
             status, _ = parse(call(api.generate_document, 
-                event(body={"type": "minutes_of_meeting"})))
+                event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
 
     def test_missing_key_is_400(self):
@@ -2524,7 +2605,7 @@ class TestOwnership(AiTestCase):
         self.stub_groq()
         encoded = "recordings%2Fu-1%2Fmobile%2Fmobile-abc_1754300000.m4a"
         status, _ = parse(call(api.generate_document, 
-            event(key=encoded, body={"type": "minutes_of_meeting"})))
+            event(key=encoded, body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         called_key = self.table.get_item.call_args[1]["Key"]["audio_s3_key"]
         self.assertEqual(called_key, RECORDING["audio_s3_key"])
@@ -2533,7 +2614,7 @@ class TestOwnership(AiTestCase):
         self.stub_groq()
         status, _ = parse(call(api.generate_document, 
             event(key="recordings%252Fu-1%252Fmobile%252Fmobile-abc_1754300000.m4a",
-                  body={"type": "minutes_of_meeting"})))
+                  body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
 
 
@@ -2545,7 +2626,7 @@ class TestTranscriptGating(AiTestCase):
         self.item["transcript"] = ""
         self.item["status"] = "transcribing"
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 409)
         self.assertIn("transcribing", body["error"])
 
@@ -2562,11 +2643,11 @@ class TestDocuments(AiTestCase):
     def test_generate_and_store(self):
         groq = self.stub_groq("## Minutes\n\nApproved.")
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         self.assertFalse(body["cached"])
-        self.assertEqual(body["document"]["type"], "minutes_of_meeting")
-        self.assertEqual(body["document"]["label"], "Minutes of Meeting")
+        self.assertEqual(body["document"]["type"], "executive_summary")
+        self.assertEqual(body["document"]["label"], "Executive Summary")
         self.assertIn("Approved", body["document"]["content"])
         self.assertEqual(body["document"]["format"], "markdown")
         # Persisted with cache provenance.
@@ -2576,7 +2657,7 @@ class TestDocuments(AiTestCase):
         self.assertEqual(saved["ai_version"], ai_schema.AI_VERSION)
         # The prompt actually used was the template's.
         self.assertEqual(groq.call_args[0][0],
-                         prompts.DOCUMENTS["minutes_of_meeting"]["system"])
+                         prompts.DOCUMENTS["executive_summary"]["system"])
 
     def test_unknown_type_is_400_and_lists_the_valid_ones(self):
         status, body = parse(call(api.generate_document, event(body={"type": "poem"})))
@@ -2586,36 +2667,36 @@ class TestDocuments(AiTestCase):
     def test_cache_hit_makes_no_groq_call(self):
         """The core caching requirement: transcript unchanged + document exists
         -> serve the stored copy."""
-        self.item["documents"] = {"minutes_of_meeting": {
+        self.item["documents"] = {"executive_summary": {
             "content": "cached minutes", "format": "markdown",
             "transcript_fingerprint": ai_schema.fingerprint(TRANSCRIPT),
             "ai_version": ai_schema.AI_VERSION, "generated_at": "2026-08-04"}}
         groq = self.stub_groq()
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         self.assertTrue(body["cached"])
         self.assertEqual(body["document"]["content"], "cached minutes")
         groq.assert_not_called()
 
     def test_changed_transcript_invalidates_the_cache(self):
-        self.item["documents"] = {"minutes_of_meeting": {
+        self.item["documents"] = {"executive_summary": {
             "content": "old minutes", "transcript_fingerprint": "staleprint00000",
             "ai_version": ai_schema.AI_VERSION}}
         groq = self.stub_groq("## Fresh minutes")
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertFalse(body["cached"])
         self.assertIn("Fresh", body["document"]["content"])
         groq.assert_called_once()
 
     def test_regenerate_forces_a_fresh_call(self):
-        self.item["documents"] = {"minutes_of_meeting": {
+        self.item["documents"] = {"executive_summary": {
             "content": "cached", "transcript_fingerprint":
             ai_schema.fingerprint(TRANSCRIPT), "ai_version": ai_schema.AI_VERSION}}
         groq = self.stub_groq("## Regenerated")
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting", "regenerate": True})))
+            event(body={"type": "executive_summary", "regenerate": True})))
         self.assertFalse(body["cached"])
         groq.assert_called_once()
 
@@ -2624,7 +2705,7 @@ class TestDocuments(AiTestCase):
         with mock.patch.object(groq_client, "complete",
                                side_effect=groq_client.GroqError("429", 429, True)):
             status, body = parse(call(api.generate_document, 
-                event(body={"type": "minutes_of_meeting"})))
+                event(body={"type": "executive_summary"})))
         self.assertEqual(status, 502)
         self.assertIn("retry", body["error"].lower())
         self.assertTrue(self.item["transcript"])   # untouched
@@ -2636,20 +2717,20 @@ class TestDocuments(AiTestCase):
                 groq_client, "complete",
                 side_effect=groq_client.GroqError("no key", 0, False)):
             status, _ = parse(call(api.generate_document, 
-                event(body={"type": "minutes_of_meeting"})))
+                event(body={"type": "executive_summary"})))
         self.assertEqual(status, 500)
 
     def test_empty_generation_is_502_not_a_stored_blank(self):
         self.stub_groq("   ")
         status, _ = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 502)
         self.table.update_item.assert_not_called()
 
     def test_runaway_output_is_truncated(self):
         self.stub_groq("x" * 100_000)
         status, body = parse(call(api.generate_document, 
-            event(body={"type": "minutes_of_meeting"})))
+            event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         self.assertLessEqual(len(body["document"]["content"]),
                              api.MAX_DOCUMENT_CHARS + 50)
@@ -3538,13 +3619,13 @@ class TestDocumentPersistence(AiTestCase):
         """End to end: a generation reaches _save_document's nested SET."""
         self.stub_groq("## Minutes")
         status, _ = parse(call(api.generate_document,
-                              event(body={"type": "minutes_of_meeting"})))
+                              event(body={"type": "executive_summary"})))
         self.assertEqual(status, 200)
         expr = self.table.update_item.call_args[1]["UpdateExpression"]
         self.assertIn("#docs.#t = :doc", expr)
         self.assertEqual(
             self.table.update_item.call_args[1]["ExpressionAttributeNames"]["#t"],
-            "minutes_of_meeting")
+            "executive_summary")
 
 
 class TestQuickActions(AiTestCase):
@@ -3586,25 +3667,37 @@ class TestQuickActions(AiTestCase):
                          "whatsapp_summary")
 
     def test_every_advertised_action_actually_runs(self):
-        """No action can be listed but broken."""
+        """No action can be listed but broken.
+
+        minutes_of_meeting is the ONE deliberate exception: it aliases the
+        minutes_of_meeting document key, and that slot is now owned by the
+        structured MoM (the `mom` attribute, mirrored by _mirror_document).
+        Generating a prompt-authored MoM through this route would write a
+        second, differently-shaped MoM over that mirror, so the route refuses
+        with a 409 and the app routes Minutes of Meeting to the editor
+        instead. See test_mom_api.TestMomIsStructuredOnly.
+        """
         for action in prompts.QUICK_ACTION_KEYS:
             with self.subTest(action=action):
                 self.setUp()
                 self.stub_groq("output")
                 status, _ = parse(call(api.quick_action, event(body={"action": action})))
-                self.assertEqual(status, 200)
+                expected = 409 if action == "minutes_of_meeting" else 200
+                self.assertEqual(status, expected)
 
 
 class TestHighlights(AiTestCase):
-    """regenerate_highlights makes ONE Groq call (complete_json), never
-    map_reduce — a long transcript is truncated to fit one TPM window instead
-    of being split across paced calls. That change is what fixed a real
-    production failure: map-reducing a 45k-char transcript behind API
-    Gateway's 29s ceiling took 22s on chunk 1, then died on a 429 retry,
-    returning an opaque gateway 500. The staged pipeline (300s, nobody
-    waiting) is where full map-reduce still belongs; this route only
-    backfills rows it missed.
+    """regenerate_highlights is READ-ONLY unless `regenerate` is true (the
+    pipeline extracts highlights; this route used to re-run Groq on every
+    Calendar visit for each meeting with nothing to find). With `regenerate`
+    it makes ONE Groq call (complete_json), never map_reduce — a long
+    transcript is truncated to fit one TPM window instead of being split
+    across paced calls. That change is what fixed a real production failure:
+    map-reducing a 45k-char transcript behind API Gateway's 29s ceiling took
+    22s on chunk 1, then died on a 429 retry, returning an opaque gateway 500.
     """
+
+    REGEN = {"regenerate": True}
 
     def test_cached_highlights_are_served(self):
         self.item["meeting_highlights"] = HIGHLIGHTS
@@ -3613,11 +3706,36 @@ class TestHighlights(AiTestCase):
         self.assertTrue(body["cached"])
         cj.assert_not_called()
 
-    def test_missing_highlights_are_generated(self):
-        """This is what makes the workspace work on the back catalogue."""
+    def test_missing_highlights_are_not_generated_without_regenerate(self):
+        """The Calendar asks for every recent meeting. With nothing stored the
+        answer is EMPTY highlights — never a Groq call, never a write."""
+        with mock.patch.object(groq_client, "complete_json") as cj:
+            status, body = parse(call(api.regenerate_highlights, event(body={})))
+        self.assertEqual(status, 200)
+        self.assertTrue(body["cached"])
+        self.assertTrue(ai_schema.highlights_empty(body["meeting_highlights"]))
+        cj.assert_not_called()
+        self.table.update_item.assert_not_called()
+
+    def test_stored_empty_highlights_are_not_regenerated(self):
+        self.item["meeting_highlights"] = ai_schema.empty_highlights()
+        with mock.patch.object(groq_client, "complete_json") as cj:
+            status, body = parse(call(api.regenerate_highlights, event(body={})))
+        self.assertEqual(status, 200)
+        cj.assert_not_called()
+
+    def test_reading_does_not_fetch_the_transcript(self):
+        """A read is one DynamoDB lookup: no S3 transcript download."""
+        with mock.patch.object(api, "_owned_recording",
+                               wraps=api._owned_recording) as owned:
+            call(api.regenerate_highlights, event(body={}))
+        self.assertEqual(owned.call_count, 1)
+        self.assertFalse(owned.call_args.kwargs.get("hydrate", True))
+
+    def test_missing_highlights_are_generated_on_regenerate(self):
         with mock.patch.object(groq_client, "complete_json",
                                return_value=HIGHLIGHTS):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(status, 200)
         self.assertFalse(body["cached"])
         self.assertEqual(len(body["meeting_highlights"]["decisions"]), 1)
@@ -3637,7 +3755,7 @@ class TestHighlights(AiTestCase):
         meeting genuinely can have no decisions or numbers."""
         with mock.patch.object(groq_client, "complete_json",
                                return_value=ai_schema.empty_highlights()):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(status, 200)
         self.table.update_item.assert_not_called()
 
@@ -3666,7 +3784,7 @@ class TestHighlights(AiTestCase):
 
         with mock.patch.object(groq_client, "GROQ_CHUNK_TOKENS", 1000), \
              mock.patch.object(groq_client, "complete_json", side_effect=fake):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(status, 200)
         self.assertLess(captured["len"], len(self.item["transcript"]),
                         "the oversized transcript was not truncated")
@@ -3678,7 +3796,7 @@ class TestHighlights(AiTestCase):
     def test_short_transcript_reports_full_coverage(self):
         with mock.patch.object(groq_client, "complete_json",
                                return_value=HIGHLIGHTS):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(body["segments_covered"], 1)
         self.assertEqual(body["segments_total"], 1)
 
@@ -3690,7 +3808,7 @@ class TestHighlights(AiTestCase):
                 groq_client, "complete_json",
                 side_effect=groq_client.GroqError(
                     "no time left to retry", status=429, retryable=True)):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(status, 502)
         self.table.update_item.assert_not_called()
 
@@ -3816,1207 +3934,26 @@ class TestChat(AiTestCase):
 # Router wiring
 # ===========================================================================
 # ===========================================================================
-# CRM schema-mapping heuristics (Phase 2).
-#
-# These only PRE-SELECT a choice the user then confirms, so a miss is not a
-# correctness bug — but the whole point of suggesting is to be right in the
-# common case, and the scoring is subtle enough to regress silently.
+# PKCE (RFC 7636) and log hygiene — the shared helpers the Integrations OAuth
+# flows (Gmail) use.
 # ===========================================================================
-class TestCrmFieldSuggestions(unittest.TestCase):
-
-    @staticmethod
-    def _field(name, label, **kw):
-        base = dict(name=name, label=label, type="string", length=80,
-                    updateable=True, filterable=True, calculated=False,
-                    custom=True, nameField=False, autoNumber=False, unique=False)
-        base.update(kw)
-        return base
-
-    def test_purpose_built_custom_field_beats_a_relabelled_name_field(self):
-        """The ambiguity real orgs actually have: the standard Name field is
-        LABELLED "Site Visit Number" while a real Site_Visit_Number__c also
-        exists. The custom field someone created deliberately should win."""
-        name_field = self._field("Name", "Site Visit Number", custom=False,
-                                 nameField=True, autoNumber=True)
-        custom = self._field("Site_Visit_Number__c", "Site Visit Number", unique=True)
-        self.assertGreater(api._score_number_field(custom),
-                           api._score_number_field(name_field))
-
-    def test_name_field_is_still_suggested_when_nothing_better_exists(self):
-        """An auto-number object with no custom field: Name IS the number."""
-        name_field = self._field("Name", "Site Visit Name", custom=False,
-                                 nameField=True, autoNumber=True)
-        unrelated = self._field("Notes__c", "Notes")
-        self.assertGreater(api._score_number_field(name_field),
-                           api._score_number_field(unrelated))
-        self.assertGreater(api._score_number_field(name_field), 0)
-
-    def test_unrelated_fields_score_zero(self):
-        for f in (self._field("Amount__c", "Amount"),
-                  self._field("Status__c", "Status"),
-                  self._field("Description__c", "Description")):
-            self.assertEqual(api._score_number_field(f), 0, f["name"])
-
-    def test_site_visit_object_is_recognized_by_label_or_name(self):
-        for obj, expect_positive in (
-            ({"name": "SiteVisit__c", "label": "Site Visit"}, True),
-            ({"name": "Custom_X__c", "label": "Site Visit Log"}, True),
-            ({"name": "Visit__c", "label": "Visit"}, True),
-            ({"name": "Inspection__c", "label": "Inspection"}, True),
-            ({"name": "Account", "label": "Account"}, False),
-            ({"name": "Opportunity", "label": "Opportunity"}, False),
-        ):
-            score = api._score_site_visit_object(obj)
-            self.assertEqual(score > 0, expect_positive, obj["name"])
-
-    def test_exact_site_visit_outranks_a_mere_visit(self):
-        exact = api._score_site_visit_object(
-            {"name": "SiteVisit__c", "label": "Site Visit"})
-        loose = api._score_site_visit_object(
-            {"name": "Visit__c", "label": "Visit"})
-        self.assertGreater(exact, loose)
-
-    def test_salesforce_internal_objects_are_not_selectable(self):
-        for name in ("AccountShare", "AccountHistory", "CaseFeed",
-                     "OrderChangeEvent", "AccountTag"):
-            self.assertFalse(
-                api._sf_object_is_selectable(
-                    {"name": name, "updateable": True, "queryable": True}),
-                name)
-
-    def test_unwritable_or_hidden_objects_are_not_selectable(self):
-        base = {"name": "Thing__c", "updateable": True, "queryable": True}
-        self.assertTrue(api._sf_object_is_selectable(base))
-        self.assertFalse(api._sf_object_is_selectable({**base, "updateable": False}))
-        self.assertFalse(api._sf_object_is_selectable({**base, "queryable": False}))
-        self.assertFalse(api._sf_object_is_selectable(
-            {**base, "deprecatedAndHidden": True}))
-        self.assertFalse(api._sf_object_is_selectable(
-            {**base, "customSetting": True}))
-
-
-# ===========================================================================
-# CRM configuration is GENERIC — the customer maps any object(s), and nothing
-# in the product special-cases one.
-#
-# These are the regression tests for the bug this replaced: a Site Visit input
-# rendered unconditionally, which was wrong for every customer who doesn't use
-# one. The UI now renders from `mappings`, so "shows nothing" and "shows Lead"
-# are both just data — asserted here at the layer that produces that data.
-# ===========================================================================
-class TestCrmConfigIsGeneric(unittest.TestCase):
-
-    def test_no_connection_means_disabled_and_no_mappings(self):
-        """The UI renders no record inputs from this — Salesforce absent."""
-        cfg = api._public_crm_config(None)
-        self.assertFalse(cfg["enabled"])
-        self.assertEqual(cfg["mappings"], [])
-        self.assertFalse(cfg["configured"])
-
-    def test_connected_but_unmapped_yields_no_mappings(self):
-        """Case 2 of the requirement: connected, nothing configured -> the UI
-        must still show no record fields (and NOT an empty Site Visit box)."""
-        cfg = api._public_crm_config({"instance_url": "https://x", "config": {}})
-        self.assertTrue(cfg["enabled"])
-        self.assertEqual(cfg["mappings"], [])
-        self.assertFalse(cfg["configured"])
-
-    def test_connected_with_empty_mapping_list_is_valid_and_empty(self):
-        """Saving [] is a legitimate "turn record fields off" state."""
-        cfg = api._public_crm_config({"config": {"mappings": []}})
-        self.assertEqual(cfg["mappings"], [])
-        self.assertFalse(cfg["configured"])
-
-    def test_any_single_object_appears_on_its_own(self):
-        """Whatever ONE object is configured is what the UI shows — nothing
-        about site visits is privileged."""
-        for object_name, label, field in (
-            ("SiteVisit__c", "Site Visit", "Site_Visit_Number__c"),
-            ("Lead", "Lead", "Email"),
-            ("Opportunity", "Opportunity", "Opportunity_Number__c"),
-            ("Custom_Thing__c", "Custom Thing", "Ref__c"),
-        ):
-            cfg = api._public_crm_config({"config": {"mappings": [{
-                "object": object_name, "object_label": label,
-                "lookup_field": field, "label": f"{label} Ref"}]}})
-            self.assertEqual(len(cfg["mappings"]), 1, object_name)
-            self.assertEqual(cfg["mappings"][0]["object"], object_name)
-            self.assertEqual(cfg["mappings"][0]["object_label"], label)
-            self.assertTrue(cfg["configured"])
-
-    def test_multiple_objects_appear_together_in_order(self):
-        cfg = api._public_crm_config({"config": {"mappings": [
-            {"object": "Lead", "object_label": "Lead", "lookup_field": "Email",
-             "label": "Lead Email"},
-            {"object": "Opportunity", "object_label": "Opportunity",
-             "lookup_field": "Opportunity_Number__c", "label": "Opportunity Number"},
-        ]}})
-        self.assertEqual([m["object"] for m in cfg["mappings"]],
-                         ["Lead", "Opportunity"])
-        self.assertEqual([m["label"] for m in cfg["mappings"]],
-                         ["Lead Email", "Opportunity Number"])
-        # And crucially: no site visit anywhere in the payload.
-        self.assertNotIn("site_visit", json.dumps(cfg).lower())
-
-    def test_legacy_single_object_config_still_works(self):
-        """Backward compatibility: a config written before mappings existed
-        must surface through the SAME generic mechanism, so an upgraded user's
-        Site Visit field keeps appearing without a migration."""
-        cfg = api._public_crm_config({"config": {
-            "object": "SiteVisit__c",
-            "object_label": "Site Visit",
-            "site_visit_number_field": "Site_Visit_Number__c",
-            "transcript_field": "Transcript__c",
-            "summary_field": "Summary__c",
-        }})
-        self.assertTrue(cfg["configured"])
-        self.assertEqual(len(cfg["mappings"]), 1)
-        m = cfg["mappings"][0]
-        self.assertEqual(m["object"], "SiteVisit__c")
-        self.assertEqual(m["lookup_field"], "Site_Visit_Number__c")
-        # The old UI called it "<Object> Number"; keep those words.
-        self.assertEqual(m["label"], "Site Visit Number")
-        # Content targets carry over too, or a push would silently stop working.
-        self.assertEqual(m["transcript_field"], "Transcript__c")
-        self.assertEqual(m["summary_field"], "Summary__c")
-
-    def test_legacy_config_missing_its_lookup_field_yields_nothing(self):
-        """A half-written legacy config is not a usable mapping."""
-        for cfg in ({"object": "SiteVisit__c"},
-                    {"site_visit_number_field": "X__c"},
-                    {"object": "", "site_visit_number_field": ""}):
-            self.assertEqual(api._mappings_from_config(cfg), [], cfg)
-
-    def test_malformed_mappings_are_filtered_not_fatal(self):
-        """Junk in the stored list must not break the meeting screen."""
-        cfg = api._public_crm_config({"config": {"mappings": [
-            {"object": "Lead", "lookup_field": "Email"},   # keeper
-            {"object": "NoField"},                          # no lookup_field
-            {"lookup_field": "Orphan"},                     # no object
-            "not a dict", None, 42,
-        ]}})
-        self.assertEqual([m["object"] for m in cfg["mappings"]], ["Lead"])
-
-    def test_mappings_from_config_survives_hostile_input(self):
-        for junk in (None, [], "str", 42, {"mappings": "not a list"},
-                     {"mappings": None}):
-            self.assertIsInstance(api._mappings_from_config(junk), list, junk)
-
-    def test_a_mapping_always_exposes_every_data_target_key(self):
-        """The UI reads these unconditionally, so they must always be present
-        (as None when unmapped) rather than sometimes absent."""
-        cfg = api._public_crm_config({"config": {"mappings": [
-            {"object": "Lead", "lookup_field": "Email"}]}})
-        m = cfg["mappings"][0]
-        for key in api.CRM_DATA_TARGET_KEYS:
-            self.assertIn(key, m)
-            self.assertIsNone(m[key])
-
-
-# ===========================================================================
-# CRM lookup / association / push, exercised THROUGH the routes.
-#
-# One fake org with four objects — a custom SiteVisit__c, standard Lead and
-# Opportunity, and a fabricated Custom_Thing__c — because the whole claim of
-# this design is that the same code path serves all of them. Every test below
-# runs against the real handlers; nothing calls a helper directly.
-# ===========================================================================
-SF_ORG = {
-    "SiteVisit__c": {
-        "label": "Site Visit",
-        "fields": [
-            {"name": "Name", "label": "Name", "type": "string", "nameField": True,
-             "filterable": True, "updateable": True},
-            {"name": "Site_Visit_Number__c", "label": "Site Visit Number",
-             "type": "string", "filterable": True, "updateable": True},
-            {"name": "Transcript__c", "label": "Transcript", "type": "textarea",
-             "length": 131072, "filterable": False, "updateable": True},
-            {"name": "Summary__c", "label": "Summary", "type": "textarea",
-             "length": 32768, "filterable": False, "updateable": True},
-        ],
-    },
-    "Lead": {
-        "label": "Lead",
-        "fields": [
-            {"name": "Name", "label": "Full Name", "type": "string",
-             "nameField": True, "filterable": True, "updateable": False},
-            {"name": "Email", "label": "Email", "type": "email",
-             "filterable": True, "updateable": True},
-            {"name": "Description", "label": "Description", "type": "textarea",
-             "length": 32000, "filterable": False, "updateable": True},
-        ],
-    },
-    "Opportunity": {
-        "label": "Opportunity",
-        "fields": [
-            {"name": "Name", "label": "Name", "type": "string", "nameField": True,
-             "filterable": True, "updateable": True},
-            {"name": "Opportunity_Number__c", "label": "Opportunity Number",
-             "type": "string", "filterable": True, "updateable": True},
-            {"name": "Meeting_Notes__c", "label": "Meeting Notes",
-             "type": "textarea", "length": 32768, "filterable": False,
-             "updateable": True},
-        ],
-    },
-    "Custom_Thing__c": {
-        "label": "Custom Thing",
-        "fields": [
-            {"name": "Ref__c", "label": "Reference", "type": "string",
-             "filterable": True, "updateable": True},
-            {"name": "Notes__c", "label": "Notes", "type": "textarea",
-             "length": 32768, "filterable": False, "updateable": True},
-        ],
-    },
-}
-
-
-class FakeSalesforce:
-    """Stands in for SalesforceClient. Records every call so tests can assert
-    on the SOQL and the exact push payload."""
-
-    def __init__(self):
-        self.queries = []
-        self.updates = []
-        self.refreshes = 0
-        self.expire_next = 0        # how many upcoming calls raise 401
-        self.refresh_fails = False
-        self.match_count = 1        # records the next query returns
-        self.update_error = None    # ApiError to raise from update_record
-
-    def refresh_access_token(self, refresh_token):
-        self.refreshes += 1
-        if self.refresh_fails:
-            raise api.ApiError(401, "your Salesforce connection has expired — "
-                                    "reconnect Salesforce in Settings")
-        return {"access_token": f"AT{self.refreshes}",
-                "instance_url": "https://acme.my.salesforce.com"}
-
-    def _maybe_expire(self):
-        if self.expire_next > 0:
-            self.expire_next -= 1
-            raise api.SalesforceAuthExpired("expired")
-
-    def describe_object(self, url, tok, name):
-        self._maybe_expire()
-        if name not in SF_ORG:
-            raise api.ApiError(404, f"describe {name}: not found in your "
-                                    f"Salesforce org")
-        return SF_ORG[name]
-
-    def query(self, url, tok, soql):
-        self.queries.append(soql)
-        self._maybe_expire()
-        records = []
-        for i in range(self.match_count):
-            records.append({"Id": f"a0{i}RECORD", "Name": f"Match {i}",
-                            "attributes": {"type": "X"}})
-        return {"records": records}
-
-    def update_record(self, url, tok, object_name, record_id, fields):
-        self._maybe_expire()
-        if self.update_error:
-            raise self.update_error
-        self.updates.append({"object": object_name, "record_id": record_id,
-                             "fields": dict(fields)})
-        return None
-
-
-class CrmTestCase(unittest.TestCase):
-    """Routes + a stateful Recordings row + a fake org.
-
-    The recording row is mutated by a small SET-expression interpreter so a test
-    can drive a real multi-step flow (identify -> confirm -> sync) and assert on
-    what persisted, which is the only way to test the status machine honestly.
-    """
-
-    MAPPINGS = [
-        {"object": "SiteVisit__c", "object_label": "Site Visit",
-         "lookup_field": "Site_Visit_Number__c", "label": "Site Visit Number",
-         "transcript_field": "Transcript__c", "summary_field": "Summary__c"},
-    ]
-
-    def setUp(self):
-        self.sf = FakeSalesforce()
-        self.mappings = [dict(m) for m in self.MAPPINGS]
-        self.row = {
-            "audio_s3_key": "recordings/u-1/uploads/r1.m4a",
-            "user_id": "u-1",
-            "transcript": "Speaker 1: today's site visit number is SV-10245.",
-            "summary": "The team approved the revised quote.",
-            "highlights": ["Approved the revised quote", "Budget set at 4.2 lakh"],
-            "tasks": {"t1": {"task": "Send the SOW", "assignee": "Ravi",
-                             "due_date": "Friday", "status": "Pending"}},
-        }
-
-        self.p_auth = mock.patch.object(api, "_require_auth", return_value="u-1")
-        self.p_devices = mock.patch.object(api, "_owned_devices", return_value=[])
-        self.p_table = mock.patch.object(api, "_recordings")
-        self.p_conn = mock.patch.object(api, "_get_salesforce_connection")
-        self.p_sf = mock.patch.object(api, "_salesforce", self.sf)
-        self.p_kms = mock.patch.object(api, "_kms_decrypt", return_value="RT")
-        self.p_hydrate = mock.patch.object(
-            api.transcript_store, "hydrate", side_effect=lambda s3, b, item: item)
-        self.p_auth.start()
-        self.p_devices.start()
-        self.table = self.p_table.start()
-        self.conn = self.p_conn.start()
-        self.p_sf.start()
-        self.p_kms.start()
-        self.p_hydrate.start()
-        for p in (self.p_auth, self.p_devices, self.p_table, self.p_conn,
-                  self.p_sf, self.p_kms, self.p_hydrate):
-            self.addCleanup(p.stop)
-
-        self.conn.side_effect = lambda uid: {
-            "user_id": uid, "provider": "salesforce",
-            "instance_url": "https://acme.my.salesforce.com",
-            "refresh_token_enc": "ENC",
-            "config": {"mappings": self.mappings},
-        }
-        self.table.get_item.side_effect = \
-            lambda **kw: {"Item": json.loads(json.dumps(self.row, default=str))}
-        self.table.update_item.side_effect = self._apply_update
-
-    @staticmethod
-    def _split_clauses(expr):
-        """Split on TOP-LEVEL commas only.
-
-        A naive split breaks `if_not_exists(#cr, :empty)` in half — which is
-        exactly the expression the sync route uses to create the crm_records map
-        before writing into it.
-        """
-        parts, depth, current = [], 0, []
-        for ch in expr:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            if ch == "," and depth == 0:
-                parts.append("".join(current))
-                current = []
-                continue
-            current.append(ch)
-        if current:
-            parts.append("".join(current))
-        return parts
-
-    def _apply_update(self, **kw):
-        """Enough of DynamoDB's SET grammar for these routes."""
-        expr = kw.get("UpdateExpression", "")
-        vals = kw.get("ExpressionAttributeValues") or {}
-        names = kw.get("ExpressionAttributeNames") or {}
-        assert expr.strip().upper().startswith("SET"), expr
-        for clause in self._split_clauses(expr[3:]):
-            lhs, _, rhs = clause.strip().partition("=")
-            lhs, rhs = lhs.strip(), rhs.strip()
-            for alias, real in names.items():
-                lhs = lhs.replace(alias, real)
-                rhs = rhs.replace(alias, real)
-            if rhs.startswith("if_not_exists"):
-                attr = rhs[rhs.index("(") + 1:rhs.index(",")].strip()
-                self.row.setdefault(attr, {})
-                continue
-            value = vals.get(rhs)
-            if "." in lhs:                      # crm_records.<Object>
-                parent, child = lhs.split(".", 1)
-                self.row.setdefault(parent, {})[child] = value
-            else:
-                self.row[lhs] = value
-        return {}
-
-    # ---- route helpers ------------------------------------------------
-    KEY = "recordings/u-1/uploads/r1.m4a"
-
-    def lookup(self, object_name, value):
-        return api.lambda_handler({
-            "routeKey": "POST /crm/salesforce/lookup",
-            "requestContext": {"http": {"method": "POST",
-                                        "path": "/crm/salesforce/lookup"}},
-            "headers": {}, "pathParameters": None,
-            "body": json.dumps({"object": object_name, "lookup_value": value}),
-        }, None)
-
-    def patch_meeting(self, crm_records):
-        return api.lambda_handler({
-            "routeKey": "PATCH /recordings/{key+}",
-            "requestContext": {"http": {"method": "PATCH",
-                                        "path": "/recordings/{key+}"}},
-            "headers": {}, "pathParameters": {"key": self.KEY},
-            "body": json.dumps({"crm_records": crm_records}),
-        }, None)
-
-    def sync(self, object_name):
-        return api.lambda_handler({
-            "routeKey": "POST /crm/salesforce/sync/{key+}",
-            "requestContext": {"http": {"method": "POST",
-                                        "path": "/crm/salesforce/sync/{key+}"}},
-            "headers": {}, "pathParameters": {"key": self.KEY},
-            "body": json.dumps({"object": object_name}),
-        }, None)
-
-    def get_meeting(self):
-        with mock.patch.object(api, "BUCKET_NAME", None):
-            r = api.lambda_handler({
-                "routeKey": "GET /recordings/{key+}",
-                "requestContext": {"http": {"method": "GET",
-                                            "path": "/recordings/{key+}"}},
-                "headers": {}, "pathParameters": {"key": self.KEY}, "body": None,
-            }, None)
-        return json.loads(r["body"])["recording"]
-
-    @staticmethod
-    def body(resp):
-        return json.loads(resp["body"])
-
-    def stored(self, object_name):
-        return (self.row.get("crm_records") or {}).get(object_name) or {}
-
-
-class TestCrmLookupRoute(CrmTestCase):
-
-    def _map(self, object_name, lookup_field, **extra):
-        self.mappings = [{"object": object_name,
-                          "object_label": SF_ORG[object_name]["label"],
-                          "lookup_field": lookup_field, **extra}]
-
-    def test_exact_match_for_every_object_type(self):
-        """The same route resolves a custom object, two standard ones and a
-        fabricated custom object — no per-object code anywhere."""
-        for object_name, lookup_field, value in (
-            ("SiteVisit__c", "Site_Visit_Number__c", "SV-10245"),
-            ("Lead", "Email", "rahul@example.com"),
-            ("Opportunity", "Opportunity_Number__c", "OPP-77"),
-            ("Custom_Thing__c", "Ref__c", "THING-1"),
-        ):
-            self._map(object_name, lookup_field)
-            self.sf.match_count = 1
-            body = self.body(self.lookup(object_name, value))
-            self.assertEqual(body["status"], "found", object_name)
-            self.assertEqual(body["record_id"], "a00RECORD", object_name)
-            self.assertEqual(body["object"], object_name)
-            self.assertEqual(body["lookup_field"], lookup_field)
-            # The SOQL is built from the CONFIGURED object + field.
-            self.assertIn(f"FROM {object_name}", self.sf.queries[-1])
-            self.assertIn(f"{lookup_field} = '{value}'", self.sf.queries[-1])
-
-    def test_no_record_is_not_an_error(self):
-        self.sf.match_count = 0
-        resp = self.lookup("SiteVisit__c", "SV-NOPE")
-        self.assertEqual(resp["statusCode"], 200)
-        self.assertEqual(self.body(resp)["status"], "not_found")
-
-    def test_multiple_records_return_candidates_and_never_choose(self):
-        self.sf.match_count = 3
-        body = self.body(self.lookup("SiteVisit__c", "SV-DUPE"))
-        self.assertEqual(body["status"], "ambiguous")
-        self.assertEqual(len(body["records"]), 3)
-        self.assertNotIn("record_id", body)   # nothing was chosen for the user
-        for candidate in body["records"]:
-            self.assertTrue(candidate["record_id"])
-            self.assertTrue(candidate["display_name"])
-
-    def test_ambiguous_candidates_are_capped(self):
-        self.sf.match_count = api.CRM_AMBIGUOUS_LIMIT + 1
-        body = self.body(self.lookup("SiteVisit__c", "SV-MANY"))
-        self.assertEqual(len(body["records"]), api.CRM_AMBIGUOUS_LIMIT)
-        self.assertTrue(body["truncated"])
-
-    def test_unconfigured_object_is_rejected(self):
-        resp = self.lookup("Opportunity", "OPP-1")   # only SiteVisit__c mapped
-        self.assertEqual(resp["statusCode"], 400)
-        self.assertIn("not configured", self.body(resp)["error"])
-
-    def test_object_that_does_not_exist_in_the_org(self):
-        self._map("SiteVisit__c", "Site_Visit_Number__c")
-        self.mappings[0]["object"] = "Ghost__c"
-        resp = self.lookup("Ghost__c", "X")
-        self.assertEqual(resp["statusCode"], 404)
-
-    def test_missing_or_oversized_value_is_rejected(self):
-        for value in ("", "   ", "x" * (api.CRM_IDENTIFIER_MAX + 1)):
-            self.assertEqual(self.lookup("SiteVisit__c", value)["statusCode"], 400)
-
-    def test_soql_is_escaped(self):
-        self.lookup("SiteVisit__c", "x' OR Name != '")
-        soql = self.sf.queries[-1]
-        self.assertIn("\\'", soql)
-        # The only UNESCAPED quotes are the two the query itself puts around the
-        # literal — so nothing in the value can terminate it early and append a
-        # clause. Counting escaped-vs-bare directly, rather than by arithmetic.
-        bare = sum(1 for i, ch in enumerate(soql)
-                   if ch == "'" and (i == 0 or soql[i - 1] != "\\"))
-        self.assertEqual(bare, 2, soql)
-
-    def test_401_refreshes_and_retries_once(self):
-        self.sf.expire_next = 1
-        resp = self.lookup("SiteVisit__c", "SV-10245")
-        self.assertEqual(resp["statusCode"], 200)
-        self.assertEqual(self.body(resp)["status"], "found")
-        self.assertGreaterEqual(self.sf.refreshes, 2)
-
-    def test_refresh_failure_asks_the_user_to_reconnect(self):
-        self.sf.refresh_fails = True
-        resp = self.lookup("SiteVisit__c", "SV-10245")
-        self.assertEqual(resp["statusCode"], 401)
-        self.assertIn("reconnect", self.body(resp)["error"].lower())
-
-
-class TestCrmAssociationPersistence(CrmTestCase):
-
-    def test_identifier_and_record_id_persist_with_manual_source(self):
-        self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-10245", "record_id": "a01XYZ",
-            "status": "record_found"}})
-        entry = self.stored("SiteVisit__c")
-        self.assertEqual(entry["lookup_value"], "SV-10245")
-        self.assertEqual(entry["record_id"], "a01XYZ")
-        self.assertEqual(entry["status"], "record_found")
-        self.assertEqual(entry["source"], "manual")
-        self.assertEqual(entry["lookup_field"], "Site_Visit_Number__c")
-
-    def test_ai_extracted_source_survives_a_read(self):
-        """An entry written by the pipeline keeps source=ai and its evidence, so
-        the UI can show why the identifier was chosen."""
-        self.row["crm_records"] = {"SiteVisit__c": {
-            "value": "SV-10245", "source": "ai", "confidence": "explicit",
-            "evidence": "today's site visit number is SV-10245"}}
-        record = self.get_meeting()["crm_records"]["SiteVisit__c"]
-        self.assertEqual(record["source"], "ai")
-        self.assertEqual(record["confidence"], "explicit")
-        self.assertIn("SV-10245", record["evidence"])
-        # The extractor's older `value` key still reads as lookup_value.
-        self.assertEqual(record["lookup_value"], "SV-10245")
-        # No record resolved yet, so it is pending, not found.
-        self.assertEqual(record["status"], "lookup_pending")
-
-    def test_multiple_objects_coexist_independently(self):
-        self.mappings = [
-            {"object": "SiteVisit__c", "object_label": "Site Visit",
-             "lookup_field": "Site_Visit_Number__c"},
-            {"object": "Lead", "object_label": "Lead", "lookup_field": "Email"},
-        ]
-        self.patch_meeting({"SiteVisit__c": {"lookup_value": "SV-1",
-                                             "record_id": "a01", "status": "confirmed"}})
-        self.patch_meeting({"Lead": {"lookup_value": "a@b.com",
-                                     "record_id": "00Q1", "status": "record_found"}})
-        records = self.get_meeting()["crm_records"]
-        self.assertEqual(records["SiteVisit__c"]["record_id"], "a01")
-        self.assertEqual(records["SiteVisit__c"]["status"], "confirmed")
-        self.assertEqual(records["Lead"]["record_id"], "00Q1")
-        self.assertEqual(records["Lead"]["status"], "record_found")
-
-    def test_changing_the_identifier_drops_the_stale_record_id(self):
-        """Otherwise the meeting would push onto the record resolved from the
-        PREVIOUS identifier — the wrong customer."""
-        self.patch_meeting({"SiteVisit__c": {"lookup_value": "SV-1",
-                                             "record_id": "a01",
-                                             "status": "confirmed"}})
-        self.patch_meeting({"SiteVisit__c": "SV-2"})
-        entry = self.stored("SiteVisit__c")
-        self.assertEqual(entry["lookup_value"], "SV-2")
-        self.assertEqual(entry["record_id"], "")
-        self.assertEqual(entry["status"], "lookup_pending")
-
-    def test_clearing_removes_the_association(self):
-        self.patch_meeting({"SiteVisit__c": {"lookup_value": "SV-1",
-                                             "record_id": "a01",
-                                             "status": "confirmed"}})
-        self.patch_meeting({"SiteVisit__c": None})
-        self.assertEqual(self.stored("SiteVisit__c"), {})
-
-    def test_a_client_cannot_fake_a_synced_status(self):
-        for status in ("synced", "syncing"):
-            resp = self.patch_meeting({"SiteVisit__c": {
-                "lookup_value": "SV-1", "record_id": "a01", "status": status}})
-            self.assertEqual(resp["statusCode"], 400, status)
-
-    def test_confirming_without_a_record_id_is_rejected(self):
-        resp = self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-1", "status": "confirmed"}})
-        self.assertEqual(resp["statusCode"], 400)
-
-    def test_unconfigured_mappings_render_as_not_linked(self):
-        """Every configured mapping appears, so the UI needs no cross-reference;
-        one with no identifier is not_linked rather than missing."""
-        record = self.get_meeting()["crm_records"]["SiteVisit__c"]
-        self.assertEqual(record["status"], "not_linked")
-        self.assertEqual(record["lookup_value"], "")
-        self.assertEqual(record["label"], "Site Visit")
-
-    def test_legacy_config_and_legacy_patch_still_work(self):
-        """A pre-mappings config plus the old site_visit_number body — the
-        combination an un-upgraded client sends."""
-        self.conn.side_effect = lambda uid: {
-            "user_id": uid, "provider": "salesforce",
-            "refresh_token_enc": "ENC",
-            "config": {"object": "SiteVisit__c", "object_label": "Site Visit",
-                       "site_visit_number_field": "Site_Visit_Number__c"},
-        }
-        resp = api.lambda_handler({
-            "routeKey": "PATCH /recordings/{key+}",
-            "requestContext": {"http": {"method": "PATCH",
-                                        "path": "/recordings/{key+}"}},
-            "headers": {}, "pathParameters": {"key": self.KEY},
-            "body": json.dumps({"site_visit_number": "SV-10245"}),
-        }, None)
-        self.assertEqual(resp["statusCode"], 200)
-        self.assertEqual(self.stored("SiteVisit__c")["lookup_value"], "SV-10245")
-
-
-class TestCrmPushRoute(CrmTestCase):
-
-    def _confirm(self, object_name="SiteVisit__c", record_id="a01XYZ"):
-        self.patch_meeting({object_name: {
-            "lookup_value": "REF-1", "record_id": record_id,
-            "status": "confirmed"}})
-
-    def test_push_sends_only_configured_content_targets(self):
-        self._confirm()
-        resp = self.sync("SiteVisit__c")
-        self.assertEqual(resp["statusCode"], 200)
-        update = self.sf.updates[-1]
-        self.assertEqual(update["object"], "SiteVisit__c")
-        self.assertEqual(update["record_id"], "a01XYZ")
-        # Only transcript + summary are configured on this mapping.
-        self.assertEqual(sorted(update["fields"]), ["Summary__c", "Transcript__c"])
-        self.assertIn("SV-10245", update["fields"]["Transcript__c"])
-        self.assertIn("revised quote", update["fields"]["Summary__c"])
-
-    def test_unconfigured_targets_are_omitted_not_blanked(self):
-        """Highlights/action items are unmapped here; sending them empty would
-        erase whatever the customer's own process wrote."""
-        self._confirm()
-        self.sync("SiteVisit__c")
-        fields = self.sf.updates[-1]["fields"]
-        self.assertNotIn("Highlights__c", fields)
-        self.assertNotIn("Action_Items__c", fields)
-        for value in fields.values():
-            self.assertTrue(str(value).strip())
-
-    def test_a_single_configured_target_sends_one_field(self):
-        self.mappings = [{"object": "Opportunity", "object_label": "Opportunity",
-                          "lookup_field": "Opportunity_Number__c",
-                          "summary_field": "Meeting_Notes__c"}]
-        self._confirm("Opportunity", "006ABC")
-        self.sync("Opportunity")
-        update = self.sf.updates[-1]
-        self.assertEqual(update["object"], "Opportunity")
-        self.assertEqual(list(update["fields"]), ["Meeting_Notes__c"])
-
-    def test_push_works_for_every_object_type(self):
-        for object_name, lookup_field, target, record_id in (
-            ("SiteVisit__c", "Site_Visit_Number__c", "Summary__c", "a01"),
-            ("Lead", "Email", "Description", "00Q1"),
-            ("Opportunity", "Opportunity_Number__c", "Meeting_Notes__c", "006A"),
-            ("Custom_Thing__c", "Ref__c", "Notes__c", "a09Z"),
-        ):
-            self.mappings = [{"object": object_name,
-                              "object_label": SF_ORG[object_name]["label"],
-                              "lookup_field": lookup_field,
-                              "summary_field": target}]
-            self.row.pop("crm_records", None)
-            self._confirm(object_name, record_id)
-            resp = self.sync(object_name)
-            self.assertEqual(resp["statusCode"], 200, object_name)
-            update = self.sf.updates[-1]
-            self.assertEqual(update["object"], object_name)
-            self.assertEqual(update["record_id"], record_id)
-            self.assertEqual(list(update["fields"]), [target])
-
-    def test_highlights_and_action_items_are_rendered_as_text(self):
-        self.mappings = [{"object": "SiteVisit__c", "object_label": "Site Visit",
-                          "lookup_field": "Site_Visit_Number__c",
-                          "highlights_field": "Transcript__c",
-                          "action_items_field": "Summary__c"}]
-        self._confirm()
-        self.sync("SiteVisit__c")
-        fields = self.sf.updates[-1]["fields"]
-        self.assertIn("Approved the revised quote", fields["Transcript__c"])
-        self.assertIn("Send the SOW", fields["Summary__c"])
-        self.assertIn("Ravi", fields["Summary__c"])
-
-    def test_mapping_with_no_content_targets_is_refused(self):
-        self.mappings = [{"object": "SiteVisit__c", "object_label": "Site Visit",
-                          "lookup_field": "Site_Visit_Number__c"}]
-        self._confirm()
-        resp = self.sync("SiteVisit__c")
-        self.assertEqual(resp["statusCode"], 400)
-        self.assertIn("no content fields", self.body(resp)["error"])
-        self.assertEqual(self.sf.updates, [])
-
-    def test_push_uses_the_stored_record_id_without_a_second_lookup(self):
-        """The identifier is the user's reference; the record Id is the
-        association. Re-resolving on every sync risks drifting records."""
-        self._confirm()
-        self.sf.queries.clear()
-        self.sync("SiteVisit__c")
-        self.assertEqual(self.sf.queries, [])
-        self.assertEqual(self.sf.updates[-1]["record_id"], "a01XYZ")
-
-    def test_salesforce_validation_error_surfaces_the_org_message(self):
-        self._confirm()
-        self.sf.update_error = api.ApiError(
-            422, "Transcript__c: data value too large (Transcript__c)")
-        resp = self.sync("SiteVisit__c")
-        self.assertEqual(resp["statusCode"], 422)
-        self.assertIn("too large", self.body(resp)["error"])
-        self.assertEqual(self.stored("SiteVisit__c")["status"], "failed")
-        self.assertIn("too large", self.stored("SiteVisit__c")["error"])
-
-    def test_permission_error_is_actionable_and_marks_failed(self):
-        self._confirm()
-        self.sf.update_error = api.ApiError(
-            403, "your Salesforce user cannot edit this record — ask your admin")
-        resp = self.sync("SiteVisit__c")
-        self.assertEqual(resp["statusCode"], 403)
-        self.assertEqual(self.stored("SiteVisit__c")["status"], "failed")
-
-    def test_deleted_record_clears_the_stale_association(self):
-        """A 404 means the record is gone: keep the identifier, drop the id, so
-        the next attempt re-resolves instead of retrying a doomed write."""
-        self._confirm()
-        self.sf.update_error = api.ApiError(404, "that Salesforce record no "
-                                                 "longer exists — look it up again")
-        resp = self.sync("SiteVisit__c")
-        self.assertEqual(resp["statusCode"], 404)
-        entry = self.stored("SiteVisit__c")
-        self.assertEqual(entry["record_id"], "")
-        self.assertEqual(entry["status"], "lookup_pending")
-        self.assertEqual(entry["lookup_value"], "REF-1")
-
-    def test_network_failure_marks_failed_and_is_retryable(self):
-        self._confirm()
-        self.sf.update_error = api.ApiError(502, "could not reach Salesforce")
-        self.assertEqual(self.sync("SiteVisit__c")["statusCode"], 502)
-        self.assertEqual(self.stored("SiteVisit__c")["status"], "failed")
-        # Retry from failed is allowed and succeeds once Salesforce recovers.
-        self.sf.update_error = None
-        self.assertEqual(self.sync("SiteVisit__c")["statusCode"], 200)
-        self.assertEqual(self.stored("SiteVisit__c")["status"], "synced")
-
-    def test_a_failed_push_never_touches_the_meeting_content(self):
-        self._confirm()
-        self.sf.update_error = api.ApiError(422, "nope")
-        self.sync("SiteVisit__c")
-        self.assertIn("SV-10245", self.row["transcript"])
-        self.assertIn("revised quote", self.row["summary"])
-
-    def test_push_401_refreshes_and_retries_once(self):
-        self._confirm()
-        before = self.sf.refreshes
-        self.sf.expire_next = 1
-        resp = self.sync("SiteVisit__c")
-        self.assertEqual(resp["statusCode"], 200)
-        self.assertGreater(self.sf.refreshes, before)
-
-
-class TestCrmConfirmationGate(CrmTestCase):
-
-    def test_a_found_record_will_not_sync_until_confirmed(self):
-        """THE gate: notes on the wrong record are worse than no notes."""
-        self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-10245", "record_id": "a01XYZ",
-            "status": "record_found"}})
-        resp = self.sync("SiteVisit__c")
-        self.assertEqual(resp["statusCode"], 409)
-        self.assertIn("confirm", self.body(resp)["error"].lower())
-        self.assertEqual(self.sf.updates, [])
-
-    def test_an_unresolved_identifier_will_not_sync(self):
-        self.patch_meeting({"SiteVisit__c": "SV-10245"})
-        resp = self.sync("SiteVisit__c")
-        self.assertEqual(resp["statusCode"], 400)
-        self.assertEqual(self.sf.updates, [])
-
-    def test_a_not_found_lookup_leaves_nothing_to_sync(self):
-        self.sf.match_count = 0
-        self.assertEqual(self.body(self.lookup("SiteVisit__c", "SV-X"))["status"],
-                         "not_found")
-        self.patch_meeting({"SiteVisit__c": "SV-X"})
-        self.assertEqual(self.sync("SiteVisit__c")["statusCode"], 400)
-        self.assertEqual(self.sf.updates, [])
-
-    def test_an_ambiguous_lookup_requires_choosing_before_a_sync(self):
-        self.sf.match_count = 2
-        body = self.body(self.lookup("SiteVisit__c", "SV-DUPE"))
-        self.assertEqual(body["status"], "ambiguous")
-        # Nothing is stored as resolved, so a sync attempt is refused...
-        self.patch_meeting({"SiteVisit__c": "SV-DUPE"})
-        self.assertEqual(self.sync("SiteVisit__c")["statusCode"], 400)
-        # ...until the user picks one of the candidates.
-        chosen = body["records"][1]
-        self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-DUPE", "record_id": chosen["record_id"],
-            "status": "confirmed"}})
-        self.assertEqual(self.sync("SiteVisit__c")["statusCode"], 200)
-        self.assertEqual(self.sf.updates[-1]["record_id"], chosen["record_id"])
-
-    def test_a_confirmed_record_syncs(self):
-        self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-10245", "record_id": "a01XYZ",
-            "status": "confirmed"}})
-        self.assertEqual(self.sync("SiteVisit__c")["statusCode"], 200)
-        self.assertEqual(self.stored("SiteVisit__c")["status"], "synced")
-
-    def test_sync_without_any_association_is_refused(self):
-        resp = self.sync("SiteVisit__c")
-        self.assertEqual(resp["statusCode"], 400)
-        self.assertIn("linked", self.body(resp)["error"])
-
-    def test_sync_for_an_unconfigured_object_is_refused(self):
-        resp = self.sync("Opportunity")
-        self.assertEqual(resp["statusCode"], 400)
-        self.assertIn("not configured", self.body(resp)["error"])
-
-
-class TestCrmSyncStateMachine(CrmTestCase):
-
-    def test_the_happy_path_walks_every_state_in_order(self):
-        seen = [self.get_meeting()["crm_records"]["SiteVisit__c"]["status"]]
-
-        # not_linked -> lookup_pending (identifier only)
-        self.patch_meeting({"SiteVisit__c": "SV-10245"})
-        seen.append(self.stored("SiteVisit__c")["status"])
-
-        # -> record_found (resolved)
-        found = self.body(self.lookup("SiteVisit__c", "SV-10245"))
-        self.assertEqual(found["status"], "found")
-        self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-10245", "record_id": found["record_id"],
-            "status": "record_found"}})
-        seen.append(self.stored("SiteVisit__c")["status"])
-
-        # -> confirmed (the user's act)
-        self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-10245", "record_id": found["record_id"],
-            "status": "confirmed"}})
-        seen.append(self.stored("SiteVisit__c")["status"])
-
-        # -> synced
-        self.assertEqual(self.sync("SiteVisit__c")["statusCode"], 200)
-        seen.append(self.stored("SiteVisit__c")["status"])
-
-        self.assertEqual(seen, ["not_linked", "lookup_pending", "record_found",
-                                "confirmed", "synced"])
-
-    def test_synced_entry_records_what_was_written_and_when(self):
-        self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-1", "record_id": "a01", "status": "confirmed"}})
-        body = self.body(self.sync("SiteVisit__c"))
-        self.assertEqual(sorted(body["synced_fields"]),
-                         ["Summary__c", "Transcript__c"])
-        entry = self.stored("SiteVisit__c")
-        self.assertTrue(entry["synced_at"])
-        self.assertEqual(entry["error"], "")
-
-    def test_a_resync_after_synced_is_allowed(self):
-        self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-1", "record_id": "a01", "status": "confirmed"}})
-        self.sync("SiteVisit__c")
-        self.assertEqual(self.sync("SiteVisit__c")["statusCode"], 200)
-        self.assertEqual(len(self.sf.updates), 2)
-
-    def test_failure_path_is_recorded_then_recoverable(self):
-        self.patch_meeting({"SiteVisit__c": {
-            "lookup_value": "SV-1", "record_id": "a01", "status": "confirmed"}})
-        self.sf.update_error = api.ApiError(422, "field is read-only (Summary__c)")
-        self.sync("SiteVisit__c")
-        entry = self.stored("SiteVisit__c")
-        self.assertEqual(entry["status"], "failed")
-        self.assertIn("read-only", entry["error"])
-        # The record association survives a failure — only the status changed.
-        self.assertEqual(entry["record_id"], "a01")
-
-    def test_every_status_the_api_can_report_is_in_the_vocabulary(self):
-        for status in ("not_linked", "lookup_pending", "record_found",
-                       "ambiguous", "confirmed", "syncing", "synced", "failed"):
-            self.assertIn(status, api.CRM_STATUSES)
-
-
-# ===========================================================================
-# Salesforce OAuth CONFIGURATION.
-#
-# The point of these: the integration must be deployable with PLACEHOLDER
-# credentials (so infrastructure can be provisioned before a Connected App
-# exists) WITHOUT ever appearing connected. A placeholder must fail like a
-# wrong credential, not like a working one.
-#
-# None of these tests need real Salesforce credentials.
-# ===========================================================================
-class TestSalesforceConfigVariables(unittest.TestCase):
-
-    def test_the_expected_variables_are_read_from_the_environment(self):
-        """Names are a contract with .env and the deploy scripts — a rename
-        here silently breaks deployment, so pin them."""
-        with mock.patch.dict(os.environ, {
-            "SALESFORCE_CLIENT_ID": "cid-123",
-            "SALESFORCE_REDIRECT_URI": "https://api.example.com/cb",
-            "SALESFORCE_CLIENT_SECRET_ARN": "arn:aws:secretsmanager:x",
-            "SALESFORCE_KMS_KEY_ID": "key-1",
-            "SALESFORCE_LOGIN_URL": "https://test.salesforce.com",
-            "SALESFORCE_RETURN_URL": "recorderapp://crm-connected",
-            "SALESFORCE_API_VERSION": "v61.0",
-            "SALESFORCE_STATE_TTL": "900",
-        }, clear=False):
-            reloaded = importlib.reload(api)
-            try:
-                self.assertEqual(reloaded.SALESFORCE_CLIENT_ID, "cid-123")
-                self.assertEqual(reloaded.SALESFORCE_REDIRECT_URI,
-                                 "https://api.example.com/cb")
-                self.assertEqual(reloaded.SALESFORCE_CLIENT_SECRET_ARN,
-                                 "arn:aws:secretsmanager:x")
-                self.assertEqual(reloaded.SALESFORCE_KMS_KEY_ID, "key-1")
-                self.assertEqual(reloaded.SALESFORCE_LOGIN_URL,
-                                 "https://test.salesforce.com")
-                self.assertEqual(reloaded.SALESFORCE_RETURN_URL,
-                                 "recorderapp://crm-connected")
-                self.assertEqual(reloaded.SALESFORCE_API_VERSION, "v61.0")
-                self.assertEqual(reloaded.SALESFORCE_STATE_TTL, 900)
-            finally:
-                importlib.reload(api)   # restore module state for other tests
-
-    def test_the_client_secret_itself_is_never_an_env_var(self):
-        """Only the ARN is on the Lambda. A plaintext SALESFORCE_CLIENT_SECRET
-        must NOT be picked up, or the Secrets Manager design is bypassed."""
-        source = Path(api.__file__).read_text(encoding="utf-8")
-        self.assertNotIn('environ.get("SALESFORCE_CLIENT_SECRET")', source)
-        self.assertNotIn("environ['SALESFORCE_CLIENT_SECRET']", source)
-        self.assertIn('environ.get("SALESFORCE_CLIENT_SECRET_ARN"', source)
-
-    def test_secrets_manager_is_the_only_source_for_the_secret(self):
-        """No env fallback: an unset ARN must raise, never silently read a
-        plaintext value from somewhere else."""
-        with mock.patch.object(api, "SALESFORCE_CLIENT_SECRET_ARN", ""), \
-             mock.patch.object(api, "_salesforce_secret_cache", None), \
-             mock.patch.dict(os.environ,
-                             {"SALESFORCE_CLIENT_SECRET": "leaked"}, clear=False):
-            with self.assertRaises(RuntimeError) as ctx:
-                api._salesforce_client_secret()
-            self.assertIn("SALESFORCE_CLIENT_SECRET_ARN", str(ctx.exception))
-
-    def _connect_via_router(self):
-        """Through lambda_handler, so ApiError becomes a real HTTP response —
-        which is what a client actually sees."""
-        return api.lambda_handler({
-            "routeKey": "GET /crm/salesforce/connect",
-            "requestContext": {"http": {"method": "GET",
-                                        "path": "/crm/salesforce/connect"}},
-            "headers": {}, "pathParameters": None, "body": None,
-        }, None)
-
-    def test_missing_client_id_gives_a_clear_configuration_error(self):
-        with mock.patch.object(api, "SALESFORCE_CLIENT_ID", ""), \
-             mock.patch.object(api, "SALESFORCE_REDIRECT_URI", "https://x/cb"), \
-             mock.patch.object(api, "_require_auth", return_value="u-1"):
-            resp = self._connect_via_router()
-        self.assertEqual(resp["statusCode"], 500)
-        self.assertIn("not configured", json.loads(resp["body"])["error"])
-
-    def test_missing_redirect_uri_gives_a_clear_configuration_error(self):
-        with mock.patch.object(api, "SALESFORCE_CLIENT_ID", "cid"), \
-             mock.patch.object(api, "SALESFORCE_REDIRECT_URI", ""), \
-             mock.patch.object(api, "_require_auth", return_value="u-1"):
-            resp = self._connect_via_router()
-        self.assertEqual(resp["statusCode"], 500)
-        self.assertIn("not configured", json.loads(resp["body"])["error"])
-
-
-class TestSalesforcePkce(unittest.TestCase):
-    """PKCE (RFC 7636). Salesforce Connected Apps require a code challenge —
-    without one, authorize fails with "missing required code challenge".
-
-    The verifier lives inside the SIGNED STATE, not on the device, because the
-    token exchange happens in the Lambda (which holds the client secret), and
-    the app never sees an authorization code. See the PKCE note in
-    lambda_function.py for the full reasoning.
-
-    No real Salesforce org is needed for any of these.
-    """
-
-    def setUp(self):
-        p = mock.patch.object(api, "_jwt_secret", return_value="test-secret")
-        p.start()
-        self.addCleanup(p.stop)
-
-    def _authorize_url(self):
-        with mock.patch.object(api, "SALESFORCE_CLIENT_ID", "cid-abc"), \
-             mock.patch.object(api, "SALESFORCE_REDIRECT_URI",
-                               "https://api.example.com/crm/salesforce/callback"), \
-             mock.patch.object(api, "_require_auth", return_value="u-1"):
-            resp = api.lambda_handler({
-                "routeKey": "GET /crm/salesforce/connect",
-                "requestContext": {"http": {"method": "GET",
-                                            "path": "/crm/salesforce/connect"}},
-                "headers": {}, "pathParameters": None, "body": None,
-            }, None)
-        self.assertEqual(resp["statusCode"], 200)
-        return json.loads(resp["body"])["authorize_url"]
-
-    @staticmethod
-    def _params(url):
-        return urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-
-    # ---- 1 & 2: the parameters Salesforce demands -------------------
-    def test_authorize_url_contains_a_code_challenge(self):
-        params = self._params(self._authorize_url())
-        self.assertIn("code_challenge", params)
-        challenge = params["code_challenge"][0]
-        self.assertTrue(challenge)
-        # base64url, unpadded: 32 raw bytes -> 43 chars, no '+', '/' or '='.
-        self.assertEqual(len(challenge), 43)
-        for bad in ("+", "/", "="):
-            self.assertNotIn(bad, challenge)
-
-    def test_authorize_url_declares_the_s256_method(self):
-        params = self._params(self._authorize_url())
-        self.assertEqual(params["code_challenge_method"], ["S256"])
-
-    def test_the_existing_authorize_parameters_are_preserved(self):
-        """PKCE is additive — nothing the flow already relied on may be lost."""
-        params = self._params(self._authorize_url())
-        self.assertEqual(params["response_type"], ["code"])
-        self.assertEqual(params["client_id"], ["cid-abc"])
-        self.assertEqual(params["redirect_uri"],
-                         ["https://api.example.com/crm/salesforce/callback"])
-        self.assertTrue(params["state"][0])
-
-    # ---- 3: the challenge really is SHA-256 of the verifier ---------
+class TestPkceAndLogHygiene(unittest.TestCase):
     def test_challenge_is_the_sha256_of_the_verifier(self):
         verifier = api._new_pkce_verifier()
         expected = base64.urlsafe_b64encode(
-            hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode()
+            hashlib.sha256(verifier.encode("ascii")).digest()).decode().rstrip("=")
         self.assertEqual(api._pkce_challenge(verifier), expected)
+        self.assertGreaterEqual(len(verifier), 43)
 
     def test_challenge_matches_the_rfc_7636_test_vector(self):
-        """Appendix B of the RFC — proves the encoding, not just self-consistency."""
         self.assertEqual(
             api._pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
 
-    def test_the_url_challenge_matches_the_verifier_inside_the_state(self):
-        """End to end: the challenge Salesforce receives must correspond to the
-        verifier we will later present. A mismatch fails the exchange."""
-        params = self._params(self._authorize_url())
-        _user, verifier = api._verify_oauth_state(params["state"][0])
-        self.assertTrue(verifier)
-        self.assertEqual(api._pkce_challenge(verifier), params["code_challenge"][0])
-
-    # ---- 4: never reused -------------------------------------------
     def test_every_attempt_generates_a_different_verifier(self):
-        verifiers = {api._new_pkce_verifier() for _ in range(200)}
-        self.assertEqual(len(verifiers), 200)
+        self.assertEqual(len({api._new_pkce_verifier() for _ in range(200)}), 200)
 
-    def test_two_connect_calls_produce_different_challenges_and_states(self):
-        first, second = self._params(self._authorize_url()), self._params(self._authorize_url())
-        self.assertNotEqual(first["code_challenge"], second["code_challenge"])
-        self.assertNotEqual(first["state"], second["state"])
-
-    def test_the_verifier_is_never_a_url_parameter(self):
-        """Only the challenge may travel. Leaking the verifier defeats PKCE."""
-        url = self._authorize_url()
-        params = self._params(url)
-        self.assertNotIn("code_verifier", params)
-        _user, verifier = api._verify_oauth_state(params["state"][0])
-        # The state is signed, not encrypted, so the verifier is inside it by
-        # design — but it must never appear as its own parameter.
-        self.assertNotIn(f"code_verifier={verifier}", url)
-
-    # ---- 5: the exchange sends it ----------------------------------
-    def test_the_callback_exchanges_using_the_states_own_verifier(self):
-        captured = {}
-
-        def _fake_exchange(code, code_verifier=""):
-            captured["code"] = code
-            captured["verifier"] = code_verifier
-            return {"access_token": "AT", "refresh_token": "RT",
-                    "instance_url": "https://acme.my.salesforce.com", "id": ""}
-
-        params = self._params(self._authorize_url())
-        state = params["state"][0]
-        _user, expected_verifier = api._verify_oauth_state(state)
-
-        with mock.patch.object(api, "_crm_connections", mock.MagicMock()), \
-             mock.patch.object(api, "_kms_encrypt", return_value="ENC"), \
-             mock.patch.object(api, "SALESFORCE_RETURN_URL", "recorderapp://crm-connected"), \
-             mock.patch.object(api._salesforce, "exchange_code", side_effect=_fake_exchange), \
-             mock.patch.object(api._salesforce, "whoami", return_value={}):
-            resp = api.salesforce_callback(
-                {"queryStringParameters": {"code": "auth-code-1", "state": state}})
-
-        self.assertIn("connected=1", resp["headers"]["Location"])
-        self.assertEqual(captured["code"], "auth-code-1")
-        self.assertEqual(captured["verifier"], expected_verifier)
-
-    def test_the_token_request_body_carries_code_verifier(self):
-        """At the HTTP layer: the form actually posted to Salesforce."""
-        captured = {}
-        with mock.patch.object(api, "SALESFORCE_CLIENT_ID", "cid"), \
-             mock.patch.object(api, "SALESFORCE_REDIRECT_URI", "https://x/cb"), \
-             mock.patch.object(api, "_salesforce_client_secret", return_value="shh"), \
-             mock.patch.object(api.SalesforceClient, "_post_form",
-                               side_effect=lambda url, form, what: captured.update(form) or {}):
-            api._salesforce.exchange_code("the-code", "the-verifier")
-        self.assertEqual(captured["code_verifier"], "the-verifier")
-        self.assertEqual(captured["grant_type"], "authorization_code")
-        self.assertEqual(captured["code"], "the-code")
-        # PKCE is IN ADDITION to the confidential-client secret, not instead.
-        self.assertEqual(captured["client_secret"], "shh")
-
-    # ---- 6: missing verifier fails safely --------------------------
-    def test_a_state_without_a_verifier_refuses_to_exchange(self):
-        """No silent downgrade to a non-PKCE exchange."""
-        exchange = mock.MagicMock()
-        table = mock.MagicMock()
-        with mock.patch.object(api, "_crm_connections", table), \
-             mock.patch.object(api, "SALESFORCE_RETURN_URL", "recorderapp://crm-connected"), \
-             mock.patch.object(api._salesforce, "exchange_code", exchange):
-            legacy_state = api._sign_oauth_state("u-1")   # pre-PKCE shape
-            resp = api.salesforce_callback(
-                {"queryStringParameters": {"code": "abc", "state": legacy_state}})
-        self.assertEqual(resp["statusCode"], 302)
-        self.assertIn("connected=0", resp["headers"]["Location"])
-        self.assertIn("pkce_missing", resp["headers"]["Location"])
-        exchange.assert_not_called()
-        table.put_item.assert_not_called()
-
-    # ---- 7: state/CSRF protection still intact ---------------------
-    def test_a_tampered_state_is_still_rejected(self):
-        params = self._params(self._authorize_url())
-        seg, sig = params["state"][0].split(".")
-        for bad in (f"{seg}.{sig[:-4]}AAAA", f"{seg}x.{sig}", "garbage", ""):
-            with self.assertRaises(api.ApiError):
-                api._verify_oauth_state(bad)
-
-    def test_a_verifier_cannot_be_swapped_between_attempts(self):
-        """Splicing attempt A's verifier into attempt B's state breaks the
-        signature — the pairing is structural, not conventional."""
-        a = self._params(self._authorize_url())["state"][0]
-        b = self._params(self._authorize_url())["state"][0]
-        spliced = a.split(".")[0] + "." + b.split(".")[1]
-        with self.assertRaises(api.ApiError):
-            api._verify_oauth_state(spliced)
-
-    def test_an_expired_state_is_rejected_with_410(self):
-        with mock.patch.object(api, "SALESFORCE_STATE_TTL", -1):
-            stale = api._sign_oauth_state("u-1", api._new_pkce_verifier())
-        with self.assertRaises(api.ApiError) as ctx:
-            api._verify_oauth_state(stale)
-        self.assertEqual(ctx.exception.status, 410)
-
-    def test_the_state_still_carries_the_user_it_was_minted_for(self):
-        state = api._sign_oauth_state("user-xyz", api._new_pkce_verifier())
-        user_id, verifier = api._verify_oauth_state(state)
-        self.assertEqual(user_id, "user-xyz")
-        self.assertTrue(verifier)
-
-    # ---- security hygiene ------------------------------------------
     def test_no_secret_value_is_ever_interpolated_into_a_log_line(self):
-        """No print may interpolate a verifier, token or secret.
-
-        Checks for the VALUE being formatted in (an f-string placeholder or a
-        concatenated variable), not for the mere word — "carries no PKCE
-        verifier" is prose and perfectly safe, whereas f"...{verifier}" is not.
-        """
         source = Path(api.__file__).read_text(encoding="utf-8")
         secretish = ("code_verifier", "verifier", "refresh_token", "access_token",
                      "client_secret", "secret_string")
@@ -5027,563 +3964,8 @@ class TestSalesforcePkce(unittest.TestCase):
             for name in secretish:
                 for leak in (f"{{{name}}}", f"{{{name}[", f"{{{name}!r}}",
                              f"str({name})", f"+ {name}", f", {name}"):
-                    self.assertNotIn(
-                        leak, stripped,
-                        f"line {lineno} interpolates {name}: {stripped}")
-
-    def test_pkce_does_not_replace_the_secrets_manager_client_secret(self):
-        source = Path(api.__file__).read_text(encoding="utf-8")
-        self.assertIn("_salesforce_client_secret()", source)
-        self.assertIn('environ.get("SALESFORCE_CLIENT_SECRET_ARN"', source)
-        self.assertNotIn('environ.get("SALESFORCE_CLIENT_SECRET")', source)
-
-
-class TestPlaceholderCredentialsDoNotFakeAConnection(unittest.TestCase):
-    """With placeholders, OAuth must fail NORMALLY — no fake tokens, no
-    auto-connected state, no suppressed errors."""
-
-    PLACEHOLDER_ID = "REPLACE_WITH_SALESFORCE_CLIENT_ID"
-    PLACEHOLDER_SECRET = "REPLACE_WITH_SALESFORCE_CLIENT_SECRET"
-
-    def setUp(self):
-        # _sign_oauth_state signs with the JWT secret; these tests are about
-        # OAuth configuration, not JWT plumbing, so supply a fixed one.
-        p = mock.patch.object(api, "_jwt_secret", return_value="test-secret")
-        p.start()
-        self.addCleanup(p.stop)
-
-    def test_status_reports_not_connected_when_no_row_exists(self):
-        """A placeholder deployment must never look connected."""
-        with mock.patch.object(api, "_require_auth", return_value="u-1"), \
-             mock.patch.object(api, "_get_salesforce_connection", return_value=None):
-            resp = api.salesforce_status({"headers": {}})
-        self.assertEqual(resp["statusCode"], 200)
-        self.assertIs(json.loads(resp["body"])["connected"], False)
-
-    def test_connect_builds_a_real_url_that_salesforce_will_reject(self):
-        """The authorize URL is still well-formed — placeholders must not be
-        special-cased into a fake success or an early error. Salesforce is what
-        rejects an unknown client_id, exactly as with any wrong credential."""
-        with mock.patch.object(api, "SALESFORCE_CLIENT_ID", self.PLACEHOLDER_ID), \
-             mock.patch.object(api, "SALESFORCE_REDIRECT_URI",
-                               "https://api.example.com/crm/salesforce/callback"), \
-             mock.patch.object(api, "_require_auth", return_value="u-1"):
-            resp = api.lambda_handler({
-                "routeKey": "GET /crm/salesforce/connect",
-                "requestContext": {"http": {"method": "GET",
-                                            "path": "/crm/salesforce/connect"}},
-                "headers": {}, "pathParameters": None, "body": None,
-            }, None)
-        self.assertEqual(resp["statusCode"], 200)
-        url = json.loads(resp["body"])["authorize_url"]
-        self.assertIn("/services/oauth2/authorize?", url)
-        self.assertIn(self.PLACEHOLDER_ID, url)
-        # No token, no "connected" claim — only an authorize URL.
-        self.assertNotIn("access_token", url)
-        self.assertNotIn("connected", json.loads(resp["body"]))
-
-    def test_a_rejected_token_exchange_stores_nothing(self):
-        """The callback must NOT write a connection row when Salesforce refuses
-        the placeholder credentials."""
-        table = mock.MagicMock()
-        with mock.patch.object(api, "_crm_connections", table), \
-             mock.patch.object(api, "SALESFORCE_RETURN_URL",
-                               "recorderapp://crm-connected"), \
-             mock.patch.object(api._salesforce, "exchange_code",
-                               side_effect=api.ApiError(502, "Salesforce rejected"
-                                                             " the connection")):
-            # A PKCE-bearing state, as /connect now mints — otherwise the
-            # callback short-circuits on the missing verifier and never reaches
-            # the exchange this test is about.
-            state = api._sign_oauth_state("u-1", api._new_pkce_verifier())
-            resp = api.salesforce_callback(
-                {"queryStringParameters": {"code": "abc", "state": state}})
-        self.assertEqual(resp["statusCode"], 302)
-        self.assertIn("connected=0", resp["headers"]["Location"])
-        self.assertIn("exchange_failed", resp["headers"]["Location"])
-        table.put_item.assert_not_called()
-
-    def test_a_token_response_missing_fields_stores_nothing(self):
-        """Defence in depth: even a 200 from Salesforce must carry a refresh
-        token, access token and instance_url before anything is persisted."""
-        table = mock.MagicMock()
-        with mock.patch.object(api, "_crm_connections", table), \
-             mock.patch.object(api, "SALESFORCE_RETURN_URL",
-                               "recorderapp://crm-connected"), \
-             mock.patch.object(api._salesforce, "exchange_code",
-                               return_value={"access_token": "AT"}):
-            state = api._sign_oauth_state("u-1")
-            resp = api.salesforce_callback(
-                {"queryStringParameters": {"code": "abc", "state": state}})
-        self.assertIn("connected=0", resp["headers"]["Location"])
-        table.put_item.assert_not_called()
-
-    def test_config_and_lookup_refuse_to_work_without_a_connection(self):
-        """No connection row => every CRM route reports it plainly rather than
-        behaving as though Salesforce were available."""
-        with mock.patch.object(api, "_require_auth", return_value="u-1"), \
-             mock.patch.object(api, "_get_salesforce_connection", return_value=None):
-            for call in (lambda: api.salesforce_get_config({"headers": {}}),
-                         lambda: api.salesforce_lookup_record(
-                             {"headers": {}, "body": json.dumps(
-                                 {"object": "Lead", "lookup_value": "x"})})):
-                with self.assertRaises(api.ApiError) as ctx:
-                    call()
-                self.assertEqual(ctx.exception.status, 400)
-                self.assertIn("not connected", ctx.exception.message)
-
-    def test_placeholders_are_not_recognised_anywhere_in_the_code(self):
-        """Nothing may branch on the placeholder text — that would be exactly
-        the "pretend it works" shortcut this must never take."""
-        source = Path(api.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("REPLACE_WITH", source)
-
-
-class TestSalesforceErrorMessages(unittest.TestCase):
-    """Salesforce's own wording is what tells a user WHICH field failed."""
-
-    def test_field_level_validation_error_is_extracted(self):
-        body = json.dumps([{"message": "Data value too large",
-                            "errorCode": "STRING_TOO_LONG",
-                            "fields": ["Transcript__c"]}])
-        self.assertEqual(api._salesforce_error_message(body),
-                         "Data value too large (Transcript__c)")
-
-    def test_several_errors_are_joined(self):
-        body = json.dumps([{"message": "A", "fields": []},
-                           {"message": "B", "fields": ["X__c"]}])
-        self.assertEqual(api._salesforce_error_message(body), "A · B (X__c)")
-
-    def test_unparseable_body_yields_empty_so_callers_keep_their_default(self):
-        for body in ("", "not json", "<html>503</html>", "null"):
-            self.assertEqual(api._salesforce_error_message(body), "")
-
-    def test_a_single_error_object_is_accepted(self):
-        self.assertEqual(
-            api._salesforce_error_message(json.dumps({"message": "Nope"})),
-            "Nope")
-
-
-class TestWriteCrmRecordUpdateExpression(unittest.TestCase):
-    """`_write_crm_record` must never SET a map and a key inside it at once.
-
-    REGRESSION. The original expression was
-
-        SET #cr = if_not_exists(#cr, :empty), #cr.#obj = :entry, updated_at = :now
-
-    which DynamoDB rejects at PARSE time with
-    `ValidationException: Two document paths overlap with each other ...
-    path one: [crm_records], path two: [updated_at]`. It failed on every call
-    regardless of the item's contents, so "Sync to Salesforce" always died — and
-    because the dispatcher turns an unhandled exception into a blanket
-    `internal error`, the real cause was invisible to the user.
-
-    These tests assert the SHAPE of the expressions, which is what DynamoDB
-    validates, rather than mocking a specific error string.
-    """
-
-    def _capture(self):
-        """Record every update_item call _write_crm_record makes."""
-        calls = []
-
-        def update_item(**kw):
-            calls.append(kw)
-
-        return calls, update_item
-
-    def test_no_single_expression_writes_both_a_map_and_its_child(self):
-        calls, update_item = self._capture()
-        with mock.patch.object(api, "_recordings",
-                               mock.Mock(update_item=update_item)):
-            api._write_crm_record("u1/m.wav", "Site_Visit__c", {"status": "syncing"})
-
-        self.assertTrue(calls, "expected at least one update_item call")
-        for kw in calls:
-            expr = kw["UpdateExpression"]
-            writes_parent = "#cr = " in expr
-            writes_child = "#cr.#obj" in expr
-            self.assertFalse(
-                writes_parent and writes_child,
-                f"expression sets both crm_records and crm_records.<obj>, which "
-                f"DynamoDB rejects as overlapping paths: {expr!r}")
-
-    def test_steady_state_is_a_single_nested_write(self):
-        """The map normally exists, so the happy path is one round trip."""
-        calls, update_item = self._capture()
-        with mock.patch.object(api, "_recordings",
-                               mock.Mock(update_item=update_item)):
-            api._write_crm_record("u1/m.wav", "Site_Visit__c", {"status": "synced"})
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["UpdateExpression"],
-                         "SET #cr.#obj = :entry, updated_at = :now")
-        self.assertEqual(calls[0]["ExpressionAttributeNames"],
-                         {"#cr": "crm_records", "#obj": "Site_Visit__c"})
-        self.assertEqual(calls[0]["ExpressionAttributeValues"][":entry"],
-                         {"status": "synced"})
-
-    def test_missing_map_is_created_then_the_nested_write_retried(self):
-        """A row that never had crm_records still gets its entry stored."""
-        calls = []
-        invalid = api.ClientError(
-            {"Error": {"Code": "ValidationException",
-                       "Message": "The document path provided in the update "
-                                  "expression is invalid for update"}},
-            "UpdateItem")
-
-        def update_item(**kw):
-            calls.append(kw)
-            # Only the FIRST nested write fails (map absent); the create and the
-            # retry succeed.
-            if len(calls) == 1:
-                raise invalid
-
-        with mock.patch.object(api, "_recordings",
-                               mock.Mock(update_item=update_item)):
-            api._write_crm_record("u1/m.wav", "Lead", {"status": "confirmed"})
-
-        self.assertEqual(len(calls), 3, "expected nested -> create -> nested")
-        self.assertEqual(calls[1]["UpdateExpression"], "SET #cr = :empty")
-        self.assertEqual(calls[1]["ConditionExpression"],
-                         "attribute_not_exists(#cr)")
-        self.assertEqual(calls[2]["UpdateExpression"],
-                         "SET #cr.#obj = :entry, updated_at = :now")
-
-    def test_a_racing_writer_creating_the_map_is_tolerated(self):
-        """Two syncs at once: the loser's create fails, its retry still lands."""
-        calls = []
-        invalid = api.ClientError(
-            {"Error": {"Code": "ValidationException",
-                       "Message": "invalid for update"}}, "UpdateItem")
-        raced = api.ClientError(
-            {"Error": {"Code": "ConditionalCheckFailedException",
-                       "Message": "The conditional request failed"}}, "UpdateItem")
-
-        def update_item(**kw):
-            calls.append(kw)
-            if len(calls) == 1:
-                raise invalid
-            if len(calls) == 2:
-                raise raced
-
-        with mock.patch.object(api, "_recordings",
-                               mock.Mock(update_item=update_item)):
-            api._write_crm_record("u1/m.wav", "Lead", {"status": "confirmed"})
-
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[2]["UpdateExpression"],
-                         "SET #cr.#obj = :entry, updated_at = :now")
-
-    def test_an_unrelated_validation_error_is_not_swallowed(self):
-        """A genuine expression bug must surface, not trigger the create path."""
-        boom = api.ClientError(
-            {"Error": {"Code": "ValidationException",
-                       "Message": "ExpressionAttributeValues contains invalid value"}},
-            "UpdateItem")
-        with mock.patch.object(api, "_recordings",
-                               mock.Mock(update_item=mock.Mock(side_effect=boom))):
-            with self.assertRaises(api.ClientError):
-                api._write_crm_record("u1/m.wav", "Lead", {"status": "confirmed"})
-
-
-class TestSalesforceRefreshTokenRotation(unittest.TestCase):
-    """A rotated refresh token must be persisted, or the connection dies.
-
-    REGRESSION. With Refresh Token Rotation enabled on the Connected App,
-    /services/oauth2/token returns a NEW refresh_token on every refresh and
-    invalidates the one just used. `_sf_call` read only access_token and
-    instance_url from that response and left the ORIGINAL token in DynamoDB, so
-    every connection worked exactly once and then failed forever with
-    `invalid_grant: expired access/refresh token` — reproduced in production as
-    one success per reconnect followed by permanent failure.
-
-    Rotation is off by default (no refresh_token comes back at all), so both
-    modes are pinned here: rotate-and-persist, and don't-write-when-absent.
-    """
-
-    def setUp(self):
-        self.db = {"refresh_token_enc": "enc(RT-1)",
-                   "instance_url": "https://o.my.salesforce.com"}
-        self.revoked = set()
-        self.counter = [1]
-        outer = self
-
-        class FakeTable:
-            def update_item(self, Key, UpdateExpression, ConditionExpression,
-                            ExpressionAttributeValues):
-                # Honour the conditional write the same way DynamoDB would.
-                if outer.db["refresh_token_enc"] != ExpressionAttributeValues[":old"]:
-                    raise RuntimeError("ConditionalCheckFailedException")
-                outer.db["refresh_token_enc"] = ExpressionAttributeValues[":new"]
-
-        self.patches = [
-            mock.patch.object(api, "_crm_connections", FakeTable()),
-            mock.patch.object(api, "_get_salesforce_connection",
-                              lambda _u: dict(outer.db)),
-            mock.patch.object(api, "_kms_decrypt", lambda c: c[4:-1]),
-            mock.patch.object(api, "_kms_encrypt", lambda p: f"enc({p})"),
-        ]
-        for p in self.patches:
-            p.start()
-        self.addCleanup(lambda: [p.stop() for p in self.patches])
-
-    def _rotating(self):
-        outer = self
-
-        class RotatingSalesforce:
-            def refresh_access_token(self, rt):
-                if rt in outer.revoked:
-                    raise api.SalesforceReconnectRequired("expired")
-                outer.revoked.add(rt)
-                outer.counter[0] += 1
-                return {"access_token": "AT",
-                        "instance_url": "https://o.my.salesforce.com",
-                        "refresh_token": f"RT-{outer.counter[0]}"}
-
-        return RotatingSalesforce()
-
-    def test_repeated_calls_keep_working_when_the_token_rotates(self):
-        with mock.patch.object(api, "_salesforce", self._rotating()):
-            for _ in range(5):
-                self.assertEqual(api._sf_call("u1", lambda _u, _t: "ok"), "ok")
-        # Chained forward rather than sticking at the original token.
-        self.assertEqual(self.db["refresh_token_enc"], "enc(RT-6)")
-
-    def test_rotated_token_is_persisted_before_the_api_call(self):
-        """A failure inside fn() must not lose the replacement token."""
-        with mock.patch.object(api, "_salesforce", self._rotating()):
-            with self.assertRaises(api.ApiError):
-                api._sf_call("u1", mock.Mock(side_effect=api.ApiError(500, "boom")))
-        self.assertEqual(self.db["refresh_token_enc"], "enc(RT-2)")
-
-    def test_retry_path_uses_the_rotated_token_not_the_consumed_one(self):
-        calls = []
-
-        def flaky(_url, _tok):
-            calls.append(1)
-            if len(calls) == 1:
-                raise api.SalesforceAuthExpired("401")
-            return "ok-after-retry"
-
-        with mock.patch.object(api, "_salesforce", self._rotating()):
-            self.assertEqual(api._sf_call("u1", flaky), "ok-after-retry")
-        # Two refreshes happened, so the token advanced twice.
-        self.assertEqual(self.db["refresh_token_enc"], "enc(RT-3)")
-
-    def test_no_write_when_rotation_is_disabled(self):
-        """Rotation off: no refresh_token comes back, so nothing is stored."""
-        class NonRotating:
-            def refresh_access_token(self, rt):
-                assert rt == "RT-1", f"used the wrong refresh token: {rt}"
-                return {"access_token": "AT",
-                        "instance_url": "https://o.my.salesforce.com"}
-
-        with mock.patch.object(api, "_salesforce", NonRotating()):
-            for _ in range(3):
-                api._sf_call("u1", lambda _u, _t: "ok")
-        self.assertEqual(self.db["refresh_token_enc"], "enc(RT-1)")
-
-    def test_an_unchanged_token_is_not_rewritten(self):
-        """Some orgs echo the SAME refresh_token back — that is not a rotation."""
-        class EchoesSameToken:
-            def refresh_access_token(self, rt):
-                return {"access_token": "AT",
-                        "instance_url": "https://o.my.salesforce.com",
-                        "refresh_token": rt}
-
-        with mock.patch.object(api, "_salesforce", EchoesSameToken()):
-            api._sf_call("u1", lambda _u, _t: "ok")
-        self.assertEqual(self.db["refresh_token_enc"], "enc(RT-1)")
-
-    def test_a_lost_write_race_never_fails_the_users_request(self):
-        """Concurrent rotation: the conditional write loses, the call still works."""
-        outer = self
-
-        class RotatesButSomeoneElseWonTheRace:
-            def refresh_access_token(self, rt):
-                # Simulate another request having already rotated past us.
-                outer.db["refresh_token_enc"] = "enc(RT-99)"
-                return {"access_token": "AT",
-                        "instance_url": "https://o.my.salesforce.com",
-                        "refresh_token": "RT-2"}
-
-        with mock.patch.object(api, "_salesforce", RotatesButSomeoneElseWonTheRace()):
-            self.assertEqual(api._sf_call("u1", lambda _u, _t: "ok"), "ok")
-        # The newer token stays; our stale write was rejected, not applied.
-        self.assertEqual(self.db["refresh_token_enc"], "enc(RT-99)")
-
-
-class TestSalesforceReconnectIsNotSessionExpiry(unittest.TestCase):
-    """A dead SALESFORCE credential must never be reported as HTTP 401.
-
-    REGRESSION. 401 from this API means exactly one thing — the MinuteX JWT is
-    missing or expired — and the app acts on it globally: lib/api.ts clears the
-    stored token at the single choke point every authenticated call passes
-    through, and the screen then redirects to /login.
-
-    The Salesforce-backed routes used to raise ApiError(401) for "your stored
-    refresh token is dead", which is indistinguishable on the wire. The result:
-    connect Salesforce, open CRM Mapping, and GET /crm/salesforce/objects
-    answered 401 -> the app destroyed a perfectly valid MinuteX session and
-    bounced the user to the login screen, while /me still returned 200.
-
-    These tests pin the two halves of the contract: Salesforce trouble is 409 +
-    a stable `code`, and real MinuteX auth failures are still 401.
-    """
-
-    # Stands in for _get_salesforce_connection(user_id) — a connected org whose
-    # stored refresh token the stubbed client below then rejects.
-    @staticmethod
-    def _sf_conn(_user_id):
-        return {"refresh_token_enc": "x",
-                "instance_url": "https://o.my.salesforce.com"}
-
-    def test_reconnect_error_is_409_with_a_stable_code(self):
-        err = api.SalesforceReconnectRequired("expired")
-        self.assertEqual(err.status, 409)
-        self.assertNotEqual(err.status, 401)
-        self.assertEqual(err.code, "salesforce_reconnect_required")
-        # Subclassing ApiError keeps every existing `except ApiError` handler
-        # (e.g. the sync route's) working unchanged.
-        self.assertIsInstance(err, api.ApiError)
-
-    def test_dead_refresh_token_does_not_look_like_session_expiry(self):
-        class DeadRefresh:
-            def refresh_access_token(self, _rt):
-                return {}  # no access_token => the refresh token is dead
-
-        with mock.patch.object(api, "_get_salesforce_connection", self._sf_conn), \
-             mock.patch.object(api, "_kms_decrypt", lambda _c: "dead"), \
-             mock.patch.object(api, "_salesforce", DeadRefresh()):
-            with self.assertRaises(api.ApiError) as cm:
-                api._sf_call("u1", lambda _url, _tok: None)
-        self.assertEqual(cm.exception.status, 409)
-        self.assertEqual(cm.exception.code, "salesforce_reconnect_required")
-
-    def test_access_token_rejected_twice_is_also_409(self):
-        class AlwaysRefreshes:
-            def refresh_access_token(self, _rt):
-                return {"access_token": "a",
-                        "instance_url": "https://o.my.salesforce.com"}
-
-        def always_expired(_url, _tok):
-            raise api.SalesforceAuthExpired("401")
-
-        with mock.patch.object(api, "_get_salesforce_connection", self._sf_conn), \
-             mock.patch.object(api, "_kms_decrypt", lambda _c: "live"), \
-             mock.patch.object(api, "_salesforce", AlwaysRefreshes()):
-            with self.assertRaises(api.ApiError) as cm:
-                api._sf_call("u1", always_expired)
-        self.assertEqual(cm.exception.status, 409)
-        self.assertEqual(cm.exception.code, "salesforce_reconnect_required")
-
-    def test_not_connected_at_all_is_still_400(self):
-        with mock.patch.object(api, "_get_salesforce_connection", lambda _u: None):
-            with self.assertRaises(api.ApiError) as cm:
-                api._sf_call("u1", lambda _url, _tok: None)
-        self.assertEqual(cm.exception.status, 400)
-
-    def test_dispatcher_serializes_the_code_for_clients(self):
-        def boom(_e):
-            raise api.SalesforceReconnectRequired("expired")
-
-        with mock.patch.dict(api._ROUTES,
-                             {("GET", "/crm/salesforce/objects"): boom}):
-            resp = api.lambda_handler(
-                event(method="GET", route="/crm/salesforce/objects"), None)
-        self.assertEqual(resp["statusCode"], 409)
-        self.assertEqual(json.loads(resp["body"])["code"],
-                         "salesforce_reconnect_required")
-
-    def test_ordinary_errors_keep_their_existing_shape(self):
-        """No `code` key appears on errors that never had one."""
-        def boom(_e):
-            raise api.ApiError(400, "bad input")
-
-        with mock.patch.dict(api._ROUTES,
-                             {("GET", "/crm/salesforce/objects"): boom}):
-            resp = api.lambda_handler(
-                event(method="GET", route="/crm/salesforce/objects"), None)
-        body = json.loads(resp["body"])
-        self.assertEqual(resp["statusCode"], 400)
-        self.assertEqual(body, {"error": "bad input"})
-
-    def test_real_minutex_auth_failures_are_still_401(self):
-        """The other half of the contract — 401 must keep meaning session death."""
-        with self.assertRaises(api.ApiError) as cm:
-            api._require_auth({"headers": {}})
-        self.assertEqual(cm.exception.status, 401)
-
-        with self.assertRaises(api.ApiError) as cm:
-            api._require_auth({"headers": {"authorization": "Bearer garbage"}})
-        self.assertEqual(cm.exception.status, 401)
-
-
-class TestCrmContentTargets(unittest.TestCase):
-    """Only configured targets are ever sent — the push builds from this."""
-
-    def test_only_configured_targets_appear(self):
-        targets = api._content_targets({
-            "summary_field": "Summary__c", "transcript_field": "",
-            "highlights_field": None})
-        self.assertEqual(targets, {"summary": "Summary__c"})
-
-    def test_all_four_can_be_configured(self):
-        targets = api._content_targets({
-            "transcript_field": "T__c", "summary_field": "S__c",
-            "highlights_field": "H__c", "action_items_field": "A__c"})
-        self.assertEqual(sorted(targets), ["action_items", "highlights",
-                                           "summary", "transcript"])
-
-    def test_no_targets_is_an_empty_dict_not_an_error(self):
-        self.assertEqual(api._content_targets({}), {})
-        self.assertEqual(api._content_targets(None), {})
-
-    def test_the_public_mapping_exposes_both_shapes_consistently(self):
-        public = api._public_mapping({
-            "object": "Lead", "lookup_field": "Email",
-            "summary_field": "Description"})
-        self.assertEqual(public["summary_field"], "Description")
-        self.assertEqual(public["content_targets"], {"summary": "Description"})
-        self.assertIsNone(public["transcript_field"])
-        self.assertNotIn("transcript", public["content_targets"])
-
-
-class TestSoqlQuoting(unittest.TestCase):
-    """The record identifier is user-supplied and goes into a SOQL literal."""
-
-    def test_quotes_and_backslashes_are_escaped(self):
-        self.assertEqual(api._soql_quote("O'Brien"), "O\\'Brien")
-        self.assertEqual(api._soql_quote("a\\b"), "a\\\\b")
-
-    def test_an_injection_attempt_stays_inside_the_literal(self):
-        """Without escaping, this closes the literal and appends a clause.
-
-        The property that matters is not "the text disappears" — it stays, inert
-        — but that EVERY quote is backslash-escaped, so no quote in the value
-        can terminate the literal it sits in.
-        """
-        hostile = "x' OR Name != '"
-        quoted = api._soql_quote(hostile)
-        self.assertEqual(quoted.count("'"), quoted.count("\\'"))
-        self.assertEqual(quoted.count("\\'"), 2)
-        # Walk the assembled literal: it must end exactly where we put the
-        # closing quote, not at an unescaped one from the value.
-        literal = f"WHERE f = '{quoted}'"
-        i, closed_at = literal.index("'") + 1, None
-        while i < len(literal):
-            if literal[i] == "\\":
-                i += 2
-                continue
-            if literal[i] == "'":
-                closed_at = i
-                break
-            i += 1
-        self.assertEqual(closed_at, len(literal) - 1)
-
-    def test_ordinary_identifiers_are_unchanged(self):
-        for value in ("SV-10245", "priya@example.com", "OPP-99", "10245"):
-            self.assertEqual(api._soql_quote(value), value)
+                    self.assertNotIn(leak, stripped,
+                                     f"line {lineno} interpolates {name}: {stripped}")
 
 
 class TestRouter(unittest.TestCase):

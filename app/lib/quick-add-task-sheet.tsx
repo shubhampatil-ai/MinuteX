@@ -81,7 +81,6 @@ function QuickAddBody({
   const [loadingMeetings, setLoadingMeetings] = useState(true);
 
   const [meetingContacts, setMeetingContacts] = useState<ApiContact[]>([]);
-  const [folderContacts, setFolderContacts] = useState<ApiContact[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -126,12 +125,10 @@ function QuickAddBody({
         setMeetingContacts(
           p.participants.map((x) => x.contact).filter((c): c is ApiContact => !!c)
         );
-        setFolderContacts(p.folder_contacts);
       })
       .catch(() => {
         if (alive) {
           setMeetingContacts([]);
-          setFolderContacts([]);
         }
       });
     return () => {
@@ -351,8 +348,6 @@ function QuickAddBody({
           setPickerOpen(false);
         }}
         meetingContacts={meetingContacts}
-        folderContacts={folderContacts}
-        folderId={meeting?.folder_id}
         title="Assign Task To"
       />
 

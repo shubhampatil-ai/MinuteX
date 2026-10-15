@@ -1,0 +1,44 @@
+<template>
+    <lightning-card title={title} icon-name="standard:event">
+        <div class="slds-p-horizontal_medium">
+            <template lwc:if={loading}>
+                <div class="slds-is-relative slds-p-around_large"><lightning-spinner size="small" alternative-text="Loading MinuteX meetings"></lightning-spinner></div>
+            </template>
+            <template lwc:if={error}>
+                <p class="slds-text-color_error">{error}</p>
+            </template>
+            <template lwc:if={empty}>
+                <p class="slds-text-color_weak">No MinuteX meetings are linked to this record yet.</p>
+            </template>
+
+            <ul class="slds-has-dividers_bottom-space">
+                <template for:each={shown} for:item="m">
+                    <li key={m.id} class="slds-item">
+                        <div class="slds-grid slds-grid_vertical-align-center slds-gutters_xx-small">
+                            <div class="slds-col slds-truncate">
+                                <a href={m.url} title={m.name} class="slds-text-heading_small">{m.name}</a>
+                            </div>
+                            <template lwc:if={m.primary}>
+                                <div class="slds-col slds-grow-none"><lightning-badge label="Main record"></lightning-badge></div>
+                            </template>
+                        </div>
+                        <template lwc:if={m.date}>
+                            <p class="slds-text-body_small slds-text-color_weak">
+                                <lightning-formatted-date-time value={m.date} year="numeric" month="short" day="numeric"
+                                    hour="2-digit" minute="2-digit"></lightning-formatted-date-time>
+                            </p>
+                        </template>
+                        <template lwc:if={m.summary}>
+                            <p class="slds-line-clamp_x-small slds-m-top_xx-small">{m.summary}</p>
+                        </template>
+                    </li>
+                </template>
+            </ul>
+        </div>
+        <template lwc:if={hasMore}>
+            <div slot="footer">
+                <lightning-button variant="base" label={moreLabel} onclick={toggleAll}></lightning-button>
+            </div>
+        </template>
+    </lightning-card>
+</template>

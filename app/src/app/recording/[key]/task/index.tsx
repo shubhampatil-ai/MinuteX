@@ -8,7 +8,7 @@ import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { FONT, S, useTheme, ColorScale } from "../../../../../lib/theme";
 import { Button, Card, EmptyState, StatusPill } from "../../../../../lib/ui";
 import { Icon } from "../../../../../lib/icons";
-import { useMeeting } from "../../../../../lib/meeting-context";
+import { useMeeting, useSyncTasksOnFocus } from "../../../../../lib/meeting-context";
 import { initialsOf, type Task } from "../../../../../lib/task-model";
 import { AddTaskSheet } from "../../../../../lib/add-task-sheet";
 
@@ -33,9 +33,19 @@ function buildStyles(C: ColorScale) {
     title: { fontFamily: FONT.semibold, fontSize: 14.5, lineHeight: 20, color: C.text, flex: 1 },
     titleDone: { textDecorationLine: "line-through" as const, color: C.textFaint },
     metaRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: S.sm, marginTop: 5, flexWrap: "wrap" as const },
-    ownerChip: { flexDirection: "row" as const, alignItems: "center" as const, gap: 5 },
-    ownerAvatar: { width: 18, height: 18, borderRadius: 9, alignItems: "center" as const, justifyContent: "center" as const },
-    ownerTxt: { fontFamily: FONT.medium, fontSize: 12, color: C.textDim },
+    // flexShrink + minWidth:0 so a long assignee name compresses the CHIP
+    // rather than growing it past the card edge. flexWrap on metaRow moves
+    // FOLLOWING items to the next line but cannot shrink an oversized
+    // child, so without this the due date and priority pill beside it were
+    // pushed out of view.
+    ownerChip: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: 5,
+      flexShrink: 1, minWidth: 0,
+    },
+    ownerAvatar: { width: 18, height: 18, borderRadius: 9, alignItems: "center" as const, justifyContent: "center" as const, flexShrink: 0 },
+    ownerTxt: {
+      fontFamily: FONT.medium, fontSize: 12, color: C.textDim, flexShrink: 1,
+    },
     dueTxt: { fontFamily: FONT.medium, fontSize: 12, color: C.textFaint },
   });
 }
@@ -47,6 +57,7 @@ export default function TaskListScreen() {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
   const { tasks, setTaskStatus, addTask } = useMeeting();
+  useSyncTasksOnFocus();
   const [addOpen, setAddOpen] = useState(false);
 
   const groups: { label: string; items: Task[] }[] = [
@@ -98,7 +109,7 @@ export default function TaskListScreen() {
                             <View style={[st.ownerAvatar, { backgroundColor: t.assignee.avatarColor }]}>
                               <Text style={{ fontFamily: FONT.bold, fontSize: 9.5, color: "#FFFFFF" }}>{initialsOf(t.assignee.name)}</Text>
                             </View>
-                            <Text style={st.ownerTxt}>{t.assignee.name}</Text>
+                            <Text style={st.ownerTxt} numberOfLines={1}>{t.assignee.name}</Text>
                           </View>
                         ) : (
                           <Text style={st.dueTxt}>Unassigned</Text>

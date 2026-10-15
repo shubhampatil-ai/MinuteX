@@ -786,7 +786,6 @@ function buildFilterStyles(C: ColorScale) {
 export type TaskCardProps = {
   task: ApiTask;
   now: Date;
-  folderName?: string;
   /** The source meeting's title, resolved by the screen from the recordings it
    *  already loads — so the card costs no extra fetch. Absent for a manual
    *  task, which correctly shows no source. */
@@ -806,7 +805,6 @@ function taskCardsEqual(a: TaskCardProps, b: TaskCardProps) {
   // invalidate every card (§22).
   return (
     a.task === b.task &&
-    a.folderName === b.folderName &&
     a.meetingTitle === b.meetingTitle &&
     a.onOpenMeeting === b.onOpenMeeting &&
     a.busy === b.busy &&
@@ -818,7 +816,7 @@ function taskCardsEqual(a: TaskCardProps, b: TaskCardProps) {
 }
 
 export const TaskCard = memo(function TaskCard({
-  task, now, folderName, meetingTitle, busy, onPress, onToggleComplete,
+  task, now, meetingTitle, busy, onPress, onToggleComplete,
   onResolve, onOpenMeeting,
 }: TaskCardProps) {
   const { C } = useTheme();
@@ -835,10 +833,9 @@ export const TaskCard = memo(function TaskCard({
   const cancelled = task.status === "Cancelled";
   const tint = statusTint(task.status, C);
 
-  // "Aug 22 · Sales · High priority" — only the parts that exist.
+  // "Aug 22 · High priority" — only the parts that exist.
   const meta = [
     shortDate(dueKeyOf(task)),
-    folderName || "",
     task.priority && task.priority !== "Medium" ? `${task.priority} priority` : "",
   ].filter(Boolean);
 
@@ -1308,10 +1305,9 @@ function buildWeekStyles(C: ColorScale) {
 // UpcomingDeadlines (§11)
 // ---------------------------------------------------------------------------
 export const UpcomingDeadlines = memo(function UpcomingDeadlines({
-  items, folderNames, onPress,
+  items, onPress,
 }: {
   items: Deadline[];
-  folderNames: Map<string, string>;
   onPress: (task: ApiTask) => void;
 }) {
   const { C } = useTheme();
@@ -1319,8 +1315,7 @@ export const UpcomingDeadlines = memo(function UpcomingDeadlines({
   return (
     <View style={{ gap: S.sm }}>
       {items.map((d) => {
-        const folder = folderNames.get(String(d.task.folder_id || "")) || "";
-        const sub = [d.label, folder].filter(Boolean).join("  ·  ");
+        const sub = d.label;
         const urgent = d.days <= 1;
         return (
           <Pressable
@@ -1563,7 +1558,7 @@ export const ActionCenterSkeleton = memo(function ActionCenterSkeleton() {
 // TaskSearchBar — narrowing the attention list by text.
 //
 // SCOPE IS STATED, NOT IMPLIED. There is no server-side text search on
-// GET /tasks (the endpoint takes status/folder/assignee/overdue/due_before and
+// GET /tasks (the endpoint takes status/assignee/overdue/due_before and
 // nothing else), so this filters the tasks already LOADED. That is a real
 // limitation and the caller renders a note saying which set was searched —
 // the same honesty the health cards already apply to their counts. A box that

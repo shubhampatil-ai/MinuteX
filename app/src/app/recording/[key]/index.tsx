@@ -1,5 +1,13 @@
 // src/app/recording/[key]/index.tsx — Meeting Detail: four analysis tabs.
 //
+// Redesign notes: the tabs read Brief / People / Tasks / Docs (the product's
+// own nouns; "Overview" and "Speakers" were implementation words). The Brief
+// tab still renders the AI's OWN sections — no fixed Summary / Key points /
+// Decisions template is imposed on top, because the model chooses the
+// sections per meeting (lib/meeting-overview.tsx). Processing shows the
+// pipeline stage the backend actually reports (lib/processing.ts), never a
+// percentage.
+//
 // MinuteX is an AI Meeting Workspace, not a printed brief and not a scroll of
 // every AI surface the backend can produce. FOUR tabs, an animated segmented
 // control, and exactly one entry point per capability:
@@ -29,7 +37,7 @@
 // MeetingProvider is mounted by the parent recording/[key]/_layout.tsx, not
 // here — this screen, Assistant, Task Detail, Assign To and Notify all share
 // that one instance so task/document state survives navigating between them.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator, Alert, KeyboardAvoidingView, Modal, Platform, Pressable,
   ScrollView, StyleSheet, Text, TextInput, View,
@@ -37,14 +45,22 @@ import {
 import { Stack, useRouter } from "expo-router";
 import { Icon } from "../../../../lib/icons";
 import { S, R, FONT, useTheme, ColorScale } from "../../../../lib/theme";
-import { Button, SegmentedTabs, Skeleton } from "../../../../lib/ui";
+import { Button, SegmentedTabs, Skeleton, Toast } from "../../../../lib/ui";
+import { BottomSheet, ProgressSteps, SheetAction } from "../../../../lib/kit";
+import { pipelineSteps } from "../../../../lib/processing";
 import { AudioPlayer, AudioPlayerProvider } from "../../../../lib/audio-player";
-import { useMeeting } from "../../../../lib/meeting-context";
+import { useMeeting, useSyncTasksOnFocus } from "../../../../lib/meeting-context";
+import {
+  applyMeetingChange, dropMeetingFromLists, forgetMeetingHighlights,
+} from "../../../../lib/shared-data";
 import { sourceMeta, statusMeta, speakerName, normalizeSpeakerLabel, fmtDuration } from "../../../../lib/sources";
 import { MeetingSummary, Highlights, Participants } from "../../../../lib/meeting-summary";
 import { MeetingOverviewView, hasOverview } from "../../../../lib/meeting-overview";
 import { buildSpeakerBlocks, buildSpeakerColors } from "../../../../lib/transcript-view";
-import { CrmRecordsBlock } from "../../../../lib/meeting-crm-records";
+// Salesforce (Site) — NEW architecture, behind EXPO_PUBLIC_SITE_SALESFORCE.
+// Salesforce WEBHOOK (Webhook Contract v2) — behind EXPO_PUBLIC_WEBHOOK_V2.
+import { WebhookMeetingBlock } from "../../../../lib/webhook-meeting";
+import { SALESFORCE_COMING_SOON, WEBHOOK_V2_ENABLED } from "../../../../lib/webhook-ui";
 import { Tasks } from "../../../../lib/meeting-tasks";
 import { AddTaskSheet } from "../../../../lib/add-task-sheet";
 import { DocumentsList, CreateDocumentSheet } from "../../../../lib/meeting-documents";
@@ -53,12 +69,11 @@ import { GmailShareRow, GmailShareSheet } from "../../../../lib/gmail-share";
 import { useGmail } from "../../../../lib/integrations";
 import { MomEditorScreen } from "../../../../lib/mom-editor";
 import { AssistantButton } from "../../../../lib/assistant-button";
-import { ContactPicker } from "../../../../lib/contact-picker";
-import { avatarColorFor, initialsOf } from "../../../../lib/task-model";
+// Identifying a speaker: the SAME card, picker and access control the
+// Participants screen and the Transcript use — one tagging UI everywhere.
+import { SpeakerTagSheet, useSpeakerTagging } from "../../../../lib/speaker-tagging";
 import {
   ApiError, isAlreadyRunning, isStillUploading, reprocessRecording, trashRecording,
-  ApiFolder, getFolders, moveRecordingToFolder,
-  ApiContact, getParticipants, setParticipant,
 } from "../../../../lib/api";
 
 // The four ANALYSIS tabs. "transcript" is deliberately NOT among them — it is
@@ -70,23 +85,23 @@ function buildStyles(C: ColorScale) {
   return StyleSheet.create({
     container: { flex: 1, backgroundColor: C.bg, paddingHorizontal: 20 },
     center: { alignItems: "center" as const, justifyContent: "center" as const, gap: S.md },
-    masthead: { paddingHorizontal: 20, paddingTop: 6 },
-    titleRow: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: 10 },
-    headline: { fontFamily: FONT.extrabold, fontSize: 21, lineHeight: 26, color: C.text, flex: 1, letterSpacing: -0.2 },
-    dateline: { fontFamily: FONT.medium, fontSize: 12.5, color: C.textFaint, marginTop: 4 },
+    titleRow: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: 10, marginTop: S.sm },
+    headline: { fontFamily: FONT.bold, fontSize: 24, lineHeight: 30, color: C.text, flex: 1, letterSpacing: -0.3 },
+    dateline: { fontFamily: FONT.medium, fontSize: 13, lineHeight: 18, color: C.textFaint, marginTop: 6 },
     section: { gap: S.xl, marginTop: S.lg },
-    stepRow: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 12,
-      paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: C.border,
+    // Processing / failed / empty states: one bordered surface, not a tinted
+    // alarm box — the step list carries the state.
+    stateCard: {
+      backgroundColor: C.surface, borderRadius: R.card, padding: S.lg, marginTop: S.xl,
+      borderWidth: StyleSheet.hairlineWidth, borderColor: C.border,
     },
-    stepDot: {
-      width: 24, height: 24, borderRadius: 12, flexShrink: 0,
-      alignItems: "center" as const, justifyContent: "center" as const,
+    stateTitle: { fontFamily: FONT.semibold, fontSize: 17, lineHeight: 23, color: C.text },
+    stateBody: { fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 20, color: C.textDim, marginTop: S.sm },
+    note: { fontFamily: FONT.medium, fontSize: 12.5, color: C.textDim, marginTop: 10 },
+    noticeCard: {
+      backgroundColor: C.surface, borderRadius: R.card, padding: S.lg,
+      borderWidth: StyleSheet.hairlineWidth, borderColor: C.border,
     },
-    stepLabel: { flex: 1, fontFamily: FONT.semibold, fontSize: 14, color: C.text },
-    progressTrack: { height: 6, backgroundColor: C.border, borderRadius: 3, overflow: "hidden" as const, marginTop: 20 },
-    failCard: { backgroundColor: C.dangerSoft, borderRadius: R.card, padding: S.lg, marginTop: 20 },
-    noticeCard: { backgroundColor: C.surface2, borderRadius: R.card, padding: S.lg },
     errorBig: { fontFamily: FONT.extrabold, fontSize: 20, lineHeight: 26, color: C.text, textAlign: "center" as const },
     sheetBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", justifyContent: "flex-end" as const },
     sheet: {
@@ -98,35 +113,10 @@ function buildStyles(C: ColorScale) {
       backgroundColor: C.surface2, borderRadius: R.md, borderWidth: 1, borderColor: C.border,
       fontFamily: FONT.regular, fontSize: 17, color: C.text, paddingVertical: 12, paddingHorizontal: 14, marginTop: 18,
     },
-    // Tag-a-contact row inside the rename sheet. Reads as a tappable list row
-    // rather than a button, because it leads to a picker rather than acting.
-    tagRow: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: S.md,
-      marginTop: 14, padding: 12, borderRadius: R.md,
-      borderWidth: 1, borderColor: C.border, backgroundColor: C.surface2,
-    },
-    tagAvatar: {
-      width: 36, height: 36, borderRadius: 18,
-      alignItems: "center" as const, justifyContent: "center" as const,
-    },
-    tagAvatarTxt: { fontFamily: FONT.bold, fontSize: 13, color: "#fff" },
-    tagName: { fontFamily: FONT.semibold, fontSize: 14, color: C.text },
-    tagHint: {
-      fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint,
-      marginTop: 2,
-    },
-    tagAction: { fontFamily: FONT.bold, fontSize: 12.5, color: C.primary },
-    // Separates the two ways of answering "who is this?" so neither looks like
-    // a sub-field of the other.
-    orRule: {
-      fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint,
-      textAlign: "center" as const, marginTop: 14, marginBottom: 2,
-    },
     menuRow: {
       flexDirection: "row" as const, alignItems: "center" as const, gap: 12,
-      paddingVertical: 15, borderBottomWidth: 1, borderBottomColor: C.border,
+      minHeight: 52, paddingVertical: S.sm,
     },
-    menuTxt: { fontFamily: FONT.medium, fontSize: 15, color: C.text },
   });
 }
 
@@ -154,11 +144,11 @@ const REPROCESSABLE_STATUSES = new Set([
 ]);
 
 function StillWriting({
-  st, C, stage, stuck, canRetry, retrying, onRetry, retryNote,
+  st, status, stuck, canRetry, retrying, onRetry, retryNote,
 }: {
   st: ReturnType<typeof buildStyles>;
-  C: ColorScale;
-  stage: number;
+  /** The backend's own status — the ONLY input to the step list. */
+  status: string;
   stuck: boolean;
   /** Whether the backend will accept a reprocess for this status. */
   canRetry: boolean;
@@ -166,34 +156,23 @@ function StillWriting({
   onRetry: () => void;
   retryNote: string;
 }) {
-  const steps = ["Audio received", "Transcribed", "Summary written"];
   return (
-    <View style={{ marginTop: 22 }}>
-      {steps.map((label, i) => {
-        const done = i < stage;
-        const active = i === stage;
-        return (
-          <View key={label} style={[st.stepRow, i > stage && { opacity: 0.4 }]}>
-            <View style={[
-              st.stepDot,
-              done ? { backgroundColor: C.success } : active ? { backgroundColor: C.primarySoft } : { backgroundColor: C.surface2 },
-            ]}>
-              {done ? <Icon name="checkmark" tintColor="#FFFFFF" size={13} /> : null}
-            </View>
-            <Text style={st.stepLabel}>{label}</Text>
-          </View>
-        );
-      })}
-      <View style={st.progressTrack}>
-        <View style={{ width: `${Math.round((stage / steps.length) * 100)}%`, height: "100%", backgroundColor: C.primary, borderRadius: 3 }} />
-      </View>
-      <Text style={{ fontFamily: FONT.regular, fontSize: 13.5, color: C.textDim, marginTop: 14 }}>
+    <View style={st.stateCard} accessibilityLiveRegion="polite">
+      <Text style={st.stateTitle} accessibilityRole="header">
+        {stuck ? "This is taking longer than usual" : "Writing your brief"}
+      </Text>
+      <Text style={st.stateBody}>
         {stuck
           ? canRetry
-            ? "This is taking much longer than usual. It may have stalled — you can start it over."
-            : "This is taking much longer than usual. The audio may not have finished uploading — you can remove this recording and record again."
-          : "Usually done in about two minutes. You can leave — it'll be here when it's ready."}
+            ? "It may have stalled. You can start it over — the audio is safe."
+            : "The audio may not have finished uploading. You can remove this recording and record again."
+          // The transcribe Lambda writes an IN-APP notification when it
+          // finishes (MEETING_PROCESSING_COMPLETED → the bell). There is no OS
+          // push transport, so the copy says "notifications" in the app's
+          // sense and does not promise the phone will buzz.
+          : "Usually a few minutes. You can leave this screen — it'll show up in your notifications when it's ready."}
       </Text>
+      <ProgressSteps steps={pipelineSteps(status, { stuck })} style={{ marginTop: S.xl }} />
       {stuck && canRetry ? (
         <>
           <Button
@@ -201,13 +180,9 @@ function StillWriting({
             variant="secondary"
             loading={retrying}
             onPress={onRetry}
-            style={{ marginTop: 16 }}
+            style={{ marginTop: S.lg }}
           />
-          {retryNote ? (
-            <Text style={{ fontFamily: FONT.medium, fontSize: 12.5, color: C.textDim, marginTop: 10 }}>
-              {retryNote}
-            </Text>
-          ) : null}
+          {retryNote ? <Text style={st.note}>{retryNote}</Text> : null}
         </>
       ) : null}
     </View>
@@ -226,23 +201,31 @@ export default function MeetingDetailScreen() {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
   const {
-    key, rec, loading, error, reload, documents, addDocument, setDocuments,
-    renameMeeting, renameSpeaker, setCrmRecord, chooseCrmCandidate,
-    confirmCrmRecord, syncCrmRecordNow, crmMappings, crmAmbiguity, tasks,
+    key, rec, loading, error, savedNote, reload, documents, addDocument, setDocuments,
+    renameMeeting, tasks,
     documentsNeedingUpdate, updateAllDocuments, addTask,
   } = useMeeting();
+  // Tasks changed on the Task dashboard or /task/[id] (reassign, status,
+  // due) must show here when the user comes back to this meeting.
+  useSyncTasksOnFocus();
   const [tab, setTab] = useState<Tab>("overview");
 
   const [renaming, setRenaming] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [savingTitle, setSavingTitle] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
-  // Folder filing. The list is fetched when the picker opens rather than on
-  // mount: most visits to a meeting never touch it, and it is one more request
-  // on a screen that already makes several.
-  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
-  const [folderOptions, setFolderOptions] = useState<ApiFolder[]>([]);
-  const [movingFolder, setMovingFolder] = useState(false);
+  // An action chosen in the meeting-actions sheet, run once the sheet has
+  // finished closing (see BottomSheet.onDismissed).
+  const afterMenu = useRef<(() => void) | null>(null);
+  const closeMenuThen = useCallback((fn: () => void) => {
+    afterMenu.current = fn;
+    setMenuOpen(false);
+  }, []);
+  const runAfterMenu = useCallback(() => {
+    const fn = afterMenu.current;
+    afterMenu.current = null;
+    fn?.();
+  }, []);
   const [createOpen, setCreateOpen] = useState(false);
   // The structured MoM editor. Full-screen rather than a route so the
   // Overview state underneath (documents, tasks) survives closing it.
@@ -255,9 +238,6 @@ export default function MeetingDetailScreen() {
   // without this screen being remounted.
   const gmail = useGmail();
 
-  const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
-  const [speakerDraft, setSpeakerDraft] = useState("");
-  const [savingSpeaker, setSavingSpeaker] = useState(false);
 
   const [search, setSearch] = useState("");
 
@@ -280,6 +260,10 @@ export default function MeetingDetailScreen() {
             setRetryNote("");
             try {
               await reprocessRecording(key);
+              // Every saved copy now says "transcribing" (the Desk starts its
+              // progress poll), and the old highlights are about to change.
+              applyMeetingChange(key, { status: "transcribing" });
+              forgetMeetingHighlights(key);
               setRetryNote("Started — this can take a few minutes.");
               // The row is now "transcribing"; reload so the screen switches to
               // the progress UI it already shows for a first-time upload.
@@ -327,6 +311,7 @@ export default function MeetingDetailScreen() {
             setDeleting(true);
             try {
               await trashRecording(key);
+              dropMeetingFromLists(key);
               router.back();
             } catch (e) {
               setDeleting(false);
@@ -346,42 +331,6 @@ export default function MeetingDetailScreen() {
   }, [key, router]);
 
   const speakerNames = rec?.speaker_names ?? undefined;
-  // The folder this meeting is filed under, resolved for display. Falls back to
-  // "" (General) when unset or when the folder list has not been fetched yet.
-  const currentFolderName = useMemo(() => {
-    const fid = (rec as any)?.folder_id || "";
-    if (!fid) return "";
-    return folderOptions.find((f) => f.id === fid)?.name || "";
-  }, [rec, folderOptions]);
-
-  // Fetch the folder list only when the picker is actually opened.
-  useEffect(() => {
-    if (!folderPickerOpen) return;
-    getFolders()
-      .then((r) => setFolderOptions(r.folders))
-      .catch(() => setFolderOptions([]));
-  }, [folderPickerOpen]);
-
-  const moveToFolder = useCallback(
-    async (folderId: string | null) => {
-      setMovingFolder(true);
-      try {
-        await moveRecordingToFolder(key, folderId);
-        setFolderPickerOpen(false);
-        // Re-read the meeting so the menu label and any folder-derived UI
-        // reflect the move without a manual refresh.
-        reload();
-      } catch (e) {
-        Alert.alert(
-          "Could not move",
-          e instanceof ApiError ? e.message : "Please try again."
-        );
-      } finally {
-        setMovingFolder(false);
-      }
-    },
-    [key, reload]
-  );
 
   const openRenameTitle = () => {
     setTitleDraft(rec?.title || "");
@@ -400,102 +349,17 @@ export default function MeetingDetailScreen() {
     }
   };
 
-  // Opens the share-link sheet. This used to Share.share() the meeting TITLE
-  // as plain text — the recipient got a sentence, not the meeting. A link
-  // gives them the actual notes on their phone with no MinuteX account, and
-  // unlike an exported PDF it can be narrowed or revoked afterwards.
-  // See lib/meeting-share.tsx.
-  const shareMeeting = () => {
-    setMenuOpen(false);
-    setShareOpen(true);
-  };
-
-  // Contact tagging inside the rename sheet.
-  //
-  // Renaming a speaker used to write a free-text NAME only, which is a display
-  // label and nothing more: no contact, so no task could be assigned to that
-  // person and nothing could notify them. Tagging a real contact here does both
-  // at once — the backend's setParticipant writes the participant row AND syncs
-  // speaker_names, so the transcript reads the same either way.
-  //
-  // Typing a name is still allowed. Some speakers genuinely aren't contacts
-  // (a receptionist, a one-off attendee), and forcing a contact record for them
-  // would be worse than a plain label.
   // Manual task entry, for what the AI did not extract.
   const [addTaskOpen, setAddTaskOpen] = useState(false);
-  const [speakerPickerOpen, setSpeakerPickerOpen] = useState(false);
-  const [speakerContacts, setSpeakerContacts] = useState<ApiContact[]>([]);
-  const [speakerFolderContacts, setSpeakerFolderContacts] = useState<ApiContact[]>([]);
-  const [taggedContact, setTaggedContact] = useState<ApiContact | null>(null);
 
+  // WHO IS THIS SPEAKER — opened from the People tab (and the Transcript
+  // screen opens the same sheet). Tagging a real contact lets tasks be
+  // assigned and the person be notified and given access; a plain name is
+  // still offered for someone who isn't a contact.
+  const speakerTagging = useSpeakerTagging(String(key));
+  const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
   const openRenameSpeaker = (label: string) => {
-    const raw = normalizeSpeakerLabel(label);
-    setEditingSpeaker(raw);
-    setSpeakerDraft(speakerNames?.[raw] ?? "");
-    setTaggedContact(null);
-    // Load who is already tagged in this meeting (and its folder) so the
-    // picker can rank them first. Best-effort: a failure only affects
-    // ORDERING, never whether the sheet works.
-    void getParticipants(String(key))
-      .then((p) => {
-        setSpeakerContacts(
-          p.participants
-            .map((x) => x.contact)
-            .filter((c): c is ApiContact => !!c)
-        );
-        setSpeakerFolderContacts(p.folder_contacts);
-        // Show what this speaker is CURRENTLY tagged as, so the sheet reflects
-        // reality rather than looking untagged every time it opens.
-        const mine = p.participants.find((x) => x.speaker_id === raw);
-        if (mine?.contact) setTaggedContact(mine.contact);
-      })
-      .catch(() => {
-        setSpeakerContacts([]);
-        setSpeakerFolderContacts([]);
-      });
-  };
-
-  /** Tag this speaker as a real contact. */
-  const tagSpeakerContact = async (contact: ApiContact) => {
-    if (!editingSpeaker) return;
-    setSavingSpeaker(true);
-    try {
-      const res = await setParticipant(String(key), editingSpeaker, contact.id);
-      setTaggedContact(contact);
-      setSpeakerDraft(contact.name);
-      // Re-read the meeting so the transcript and Participants list pick up the
-      // speaker_names the backend just synced.
-      await reload();
-      setEditingSpeaker(null);
-      const n = res.tasks_resolved ?? 0;
-      if (n > 0) {
-        Alert.alert(
-          "Speaker tagged",
-          `${contact.name} is now Speaker ${editingSpeaker}. ` +
-          `${n} task${n === 1 ? "" : "s"} from this meeting ${n === 1 ? "is" : "are"} ` +
-          `now assigned to them.`
-        );
-      }
-    } catch (e) {
-      Alert.alert(
-        "Couldn't tag that contact",
-        e instanceof ApiError ? e.message : "Something went wrong."
-      );
-    } finally {
-      setSavingSpeaker(false);
-    }
-  };
-  const saveSpeaker = async () => {
-    if (!editingSpeaker) return;
-    setSavingSpeaker(true);
-    try {
-      await renameSpeaker(editingSpeaker, speakerDraft);
-      setEditingSpeaker(null);
-    } catch {
-      // renameSpeaker already alerted
-    } finally {
-      setSavingSpeaker(false);
-    }
+    setEditingSpeaker(normalizeSpeakerLabel(label));
   };
 
   const speakerColors = useMemo(
@@ -569,7 +433,9 @@ export default function MeetingDetailScreen() {
     Date.now() - createdMs > LIKELY_STUCK_AFTER_MS;
   const srcMeta = sourceMeta(rec);
   const duration = fmtDuration(rec.duration);
-  const hasTranscript = !!rec.transcript;
+  // A copy saved on the phone leaves the transcript out but records that one
+  // exists (transcript_withheld), so the tabs still show offline.
+  const hasTranscript = !!rec.transcript || !!rec.transcript_withheld;
   const showTabs = hasTranscript;
 
   // "Is there an analysis to show?" — the overview is the primary output, and
@@ -577,18 +443,42 @@ export default function MeetingDetailScreen() {
   // one counts; neither means the AI stage produced nothing.
   const hasAnalysis = hasOverview(rec.overview) || !!rec.summary;
 
-  const stage = rec.transcript ? (hasAnalysis ? 2 : 1) : 0;
+  // Terminal, not failed, and still nothing to read: a silent or near-silent
+  // recording transcribes to "" and the pipeline finishes as "transcribed".
+  // Every tab is gated on hasTranscript, so without this branch the screen
+  // showed a title, a player and then nothing at all.
+  const finishedEmpty = !failed && !stillProcessing && !hasTranscript;
 
-  const datelineParts = [fmtDate(rec.created_at), duration, srcMeta.label].filter(Boolean);
+  const speakerCount = rec.participants?.length ?? 0;
+  const datelineParts = [
+    fmtDate(rec.created_at),
+    duration,
+    speakerCount ? `${speakerCount} ${speakerCount === 1 ? "participant" : "participants"}` : "",
+    srcMeta.label,
+  ].filter(Boolean);
 
   return (
     <AudioPlayerProvider url={rec.audio_url}>
       <View style={{ flex: 1, backgroundColor: C.bg }}>
+        {/* A CONSTANT header title, not the meeting's own.
+            An AI-written title runs long ("Quarterly Business Review with
+            ACME Corporation — Renewal Discussion") and the native header
+            has to fit it between the back chevron and the ellipsis: iOS
+            centre-elides it to an unreadable stub, Android collides with
+            the back arrow. It also duplicated the headline rendered a few
+            points below, so the risk bought nothing. The page keeps the
+            real title where it has room to wrap. */}
         <Stack.Screen
           options={{
-            title: rec.title || "Meeting",
+            title: "Meeting",
             headerRight: () => (
-              <Pressable onPress={() => setMenuOpen(true)} hitSlop={10} accessibilityLabel="More">
+              <Pressable
+                onPress={() => setMenuOpen(true)}
+                hitSlop={12}
+                accessibilityRole="button"
+                accessibilityLabel="Meeting actions"
+                style={{ minWidth: 44, minHeight: 44, alignItems: "center", justifyContent: "center" }}
+              >
                 <Icon name="ellipsis" tintColor={C.text} size={20} />
               </Pressable>
             ),
@@ -604,10 +494,23 @@ export default function MeetingDetailScreen() {
           keyboardShouldPersistTaps="handled">
           {/* ---- Shared masthead: title (tap to rename), dateline, player ---- */}
           <View>
-            <Pressable onPress={openRenameTitle} style={st.titleRow} accessibilityLabel="Rename meeting">
-              <Text style={st.headline}>{rec.title || "Untitled meeting"}</Text>
+            <Pressable
+              onPress={openRenameTitle}
+              style={st.titleRow}
+              accessibilityRole="button"
+              accessibilityLabel={`${rec.title || "Untitled meeting"}. Rename meeting`}
+            >
+              {/* Four lines is generous enough for any real AI title while
+                  still guaranteeing the player and tabs stay above the
+                  fold on a small phone. */}
+              <Text style={st.headline} numberOfLines={4}>
+                {rec.title || "Untitled meeting"}
+              </Text>
             </Pressable>
             <Text style={st.dateline}>{datelineParts.join(" · ")}</Text>
+            {savedNote ? (
+              <Text style={[st.dateline, { marginTop: S.xs }]} accessibilityRole="text">{savedNote}</Text>
+            ) : null}
 
             {rec.audio_url ? (
               <View style={{ marginTop: S.lg }}>
@@ -634,13 +537,16 @@ export default function MeetingDetailScreen() {
           {showTabs ? (
             <View style={{ backgroundColor: C.bg, paddingTop: S.lg, paddingBottom: S.sm }}>
               <SegmentedTabs
+                fill
                 value={tab}
                 onChange={(v) => setTab(v as Tab)}
                 tabs={[
-                  { key: "overview", label: "Overview" },
-                  { key: "speakers", label: "Speakers" },
+                  // Keys keep their original names (internal state only);
+                  // labels are the product's nouns.
+                  { key: "overview", label: "Brief" },
+                  { key: "speakers", label: "People" },
                   { key: "tasks", label: "Tasks" },
-                  { key: "documents", label: "Documents" },
+                  { key: "documents", label: "Docs" },
                 ]}
               />
             </View>
@@ -648,24 +554,21 @@ export default function MeetingDetailScreen() {
 
           {/* ---- Failed ---- */}
           {failed ? (
-            <View style={st.failCard}>
-              <Text style={{ fontFamily: FONT.bold, fontSize: 16, lineHeight: 22, color: C.danger }}>
-                We couldn&apos;t write this one up, so we stopped rather than guess.
+            <View style={st.stateCard}>
+              <Text style={st.stateTitle} accessibilityRole="header">
+                We couldn&apos;t write this one up
               </Text>
-              <Text style={{ fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 20, color: C.textDim, marginTop: 10 }}>
+              <Text style={st.stateBody}>
                 The recording finished, but transcription didn&apos;t return usable text —
-                most often that means the audio was too quiet or too short. The
-                audio itself is still here; nothing was thrown away.
+                most often the audio was too quiet or too short. We stopped rather than
+                guess. The audio itself is still here; nothing was thrown away.
               </Text>
-              {/* The audio is still in S3, so this is genuinely recoverable —
-                  a transient STT/Groq failure usually succeeds on a second
-                  pass. (Audio that is truly too quiet will fail again, which
-                  is why the confirm dialog names the cost in time.) */}
-              {/* Two ways out of a dead end, side by side: replay it, or file
-                  it away. Before this, a recording that failed twice could
-                  only be left on MinuteX forever. Trash keeps the audio, so
-                  a user who bins it can still change their mind. */}
-              <View style={{ flexDirection: "row", gap: S.sm, marginTop: 16 }}>
+              <ProgressSteps steps={pipelineSteps(rec.status)} style={{ marginTop: S.xl }} />
+              {/* Two ways out of a dead end, side by side: replay it (the audio
+                  is still in S3, and a transient STT/Groq failure usually
+                  succeeds on a second pass), or file it away. Trash keeps the
+                  audio, so a user who bins it can still change their mind. */}
+              <View style={{ flexDirection: "row", gap: S.sm, marginTop: S.xl }}>
                 <Button
                   label="Try again"
                   variant="secondary"
@@ -675,30 +578,59 @@ export default function MeetingDetailScreen() {
                 />
                 <Button
                   label="Move to Trash"
-                  variant="danger"
+                  variant="destructive"
                   loading={deleting}
                   onPress={confirmDelete}
                   style={{ flex: 1 }}
                 />
               </View>
-              {retryNote ? (
-                <Text style={{ fontFamily: FONT.medium, fontSize: 12.5, color: C.textDim, marginTop: 10 }}>
-                  {retryNote}
-                </Text>
-              ) : null}
+              {retryNote ? <Text style={st.note}>{retryNote}</Text> : null}
             </View>
           ) : null}
 
           {/* ---- Still processing (real backend status, not string-length guessing) ---- */}
           {!failed && stillProcessing ? (
             <StillWriting
-              st={st} C={C} stage={stage}
+              st={st}
+              status={String(rec.status ?? "")}
               stuck={likelyStuck}
               canRetry={REPROCESSABLE_STATUSES.has(String(rec.status ?? ""))}
               retrying={retrying}
               onRetry={retryProcessing}
               retryNote={retryNote}
             />
+          ) : null}
+
+          {/* ---- Finished, but nothing was heard ----
+              The pipeline is terminal and did not fail, yet there is no
+              transcript: silent or near-silent audio. Same two ways out as a
+              failure, worded around what actually happened. */}
+          {finishedEmpty ? (
+            <View style={st.stateCard}>
+              <Text style={st.stateTitle} accessibilityRole="header">No speech found</Text>
+              <Text style={st.stateBody}>
+                This recording finished, but no words came through — usually the
+                microphone was too far away, muted, or the recording was very short.
+                The audio is still here if you want to listen.
+              </Text>
+              <View style={{ flexDirection: "row", gap: S.sm, marginTop: S.xl }}>
+                <Button
+                  label="Try again"
+                  variant="secondary"
+                  loading={retrying}
+                  onPress={retryProcessing}
+                  style={{ flex: 1 }}
+                />
+                <Button
+                  label="Move to Trash"
+                  variant="destructive"
+                  loading={deleting}
+                  onPress={confirmDelete}
+                  style={{ flex: 1 }}
+                />
+              </View>
+              {retryNote ? <Text style={st.note}>{retryNote}</Text> : null}
+            </View>
           ) : null}
 
           {/* ================= OVERVIEW TAB =================
@@ -711,7 +643,10 @@ export default function MeetingDetailScreen() {
             hasAnalysis ? (
               <View style={st.section}>
                 {hasOverview(rec.overview) ? (
-                  <MeetingOverviewView overview={rec.overview} />
+                  <MeetingOverviewView
+                    overview={rec.overview}
+                    speakerNames={rec.speaker_names}
+                  />
                 ) : (
                   <>
                     <MeetingSummary summary={rec.summary} />
@@ -721,15 +656,6 @@ export default function MeetingDetailScreen() {
                     />
                   </>
                 )}
-                <CrmRecordsBlock
-                  mappings={crmMappings}
-                  records={rec.crm_records}
-                  ambiguity={crmAmbiguity}
-                  onSave={setCrmRecord}
-                  onChoose={chooseCrmCandidate}
-                  onConfirm={confirmCrmRecord}
-                  onSync={syncCrmRecordNow}
-                />
               </View>
             ) : (
               // The backend has genuinely FINISHED (status is terminal) but the
@@ -764,21 +690,27 @@ export default function MeetingDetailScreen() {
                     </Text>
                   ) : null}
                 </View>
-                {/* Still offered when the analysis failed: the record
-                    identifier is independent of it, and the user may well want
-                    to link this meeting to Salesforce anyway. Renders nothing
-                    when no mappings are configured. */}
-                <CrmRecordsBlock
-                  mappings={crmMappings}
-                  records={rec.crm_records}
-                  ambiguity={crmAmbiguity}
-                  onSave={setCrmRecord}
-                  onChoose={chooseCrmCandidate}
-                  onConfirm={confirmCrmRecord}
-                  onSync={syncCrmRecordNow}
-                />
               </View>
             )
+          ) : null}
+
+          {/* Salesforce (Site) — the NEW, isolated integration, only when the
+              build enables it:
+              Push Meeting and Create Salesforce Task for THIS meeting. */}
+          {WEBHOOK_V2_ENABLED && rec?.workspace_id && !failed
+            && !stillProcessing && hasTranscript && tab === "overview" ? (
+            <View style={st.section}>
+              {/* THE Salesforce section: interactive when connected; a
+                  read-only "sent" card when it was sent but Salesforce is
+                  not connected now (or this is a coming-soon build);
+                  nothing when never sent and not connected. */}
+              <WebhookMeetingBlock
+                enabled={WEBHOOK_V2_ENABLED}
+                readOnly={SALESFORCE_COMING_SOON}
+                meetingKey={key}
+                workspaceId={rec.workspace_id}
+              />
+            </View>
           ) : null}
 
           {/* ================= SPEAKERS TAB =================
@@ -861,153 +793,58 @@ export default function MeetingDetailScreen() {
           />
         </Modal>
 
-        {/* ---- Overflow menu: Rename, Share, Move to Trash ---- */}
-        <Modal visible={menuOpen} transparent animationType="fade" onRequestClose={() => setMenuOpen(false)}>
-          <Pressable style={st.sheetBackdrop} onPress={() => setMenuOpen(false)}>
-            <Pressable style={st.sheet} onPress={() => { }}>
-              <Pressable style={st.menuRow} onPress={openRenameTitle} accessibilityLabel="Rename meeting">
-                <Icon name="pencil" tintColor={C.text} size={18} />
-                <Text style={st.menuTxt}>Rename meeting</Text>
-              </Pressable>
-              <Pressable style={st.menuRow} onPress={shareMeeting} accessibilityLabel="Share meeting">
-                <Icon name="square.and.arrow.up" tintColor={C.text} size={18} />
-                <Text style={st.menuTxt}>Share meeting</Text>
-              </Pressable>
-              {/* Email the minutes through the user's own Gmail. GmailShareRow
-                  owns the visibility rule: when Gmail is not connected (or the
-                  connection went stale) it renders as an explanatory prompt
-                  routing to Settings, never as an action that would fail. */}
-              <GmailShareRow
-                usable={gmail.usable}
-                needsReauth={gmail.needsReauth}
-                onPress={() => { setMenuOpen(false); setGmailShareOpen(true); }}
-                style={st.menuRow}
-              />
-              {/* Identify the voices. Mapping a speaker to a contact is also
-                  what lets this meeting's AI tasks find a real owner, which is
-                  why it sits in the primary menu rather than buried in the
-                  transcript. */}
-              <Pressable
-                style={st.menuRow}
-                onPress={() => {
-                  setMenuOpen(false);
-                  router.push({
-                    pathname: "/recording/[key]/participants",
-                    params: { key },
-                  });
-                }}
-                accessibilityLabel="Manage participants"
-              >
-                <Icon name="person.2.fill" tintColor={C.text} size={18} />
-                <Text style={st.menuTxt}>Participants &amp; speakers</Text>
-              </Pressable>
-              {/* Filing the meeting. Never a copy — this rewrites one field. */}
-              <Pressable
-                style={st.menuRow}
-                onPress={() => {
-                  setMenuOpen(false);
-                  setFolderPickerOpen(true);
-                }}
-                accessibilityLabel="Move meeting to a folder"
-              >
-                <Icon name="folder" tintColor={C.text} size={18} />
-                <Text style={st.menuTxt}>
-                  {currentFolderName ? `Folder: ${currentFolderName}` : "Move to folder"}
-                </Text>
-              </Pressable>
-              {/* Destructive last and coloured, so it is never the row a
-                  thumb lands on by accident reaching for Share. */}
-              <Pressable
-                style={[st.menuRow, { borderBottomWidth: 0 }]}
-                onPress={confirmDelete}
-                disabled={deleting}
-                accessibilityLabel="Move meeting to Trash"
-              >
-                <Icon name="trash" tintColor={C.danger} size={18} />
-                <Text style={[st.menuTxt, { color: C.danger }]}>
-                  {deleting ? "Moving…" : "Move to Trash"}
-                </Text>
-              </Pressable>
-            </Pressable>
-          </Pressable>
-        </Modal>
-
-        {/* ---- Move to folder ----
-            One list, one tap. "General" is offered as the first row rather
-            than as a separate "remove" action, because to the user it IS a
-            destination — it just happens to be represented server-side by the
-            absence of a folder. */}
-        <Modal
-          visible={folderPickerOpen}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setFolderPickerOpen(false)}
+        {/* ---- Meeting actions: Rename, Share, Email, People, Trash ----
+            Any action that opens ANOTHER modal runs from onDismissed, after
+            this sheet is fully gone — see BottomSheet in lib/kit.tsx. */}
+        <BottomSheet
+          visible={menuOpen}
+          onClose={() => setMenuOpen(false)}
+          onDismissed={runAfterMenu}
+          title={rec.title || "Untitled meeting"}
         >
-          <Pressable
-            style={st.sheetBackdrop}
-            onPress={() => setFolderPickerOpen(false)}
-          >
-            <Pressable style={st.sheet} onPress={() => { }}>
-              <Text style={{
-                fontFamily: FONT.semibold, fontSize: 11, color: C.textFaint,
-                textTransform: "uppercase", letterSpacing: 0.6,
-              }}>
-                Organize
-              </Text>
-              <Text style={st.sheetTitle}>Move to folder</Text>
-              <Text style={{
-                fontFamily: FONT.regular, fontSize: 13, color: C.textDim,
-                marginTop: 4, marginBottom: 10, lineHeight: 19,
-              }}>
-                The meeting moves — it is never copied. Its tasks follow it.
-              </Text>
-
-              <Pressable
-                style={st.menuRow}
-                onPress={() => moveToFolder(null)}
-                disabled={movingFolder}
-                accessibilityLabel="Move to General"
-              >
-                <Icon name="tray.fill" tintColor={C.text} size={18} />
-                <Text style={[st.menuTxt, { flex: 1 }]}>General (no folder)</Text>
-                {!(rec as any)?.folder_id && (
-                  <Icon name="checkmark" tintColor={C.primary} size={16} />
-                )}
-              </Pressable>
-
-              {folderOptions.map((f, i) => {
-                const active = (rec as any)?.folder_id === f.id;
-                return (
-                  <Pressable
-                    key={f.id}
-                    style={[
-                      st.menuRow,
-                      i === folderOptions.length - 1 && { borderBottomWidth: 0 },
-                    ]}
-                    onPress={() => moveToFolder(f.id)}
-                    disabled={movingFolder || active}
-                    accessibilityLabel={`Move to ${f.name}`}
-                  >
-                    <Icon name="folder" tintColor={C.text} size={18} />
-                    <Text style={[st.menuTxt, { flex: 1 }]}>{f.name}</Text>
-                    {active && (
-                      <Icon name="checkmark" tintColor={C.primary} size={16} />
-                    )}
-                  </Pressable>
-                );
-              })}
-
-              {folderOptions.length === 0 && (
-                <Text style={{
-                  fontFamily: FONT.regular, fontSize: 13, color: C.textFaint,
-                  paddingVertical: 14,
-                }}>
-                  No folders yet. Create one from You › Folders.
-                </Text>
-              )}
-            </Pressable>
-          </Pressable>
-        </Modal>
+          <SheetAction icon="pencil" label="Rename meeting" onPress={() => closeMenuThen(openRenameTitle)} />
+          {/* A share LINK, not Share.share() of the title (which gave the
+              recipient a sentence, not the meeting): the actual notes, no
+              MinuteX account needed, and narrowable or revocable afterwards.
+              See lib/meeting-share.tsx. */}
+          <SheetAction
+            icon="square.and.arrow.up"
+            label="Share meeting"
+            description="A read-only link you can narrow or revoke"
+            onPress={() => closeMenuThen(() => setShareOpen(true))}
+          />
+          {/* Email the minutes through the user's own Gmail. GmailShareRow
+              owns the visibility rule: when Gmail is not connected (or the
+              connection went stale) it renders as an explanatory prompt
+              routing to Settings, never as an action that would fail. */}
+          <GmailShareRow
+            usable={gmail.usable}
+            needsReauth={gmail.needsReauth}
+            onPress={() => closeMenuThen(() => setGmailShareOpen(true))}
+            onPrompt={closeMenuThen}
+            style={st.menuRow}
+          />
+          {/* Identify the voices. Mapping a speaker to a contact is also what
+              lets this meeting's AI tasks find a real owner, which is why it
+              sits in the primary menu rather than buried in the transcript. */}
+          <SheetAction
+            icon="person.2.fill"
+            label="Participants & speakers"
+            onPress={() => closeMenuThen(() => router.push({
+              pathname: "/recording/[key]/participants",
+              params: { key },
+            }))}
+          />
+          {/* Destructive last and coloured, so it is never the row a thumb
+              lands on by accident reaching for Share. */}
+          <SheetAction
+            icon="trash"
+            label={deleting ? "Moving…" : "Move to Trash"}
+            destructive
+            disabled={deleting}
+            onPress={() => closeMenuThen(confirmDelete)}
+          />
+        </BottomSheet>
 
         {/* ---- Rename meeting title ---- */}
         <Modal visible={renaming} transparent animationType="fade" onRequestClose={() => setRenaming(false)}>
@@ -1037,95 +874,14 @@ export default function MeetingDetailScreen() {
           </KeyboardAvoidingView>
         </Modal>
 
-        {/* ---- Rename a speaker (opened from the transcript or the
-             Participants list — both feed the same openRenameSpeaker) ---- */}
-        <Modal visible={editingSpeaker !== null} transparent animationType="fade" onRequestClose={() => setEditingSpeaker(null)}>
-          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
-            <Pressable style={st.sheetBackdrop} onPress={() => setEditingSpeaker(null)}>
-              <Pressable style={st.sheet} onPress={() => { }}>
-                <Text style={{ fontFamily: FONT.semibold, fontSize: 11, color: C.textFaint, textTransform: "uppercase", letterSpacing: 0.6 }}>
-                  {editingSpeaker != null ? speakerName(editingSpeaker, speakerNames) : ""}
-                </Text>
-                <Text style={st.sheetTitle}>Who is this?</Text>
+        {/* ---- Who is this speaker — the shared tagging sheet ---- */}
+        <SpeakerTagSheet
+          tagging={speakerTagging}
+          speakerId={editingSpeaker}
+          onClose={() => setEditingSpeaker(null)}
+        />
+        <Toast visible={!!speakerTagging.toast} label={speakerTagging.toast} />
 
-                {/* TAG A CONTACT — the preferred path, offered first.
-                    A tagged contact is a real person the system can assign
-                    tasks to and notify; a typed name is only a display label.
-                    Both are legitimate, so both are here, with the one that
-                    does more listed above. */}
-                <Pressable
-                  style={st.tagRow}
-                  onPress={() => setSpeakerPickerOpen(true)}
-                  disabled={savingSpeaker}
-                  accessibilityRole="button"
-                  accessibilityLabel={
-                    taggedContact
-                      ? `Tagged as ${taggedContact.name}. Change contact`
-                      : "Tag a contact"
-                  }
-                >
-                  {taggedContact ? (
-                    <>
-                      <View style={[st.tagAvatar, { backgroundColor: avatarColorFor(taggedContact.name) }]}>
-                        <Text style={st.tagAvatarTxt}>{initialsOf(taggedContact.name)}</Text>
-                      </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={st.tagName}>{taggedContact.name}</Text>
-                        <Text style={st.tagHint}>
-                          Tagged — tasks can be assigned to them
-                        </Text>
-                      </View>
-                      <Text style={st.tagAction}>Change</Text>
-                    </>
-                  ) : (
-                    <>
-                      <View style={[st.tagAvatar, { backgroundColor: C.primarySoft }]}>
-                        <Icon name="person.2.fill" size={17} tintColor={C.primary} />
-                      </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={st.tagName}>Tag a contact</Text>
-                        <Text style={st.tagHint}>
-                          So tasks can be assigned to this person
-                        </Text>
-                      </View>
-                      <Icon name="chevron.right" size={15} tintColor={C.textFaint} />
-                    </>
-                  )}
-                </Pressable>
-
-                <Text style={st.orRule}>or just set a name</Text>
-
-                <TextInput
-                  style={st.nameInput}
-                  value={speakerDraft}
-                  onChangeText={setSpeakerDraft}
-                  placeholder="Their name"
-                  placeholderTextColor={C.textFaint}
-                  autoCapitalize="words"
-                  maxLength={60}
-                  returnKeyType="done"
-                  onSubmitEditing={saveSpeaker}
-                />
-                <Text style={{ fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 8 }}>
-                  Updates the transcript and participants immediately. Generated
-                  documents that mention this speaker will be flagged for an update.
-                </Text>
-                <View style={{ flexDirection: "row", gap: S.sm, marginTop: 22 }}>
-                  <Button label="Cancel" variant="secondary" style={{ flex: 1 }} onPress={() => setEditingSpeaker(null)} disabled={savingSpeaker} />
-                  <Button label="Save" style={{ flex: 1 }} onPress={saveSpeaker} loading={savingSpeaker} />
-                </View>
-              </Pressable>
-            </Pressable>
-          </KeyboardAvoidingView>
-        </Modal>
-
-        {/* The contact picker for speaker tagging. Mounted as its own Modal
-            OUTSIDE the rename sheet: nesting one Modal inside another is
-            unreliable on Android (the inner one can render behind), and this
-            way the rename sheet stays open underneath so cancelling the picker
-            returns to it rather than losing the user's place.
-            Ordering: people already tagged in this meeting, then the folder's
-            contacts, then everyone — plus create-new and phone import. */}
         <AddTaskSheet
           visible={addTaskOpen}
           onClose={() => setAddTaskOpen(false)}
@@ -1159,23 +915,6 @@ export default function MeetingDetailScreen() {
           onSent={(count) => Alert.alert(
             "Sent",
             `Your email was sent to ${count} ${count === 1 ? "person" : "people"}.`)}
-        />
-
-        <ContactPicker
-          visible={speakerPickerOpen}
-          onClose={() => setSpeakerPickerOpen(false)}
-          onPick={(c) => {
-            setSpeakerPickerOpen(false);
-            void tagSpeakerContact(c);
-          }}
-          meetingContacts={speakerContacts}
-          folderContacts={speakerFolderContacts}
-          folderId={rec?.folder_id || undefined}
-          title={
-            editingSpeaker != null
-              ? `Who is Speaker ${editingSpeaker}?`
-              : "Select Contact"
-          }
         />
       </View>
     </AudioPlayerProvider>

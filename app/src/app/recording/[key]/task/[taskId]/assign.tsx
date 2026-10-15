@@ -17,7 +17,7 @@
 //     lib/contact-picker.tsx, with the ordering the product wants.
 //
 // So this screen now delegates to that picker and assigns a contact_id. The
-// picker ranks: people tagged in THIS meeting, then this folder's contacts,
+// picker ranks: people tagged in THIS meeting,
 // then every contact — plus create-new and import-from-phone, which together
 // replace the manual-entry and phone-contacts paths this file used to own.
 //
@@ -91,13 +91,11 @@ export default function AssignScreen() {
   // tap again to see the list would be a step for nothing.
   const [pickerOpen, setPickerOpen] = useState(true);
   const [meetingContacts, setMeetingContacts] = useState<ApiContact[]>([]);
-  const [folderContacts, setFolderContacts] = useState<ApiContact[]>([]);
-  const [folderId, setFolderId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   // The ranking context. One call gives us both the meeting's tagged people and
-  // its folder's contacts. Failure only degrades ORDERING — the picker still
+  // Failure only degrades ORDERING — the picker still
   // lists every contact — so it is not surfaced as an error.
   useEffect(() => {
     let alive = true;
@@ -110,8 +108,6 @@ export default function AssignScreen() {
             .map((x) => x.contact)
             .filter((c): c is ApiContact => !!c)
         );
-        setFolderContacts(p.folder_contacts);
-        setFolderId(p.folder_id);
       } catch {
         if (alive) setMeetingContacts([]);
       }
@@ -180,8 +176,8 @@ export default function AssignScreen() {
       ) : (
         <>
           <Text style={st.intro}>
-            People tagged in this meeting come first, then this folder&apos;s
-            contacts, then everyone. You can also add someone new.
+            People tagged in this meeting come first, then everyone. You can
+            also add someone new.
           </Text>
           {!!error && <ErrorText>{error}</ErrorText>}
           <Button
@@ -196,8 +192,6 @@ export default function AssignScreen() {
         onClose={() => setPickerOpen(false)}
         onPick={assign}
         meetingContacts={meetingContacts}
-        folderContacts={folderContacts}
-        folderId={folderId}
         title="Assign Task To"
       />
     </View>

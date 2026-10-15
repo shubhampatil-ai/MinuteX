@@ -6,18 +6,10 @@ and for WhatsApp / Google Calendar / Google Tasks / Slack / whatever comes
 next without a second table, a second status vocabulary or a second OAuth
 implementation.
 
-WHY IT IS NOT CrmConnections. CrmConnections already stores a per-user OAuth
-credential keyed (user_id, provider), and its docstring explicitly leaves the
-sort key open "for hubspot/zoho later". That is the right shape and this table
-copies it deliberately. What it does NOT copy is the SCOPE: CrmConnections
-carries Salesforce-shaped attributes (instance_url, org_id, sf_username) and
-a CRM field-mapping config, and every consumer of it reads those. Widening it
-to hold Gmail would mean either Salesforce columns sitting empty on Gmail rows
-or a union type nobody can reason about — and, worse, it would put the CRM
-mapping config and the mail credential in one item that two unrelated features
-both write. So: same proven shape, separate table, and Salesforce stays where
-it is. Migrating Salesforce onto this table later is a data move, not a
-redesign — see PROVIDERS below.
+One row per (user_id, provider) in the Integrations table. Salesforce is not
+an integration here: it is reached through the workspace's Salesforce Site
+endpoint (the site-delivery / site-salesforce routes), which is configured per
+workspace, not per user.
 
 THE STATUS VOCABULARY IS THE POINT. The product requirement is that the app
 never guesses; the backend is the source of truth. A row's mere existence is
@@ -56,7 +48,6 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 PROVIDER_GMAIL = "gmail"
 PROVIDER_WHATSAPP = "whatsapp"
-PROVIDER_SALESFORCE = "salesforce"
 PROVIDER_GOOGLE_CALENDAR = "google_calendar"
 PROVIDER_GOOGLE_TASKS = "google_tasks"
 
@@ -79,26 +70,6 @@ PROVIDERS = [
         "available": False,
     },
     {
-        # Salesforce WORKS — it predates this system and is connected through
-        # /crm/salesforce/* against the CrmConnections table. So it is a fully
-        # available integration, NOT a Coming Soon card, and its real
-        # connection state is read from that table (see salesforce_row_status
-        # below) rather than being reported as "not connected" because this
-        # system does not own the row.
-        #
-        # `managed_elsewhere` is what stops the generic flow being applied to
-        # it: /integrations/salesforce/connect does not exist, so the app
-        # routes this card to the existing Salesforce screen, which owns both
-        # connecting and the field mapping. The flag is about WHICH FLOW runs,
-        # never about whether the integration works.
-        "provider": PROVIDER_SALESFORCE,
-        "name": "Salesforce",
-        "category": "crm",
-        "description": "Push meeting notes onto your CRM records.",
-        "available": True,
-        "managed_elsewhere": True,
-    },
-    {
         "provider": PROVIDER_GOOGLE_CALENDAR,
         "name": "Google Calendar",
         "category": "productivity",
@@ -116,17 +87,8 @@ PROVIDERS = [
 
 PROVIDERS_BY_ID = {p["provider"]: p for p in PROVIDERS}
 
-# Providers whose connect flow THIS system runs.
-#
-# `available` alone is not the test: Salesforce is available (it genuinely
-# works) but is connected through /crm/salesforce/*, so
-# POST /integrations/salesforce/connect must still be refused. Excluding
-# managed_elsewhere here is what keeps "this integration works" and "this
-# integration uses the generic flow" as two separate facts — the day
-# Salesforce is migrated onto the Integrations table, dropping its
-# managed_elsewhere flag is the only change needed.
-CONNECTABLE = {p["provider"] for p in PROVIDERS
-               if p.get("available") and not p.get("managed_elsewhere")}
+# Providers whose connect flow this system runs: the available ones.
+CONNECTABLE = {p["provider"] for p in PROVIDERS if p.get("available")}
 
 # ---------------------------------------------------------------------------
 # Status.
@@ -180,7 +142,6 @@ def public_status(provider: str, row=None) -> dict:
         "category": meta.get("category", ""),
         "description": meta.get("description", ""),
         "available": bool(meta.get("available")),
-        "managed_elsewhere": bool(meta.get("managed_elsewhere")),
         "status": STATUS_NOT_CONNECTED,
         "connected": False,
         "account_identifier": "",
@@ -212,40 +173,6 @@ def public_status(provider: str, row=None) -> dict:
     return out
 
 
-def salesforce_row(crm_row) -> dict:
-    """A CrmConnections row in this module's row shape.
-
-    Salesforce predates the Integrations table and stores different attribute
-    names (`sf_username`, no `status`, no `scopes`). Translating here — rather
-    than special-casing Salesforce inside public_status — keeps the catalog
-    uniform: every card downstream reads one shape, and the Integrations
-    screen needs no knowledge that one provider's row lives elsewhere.
-
-    STATUS IS INFERRED, and only two of the four states are reachable.
-    CrmConnections has no status attribute: the row exists or it does not.
-    A dead Salesforce refresh token is discovered by _sf_call at CALL time and
-    surfaced as 409 there, so this cannot report REAUTH_REQUIRED without
-    making a network call the catalog has no business making. Reporting
-    CONNECTED for a row whose token later turns out to be dead is the honest
-    limit of what a cheap read can know — and the Salesforce screen itself
-    already probes and shows "Reconnect required" when the user opens it.
-    """
-    if not crm_row:
-        return None
-    return {
-        "status": STATUS_CONNECTED,
-        "status_message": "",
-        "refresh_token_enc": crm_row.get("refresh_token_enc", ""),
-        # The org username is what the user recognises, exactly as the Gmail
-        # address is for Gmail.
-        "account_identifier": crm_row.get("sf_username", ""),
-        "account_name": crm_row.get("instance_url", ""),
-        "scopes": [],
-        "connected_at": crm_row.get("connected_at", ""),
-        "updated_at": crm_row.get("updated_at", ""),
-    }
-
-
 def catalog(rows_by_provider=None) -> list:
     """Every integration MinuteX knows about, with this user's status on each.
 
@@ -254,10 +181,8 @@ def catalog(rows_by_provider=None) -> list:
     list on the client would mean shipping a new build to announce a new
     integration.
 
-    `rows_by_provider` may legitimately mix sources — the caller passes the
-    Integrations table's rows plus a translated CrmConnections row for
-    Salesforce (see salesforce_row). That is the whole reason this takes a
-    mapping rather than reading a table itself.
+    `rows_by_provider` is the caller's Integrations rows keyed by provider;
+    taking a mapping keeps this module free of any table access.
     """
     rows_by_provider = rows_by_provider or {}
     return [public_status(p["provider"], rows_by_provider.get(p["provider"]))

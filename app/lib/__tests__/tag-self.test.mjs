@@ -119,20 +119,56 @@ describe("picking yourself produces a linkable contact", () => {
     assert.match(fn, /onPick\(contact\)/, "it must select the contact it made");
   });
 
-  it("files the contact into the folder when there is one", () => {
-    const fn = PICKER.slice(
-      PICKER.indexOf("const pickSelf"),
-      PICKER.indexOf("// Ask for permission and load the device list")
-    );
-    assert.match(fn, /folder_id: folderId \|\| undefined/);
-  });
-
   it("surfaces a failure instead of silently doing nothing", () => {
     const fn = PICKER.slice(
       PICKER.indexOf("const pickSelf"),
       PICKER.indexOf("// Ask for permission and load the device list")
     );
     assert.match(fn, /setCreateError\(/, "a failed create must be visible");
+  });
+});
+
+describe("one speaker-tagging UI on every surface", () => {
+  // People tab, Transcript and Participants used to be three different UIs —
+  // only Participants offered "That's me" and meeting access.
+  const TAGGING = read("lib/speaker-tagging.tsx");
+  const MEETING = read("src/app/recording/[key]/index.tsx");
+  const TRANSCRIPT = read("src/app/recording/[key]/transcript.tsx");
+
+  it("the People tab and the Transcript open the shared sheet", () => {
+    for (const [name, src] of [["meeting", MEETING], ["transcript", TRANSCRIPT]]) {
+      assert.match(src, /<SpeakerTagSheet/, `${name} must use the shared sheet`);
+      assert.match(src, /useSpeakerTagging\(/, `${name} must use the shared state`);
+      assert.doesNotMatch(src, /<ContactPicker/, `${name} must not grow its own picker`);
+      assert.doesNotMatch(src, /setParticipant\(/, `${name} must not write mappings itself`);
+    }
+  });
+
+  it("the Participants screen renders the shared card", () => {
+    assert.match(PARTICIPANTS, /<SpeakerTagCard/);
+    assert.match(PARTICIPANTS, /<SpeakerContactPicker/);
+  });
+
+  it("the shared sheet IS the shared card", () => {
+    const sheet = TAGGING.slice(TAGGING.indexOf("export function SpeakerTagSheet"));
+    assert.match(sheet, /<SpeakerTagCard/);
+  });
+
+  it("the shared picker offers That's me", () => {
+    const picker = TAGGING.slice(
+      TAGGING.indexOf("export function SpeakerContactPicker"),
+      TAGGING.indexOf("export function SpeakerNameSheet"));
+    assert.match(picker, /allowSelf/);
+  });
+
+  it("the card carries contact, name and meeting access — no CRM identity", () => {
+    const card = TAGGING.slice(
+      TAGGING.indexOf("export function SpeakerTagCard"),
+      TAGGING.indexOf("// The three follow-ups the card opens."));
+    assert.match(card, /Select Contact/);
+    assert.match(card, /Set name/);
+    assert.doesNotMatch(card, /CRM identity/);
+    assert.match(card, /Meeting access/);
   });
 });
 

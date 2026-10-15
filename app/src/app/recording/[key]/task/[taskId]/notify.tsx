@@ -10,6 +10,7 @@
 import { useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ELEV, FONT, R, S, useTheme, ColorScale } from "../../../../../../lib/theme";
 import { Button, KeyboardAware } from "../../../../../../lib/ui";
 import { Icon } from "../../../../../../lib/icons";
@@ -177,6 +178,9 @@ function NotificationPreviewSheet({
   onSent: () => void;
 }) {
   const { C, T } = useTheme();
+  // Absolutely positioned from top: 0 to bottom: 0, so it owns both the
+  // status bar and the home indicator. Both were hard-coded before.
+  const insets = useSafeAreaInsets();
   const [sending, setSending] = useState(false);
   const [result, setResult] = useState("");
   const assignee = task.assignee!;
@@ -235,7 +239,7 @@ function NotificationPreviewSheet({
     <View style={{ position: "absolute", left: 0, right: 0, top: 0, bottom: 0, backgroundColor: C.bg }}>
       <View style={{
         flexDirection: "row", alignItems: "center", gap: S.md,
-        paddingHorizontal: 20, paddingTop: 60, paddingBottom: 14,
+        paddingHorizontal: 20, paddingTop: insets.top + 14, paddingBottom: 14,
         borderBottomWidth: 1, borderBottomColor: C.border,
       }}>
         <Pressable onPress={onClose} hitSlop={8} accessibilityLabel="Close">
@@ -278,7 +282,9 @@ function NotificationPreviewSheet({
         ) : null}
       </ScrollView>
 
-      <View style={{ padding: 20, paddingBottom: 32 }}>
+      {/* The Send button is the only way to finish, so it clears the
+          home indicator rather than assuming a fixed 32. */}
+      <View style={{ padding: 20, paddingBottom: Math.max(insets.bottom, 16) + 16 }}>
         <Button label={`Send ${channel === "app" ? "" : "via " + CHANNELS.find((c) => c.key === channel)?.label}`.trim()} onPress={send} loading={sending} />
       </View>
     </View>

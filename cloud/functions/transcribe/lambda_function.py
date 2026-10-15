@@ -42,8 +42,8 @@ Flow B — completion (webhook -> userApi -> here):
      (grouping consecutive `type=="word"` tokens by `speaker_id`) and real
      per-speaker-turn `timestamps` from the same words' start/end.
   6. ONE Groq call produces the whole analysis — title, summary, highlights,
-     tasks, participants, the structured `meeting_highlights` AND any
-     configured CRM identifiers (see analyze_meeting()).
+     tasks, participants and the structured `meeting_highlights` (see
+     analyze_meeting()).
   7. UPSERT one item into DynamoDB keyed by audio_s3_key, with the transcript
      itself offloaded to S3 (see lambda-shared/transcript_store.py).
 
@@ -83,6 +83,7 @@ from decimal import Decimal
 
 import boto3
 from botocore.config import Config as _BotoConfig
+from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 # The shared AI core — one Groq client, one set of prompts, one coercion layer
@@ -92,6 +93,7 @@ import groq_client
 import notification_schema
 import pageindex_store
 import prompts
+import push_delivery
 import stt_result
 import transcript_store
 
@@ -113,11 +115,13 @@ URL_EXPIRY = int(os.environ.get("URL_EXPIRY", "900"))
 # summary stage used to get.
 GROQ_DEADLINE_SECONDS = int(os.environ.get("GROQ_DEADLINE_SECONDS", "180"))
 
-# The user's CRM config lives on the CrmConnections row userApi owns. This
-# Lambda reads it (never writes it) to learn WHAT to extract — without it there
-# is no way to know that this customer identifies records by "Lead Email".
-CRM_CONNECTIONS_TABLE = os.environ.get("CRM_CONNECTIONS_TABLE", "CrmConnections")
-CRM_PROVIDER_SALESFORCE = "salesforce"
+# The task call's own budget, on top of the analysis's (see extract_tasks). A
+# normal meeting's task call takes 15-25s; this leaves room for the generation
+# retries. 180 + 60 stays well inside the Lambda's 300s timeout, so even a
+# worst-case analysis cannot push the task call into killing the invocation
+# before the transcript is persisted.
+GROQ_TASKS_DEADLINE_SECONDS = int(
+    os.environ.get("GROQ_TASKS_DEADLINE_SECONDS", "60"))
 
 # --- ElevenLabs speech-to-text (Scribe) ---
 ELEVENLABS_URL = "https://api.elevenlabs.io/v1/speech-to-text"
@@ -502,7 +506,7 @@ _merge_partials = ai_schema.merge_analyses
 #
 # `action_items` here is the ANALYSIS field only. Do not confuse it with
 # meeting_highlights["action_items"] (the Stage 2 structured extraction, still
-# live) or userApi's action_items document/CRM target, which keep their names.
+# live) or userApi's action_items document, which keep their names.
 RETIRED_ANALYSIS_ATTRS = (
     "agenda",
     "key_points",
@@ -513,12 +517,11 @@ RETIRED_ANALYSIS_ATTRS = (
     # `overview`, whose sections carry the same ground in the shape this
     # meeting actually warranted. NOT accompanied by `summary`, which is
     # deliberately still written (derived, see analyze_and_persist) because
-    # the meetings list and the Salesforce push both need one short string.
+    # the meetings list and the Salesforce Site delivery both need one short
+    # string.
     "highlights",
-    # Never written by this pipeline again — CRM extraction left the analysis
-    # path. Deliberately ABSENT from this tuple even so: a stored crm_records
-    # value may be a user's MANUAL, confirmed link to a real Salesforce
-    # record, and reprocessing a recording must not silently unlink it.
+    # (`crm_records`, from the removed OAuth CRM integration, is left on old
+    # rows and read by nothing; it is deliberately not stripped here.)
 )
 
 # How much of the overview the derived `summary` preview carries. Sized for
@@ -569,9 +572,11 @@ def _note_partial_overview(overview, covered, total):
     return {**overview, "sections": [first] + list(sections[1:])}
 
 
-def analyze_meeting(transcript, valid_ids=None, roster_source=None):
-    """THE analysis: title, the dynamic overview, tasks, participants and the
-    structured meeting_highlights — in ONE Groq call.
+def analyze_meeting(transcript, valid_ids=None, roster_source=None,
+                    speaker_names=None):
+    """THE analysis: title, the dynamic overview, participants and the
+    structured meeting_highlights — in ONE Groq call. (Tasks are a second call,
+    extract_tasks(), which reads this analysis.)
 
     Replaces stages that each re-sent the same transcript:
         summarize()               title/summary/highlights/tasks/participants
@@ -639,12 +644,19 @@ def analyze_meeting(transcript, valid_ids=None, roster_source=None):
         # model who the speakers are beats asking it to work that out from prose,
         # and it means the contribution blurbs land on the right speakers rather
         # than being dropped by the filter for naming someone else.
-        map_prompt=prompts.unified_analysis_system(roster),
+        # speaker_names too, so the prompt can state the id -> name mapping
+        # explicitly. The transcript the model reads has already had those
+        # names substituted into its lines, so without this table it has no
+        # way to know that "Rahul:" is the speaker whose id is "0" — and it
+        # answers "Rahul" in `assignee_speaker_id`.
+        map_prompt=prompts.unified_analysis_system(roster, speaker_names),
         # OVERFLOW ONLY — a transcript past the single-pass budget. Still built
         # on SUMMARY_REDUCE_SYSTEM, which is NOT retired.
         reduce_prompt=prompts.unified_reduce_system(),
-        merge=lambda partials: ai_schema.merge_unified(partials, roster),
-        coerce=lambda obj: ai_schema.coerce_unified(obj, roster, valid_ids),
+        merge=lambda partials: ai_schema.merge_unified(
+            partials, roster, speaker_names),
+        coerce=lambda obj: ai_schema.coerce_unified(
+            obj, roster, valid_ids, speaker_names),
         # The whole analysis is ONE call, so it gets the whole analysis budget
         # instead of the old summary-vs-highlights split.
         deadline_seconds=GROQ_DEADLINE_SECONDS,
@@ -667,7 +679,6 @@ def analyze_meeting(transcript, valid_ids=None, roster_source=None):
           f"title={analysis['title']!r}, "
           f"{len(sections)} overview section(s) "
           f"{[s.get('title') for s in sections]}, "
-          f"{len(analysis['tasks'])} tasks, "
           f"{len(analysis['participants'])} participants, "
           + ", ".join(f"{len(hl.get(k, []))} {k}"
                       for k in ai_schema.HIGHLIGHT_SECTIONS)
@@ -675,39 +686,46 @@ def analyze_meeting(transcript, valid_ids=None, roster_source=None):
     return analysis
 
 
-def _crm_mappings_for_user(user_id):
-    """The user's configured CRM mappings, or [] if none/unreachable.
+def extract_tasks(transcript, analysis, valid_ids=None, roster_source=None,
+                  speaker_names=None, language=None, duration=None):
+    """THE TASK CALL: the meeting's committed work, as `analysis["tasks"]`.
 
-    Read-only view of the config userApi owns (see its CRM configuration
-    section for the shape and the legacy-config compatibility rule, which is
-    reimplemented here because the two Lambdas share no code for it).
+    A second Groq call, made after analyze_meeting(), with tasks as its ONLY
+    output and the analysis that call just wrote — in English — placed ahead of
+    the transcript. Why both matter is in prompts.TASKS_SYSTEM.
 
-    Every failure path returns [] rather than raising: a CRM config problem must
-    never cost a user their transcript and summary. Not configured is also by
-    far the common case.
+    Returns the coerced task list. Raises on failure; the caller decides what a
+    failure means (it stores no tasks rather than failing the meeting).
     """
-    if not user_id:
-        return []
-    try:
-        item = _ddb.Table(CRM_CONNECTIONS_TABLE).get_item(
-            Key={"user_id": user_id, "provider": CRM_PROVIDER_SALESFORCE}
-        ).get("Item")
-    except Exception as err:  # noqa: BLE001
-        print(f"[crm] could not read config for {user_id}: {err}")
-        return []
-    cfg = (item or {}).get("config") or {}
-    stored = cfg.get("mappings")
-    if isinstance(stored, list):
-        return [m for m in stored if isinstance(m, dict)
-                and m.get("object") and m.get("lookup_field")]
-    # Legacy single-object config (pre-mappings). Mirrors userApi's
-    # _mappings_from_config so an upgraded user's extraction keeps working.
-    obj, lookup = cfg.get("object"), cfg.get("site_visit_number_field")
-    if obj and lookup:
-        label = cfg.get("object_label") or obj
-        return [{"object": obj, "object_label": label,
-                 "lookup_field": lookup, "label": f"{label} Number"}]
-    return []
+    roster = ai_schema.speaker_roster(
+        roster_source if roster_source is not None else transcript)
+    # The same digest the meeting chat reads (prompts.analysis_context), built
+    # from what analyze_meeting just produced rather than from the row, which
+    # has not been written yet.
+    analysis_text = prompts.analysis_context(
+        {"title": analysis.get("title"),
+         "overview": analysis.get("overview"),
+         "participants": analysis.get("participants"),
+         "speaker_names": speaker_names or {},
+         "language": language or "",
+         "duration": duration},
+        analysis.get("meeting_highlights"))
+    result, covered, total = groq_client.analyze(
+        prompts.tasks_user_content(analysis_text, transcript),
+        map_prompt=prompts.tasks_system(roster, speaker_names),
+        reduce_prompt=prompts.TASKS_REDUCE_SYSTEM,
+        merge=ai_schema.merge_tasks,
+        coerce=lambda obj: ai_schema.coerce_task_reply(
+            obj, roster, valid_ids, speaker_names),
+        deadline_seconds=GROQ_TASKS_DEADLINE_SECONDS,
+        label="tasks",
+        # No is_usable: an empty list is a legitimate answer (a meeting that
+        # agreed nothing), not a failed generation to retry.
+    )
+    tasks = (result or {}).get("tasks") or []
+    print(f"[groq] tasks ok ({covered}/{total} segments): {len(tasks)} tasks "
+          f"(model={groq_client.GROQ_MODEL})")
+    return tasks
 
 
 # ---------------------------------------------------------------------------
@@ -1019,8 +1037,8 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     # Step 2: analyze with Groq — ONE call over the full transcript producing
-    # EVERYTHING: title, the dynamic overview, tasks, participants and the
-    # structured meeting_highlights.
+    # title, the dynamic overview, participants and the structured
+    # meeting_highlights; then the TASK call (extract_tasks), fed that analysis.
     # Failure here is non-fatal — we still keep the transcript + timestamps.
     #
     # The segment ids are derived the SAME way the read path derives them
@@ -1030,20 +1048,31 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
     # reference that validates at write time but resolves to nothing at read
     # time is the one failure the validation exists to prevent.
     _upsert(key, {"status": "generating_ai"})
+    # The row's rename map ({"0": "Yuvraj Sir", ...}), read BEFORE analysis so
+    # both the rendered transcript and the participant matcher can use it. A
+    # rename made after this point simply is not reflected in this analysis —
+    # same as any other row edit made mid-run.
+    prior_row = _table.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+    speaker_names = prior_row.get("speaker_names") or {}
     # The allow-list of real segment ids, and the transcript rendered WITH those
     # ids on each line. Both come from transcript_store so the input the model
     # reads and the validator's allow-list can never disagree about what a valid
     # reference is. Before this, the model was handed the plain prose transcript
     # — it had no ids to copy, so every extraction returned
     # evidence_segment_ids: [] however clearly the prompt asked for them.
+    # speaker_names renders the user's renames INTO the lines the model reads
+    # (see transcript_store.as_labelled_lines) — otherwise a renamed meeting
+    # answers "who said X" worse, not better, than an unrenamed one.
     valid_ids = transcript_store.valid_segment_ids(timestamps)
-    labelled = transcript_store.as_labelled_lines(transcript, timestamps)
+    labelled = transcript_store.as_labelled_lines(transcript, timestamps,
+                                                  speaker_names)
 
     analysis = ai_schema.empty_unified()
     status = "complete"
     try:
         analysis = analyze_meeting(labelled, valid_ids,
-                                   roster_source=transcript)
+                                   roster_source=transcript,
+                                   speaker_names=speaker_names)
         if ai_schema.overview_empty(analysis.get("overview")):
             # analyze_meeting() can return NORMALLY with an empty overview (e.g.
             # map_reduce's reduce step came back blank without Groq itself
@@ -1060,6 +1089,20 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
         print(f"[groq] FAILED for {key} — persisting transcript only: {err}")
         analysis = ai_schema.empty_unified()
         status = "transcribed"
+
+    # Step 2b: the TASK call. Only after a usable analysis: it reads that
+    # analysis, and a "transcribed" row is already the degraded state a
+    # reprocess repairs as a whole. A task-call failure costs the tasks, never
+    # the meeting — the overview the user is waiting for is already in hand.
+    if status == "complete":
+        try:
+            analysis["tasks"] = extract_tasks(
+                labelled, analysis, valid_ids, roster_source=transcript,
+                speaker_names=speaker_names, language=language,
+                duration=prior_row.get("duration"))
+        except Exception as err:  # noqa: BLE001
+            print(f"[groq] task call FAILED for {key} — storing no tasks: {err}")
+            analysis["tasks"] = []
 
     # The outputs now arrive TOGETHER, so they no longer degrade independently —
     # there is one call to fail, not several. That trade is deliberate and it is
@@ -1124,8 +1167,8 @@ def analyze_and_persist(bucket, key, transcript, timestamps, language):
         # need one short string per meeting and neither can render sections:
         #   * the meetings list, which shows a 3-line snippet under each row
         #     and searches it (app/src/app/(tabs)/index.tsx);
-        #   * the Salesforce push's Summary content target, which writes into
-        #     a single long-text field.
+        #   * the Salesforce Site meeting delivery, which writes it into a
+        #     single long-text field (MinuteX_Site_Meeting__c.Summary__c).
         # Bounded to a preview length rather than the whole overview: the list
         # view reads this attribute for EVERY row it returns, so its size is
         # multiplied across the page.
@@ -1389,6 +1432,11 @@ NOTIFICATION_DEDUPE_TABLE = os.environ.get("NOTIFICATION_DEDUPE_TABLE",
                                            "NotificationDedupe")
 NOTIFICATION_DEDUPE_TTL_DAYS = int(
     os.environ.get("NOTIFICATION_DEDUPE_TTL_DAYS", "90"))
+# OS push (the CHANNEL_PUSH seam). Tokens live in userApi's PushTokens table;
+# this Lambda only reads them and marks dead ones. EXPO_ACCESS_TOKEN is
+# optional — needed only if the Expo project enforces enhanced push security.
+PUSH_TOKENS_TABLE = os.environ.get("PUSH_TOKENS_TABLE", "PushTokens")
+EXPO_ACCESS_TOKEN = os.environ.get("EXPO_ACCESS_TOKEN", "")
 
 
 def _notify(user_id, notification_type, entity_id, *, subject="",
@@ -1485,8 +1533,66 @@ def _notify_processing_outcome(key, user_id, status, title):
     _notify(user_id, notification_schema.TYPE_MEETING_PROCESSING_COMPLETED,
             key, subject=title)
     if status == "complete":
-        _notify(user_id, notification_schema.TYPE_AI_OUTPUT_READY,
-                key, subject=title)
+        row = _notify(user_id, notification_schema.TYPE_AI_OUTPUT_READY,
+                      key, subject=title)
+        # The OS push rides on the in-app row: `row` is non-None only when
+        # this run actually created the AI_OUTPUT_READY notification, so a
+        # reprocess of an already-announced meeting stays silent on the lock
+        # screen exactly as it does in the bell.
+        _push_brief_ready(user_id, key, row)
+
+
+def _push_brief_ready(user_id, key, notification_row):
+    """Deliver ONE "Brief ready" OS push for a newly-ready brief.
+
+    WHEN. Only from the `complete` branch above — the analysis exists and is
+    persisted. Never on upload, never on transcript, never on the degraded
+    "transcribed" status (no brief to open), never on failure.
+
+    IDEMPOTENCY. Two layers, both server-side:
+      1. `notification_row` exists only if the in-app claim was won;
+      2. a PUSH claim in the same NotificationDedupe table, keyed by that
+         row's dedupe identity + the channel. Unlike the in-app claim this
+         one fails CLOSED — if the claim cannot be written, nothing is sent.
+         A missed push still leaves the in-app notification; a duplicate
+         buzz on every retry is the thing users disable notifications over.
+
+    Never raises: the brief is already paid for and persisted, and an error
+    here must not make S3 retry the whole pipeline.
+    """
+    try:
+        recipient = str(user_id or "").strip()
+        if not recipient or not notification_row:
+            return None
+        claim = (str(notification_row.get("dedupe_key") or "")
+                 or notification_schema.dedupe_key(
+                     recipient, notification_schema.TYPE_AI_OUTPUT_READY, key))
+        claim += "\x00" + notification_schema.CHANNEL_PUSH
+        try:
+            _ddb.Table(NOTIFICATION_DEDUPE_TABLE).put_item(
+                Item={"dedupe_key": claim,
+                      "created_at": datetime.now(timezone.utc).isoformat()
+                                    .replace("+00:00", "Z"),
+                      "expires_at": int(time.time())
+                                    + NOTIFICATION_DEDUPE_TTL_DAYS * 86400},
+                ConditionExpression="attribute_not_exists(dedupe_key)",
+            )
+        except ClientError as err:
+            if err.response.get("Error", {}).get("Code")                     != "ConditionalCheckFailedException":
+                print(f"[push] claim errored for {key} — not sending: {err}")
+            return None
+
+        notification_id = str(notification_row.get("notification_id") or "")
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return push_delivery.send_to_user(
+            _ddb.Table(PUSH_TOKENS_TABLE), recipient,
+            lambda token: push_delivery.brief_ready_message(
+                token, key, notification_id),
+            post=push_delivery.urllib_transport(access_token=EXPO_ACCESS_TOKEN),
+            key_cls=Key, now_iso=now_iso, now_epoch=int(time.time()))
+    except Exception as err:  # noqa: BLE001
+        print(f"[push] FAILED for {key}: {type(err).__name__}: {err}")
+        return None
 
 
 def _notify_recipient(key):

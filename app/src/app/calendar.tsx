@@ -35,11 +35,12 @@ import { Icon } from "../../lib/icons";
 import { S, R, ELEV, CAPS, FONT, useTheme, ColorScale } from "../../lib/theme";
 import { Button, EmptyState, ErrorText } from "../../lib/ui";
 import {
-  ApiError, ApiFolder, ApiTask, RecordingSummary, getAllTasks, getFolders,
-  getMeetingHighlights, getRecordings, patchTaskById,
+  ApiError, ApiTask, getAllTasks, patchTaskById,
 } from "../../lib/api";
+import { fetchMeetingHighlights, useRecordings } from "../../lib/shared-data";
+import { hasReadableHighlights } from "../../lib/offline-cache-rules";
+import { mapLimit } from "../../lib/request-guard";
 import { TaskCard, SectionHeader } from "../../lib/task-action-center";
-import { folderIcon, folderSwatch } from "../../lib/folder-appearance";
 import {
   AgendaEntry, CalendarCell, GRID_DAY_LABELS, MeetingDeadline, addDays,
   addMonths, agendaForDay, clockLabel, dayHeading, dayLoad, deadlinesFromHighlights,
@@ -71,6 +72,8 @@ const RANGE_MAX_PAGES = 5;
 // calendar is actually likely to show. Older meetings' dates surface on the
 // meeting itself, where they always have.
 const HIGHLIGHT_MEETINGS = 12;
+// How many of those requests may be in flight at once.
+const HIGHLIGHT_CONCURRENCY = 3;
 
 export default function TaskCalendarScreen() {
   const { C, T, mode } = useTheme();
@@ -86,9 +89,11 @@ export default function TaskCalendarScreen() {
   const [selected, setSelected] = useState(() => day || toDayKey(new Date()));
 
   const [tasks, setTasks] = useState<ApiTask[]>([]);
-  const [meetings, setMeetings] = useState<RecordingSummary[]>([]);
+  // The Desk's own list (lib/shared-data.ts): no second /recordings request
+  // while that copy is fresh.
+  const recordingsQuery = useRecordings("").query;
+  const meetings = useMemo(() => recordingsQuery.data ?? [], [recordingsQuery.data]);
   const [deadlines, setDeadlines] = useState<MeetingDeadline[]>([]);
-  const [folders, setFolders] = useState<ApiFolder[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -157,62 +162,47 @@ export default function TaskCalendarScreen() {
     []
   );
 
-  // Meetings and folders are cheap, whole-list reads and are not month-scoped:
-  // the recordings list is the app's one meeting collection, filtered by day
-  // here. Best-effort — a failure costs the meeting markers, and must never
-  // take the task grid down with it.
-  const loadContext = useCallback(() => {
-    getRecordings()
-      .then(async (rs) => {
-        setMeetings(rs);
-
-        // The dates those meetings MENTIONED. Highlights are stored per
-        // recording and returned cached (regenerate: false), so this is a
-        // batch of cheap reads — but it is still N requests, hence the bound.
-        // Newest first: a calendar is read forward from now.
-        const recent = [...rs]
-          .sort((a, b) =>
-            String(b.recorded_at || b.created_at || "").localeCompare(
-              String(a.recorded_at || a.created_at || "")
-            )
-          )
-          .slice(0, HIGHLIGHT_MEETINGS);
-
-        const results = await Promise.all(
-          recent.map(async (r) => {
-            try {
-              const h = await getMeetingHighlights(r.audio_s3_key);
-              return deadlinesFromHighlights(
-                r.audio_s3_key,
-                r.title || "Untitled meeting",
-                String(r.recorded_at || r.created_at || ""),
-                h.meeting_highlights?.deadlines ?? [],
-                resolveSpokenDate
-              );
-            } catch {
-              // A meeting whose highlights are missing or still generating
-              // contributes nothing. It must not fail the calendar.
-              return [];
-            }
-          })
+  // The dates the recent meetings MENTIONED, from their highlights.
+  //
+  // Each answer is remembered per meeting for a day, empty ones included
+  // (fetchMeetingHighlights): the route generates with AI when nothing is
+  // stored and never stores an empty result, so asking on every visit cost
+  // one AI call per such meeting. Only processed meetings are asked, at most
+  // HIGHLIGHT_CONCURRENCY at a time — twelve at once outnumbered the
+  // account's Lambda slots. Best-effort: a failure costs that meeting's
+  // markers, never the grid.
+  useEffect(() => {
+    let alive = true;
+    const recent = meetings
+      .filter((r) => hasReadableHighlights(r.status))
+      .sort((a, b) =>
+        String(b.recorded_at || b.created_at || "").localeCompare(
+          String(a.recorded_at || a.created_at || "")
+        )
+      )
+      .slice(0, HIGHLIGHT_MEETINGS);
+    void mapLimit(recent, HIGHLIGHT_CONCURRENCY, async (r) => {
+      try {
+        const h = await fetchMeetingHighlights(r.audio_s3_key);
+        return deadlinesFromHighlights(
+          r.audio_s3_key,
+          r.title || "Untitled meeting",
+          String(r.recorded_at || r.created_at || ""),
+          h?.deadlines ?? [],
+          resolveSpokenDate
         );
-        setDeadlines(results.flat());
-      })
-      .catch(() => {
-        setMeetings([]);
-        setDeadlines([]);
-      });
-    getFolders()
-      .then((r) => setFolders(r.folders))
-      .catch(() => setFolders([]));
-  }, []);
+      } catch {
+        return [];
+      }
+    }).then((results) => { if (alive) setDeadlines(results.flat()); });
+    return () => { alive = false; };
+  }, [meetings]);
 
   useFocusEffect(
     useCallback(() => {
       setNow(new Date());
       load(month);
-      loadContext();
-    }, [load, loadContext, month])
+    }, [load, month])
   );
 
   // ---- Derived ------------------------------------------------------------
@@ -234,17 +224,7 @@ export default function TaskCalendarScreen() {
     [loads, selected]
   );
 
-  const folderById = useMemo(() => {
-    const m = new Map<string, ApiFolder>();
-    for (const f of folders) m.set(f.id, f);
-    return m;
-  }, [folders]);
 
-  const folderNames = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const f of folders) m.set(f.id, f.name);
-    return m;
-  }, [folders]);
 
   const monthTotals = useMemo(() => {
     let open = 0;
@@ -412,7 +392,6 @@ export default function TaskCalendarScreen() {
         <TaskCard
           task={item.task}
           now={now}
-          folderName={folderNames.get(String(item.task.folder_id || ""))}
           busy={busyId === item.task.id}
           onPress={openTask}
           onToggleComplete={toggleComplete}
@@ -452,14 +431,12 @@ export default function TaskCalendarScreen() {
     }
 
     const r = item.recording;
-    const folder = folderById.get(String(r.folder_id || ""));
-    const swatch = folderSwatch(folder?.color, mode === "dark");
     const when = clockLabel(String(r.recorded_at || r.created_at || ""));
     const dur = durationLabel(r.duration);
     // Only the facts we have. A meeting still processing says so, because
     // opening it would show an empty transcript.
     const processing = r.status !== "complete" && r.status !== "transcribed";
-    const meta = [when, dur, folder?.name].filter(Boolean).join("  ·  ");
+    const meta = [when, dur].filter(Boolean).join("  ·  ");
 
     return (
       <Pressable
@@ -470,13 +447,13 @@ export default function TaskCalendarScreen() {
       >
         {/* A colour spine, so a meeting reads as a different kind of thing
             from a task at a glance rather than by reading the label. */}
-        <View style={[st.spine, { backgroundColor: swatch.solid }]} />
+        <View style={[st.spine, { backgroundColor: C.primary }]} />
         <View style={st.meetingBody}>
           <View style={st.meetingHead}>
             <Icon
-              name={folder ? folderIcon(folder.icon) : "waveform"}
+              name="waveform"
               size={13}
-              tintColor={swatch.solid}
+              tintColor={C.primary}
             />
             <Text style={st.meetingTitle} numberOfLines={1}>
               {r.title || "Untitled meeting"}
@@ -686,7 +663,7 @@ export default function TaskCalendarScreen() {
             refreshing={refreshing}
             onRefresh={() => {
               load(month, true);
-              loadContext();
+              void recordingsQuery.refetch();
             }}
             tintColor={C.primary}
           />

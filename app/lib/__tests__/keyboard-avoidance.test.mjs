@@ -90,14 +90,18 @@ const DELEGATES = new Map([
   // Same: a top-anchored search over a list. Nothing to cover.
   ["src/app/(tabs)/index.tsx", "top-anchored search over a list"],
   // The picker/sheet components own every input on these screens.
-  ["src/app/folders.tsx", "inputs live in FolderSheet"],
-  ["src/app/folder/[id].tsx", "inputs live in ContactPicker"],
   // Its search field is rendered by TaskSearchBar at the TOP of the list
   // header, so the keyboard opens below it and cannot cover it — the same
   // top-anchored-search-over-a-list case as contacts.tsx and the home tab.
   ["src/app/tasks.tsx", "top-anchored search over a list"],
   ["src/app/task/[id].tsx", "inputs live in ContactPicker"],
+  // AuthField is a component, not a screen: login.tsx and forgot-password.tsx
+  // render it inside their own KeyboardAvoidingView (behavior="padding").
+  ["lib/auth-ui.tsx", "component; login/forgot-password screens wrap it"],
   ["src/app/recording/[key]/participants.tsx", "inputs live in ContactPicker"],
+  // A card, not a screen: rendered only inside src/app/salesforce/index.tsx,
+  // which wraps its ScrollView in <KeyboardAware>.
+  ["lib/salesforce-login-card.tsx", "card inside the KeyboardAware Salesforce screen"],
   ["src/app/recording/[key]/task/[taskId]/assign.tsx", "inputs live in ContactPicker"],
   ["lib/ui.tsx", "defines the input primitives and the wrappers themselves"],
   // TaskSearchBar is the only input here and it is top-anchored inside the

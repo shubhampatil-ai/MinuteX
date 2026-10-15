@@ -1,0 +1,8 @@
+{
+  "orgName": "MinuteX Site Receiver Test",
+  "edition": "Developer",
+  "features": ["EnableSetPasswordInApi"],
+  "settings": {
+    "lightningExperienceSettings": { "enableS1DesktopEnabled": true }
+  }
+}

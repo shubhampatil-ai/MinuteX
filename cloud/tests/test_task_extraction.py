@@ -130,6 +130,12 @@ class TestTaskContract(unittest.TestCase):
 
         The speaker owes the work, so the transcript label is the join key
         that later resolves to a real person.
+
+        The label is now stored CANONICALLY ("0", not "Speaker 0"). It is the
+        same identity written the one way every join already keys on —
+        participant rows, speaker_names, _resolve_tasks_for_speaker — so the
+        resolution this test is about happens without each reader having to
+        re-normalize. See ai_schema._resolve_task_speakers.
         """
         got = self.coerce_one({
             "task": "Send the proposal",
@@ -140,7 +146,7 @@ class TestTaskContract(unittest.TestCase):
             "confidence": "high",
             "evidence": "I'll send the proposal tomorrow.",
         })
-        self.assertEqual(got["assignee_speaker_id"], "Speaker 0")
+        self.assertEqual(got["assignee_speaker_id"], "0")
         self.assertEqual(got["confidence"], "high")
         self.assertEqual(got["evidence"], "I'll send the proposal tomorrow.")
         self.assertEqual(got["due_date"], "tomorrow")
@@ -162,6 +168,56 @@ class TestTaskContract(unittest.TestCase):
         })
         self.assertEqual(got["assignee"], "Rahul")
         self.assertEqual(got["assignee_speaker_id"], "")
+
+    def test_committed_task_with_no_owner_at_all_is_extracted(self):
+        """GOLDEN CASE for the ownerless-task fix.
+
+        The shape production dropped: a real, explicit obligation with NO
+        owner anywhere — not a name, not a speaker label. The meeting that
+        exposed it ("every document shared with a customer must include the
+        logo") returned 0 tasks at finish_reason=stop and 24% of the token
+        budget, so nothing was truncated; the model had simply treated "no
+        owner" as "not a task".
+
+        Every ownership field is empty AND the task still survives with its
+        text and evidence intact. Deliberately asserts the whole row rather
+        than one field: the failure being guarded against is the task being
+        absent altogether, which a single-field assertion would not catch.
+        """
+        got = self.coerce_one({
+            "task": "Include the company logo on every document shared "
+                    "with a customer",
+            "assignee": "",
+            "assignee_speaker_id": "",
+            "due_date": "",
+            "priority": "",
+            "confidence": "medium",
+            "evidence": "Every document shared with a customer must include "
+                        "the company logo.",
+        })
+        self.assertEqual(got["task"],
+                         "Include the company logo on every document shared "
+                         "with a customer")
+        self.assertEqual(got["assignee"], "")
+        self.assertEqual(got["assignee_speaker_id"], "")
+        self.assertEqual(got["due_date"], "")
+        self.assertEqual(got["evidence"],
+                         "Every document shared with a customer must include "
+                         "the company logo.")
+
+    def test_ownerless_task_needs_only_its_text_to_survive(self):
+        """The minimum viable task: text and nothing else.
+
+        `required=("task",)` is what makes an unowned, undated,
+        unprioritised commitment valid, so it is asserted directly. If a
+        future change adds `assignee` to `required`, the prompt would be
+        telling the model to emit something the schema then discards.
+        """
+        got = self.coerce_one({"task": "Rotate the shared API credentials"})
+        self.assertEqual(got["task"], "Rotate the shared API credentials")
+        for field in ("assignee", "assignee_speaker_id", "due_date"):
+            with self.subTest(field=field):
+                self.assertEqual(got[field], "")
 
     def test_ambiguous_assignment_survives_as_low_confidence(self):
         """Ambiguity is DATA, not an error — it must reach the row so the UI
@@ -230,7 +286,9 @@ class TestTaskContract(unittest.TestCase):
              "confidence": "high", "evidence": "I'll send the proposal."},
         ]})
         self.assertEqual(len(out["tasks"]), 1)
-        self.assertEqual(out["tasks"][0]["assignee_speaker_id"], "Speaker 0")
+        # Canonical, per ai_schema._resolve_task_speakers — same identity,
+        # written the one way every join keys on.
+        self.assertEqual(out["tasks"][0]["assignee_speaker_id"], "0")
         self.assertEqual(out["tasks"][0]["confidence"], "high")
         self.assertEqual(out["tasks"][0]["evidence"],
                          "I'll send the proposal.")
@@ -254,7 +312,7 @@ class TestPromptContract(unittest.TestCase):
         import prompts
         for field in ai_schema.TASK_SPEC:
             with self.subTest(field=field):
-                self.assertIn(field, prompts.SUMMARY_SYSTEM)
+                self.assertIn(field, prompts.TASKS_SYSTEM)
 
     def test_reduce_prompt_requests_every_spec_field(self):
         """The map-reduce OVERFLOW path returns tasks too; a schema that
@@ -263,16 +321,110 @@ class TestPromptContract(unittest.TestCase):
         import prompts
         for field in ai_schema.TASK_SPEC:
             with self.subTest(field=field):
-                self.assertIn(field, prompts.SUMMARY_REDUCE_SYSTEM)
+                self.assertIn(field, prompts.TASKS_REDUCE_SYSTEM)
 
     def test_prompt_states_the_speaker_id_rules(self):
         import prompts
-        text = prompts.SUMMARY_SYSTEM
+        text = prompts.TASKS_SYSTEM
         self.assertIn("SPEAKER-ID, EVIDENCE AND CONFIDENCE", text)
         # The three cases that decide who gets assigned the work.
         self.assertIn("Self-commitment", text)
         self.assertIn("Explicit assignment", text)
         self.assertIn("General discussion", text)
+
+    def test_prompt_separates_qualification_from_ownership(self):
+        """An unowned commitment must still qualify as a task.
+
+        The rule existed only in TASK ASSIGNMENT RULE, ~110 lines after the
+        `tasks` field spec. Production returned 0 tasks for a meeting whose
+        every commitment was an unowned process obligation, with
+        finish_reason=stop at 24% of the token budget — so the model read
+        "requires actual responsibility or commitment" beside the field and
+        collapsed "no owner" into "not a task". This asserts the separation is
+        stated where the qualification bar is stated.
+        """
+        import prompts
+        text = prompts.TASKS_SYSTEM
+        self.assertIn("QUALIFICATION AND OWNERSHIP ARE SEPARATE TESTS", text)
+        self.assertIn("MUST be extracted even when NO owner is identifiable",
+                      text)
+
+    def test_ownerless_rule_sits_beside_the_qualification_bar(self):
+        """ADJACENCY is the fix, not the mere presence of the words.
+
+        TASK ASSIGNMENT RULE already said an empty assignee was correct and the
+        model still dropped the tasks, so a test that only checked the text
+        appeared SOMEWHERE would have passed while the bug shipped. The rule
+        must fall between the qualification sentence and the next field's spec.
+        """
+        import prompts
+        text = prompts.TASKS_SYSTEM
+        bar = text.index("Only create a task when the transcript indicates")
+        rule = text.index("QUALIFICATION AND OWNERSHIP ARE SEPARATE TESTS")
+        speaker_id = text.index('"assignee_speaker_id" links a task to')
+        self.assertLess(bar, rule, "ownership rule must follow the bar")
+        self.assertLess(rule, speaker_id,
+                        "ownership rule must precede the next field spec")
+
+    def test_prompt_keeps_the_anti_hallucination_bar(self):
+        """The ownerless allowance must not read as a general loosening.
+
+        Dropping the owner requirement is one change; it must not license
+        turning questions, suggestions or standing facts into tasks. These are
+        the exact categories the extraction has always refused.
+        """
+        import prompts
+        text = prompts.TASKS_SYSTEM
+        self.assertIn("This does NOT lower the qualification bar", text)
+        for category in ("question", "suggestion", "recommendation",
+                         "possibility", "general "):
+            with self.subTest(category=category):
+                self.assertIn(category, text)
+        # The two worked rejections, kept verbatim as the counter-examples.
+        self.assertIn("Should someone check the API limit?", text)
+        self.assertIn("remain no task", text)
+
+    def test_prompt_gives_a_positive_ownerless_example(self):
+        """A rule with no worked example loses to the nearest example that
+        contradicts it — here "General discussion -> no task", which was the
+        closest case to an unowned commitment and taught rejection."""
+        import prompts
+        text = prompts.TASKS_SYSTEM
+        self.assertIn("Committed, no owner named", text)
+        self.assertIn("must include the company logo", text)
+        self.assertIn('assignee ""', text)
+
+    def test_prompt_counts_directives_and_code_switched_speech(self):
+        """On a Hinglish/Marathi team sync, work a manager TOLD someone to do
+        and follow-ups with a named person were being dropped. Both shapes,
+        and the language rule, must be stated, with a worked example."""
+        import prompts
+        text = prompts.TASKS_SYSTEM
+        self.assertIn("WHAT COUNTS AS COMMITTED WORK", text)
+        self.assertIn("A DIRECTIVE", text)
+        self.assertIn("CODE-SWITCHED SPEECH", text)
+        self.assertIn("baith ke plan banao", text)
+        self.assertIn('assignee "Isha"', text)
+        # The follow-up allowance stays bounded.
+        self.assertIn("We should catch up sometime", text)
+        # And none of it may sit between the bar and the ownership rule,
+        # which test_ownerless_rule_sits_beside_the_qualification_bar needs.
+        self.assertGreater(text.index("WHAT COUNTS AS COMMITTED WORK"),
+                           text.index("QUALIFICATION AND OWNERSHIP"))
+
+    def test_prompt_keeps_one_owner_and_no_collaborators_field(self):
+        """TASK_SPEC holds one assignee and obj_list drops unknown keys, so a
+        "collaborators" field would cost output tokens and be thrown away. The
+        co-workers belong in the task text, and no lead may be picked."""
+        import prompts
+        text = prompts.TASKS_SYSTEM
+        self.assertNotIn('"collaborators"', text)
+        self.assertNotIn("collaborators", ai_schema.TASK_SPEC)
+        self.assertIn("Never pick a lead yourself", text)
+
+    def test_prompt_never_defaults_priority(self):
+        import prompts
+        self.assertIn('never default to "Medium"', prompts.TASKS_SYSTEM)
 
 
 # ===========================================================================
@@ -432,9 +584,6 @@ class TestSeedingChain(unittest.TestCase):
         self.patches = [
             mock.patch.object(api, "_recordings", self.t["recordings"]),
             mock.patch.object(api, "_contacts", self.t["contacts"]),
-            mock.patch.object(api, "_folders", self.t["folders"]),
-            mock.patch.object(api, "_folder_contacts",
-                              self.t["folder_contacts"]),
             mock.patch.object(api, "_meeting_participants",
                               self.t["participants"]),
             mock.patch.object(api, "_tasks", self.t["tasks"]),

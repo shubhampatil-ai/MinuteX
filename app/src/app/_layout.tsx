@@ -14,10 +14,16 @@ import { JetBrainsMono_500Medium } from "@expo-google-fonts/jetbrains-mono";
 import { FONT, ThemeProvider, useTheme } from "../../lib/theme";
 import { Splash } from "../../lib/splash";
 import { getToken } from "../../lib/api";
+import { fetchMe } from "../../lib/shared-data";
 import { DeviceProvider } from "../../lib/device-context";
+import { WorkspaceProvider } from "../../lib/workspace-context";
+import { QueryProvider } from "../../lib/query-client";
+import { OfflineBanner } from "../../lib/offline-banner";
+import { onProfileNameSaved } from "../../lib/profile-gate";
 import { IntegrationsProvider } from "../../lib/integrations";
 import { NotificationsProvider } from "../../lib/notification-center";
 import { recoverUploads } from "../../lib/uploads";
+import { PushBridge } from "../../lib/push-bridge";
 
 // Root error boundary — a crash anywhere in the tree lands here instead of a
 // red screen (prod: a white screen). Styled with static colors on purpose:
@@ -63,7 +69,12 @@ export function ErrorBoundary({ error, retry }: ErrorBoundaryProps) {
 const SPLASH_MIN_MS = 1200;
 
 // Route groups that do NOT require auth.
-const PUBLIC_SEGMENTS = ["login", "signup"];
+const PUBLIC_SEGMENTS = ["login", "signup", "forgot-password"];
+
+// The profile gate's OWN route. Requires auth (so it is not public) but must
+// be exempt from the gate below, or the redirect would target the screen it is
+// already on and loop.
+const ONBOARDING_SEGMENT = "onboarding";
 
 // ThemeProvider must wrap everything BELOW it that calls useTheme() — so the
 // actual root content lives in a child component, with this default export
@@ -138,16 +149,106 @@ function RootContent() {
     return () => { cancelled = true; };
   }, [segments]);
 
+  // PROFILE GATE — does this signed-in user have a name yet?
+  //
+  // `null` means "not known yet", kept distinct from `false` for the same
+  // reason `authFresh` exists above: acting on an unknown would bounce the
+  // user on the very first frame after login, before the answer arrives.
+  //
+  // Read ONCE per session rather than on every navigation (unlike the token,
+  // which is a cheap local read). This is a network call, so putting it on
+  // `segments` would fire a /me request on every tab switch. The gate only
+  // ever needs to open, and the one thing that opens it — saving a name — is
+  // followed by router.replace("/"), so the local flip below is enough.
+  const [needsName, setNeedsName] = useState<boolean | null>(null);
+  // Whether the /me read has been STARTED for the current sign-in. A ref, not
+  // state, and deliberately not in the dep array: it latches the one-shot
+  // without re-running this effect, which is what keeps a single /me call a
+  // single /me call.
+  const nameChecked = useRef(false);
+  // The gate is ONE-WAY once satisfied. The /me read below is async and can
+  // still be in flight while the user is already filling in the onboarding
+  // form, so its response carries the PRE-SAVE profile. Without this latch
+  // that stale answer lands after the save and flips needsName back to true,
+  // and the gate bounces the user straight back to the screen they just
+  // completed — the exact "Continue does nothing until I restart the app"
+  // symptom, and the reason the notify-only fix was not enough on its own.
+  const nameSatisfied = useRef(false);
+  useEffect(() => {
+    if (!authed) {
+      // Signed out: reset the latch so the NEXT sign-in re-asks. Guarded on
+      // the ref rather than set unconditionally — an unconditional
+      // setNeedsName(null) here would re-render, re-run this effect, and set
+      // it again on every pass.
+      if (nameChecked.current) {
+        nameChecked.current = false;
+        nameSatisfied.current = false;   // next sign-in re-asks from scratch
+        setNeedsName(null);
+      }
+      return;
+    }
+    if (nameChecked.current) return;   // already asked for this sign-in
+    nameChecked.current = true;
+    let cancelled = false;
+    (async () => {
+      try {
+        const me = await fetchMe();
+        if (cancelled || nameSatisfied.current) return;
+        // name_set is authoritative: `name` on /me is the RAW stored value, so
+        // an older server that predates the flag still resolves correctly via
+        // the name fallback rather than gating everyone.
+        setNeedsName(me.name_set === undefined
+          ? !String(me.name || "").trim()
+          : !me.name_set);
+      } catch {
+        // A failed /me must NEVER trap a signed-in user behind the gate —
+        // that would make a transient network error look like a lockout.
+        // Fail OPEN: the worst case is a derived name shown for one session.
+        // The latch stays set, so this does not retry in a loop.
+        if (!cancelled && !nameSatisfied.current) setNeedsName(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [authed]);
+
+  // The one thing that OPENS the gate, wired to the screen that does it.
+  //
+  // The /me read above is one-shot per sign-in, so saving a name cannot be
+  // observed by re-reading it — and `needsName` is private to this component,
+  // so the onboarding screen could not flip it either. The result was a gate
+  // that stayed shut after being satisfied: Continue saved the name, then the
+  // effect below bounced the user back to the gate, and only a full app
+  // restart (a fresh /me) let them in.
+  //
+  // Trusting this ping is safe because it can only ever OPEN the gate, and
+  // only for a session that already authenticated. A cold start still asks
+  // the server.
+  useEffect(() => onProfileNameSaved(() => {
+    // Latch FIRST: an in-flight /me that resolves after this must not undo it.
+    nameSatisfied.current = true;
+    setNeedsName(false);
+  }), []);
+
   // Gate: once we know auth state FOR THIS ROUTE, keep the user on the right side.
   useEffect(() => {
     if (!checked || !authFresh) return;
     const inPublic = PUBLIC_SEGMENTS.includes(segments[0] as string);
+    const inOnboarding = segments[0] === ONBOARDING_SEGMENT;
     if (!authed && !inPublic) {
       router.replace("/login");
     } else if (authed && inPublic) {
       router.replace("/");
+    } else if (authed && needsName === true && !inOnboarding) {
+      // Signed in but nameless. Everything downstream — members lists, task
+      // assignees, "recorded by" — needs a human label, so collect it before
+      // the app proper. `replace` keeps it out of the back stack.
+      router.replace("/onboarding/name");
+    } else if (authed && needsName === false && inOnboarding) {
+      // The gate is satisfied (or was never needed) but we are still sitting
+      // on it — e.g. a name saved on another device. Let them through.
+      router.replace("/");
     }
-  }, [checked, authFresh, authed, segments, router]);
+  }, [checked, authFresh, authed, needsName, segments, router]);
 
   // RECORDING RECOVERY — finish what a previous run of the app started.
   //
@@ -164,6 +265,14 @@ function RootContent() {
     recovered.current = true;
     void recoverUploads().catch(() => { /* the upload banners report per-job */ });
   }, [checked, authed]);
+
+  // PUSH TAPS may navigate only once the user is signed in, past the name
+  // gate, AND out of the public/onboarding routes. Without the segment check a
+  // cold-start tap would open the brief a moment before the gate above
+  // replaces the stack with "/", losing it. See lib/push-bridge.tsx.
+  const pushReady = authed && needsName === false
+    && !PUBLIC_SEGMENTS.includes(segments[0] as string)
+    && segments[0] !== ONBOARDING_SEGMENT;
 
   // Status-bar icons follow the live theme (light icons on dark surfaces).
   const statusBar = <StatusBar style={mode === "dark" ? "light" : "dark"} />;
@@ -190,6 +299,18 @@ function RootContent() {
           per-screen fetch would let the badge disagree with the list the
           moment either marked something read. */}
       <NotificationsProvider>
+      {/* ONE active workspace for the whole app, for the same reason as the
+          two above: Desk, Record, Tasks and Contacts must all agree about
+          WHICH workspace they are showing, and a per-screen read would let
+          the recording banner disagree with the list it was started from.
+          UI state only — the backend re-resolves membership every request. */}
+      <WorkspaceProvider>
+      {/* On-device cache (local-first): screens that opt in show their last
+          good answer at once, also offline. Wiped on sign-out. */}
+      <QueryProvider>
+      {/* OS push: tap routing, foreground rule, registration refresh. Inside
+          NotificationsProvider so a tapped push marks its in-app row read. */}
+      <PushBridge ready={pushReady} />
       {statusBar}
       <Stack
         screenOptions={{
@@ -203,7 +324,14 @@ function RootContent() {
         }}
       >
         <Stack.Screen name="login" options={{ headerShown: false }} />
+        <Stack.Screen name="forgot-password" options={{ headerShown: false }} />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+        {/* The profile gate. No header and no back gesture — the only way
+            out is saving a name (see the gate in RootContent). */}
+        <Stack.Screen
+          name="onboarding/name"
+          options={{ headerShown: false, gestureEnabled: false }}
+        />
         {/* Recording sources — one chooser, three entry points, one pipeline */}
         <Stack.Screen name="new-recording" options={{ title: "New recording", presentation: "modal" }} />
         <Stack.Screen name="record" options={{ headerShown: false, presentation: "fullScreenModal" }} />
@@ -211,20 +339,14 @@ function RootContent() {
         <Stack.Screen name="upload" options={{ title: "Upload audio", presentation: "modal" }} />
         <Stack.Screen name="settings" options={{ title: "Settings" }} />
         <Stack.Screen name="trash" options={{ title: "Trash" }} />
-        <Stack.Screen name="salesforce" options={{ title: "Salesforce" }} />
-        {/* The OAuth redirect landing route. headerShown:false because it is a
-            transient hop, not a place — see crm-connected.tsx for why a route
-            must exist at all (the OS delivers the deep link to the app, so
-            expo-router tries to route it). */}
-        <Stack.Screen name="crm-connected" options={{ headerShown: false }} />
-        <Stack.Screen name="salesforce-config" options={{ title: "Salesforce mapping" }} />
         {/* Integrations — the central place external applications are
             connected. index is the card list; one screen per provider that
             has something to manage (Gmail today). */}
         <Stack.Screen name="integrations/index" options={{ title: "" }} />
         <Stack.Screen name="integrations/gmail" options={{ title: "" }} />
-        {/* The generic OAuth redirect landing route, for every provider —
-            same transient-hop reasoning as crm-connected above. */}
+        {/* The generic OAuth redirect landing route, for every provider.
+            headerShown:false because it is a transient hop, not a place (the
+            OS delivers the deep link to the app, so expo-router routes it). */}
         <Stack.Screen name="integrations-connected" options={{ headerShown: false }} />
         {/* Your device — reached from MinuteX's top-left status pill (and
             from You › Your device). It was a bottom tab until the bar went
@@ -242,14 +364,19 @@ function RootContent() {
             this screen serves. See the file header for why read-only is a
             separate screen instead of a flag. */}
         <Stack.Screen name="meeting/[key]/shared" options={{ title: "Meeting" }} />
-        {/* Organization layer — folders, contacts and the cross-meeting task
-            tracker. All three are top-level destinations rather than tabs: the
-            bottom bar is deliberately three items, and these are places you go
-            to from You / a meeting, not places you live in. Each screen sets
-            its own title via its own Stack.Screen (folder and contact titles
-            are data, not constants). */}
-        <Stack.Screen name="folders" options={{ title: "Folders" }} />
-        <Stack.Screen name="folder/[id]" options={{ title: "Folder" }} />
+        {/* Organization layer — contacts and the cross-meeting task tracker.
+            Both are top-level destinations rather than tabs: the bottom bar is
+            deliberately three items, and these are places you go to from
+            You / a meeting, not places you live in. Each screen sets its own
+            title via its own Stack.Screen (contact titles are data, not
+            constants). */}
+        {/* Workspaces. Destinations reached from You, like Devices and
+            Integrations — not a new navigation layer. */}
+        <Stack.Screen name="workspaces" options={{ title: "Workspaces" }} />
+        <Stack.Screen name="organisation/index" options={{ title: "Organisation" }} />
+        <Stack.Screen name="organisation/create" options={{ title: "Create organisation" }} />
+        <Stack.Screen name="organisation/join" options={{ title: "Join organisation" }} />
+        <Stack.Screen name="organisation/members" options={{ title: "Members" }} />
         <Stack.Screen name="contacts" options={{ title: "Contacts" }} />
         <Stack.Screen name="contact/[id]" options={{ title: "Contact" }} />
         <Stack.Screen name="tasks" options={{ title: "Tasks" }} />
@@ -262,6 +389,10 @@ function RootContent() {
         <Stack.Screen name="calendar" options={{ title: "Calendar" }} />
         <Stack.Screen name="notifications" options={{ title: "Notifications" }} />
       </Stack>
+      {/* After the Stack so it draws on top; never takes a tap. */}
+      <OfflineBanner />
+      </QueryProvider>
+      </WorkspaceProvider>
       </NotificationsProvider>
       </IntegrationsProvider>
     </DeviceProvider>

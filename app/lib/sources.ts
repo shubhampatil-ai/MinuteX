@@ -42,6 +42,52 @@ export function normalizeSpeakerLabel(label: string): string {
   return (m ? m[1] : s).trim();
 }
 
+/**
+ * A speaker label as it appears INSIDE prose: "Speaker 0", "speaker_12".
+ *
+ * Only the NUMERIC form. A word label ("agent") is a bare English word once
+ * its prefix is gone, and replacing every "agent" in a sentence would corrupt
+ * prose that merely used the word — those render unprefixed anyway, so there
+ * is no "Speaker agent" in the text to find.
+ *
+ * The trailing (?!\w) stops "Speaker 1" matching inside "Speaker 12", which
+ * would otherwise become the shorter speaker's name plus a stray digit.
+ */
+const PROSE_LABEL_RE = /\bspeaker[\s_-]*(\d+)(?!\w)/gi;
+
+/**
+ * Prose with every "Speaker N" replaced by that speaker's current name.
+ *
+ * The mirror of speaker_identity.substitute_speaker_names on the backend, for
+ * the same reason speakerName mirrors its resolve_speaker_display: the
+ * Overview tab renders `rec.overview` straight from the recording, never
+ * through the MoM builder, so a client-side copy is the only thing that makes
+ * the two agree. Both must change together.
+ *
+ * WHY prose needs this at all. Every other surface stores a speaker as an id
+ * and resolves the name at render, so a rename reaches it for free. AI prose
+ * spells the label out inside a sentence, so the join has to run over the
+ * text. A label with no name is left as written ("Speaker 0"), matching what
+ * the transcript beside it shows. A NAME the model wrote into prose is not
+ * rewritten — there is no label to find, and guessing which speaker it meant
+ * would risk misattributing one person's words to another.
+ */
+export function substituteSpeakerNames(
+  text: string,
+  names?: Record<string, string> | null
+): string {
+  const body = text ?? "";
+  if (!body || !names) return body;
+  return body.replace(PROSE_LABEL_RE, (whole, digits: string) => {
+    // The canonical key first. The display-form fallback covers a row stored
+    // before the API canonicalized keys on write ({"Speaker 0": "Rahul"}) —
+    // the backend still tolerates those, so this must too, or the same
+    // meeting would resolve in the MoM but not in the Overview tab.
+    const given = names[digits]?.trim() || names[`Speaker ${digits}`]?.trim();
+    return given || whole;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Source — icon + label per recording source.
 // ---------------------------------------------------------------------------

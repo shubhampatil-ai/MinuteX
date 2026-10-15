@@ -51,10 +51,11 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { S, useTheme, ColorScale } from "../../lib/theme";
 import { Button, EmptyState, ErrorText } from "../../lib/ui";
 import {
-  ApiError, ApiFolder, ApiTask, RecordingSummary, TaskFilters, TaskIntelRow,
-  getAllTasks, getFolders, getMe, getRecordings, getTaskIntelligence,
+  ApiError, ApiTask, TaskFilters, TaskIntelRow,
+  getAllTasks, getTaskIntelligence,
   isRetryable, patchTaskById,
 } from "../../lib/api";
+import { fetchMe, fetchUnfilteredTasks, useRecordings } from "../../lib/shared-data";
 import {
   ActionCenterSkeleton, AttentionFilters, HealthKey,
   MeetingTaskInsight,
@@ -214,10 +215,12 @@ export default function TasksScreen() {
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState("");
 
-  // Context for the derived sections and for naming a task's folder.
+  // Context for the derived sections.
   const [insightTasks, setInsightTasks] = useState<ApiTask[]>([]);
-  const [folders, setFolders] = useState<ApiFolder[]>([]);
-  const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
+  // The Desk's own list (lib/shared-data.ts): no second /recordings request
+  // while that copy is fresh.
+  const recordingsData = useRecordings("").query.data;
+  const recordings = useMemo(() => recordingsData ?? [], [recordingsData]);
   const [me, setMe] = useState<{ name: string; avatar_url: string } | null>(null);
   const [myUserId, setMyUserId] = useState("");
   const [quickAdd, setQuickAdd] = useState(false);
@@ -268,7 +271,12 @@ export default function TasksScreen() {
       else setLoading(true);
       setError("");
       try {
-        const res = await getAllTasks({ ...filters, limit: PAGE_SIZE });
+        // No server filter: the SAME read the summary cards make below, so
+        // the two share one request (fetchUnfilteredTasks) instead of asking
+        // for 50 and then 100 of the same rows.
+        const res = Object.keys(filters).length === 0
+          ? await fetchUnfilteredTasks(INSIGHT_PAGE)
+          : await getAllTasks({ ...filters, limit: PAGE_SIZE });
         setTasks(res.tasks);
         setCursor(res.next_cursor);
       } catch (e) {
@@ -290,18 +298,12 @@ export default function TasksScreen() {
   // never take the task list down with it.
   const loadInsights = useCallback(async () => {
     try {
-      const res = await getAllTasks({ limit: INSIGHT_PAGE });
+      const res = await fetchUnfilteredTasks(INSIGHT_PAGE);
       setInsightTasks(res.tasks);
     } catch {
       setInsightTasks([]);
     }
-    getFolders()
-      .then((r) => setFolders(r.folders))
-      .catch(() => setFolders([]));
-    getRecordings()
-      .then(setRecordings)
-      .catch(() => setRecordings([]));
-    getMe()
+    fetchMe()
       .then((u) => {
         setMe({ name: u.name, avatar_url: u.avatar_url });
         // Kept so "Assigned to others" can be expressed as "has a real
@@ -385,11 +387,6 @@ export default function TasksScreen() {
     [summarySource, now]
   );
 
-  const folderNames = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const f of folders) m.set(f.id, f.name);
-    return m;
-  }, [folders]);
 
   const meetingTitles = useMemo(() => {
     const m = new Map<string, string>();
@@ -531,7 +528,7 @@ export default function TasksScreen() {
   );
 
   // Reassign and Resolve are the same destination: the task detail screen owns
-  // the candidate list, the folder hint and the contact picker. Duplicating any
+  // the candidate list and the contact picker. Duplicating any
   // of that here would be a second, divergent copy of the identity rules.
   const openResolve = useCallback(
     (t: ApiTask) => {
@@ -726,7 +723,6 @@ export default function TasksScreen() {
         <TaskCard
           task={item}
           now={now}
-          folderName={folderNames.get(String(item.folder_id || ""))}
           meetingTitle={meetingTitles.get(String(item.source_recording_id || ""))}
           busy={busyId === item.id}
           onPress={openTask}
@@ -737,7 +733,7 @@ export default function TasksScreen() {
       </SwipeableRow>
     ),
     [
-      C, now, folderNames, meetingTitles, busyId, openTask, toggleComplete,
+      C, now, meetingTitles, busyId, openTask, toggleComplete,
       openResolve, openMeeting, snooze,
     ]
   );
@@ -888,7 +884,6 @@ export default function TasksScreen() {
             />
             <UpcomingDeadlines
               items={deadlines}
-              folderNames={folderNames}
               onPress={openTask}
             />
           </>

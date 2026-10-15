@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <deploymentStatus>Deployed</deploymentStatus>
+    <description>A MinuteX meeting delivered through the MinuteX Site receiver (Apex REST). MinuteX writes these records; build your own Flow, Apex or reports on top of them.</description>
+    <enableActivities>true</enableActivities>
+    <enableFeeds>false</enableFeeds>
+    <enableHistory>false</enableHistory>
+    <enableReports>true</enableReports>
+    <enableSearch>true</enableSearch>
+    <label>MinuteX Site Meeting</label>
+    <nameField>
+        <label>Meeting Name</label>
+        <type>Text</type>
+    </nameField>
+    <pluralLabel>MinuteX Site Meetings</pluralLabel>
+    <sharingModel>Private</sharingModel>
+</CustomObject>

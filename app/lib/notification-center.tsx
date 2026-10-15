@@ -40,10 +40,13 @@ import {
 import {
   AppNotification,
   getNotifications,
-  getUnreadNotificationCount,
+  getToken,
   markAllNotificationsRead,
   markNotificationRead,
+  onSignIn,
+  onSignOut,
 } from "./api";
+import { fetchUnreadCount } from "./shared-data";
 
 // One page. Matches the backend default; the centre pages with "Load more"
 // rather than loading a user's whole history (which is the requirement's
@@ -55,7 +58,8 @@ export const NOTIFICATIONS_PAGE_SIZE = 20;
 // ---------------------------------------------------------------------------
 export type NotificationDestination =
   | { pathname: "/task/[id]"; params: { id: string } }
-  | { pathname: "/recording/[key]"; params: { key: string } };
+  | { pathname: "/recording/[key]"; params: { key: string } }
+  | { pathname: "/meeting/[key]/shared"; params: { key: string } };
 
 /**
  * Where tapping this notification should go, or null when it is not
@@ -78,10 +82,17 @@ export type NotificationDestination =
  * does not navigate.
  */
 export function destinationFor(
-  n: Pick<AppNotification, "entity_type" | "entity_id">
+  n: Pick<AppNotification, "entity_type" | "entity_id"> &
+    Partial<Pick<AppNotification, "type">>
 ): NotificationDestination | null {
   const id = (n.entity_id ?? "").trim();
   if (!id) return null;
+  // The one TYPE-keyed route: a participant the recorder gave access to
+  // cannot open the owner's screen (it 404s for them), so their "shared with
+  // you" notification opens the read-only shared view instead.
+  if (n.type === "MEETING_ACCESS_GRANTED") {
+    return { pathname: "/meeting/[key]/shared", params: { key: id } };
+  }
   switch (n.entity_type) {
     case "task":
       return { pathname: "/task/[id]", params: { id } };
@@ -141,7 +152,9 @@ export function NotificationsProvider({
 
   const refreshCount = useCallback(async () => {
     try {
-      const count = await getUnreadNotificationCount();
+      // Shared with any count request already in flight (the bell asks at
+      // the same moment on start-up); never served from an old answer.
+      const count = await fetchUnreadCount();
       if (alive.current) setUnreadCount(count);
     } catch {
       // Deliberately silent. The badge is ambient: a failed count must not
@@ -248,7 +261,22 @@ export function NotificationsProvider({
   // The badge is loaded once at mount. It is refreshed on focus by the screens
   // that show it, rather than polled here — a timer in a context would keep
   // firing on every screen in the app for a number most of them never show.
-  useEffect(() => { refreshCount(); }, [refreshCount]);
+  //
+  // Mounted ABOVE the auth gate: no call without a token (it could only 401),
+  // a fresh count on every sign-in, and the previous account's inbox dropped
+  // on sign-out.
+  useEffect(() => {
+    void getToken().then((t) => { if (t) void refreshCount(); });
+    const offIn = onSignIn(() => { void refreshCount(); });
+    const offOut = onSignOut(() => {
+      if (!alive.current) return;
+      setUnreadCount(0);
+      setNotifications([]);
+      setCursor("");
+      setError("");
+    });
+    return () => { offIn(); offOut(); };
+  }, [refreshCount]);
 
   const value = useMemo<NotificationsState>(
     () => ({
@@ -305,6 +333,8 @@ export function iconForNotification(type: string): string {
       return "doc.text.fill";
     case "MEETING_OUTPUT_SHARED":
       return "square.and.arrow.up";
+    case "MEETING_ACCESS_GRANTED":
+      return "person.2.fill";
     default:
       return "bell.fill";
   }
@@ -321,10 +351,10 @@ export function toneForNotification(type: string): NotificationTone {
     case "TASK_OVERDUE":
       return "danger";
     case "TASK_DUE_TODAY":
+    case "AI_ACTION_REQUIRED":
       return "warn";
     case "MEETING_PROCESSING_COMPLETED":
       return "success";
-    case "AI_ACTION_REQUIRED":
     case "AI_OUTPUT_READY":
       return "accent";
     default:
@@ -333,20 +363,70 @@ export function toneForNotification(type: string): NotificationTone {
 }
 
 // ---------------------------------------------------------------------------
-// Grouping + relative time.
+// Filters. Every type belongs to exactly ONE tab, so nothing is reachable only
+// from "All": the meeting's own events, what the AI produced or needs, and
+// everything else (tasks, and any type a newer backend adds) under System.
+// ---------------------------------------------------------------------------
+export type NotificationFilter = "all" | "meetings" | "ai" | "system";
+
+export const NOTIFICATION_FILTERS: { key: NotificationFilter; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "meetings", label: "Meetings" },
+  { key: "ai", label: "AI Output" },
+  { key: "system", label: "System" },
+];
+
+export function filterForNotification(type: string): Exclude<NotificationFilter, "all"> {
+  switch (type) {
+    case "MEETING_PROCESSING_COMPLETED":
+    case "MEETING_PROCESSING_FAILED":
+    case "MEETING_DOCUMENT_READY":
+    case "MEETING_OUTPUT_SHARED":
+    case "MEETING_ACCESS_GRANTED":
+      return "meetings";
+    case "AI_OUTPUT_READY":
+    case "AI_ACTION_REQUIRED":
+      return "ai";
+    default:
+      return "system";
+  }
+}
+
+/** The loaded page, narrowed to one tab. Client-side only: the list and the
+ *  badge stay the same data, and order is preserved. */
+export function filterNotifications(
+  items: AppNotification[], filter: NotificationFilter
+): AppNotification[] {
+  if (filter === "all") return items;
+  return items.filter((n) => filterForNotification(n.type) === filter);
+}
+
+// ---------------------------------------------------------------------------
+// Grouping + time.
 // ---------------------------------------------------------------------------
 export type NotificationGroup = {
-  title: "Today" | "Yesterday" | "Earlier";
+  /** "Today", "Yesterday", a day ("28 Sept", with the year when it is not
+   *  this year), or "Earlier" for a timestamp that cannot be read. */
+  title: string;
   items: AppNotification[];
 };
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"];
+
+/** A day header: "28 Sept", or "28 Sept 2025" outside the current year. */
+export function dayLabel(d: Date, now: Date = new Date()): string {
+  const base = `${d.getDate()} ${MONTHS[d.getMonth()]}`;
+  return d.getFullYear() === now.getFullYear() ? base : `${base} ${d.getFullYear()}`;
+}
+
 /**
- * Bucket a page into Today / Yesterday / Earlier.
+ * Bucket a page into Today / Yesterday / one group per earlier day.
  *
  * Compared on the LOCAL calendar day, not on elapsed hours: "yesterday" means
  * the day before today to a person, so something from 20:00 last night is
  * Yesterday at 09:00 even though it is only 13 hours old. Empty groups are
- * dropped so the list never renders a header with nothing under it.
+ * never created, so the list never renders a header with nothing under it.
  *
  * Order within a group is preserved — the API already returns newest first,
  * and re-sorting here would let the list disagree with the pagination cursor.
@@ -360,26 +440,41 @@ export function groupNotifications(
   ).getTime();
   const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000;
 
-  const today: AppNotification[] = [];
-  const yesterday: AppNotification[] = [];
-  const earlier: AppNotification[] = [];
+  const groups: NotificationGroup[] = [];
+  const byTitle = new Map<string, NotificationGroup>();
+  const unreadable: AppNotification[] = [];
 
   for (const n of items) {
     const t = Date.parse(n.created_at);
-    // An unparseable timestamp goes to Earlier rather than crashing or being
-    // dropped: the notification is real even if its clock string is odd, and
-    // silently hiding it would be worse than filing it conservatively.
-    if (!Number.isFinite(t)) earlier.push(n);
-    else if (t >= startOfToday) today.push(n);
-    else if (t >= startOfYesterday) yesterday.push(n);
-    else earlier.push(n);
+    // An unparseable timestamp goes to Earlier (last) rather than crashing or
+    // being dropped: the notification is real even if its clock string is
+    // odd, and silently hiding it would be worse than filing it conservatively.
+    if (!Number.isFinite(t)) { unreadable.push(n); continue; }
+    const title = t >= startOfToday ? "Today"
+      : t >= startOfYesterday ? "Yesterday"
+        : dayLabel(new Date(t), now);
+    let g = byTitle.get(title);
+    if (!g) {
+      g = { title, items: [] };
+      byTitle.set(title, g);
+      groups.push(g);
+    }
+    g.items.push(n);
   }
 
-  const groups: NotificationGroup[] = [];
-  if (today.length) groups.push({ title: "Today", items: today });
-  if (yesterday.length) groups.push({ title: "Yesterday", items: yesterday });
-  if (earlier.length) groups.push({ title: "Earlier", items: earlier });
+  if (unreadable.length) groups.push({ title: "Earlier", items: unreadable });
   return groups;
+}
+
+/** "9:24 AM" — the row's timestamp. The group header already says which day,
+ *  so the row only needs the time. Empty for an unreadable timestamp. */
+export function clockTime(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "";
+  const d = new Date(t);
+  const h = d.getHours();
+  const m = String(d.getMinutes()).padStart(2, "0");
+  return `${h % 12 || 12}:${m} ${h < 12 ? "AM" : "PM"}`;
 }
 
 /** "10 min ago" / "2 hr ago" / "Yesterday" / "12 Aug". Short by design — it

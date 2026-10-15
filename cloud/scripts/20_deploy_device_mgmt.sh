@@ -51,19 +51,76 @@ if [[ "$API_ID" == "None" || -z "$API_ID" ]]; then
 fi
 echo ">> API: $API_NAME ($API_ID)"
 
+# Package a Python Lambda, vendoring shared/*.py ONLY when the handler
+# actually imports it.
+#
+# THE BUG THIS FIXES: this packager used to write lambda_function.py alone.
+# That was correct when both handlers were stdlib-only, but userApi now
+# imports 15 modules from shared/ at TOP LEVEL, so a single-file zip does
+# not fail on some route - it fails in Runtime.ImportModuleError during
+# init and EVERY request 500s. Running this script took production down
+# exactly that way; script 19 had the identical defect.
+#
+# NOT a blanket vendor, though: device-presign (getUploadUrl) is genuinely
+# stdlib-only, and shipping 15 unused modules into it would inflate a 4.6KB
+# function to ~180KB for nothing. The zip is decided by what the handler
+# IMPORTS, so each function gets exactly what it needs and this stays
+# correct if either handler's imports change.
+#
+# Zipped FLAT (ai_schema.py at the archive root): the handler's directory is
+# on sys.path, subdirectories are not.
 deploy_py() {
   local fn="$1" src_dir="$2"
   local zip="$PROJECT_ROOT/$src_dir/function.zip"
   rm -f "$zip"
-  (cd "$PROJECT_ROOT/$src_dir" && \
-     python -c "import zipfile; z = zipfile.ZipFile('function.zip', 'w', zipfile.ZIP_DEFLATED); z.write('lambda_function.py'); z.close()")
+  ( cd "$PROJECT_ROOT" && python - "$src_dir" <<'PY'
+import re, sys, zipfile
+from pathlib import Path
+
+src_dir = sys.argv[1]
+root = Path.cwd()
+out = root / src_dir / "function.zip"
+handler = root / src_dir / "lambda_function.py"
+shared = root / "shared"
+
+# Which shared modules does this handler need? Resolved as a TRANSITIVE
+# CLOSURE, not just the handler's own import lines: ai_schema imports
+# ai_sanitize, so scanning one level deep ships a zip that still dies with
+# ModuleNotFoundError - the very failure this packager exists to prevent.
+available = {m.stem: m for m in shared.glob("*.py")}
+
+
+def imports_of(path):
+    src = path.read_text(encoding="utf-8")
+    return set(re.findall(r"^(?:import|from)[ 	]+([A-Za-z_][A-Za-z0-9_]*)",
+                          src, re.MULTILINE))
+
+
+needed, queue = {}, list(imports_of(handler))
+while queue:
+    name = queue.pop()
+    if name in needed or name not in available:
+        continue
+    needed[name] = available[name]
+    queue.extend(imports_of(available[name]))
+needed = [needed[k] for k in sorted(needed)]
+
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    z.write(handler, "lambda_function.py")
+    for mod in needed:
+        z.write(mod, mod.name)
+        print(f"   + {mod.name}")
+label = f"{len(needed)} shared module(s)" if needed else "stdlib only"
+print(f">> packaged {out.relative_to(root)} ({label})")
+PY
+  )
   aws lambda update-function-code \
     --function-name "$fn" \
     --zip-file "fileb://$(winpath "$zip")" \
     --publish \
     --query "[FunctionName,CodeSize,LastModified]" --output text
   aws lambda wait function-updated-v2 --function-name "$fn"
-  echo ">> $fn deployed from $src_dir/lambda_function.py"
+  echo ">> $fn deployed from $src_dir/"
 }
 
 # ensure_route <integration-id> <route-key>

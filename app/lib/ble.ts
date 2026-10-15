@@ -1,6 +1,6 @@
 // lib/ble.ts — BLE manager for the AI Recorder (matches firmware v1.7)
 // Place at: recorder-app/lib/ble.ts
-import { BleManager, Device, Subscription } from "react-native-ble-plx";
+import { BleError, BleManager, Device, Subscription } from "react-native-ble-plx";
 import { PermissionsAndroid, Platform } from "react-native";
 import { Buffer } from "buffer";
 import type { PermissionOutcome } from "./device/types";
@@ -28,7 +28,55 @@ export type Esp32Status = {
   fw: string;
 };
 
-const manager = new BleManager();
+// react-native-ble-plx is a NATIVE module: constructing a BleManager throws
+// "native module doesn't exist" wherever the native side isn't linked — Expo
+// Go, and any JS-only context (jest, node scripts). Constructing it at module
+// scope made that throw happen on IMPORT, so merely importing this file took
+// down everything that transitively reached it: device-context ->
+// (tabs)/_layout -> the whole route tree failed to export, which surfaced as
+// "Route is missing the required default export" for every screen.
+//
+// So build it lazily and only once, and let callers ask whether BLE exists at
+// all (isBleAvailable) instead of discovering it by crashing.
+let managerInstance: BleManager | null = null;
+let managerFailed = false;
+
+/** True when the BLE native module is actually linked (a dev/production
+ *  build). False in Expo Go and JS-only environments. */
+export function isBleAvailable(): boolean {
+  return getManager() !== null;
+}
+
+function getManager(): BleManager | null {
+  if (managerInstance || managerFailed) return managerInstance;
+  try {
+    managerInstance = new BleManager();
+  } catch (e) {
+    // Expo Go / unlinked native module. Remember it so we don't retry (and
+    // re-log) on every single call.
+    managerFailed = true;
+    console.warn(
+      "[ble] Bluetooth unavailable: the react-native-ble-plx native module is not linked. " +
+        "Use a development build to talk to the recorder."
+    );
+  }
+  return managerInstance;
+}
+
+/** The manager, or a thrown error for paths that genuinely cannot proceed
+ *  without one. Callers that can degrade should check isBleAvailable first. */
+function requireManager(): BleManager {
+  const m = getManager();
+  if (!m) throw new BleUnavailableError();
+  return m;
+}
+
+export class BleUnavailableError extends Error {
+  constructor() {
+    super("Bluetooth is not available in this build. Use a development build.");
+    this.name = "BleUnavailableError";
+  }
+}
 
 // startDeviceScan/stopDeviceScan are GLOBAL on the manager — a second caller
 // starting or stopping a scan silently kills the first one's. This flag lets
@@ -41,12 +89,21 @@ export function isScanning(): boolean {
 
 // ---- Bluetooth radio state ----
 export async function isBluetoothOn(): Promise<boolean> {
-  return (await manager.state()) === "PoweredOn";
+  const m = getManager();
+  if (!m) return false;
+  return (await m.state()) === "PoweredOn";
 }
 
 // Fires cb immediately with current state and on every change ("PoweredOn"...)
 export function onBluetoothState(cb: (on: boolean) => void) {
-  return manager.onStateChange((s) => cb(s === "PoweredOn"), true);
+  const m = getManager();
+  if (!m) {
+    // Match the eager-emit contract: tell the caller "off" once, then never
+    // again. Returning a no-op subscription keeps cleanup code uniform.
+    cb(false);
+    return { remove: () => {} } as Subscription;
+  }
+  return m.onStateChange((s) => cb(s === "PoweredOn"), true);
 }
 
 // Shows the native "App wants to turn on Bluetooth" system dialog (Android).
@@ -59,7 +116,7 @@ export async function enableBluetooth(): Promise<boolean> {
       const res = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT);
       if (res !== PermissionsAndroid.RESULTS.GRANTED) return isBluetoothOn();
     }
-    await manager.enable();          // triggers the system popup
+    await requireManager().enable();          // triggers the system popup
     // Some OEM builds resolve enable() before the radio has actually flipped
     // on — give it a beat and re-check the real state rather than trusting
     // the resolved promise alone.
@@ -139,13 +196,20 @@ export function scanForRecorders(
 ): () => void {
   const seen = new Set<string>();
   let foundAny = false;
+  const m = getManager();
+  if (!m) {
+    // No BLE in this build: behave like a scan that found nothing, so the UI
+    // shows its normal "no recorder found" path instead of a red screen.
+    onTimeout?.();
+    return () => {};
+  }
   console.log("SCAN: starting...");
   scanning = true;
-  manager.startDeviceScan(null, { allowDuplicates: false }, (error, device) => {
+  m.startDeviceScan(null, { allowDuplicates: false }, (error, device) => {
     if (error) {
       console.log("SCAN ERROR:", error.message, (error as any).reason ?? "");
       scanning = false;
-      manager.stopDeviceScan();
+      m.stopDeviceScan();
       return;
     }
     if (!device || seen.has(device.id)) return;
@@ -157,10 +221,10 @@ export function scanForRecorders(
   const t = setTimeout(() => {
     console.log("SCAN: timeout stop, foundAny=" + foundAny);
     scanning = false;
-    manager.stopDeviceScan();
+    m.stopDeviceScan();
     if (!foundAny) onTimeout?.();
   }, timeoutMs);
-  return () => { clearTimeout(t); scanning = false; manager.stopDeviceScan(); };
+  return () => { clearTimeout(t); scanning = false; m.stopDeviceScan(); };
 }
 
 // Are location services (the phone's master GPS toggle) switched on?
@@ -190,6 +254,8 @@ export async function areLocationServicesEnabled(): Promise<boolean> {
     // screen's own scan mid-flight. A running scan is itself proof that
     // location services are on, so answer from that instead.
     if (scanning) return true;
+    const m = getManager();
+    if (!m) return true; // inconclusive — see the hint-not-gate note above
     // The probe costs one immediate start/stop of the scanner; results are
     // never consumed.
     return await new Promise<boolean>((resolve) => {
@@ -198,13 +264,13 @@ export async function areLocationServicesEnabled(): Promise<boolean> {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        try { manager.stopDeviceScan(); } catch {}
+        try { m.stopDeviceScan(); } catch {}
         resolve(v);
       };
       // No callback at all within a beat means the scanner started fine.
       const timer = setTimeout(() => done(true), 700);
       try {
-        manager.startDeviceScan(null, null, (error) => {
+        m.startDeviceScan(null, null, (error: BleError | null) => {
           done(!error || error.errorCode !== 601);
         });
       } catch {
@@ -229,7 +295,7 @@ async function negotiateMtu(d: Device): Promise<Device> {
 }
 
 export async function connectToDevice(device: Device): Promise<Device> {
-  const d = await manager.connectToDevice(device.id, { timeout: 10000 });
+  const d = await requireManager().connectToDevice(device.id, { timeout: 10000 });
   await negotiateMtu(d);
   await d.discoverAllServicesAndCharacteristics();
   return d;
@@ -299,7 +365,7 @@ export const setWifi = (d: Device, ssid: string, pass: string) =>
 export const clearWifi = (d: Device) => writeCommand(d, "CLEAR_WIFI");
 
 export function onDisconnected(device: Device, cb: () => void): Subscription {
-  return manager.onDeviceDisconnected(device.id, () => cb());
+  return requireManager().onDeviceDisconnected(device.id, () => cb());
 }
 
 // Connect with bounded retries + backoff. Rediscovers services each attempt.
@@ -316,7 +382,7 @@ export async function connectWithRetry(
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
-      const d = await manager.connectToDevice(deviceId, { timeout: 10000 });
+      const d = await requireManager().connectToDevice(deviceId, { timeout: 10000 });
       await negotiateMtu(d);
       await d.discoverAllServicesAndCharacteristics();
       return d;
@@ -339,7 +405,7 @@ export function autoReconnect(
   onLost?: () => void
 ): { stop: () => void } {
   let stopped = false;
-  const sub = manager.onDeviceDisconnected(deviceId, async () => {
+  const sub = requireManager().onDeviceDisconnected(deviceId, async () => {
     if (stopped) return;
     onLost?.();
     try {
@@ -354,4 +420,4 @@ export function autoReconnect(
   };
 }
 
-export default manager;
+

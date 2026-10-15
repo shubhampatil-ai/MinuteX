@@ -14,7 +14,7 @@
 // and the failure vocabulary are stated once.
 import { Buffer } from "buffer";
 import type { EmailAttachment, EmailAttachmentType, Mom } from "./api";
-import { canExportPdf, exportFilename } from "./export-doc";
+import { canExportPdf, exportFilename, markdownToHtml } from "./export-doc";
 import { buildMomDocx } from "./mom-docx";
 import { momHtml } from "./mom-html";
 
@@ -81,6 +81,29 @@ export async function momPdfAttachment(
           mom.title || "Minutes of Meeting", meetingTitle, "pdf"),
         content_base64: base64,
       },
+    };
+  } catch {
+    return { ok: false, reason: "failed" };
+  }
+}
+
+/** A generated document (Markdown) as a PDF, rendered the same way the
+ *  document screen's PDF export renders it. "unsupported" without expo-print. */
+export async function documentPdfAttachment(
+  markdown: string, label: string, meetingTitle: string
+): Promise<AttachmentBuild> {
+  if (!print) return { ok: false, reason: "unsupported" };
+  try {
+    const { base64 } = await print.printToFileAsync({
+      html: markdownToHtml(markdown, label, meetingTitle), base64: true,
+    });
+    if (!base64) return { ok: false, reason: "failed" };
+    if ((base64.length * 3) / 4 > MAX_ATTACHMENT_BYTES) {
+      return { ok: false, reason: "too_large" };
+    }
+    return {
+      ok: true,
+      attachment: { type: "pdf", filename: exportFilename(label, meetingTitle, "pdf"), content_base64: base64 },
     };
   } catch {
     return { ok: false, reason: "failed" };

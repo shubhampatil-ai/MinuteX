@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <classAccesses>
+        <apexClass>MinuteXSiteReceiver</apexClass>
+        <enabled>true</enabled>
+    </classAccesses>
+    <description>Lets the Salesforce Site guest user reach the MinuteX Apex REST receiver. Grants class access ONLY: the receiver runs without sharing and performs its own authentication, so the guest user needs no object or field permissions.</description>
+    <hasActivationRequired>false</hasActivationRequired>
+    <label>MinuteX Site Guest Access</label>
+</PermissionSet>

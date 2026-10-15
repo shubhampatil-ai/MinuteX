@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Transcript__c</fullName>
+    <description>The full meeting transcript as text. MinuteX refuses to deliver a transcript longer than 131,072 characters rather than truncating it.</description>
+    <label>Transcript</label>
+    <length>131072</length>
+    <required>false</required>
+    <type>LongTextArea</type>
+    <visibleLines>10</visibleLines>
+</CustomField>

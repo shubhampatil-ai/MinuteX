@@ -13,7 +13,9 @@ means to add or change one variable.
 
     argv[1]  the current env as JSON (aws --query 'Environment.Variables'),
              or "null"/"" when the function has none
-    argv[2:] KEY=VALUE pairs to set
+    argv[2:] KEY=VALUE pairs to set, or -KEY to remove KEY (used to drop
+             variables the deployed code no longer reads: Lambda caps the
+             whole map at 4 KB)
 
 Prints {"Variables": {...}} for `aws lambda update-function-configuration
 --environment`.
@@ -28,13 +30,22 @@ def main():
     if not isinstance(env, dict):
         env = {}
     for pair in sys.argv[2:]:
+        if pair.startswith("-"):
+            env.pop(pair[1:], None)
+            continue
         key, sep, value = pair.partition("=")
         if not sep:
             # A bare word is almost certainly a quoting mistake in the caller;
             # silently dropping it would deploy a missing env var.
             sys.exit(f"expected KEY=VALUE, got {pair!r}")
         env[key] = value
-    print(json.dumps({"Variables": env}))
+    out = json.dumps({"Variables": env})
+    # Lambda measures the variables as compact JSON; fail here with the size
+    # rather than as an opaque InvalidParameterValueException.
+    size = len(json.dumps(env, separators=(",", ":")).encode("utf-8"))
+    if size > 4096:
+        sys.exit(f"environment would be {size} bytes; Lambda's limit is 4096")
+    print(out)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@ import hashlib
 import re
 
 import ai_sanitize
+import mom_schema
+import speaker_identity
 
 from decimal import Decimal
 
@@ -156,27 +158,132 @@ def speaker_roster(transcript):
     return out
 
 
-def _roster_filtered(participants, roster):
+def _roster_filtered(participants, roster, speaker_names=None):
     """Keep only participants whose speaker is in `roster`, in ROSTER order.
 
     Roster order (not model order) so the list reads as the meeting's own
     speaker order, and every roster speaker appears even if the model omitted
     one — a speaker with turns in the transcript IS a participant whether or not
     the model bothered to describe them.
+
+    Matching is on the NORMALIZED label, not the raw string. The roster handed
+    to the prompt is authoritative about WHO spoke, but it is only guidance
+    about how to spell them back, and an exact-string lookup made that spelling
+    load-bearing: a model answering "0", "speaker_0" or "Speaker  0" for a
+    roster of "Speaker 0" missed on every entry, and each speaker silently took
+    the "" default. The visible symptom is a meeting where every speaker is
+    listed and every contribution blurb is blank, which is indistinguishable
+    from a model that wrote no blurbs at all. Observed in production on
+    code-switched (Hindi/Marathi) meetings, where label drift is common.
+
+    `speaker_names` (the row's rename map, {"0": "Yuvraj Sir"}) adds the second
+    miss: a model that answers with the HUMAN name it read off a renamed
+    transcript. Those names are resolved back to their label so the blurb lands
+    on the right speaker instead of being dropped.
+
+    Widening the MATCH does not widen the FILTER — the output is still exactly
+    the roster, in roster order, so a merely-mentioned name still cannot become
+    an attendee. That guarantee is the whole point of this function and is
+    unchanged; only the lookup that finds an existing blurb got more forgiving.
     """
     if not roster:
         return participants
-    by_label = {}
+
+    def _key(label):
+        return mom_schema.normalize_speaker_label(label).strip().casefold()
+
+    # Human name -> roster label, so a model answering "Yuvraj Sir" for
+    # "Speaker 1" still lands. Built only from the roster's own speakers: a
+    # name outside the roster must not resolve to anyone.
+    by_name = {}
+    for label in roster:
+        named = (speaker_names or {}).get(
+            mom_schema.normalize_speaker_label(label))
+        if named and str(named).strip():
+            by_name.setdefault(str(named).strip().casefold(), label)
+
+    by_label, unmatched = {}, []
     for p in participants:
-        k = " ".join((p.get("speaker") or "").split()).lower()
-        if k and k not in by_label:
+        raw = p.get("speaker") or ""
+        k = _key(raw)
+        if not k:
+            continue
+        # A human name resolves to that speaker's label; anything else is
+        # already a label (or a name nobody is mapped to, which stays unmatched
+        # and is reported below).
+        k = _key(by_name.get(k, k))
+        if k not in by_label:
             by_label[k] = p
+        else:
+            unmatched.append(raw)
+
     out = []
     for label in roster:
-        got = by_label.get(label.lower())
+        got = by_label.pop(_key(label), None)
         out.append({"speaker": label,
                     "summary": (got or {}).get("summary", "")})
+
+    # Anything left in by_label named someone outside the roster. Dropping it
+    # is correct (that is the anti-hallucination filter doing its job), but a
+    # DROP CARRYING A SUMMARY is also the signature of the label-drift bug
+    # above, so it is logged rather than silently discarded — the failure that
+    # needed a DynamoDB read to diagnose leaves a trace now.
+    dropped = [p.get("speaker") or "" for p in by_label.values()
+               if str(p.get("summary") or "").strip()]
+    dropped += [lbl for lbl in unmatched if lbl]
+    if dropped:
+        print(f"[ai_schema] roster: dropped {len(dropped)} participant "
+              f"summary/summaries not matching the roster {roster}: {dropped}")
+    blank = sum(1 for p in out if not str(p.get("summary") or "").strip())
+    if blank and participants:
+        print(f"[ai_schema] roster: {blank}/{len(out)} speaker(s) have no "
+              "contribution summary after matching")
     return out
+
+def _resolve_task_speakers(tasks, roster=None, speaker_names=None):
+    """Force every `assignee_speaker_id` to a canonical id, or to "".
+
+    THE BUG THIS CLOSES. transcript_store.as_labelled_lines renders the user's
+    names INTO the lines the model reads ("Rahul: I'll send it"), while the
+    prompt asks it to copy a "Speaker 0" label that is no longer on the page.
+    So on a RENAMED meeting the model answers with the name, and `s` stored it
+    verbatim — a name sitting in an id field. That value matches no
+    participant row (normalize("Rahul") is "Rahul", not "0"), so the task
+    never resolves to a contact, never fires TASK_ASSIGNED, and can never be
+    corrected by a later rename, because nothing records that it ever meant
+    speaker "0". Renaming a meeting therefore made task ownership WORSE.
+
+    `participants` already survives this — _roster_filtered resolves a
+    human name back to its label. This gives tasks the same treatment, at the
+    one place a task's speaker enters the system.
+
+    UNRESOLVABLE BECOMES "", WHICH IS A SUPPORTED VALUE. The prompt already
+    documents "" as correct and expected whenever the owner is not a specific
+    speaker, and _seed_ai_tasks treats a task with no speaker as unresolved —
+    a visible, fixable gap. A wrong id is invisible and assigns real work to
+    the wrong person, so an ambiguous name resolves to nothing (see
+    speaker_identity.resolve_legacy_speaker_reference's ambiguity rule).
+
+    `assignee` (the spoken NAME) is untouched: it is legitimately a name, it
+    is what the confidence gate and the fingerprint read, and rewriting it
+    would change task identity for every already-seeded row.
+    """
+    roster_ids = [speaker_identity.normalize_speaker_id(r)
+                  for r in (roster or [])]
+    roster_ids = [r for r in roster_ids if r] or None
+    for t in tasks:
+        raw = t.get("assignee_speaker_id")
+        if not str(raw or "").strip():
+            t["assignee_speaker_id"] = ""
+            continue
+        resolved = speaker_identity.resolve_legacy_speaker_reference(
+            raw, roster_ids, speaker_names)
+        if not resolved and str(raw or "").strip():
+            print("[ai_schema] task: dropped unresolvable "
+                  f"assignee_speaker_id {raw!r} (roster {roster_ids})")
+        t["assignee_speaker_id"] = resolved
+    return tasks
+
 
 CONFIDENCE_HIGH = "high"
 CONFIDENCE_MEDIUM = "medium"
@@ -219,6 +326,9 @@ def coerce_confidence(value):
 TASK_SPEC = {
     "task": ("task", s),
     "assignee": ("assignee", s),
+    # Shape-coerced only here; the ROSTER-aware pass is _resolve_task_speakers
+    # below, which is the one that can tell a real speaker from a name. Same
+    # split as evidence_segment_ids: obj_list cannot see the meeting.
     "assignee_speaker_id": ("assignee_speaker_id", s),
     "due_date": ("due_date", s),
     "priority": ("priority", lambda x: clamp(
@@ -510,6 +620,48 @@ def _dedupe_tasks(tasks):
     return out
 
 
+def coerce_tasks(raw, roster=None, valid_ids=None, speaker_names=None):
+    """Strict coerce a model's task array into TASK_SPEC rows.
+
+    The one place task rows are validated, whichever call produced them (the
+    dedicated task call, prompts.TASKS_SYSTEM, or an older analysis reply).
+
+    Note tasks are deliberately NOT roster-filtered — an assignee may be a
+    non-attendee, a team or an external party. Participation and responsibility
+    are independent (see prompts._TASK_RULES' TASK ASSIGNMENT RULE).
+    """
+    tasks = obj_list(raw, TASK_SPEC, required=("task",))
+    if valid_ids is not None:
+        # Re-check what TASK_SPEC could only shape-check: obj_list has no
+        # access to the transcript. A task NEVER fails over a bad reference —
+        # the reference is dropped and the commitment is kept.
+        for t in tasks:
+            t["evidence_segment_ids"] = _evidence_ids(
+                t.get("evidence_segment_ids"), valid_ids)
+    _resolve_task_speakers(tasks, roster, speaker_names)
+    return _dedupe_tasks(tasks)
+
+
+def coerce_task_reply(obj, roster=None, valid_ids=None, speaker_names=None):
+    """One task-call reply -> {"tasks": [...]}. A non-dict reply is no tasks."""
+    raw = obj.get("tasks") if isinstance(obj, dict) else None
+    return {"tasks": coerce_tasks(raw, roster, valid_ids, speaker_names)}
+
+
+def merge_tasks(partials):
+    """Fold per-chunk task replies into one — the task call's OVERFLOW path.
+
+    Collected RAW and de-duplicated once, for the reason merge_analyses gives:
+    _dedupe_tasks fills a later chunk's assignee/due_date onto an earlier
+    chunk's bare mention, which a keep-first pre-filter would throw away.
+    """
+    tasks = []
+    for p in partials:
+        if isinstance(p, dict):
+            tasks.extend(p.get("tasks") or [])
+    return {"tasks": _dedupe_tasks(tasks)}
+
+
 def empty_analysis():
     """Fresh dict with every field; never shares mutable lists."""
     return {
@@ -520,7 +672,7 @@ def empty_analysis():
     }
 
 
-def coerce_analysis(obj, roster=None, valid_ids=None):
+def coerce_analysis(obj, roster=None, valid_ids=None, speaker_names=None):
     """Strict coerce a parsed Groq object into the fixed analysis schema.
 
     Builds the result key-by-key from the four known fields, so a model that
@@ -547,27 +699,25 @@ def coerce_analysis(obj, roster=None, valid_ids=None):
     if not isinstance(obj, dict):
         return empty_analysis() if not roster else {
             **empty_analysis(),
-            "participants": _roster_filtered([], roster),
+            "participants": _roster_filtered([], roster, speaker_names),
         }
-    tasks = obj_list(obj.get("tasks"), TASK_SPEC, required=("task",))
-    if valid_ids is not None:
-        # Re-check what TASK_SPEC could only shape-check: obj_list has no
-        # access to the transcript. A task NEVER fails over a bad reference —
-        # the reference is dropped and the commitment is kept.
-        for t in tasks:
-            t["evidence_segment_ids"] = _evidence_ids(
-                t.get("evidence_segment_ids"), valid_ids)
     participants = obj_list(obj.get("participants"), PARTICIPANT_SPEC,
                             required=("speaker",))
     return {
         "title": s(obj.get("title")),
         "overview": coerce_overview(obj.get("overview"), valid_ids),
-        "tasks": _dedupe_tasks(tasks),
-        "participants": _roster_filtered(participants, roster or []),
+        # The analysis prompt no longer asks for tasks (prompts.TASKS_SYSTEM
+        # owns them), so this is [] for a current reply. Still coerced, not
+        # dropped, so an older caller that hands in a reply WITH tasks keeps
+        # getting them.
+        "tasks": coerce_tasks(obj.get("tasks"), roster, valid_ids,
+                              speaker_names),
+        "participants": _roster_filtered(participants, roster or [],
+                                         speaker_names),
     }
 
 
-def merge_analyses(partials, roster=None):
+def merge_analyses(partials, roster=None, speaker_names=None):
     """Fold per-chunk analyses into one, de-duplicated, order-preserving.
 
     Used as the reduce step's input, and as the final result if the reduce call
@@ -645,7 +795,7 @@ def merge_analyses(partials, roster=None):
     # Same structural guarantee as the single-pass path: a name that never had a
     # speaker turn is not a participant, however many segments volunteered it.
     merged["participants"] = _roster_filtered(merged["participants"],
-                                              roster or [])
+                                              roster or [], speaker_names)
     return merged
 
 
@@ -655,11 +805,16 @@ def merge_analyses(partials, roster=None):
 HL_DECISION_SPEC = {
     "decision": ("decision", s),
     "context": ("context", s),
-}
-HL_ACTION_SPEC = {
-    "task": ("task", s),
-    "owner": ("owner", s),
-    "deadline": ("deadline", s),
+    # WHO decided, as a canonical speaker id — the structured half of
+    # attribution, so a rename moves the displayed name without the decision
+    # TEXT having to be rewritten. Shape-coerced here; resolved against the
+    # roster by coerce_highlights, which is where the meeting is known.
+    #
+    # OPTIONAL BY CONSTRUCTION. Not in `required`, so a decision without one
+    # is kept exactly as before, and every stored decision written before
+    # this field existed still coerces and still renders. "" is the ordinary
+    # value for a collective decision.
+    "speaker_id": ("speaker_id", s),
 }
 HL_DEADLINE_SPEC = {
     "what": ("what", s),
@@ -674,10 +829,21 @@ HL_DEADLINE_SPEC = {
 # remaining section is kept because something reads it:
 #
 #   decisions      -> mom_schema._build_decisions      (MoM "Decisions")
-#   action_items   -> mom_schema._build_points         (MoM "Meeting Points")
 #   deadlines      -> mom_schema._build_followups      (MoM "Follow-ups") AND
 #                     app calendar.tsx (deadline markers on the month grid)
 #   open_questions -> mom_schema._build_followups      (MoM "Follow-ups")
+#
+# `action_items` was REMOVED because it DUPLICATED `tasks`. Measured on a real
+# meeting, the two came back with identical task text, owners and deadlines,
+# three for three — the model was extracting the same commitments twice, in one
+# already-truncating reply, and the copies were free to disagree. `tasks` is
+# the survivor: it alone carries evidence, confidence and assignee_speaker_id,
+# and it is what the Tasks screen, notifications and Salesforce delivery read.
+# Its MoM consumer (_build_points, the "Meeting Points" table) went with it —
+# that table printed the same string in both its "Discussion Point" and
+# "Action Item" columns, so it was a duplicate of the Action Items table.
+# mom_schema._build_actions still FALLS BACK to a stored action_items list for
+# a row older than task seeding, which is why old rows keep rendering.
 #
 # `important_numbers` and `risks` were REMOVED: nothing consumed them in rows.
 # Their content is not lost — a meeting's figures and risks now land in the
@@ -689,28 +855,37 @@ HL_DEADLINE_SPEC = {
 # both iterate it, and old rows carrying the two removed keys stay readable
 # because coercion builds the result key-by-key and simply never looks at them.
 # ---------------------------------------------------------------------------
-HIGHLIGHT_SECTIONS = ("decisions", "action_items", "deadlines",
-                      "open_questions")
+HIGHLIGHT_SECTIONS = ("decisions", "deadlines", "open_questions")
 
 
 def empty_highlights():
     return {k: [] for k in HIGHLIGHT_SECTIONS}
 
 
-def coerce_highlights(obj):
+def coerce_highlights(obj, roster=None, speaker_names=None):
     """Strict coerce a parsed Groq object into the meeting_highlights schema.
 
     Elements missing their load-bearing field are dropped: a deadline with no
     "what" or a number with no "value" carries no information, and keeping it
     would render as an empty row in the workspace.
+
+    `roster`/`speaker_names` resolve each decision's `speaker_id` the same way
+    tasks are resolved — a name or a display label becomes a canonical id, and
+    anything ambiguous becomes "". Both default to None so every existing
+    caller keeps working; without them the field is shape-checked only.
     """
     if not isinstance(obj, dict):
         return empty_highlights()
+    decisions = obj_list(obj.get("decisions"), HL_DECISION_SPEC,
+                         required=("decision",))
+    roster_ids = [speaker_identity.normalize_speaker_id(r)
+                  for r in (roster or [])]
+    roster_ids = [r for r in roster_ids if r] or None
+    for d in decisions:
+        d["speaker_id"] = speaker_identity.resolve_legacy_speaker_reference(
+            d.get("speaker_id"), roster_ids, speaker_names)
     return {
-        "decisions": obj_list(obj.get("decisions"), HL_DECISION_SPEC,
-                              required=("decision",)),
-        "action_items": obj_list(obj.get("action_items"), HL_ACTION_SPEC,
-                                 required=("task",)),
+        "decisions": decisions,
         "deadlines": obj_list(obj.get("deadlines"), HL_DEADLINE_SPEC,
                               required=("what",)),
         "open_questions": slist(obj.get("open_questions")),
@@ -731,8 +906,6 @@ def merge_highlights(partials):
     def _key(section, item):
         if section == "decisions":
             return (item.get("decision") or "").strip().lower()
-        if section == "action_items":
-            return (item.get("task") or "").strip().lower()
         if section == "deadlines":
             return (item.get("what") or "").strip().lower()
         return str(item).strip().lower()
@@ -746,7 +919,7 @@ def merge_highlights(partials):
                 if norm and norm not in seen[section]:
                     seen[section][norm] = True
                     merged[section].append(item)
-        for section in ("decisions", "action_items", "deadlines"):
+        for section in ("decisions", "deadlines"):
             for item in p.get(section, []):
                 if not isinstance(item, dict):
                     continue
@@ -778,334 +951,6 @@ def highlights_empty(h):
 
 
 # ---------------------------------------------------------------------------
-# STAGE 2b — CRM record identifier.
-#
-# Coerced HARDER than the other stages, because this value selects which
-# Salesforce record a meeting is pushed onto: a hallucinated identifier doesn't
-# render as a bad UI row, it writes real notes onto the wrong customer's record.
-# So the prompt's "never invent" rule is ALSO enforced here in code — see
-# _ident_grounded below. Prompt rules are a strong prior, not a guarantee; this
-# is the guarantee.
-#
-# Object-agnostic: the same coercion serves a site visit number, a lead email or
-# an opportunity number. Nothing here knows which object it is validating for.
-#
-# Two steps, in this order and not the other: GROUND the model's answer against
-# its own evidence quote (is it real?), then NORMALIZE spoken digit words into
-# digits (is it in the form Salesforce stores?). See normalize_crm_identifier.
-# ---------------------------------------------------------------------------
-CRM_IDENT_CONFIDENCE = ("explicit", "probable", "none")
-
-# Confidence label -> the numeric score stored/shown. The model gives a coarse
-# label (it is poorly calibrated at emitting floats); the mapping to a number
-# lives here so the UI and the CRM-link record agree on one scale.
-CRM_IDENT_CONFIDENCE_SCORE = {"explicit": 0.95, "probable": 0.6, "none": 0.0}
-
-# Comparing an extracted number against its evidence quote: strip everything
-# that is formatting rather than identity, so "SV-10245" still matches an
-# evidence quote that says "SV 10245" or "sv10245".
-_IDENT_NOISE = str.maketrans("", "", " -_/.,#:")
-
-
-def _ident_norm(v):
-    return (v or "").translate(_IDENT_NOISE).lower()
-
-
-def _ident_grounded(value, evidence):
-    """True when `value` appears in `evidence` as a COMPLETE reference.
-
-    A plain substring test is not enough. "SV-102" is a substring of the
-    evidence "SV-10245", so a model that truncated the number would pass a
-    naive check — and a truncated number is not a harmless typo here, it
-    resolves to a DIFFERENT Salesforce record. Same for a value that is
-    really a slice of a phone number.
-
-    The boundary test looks only for DIGITS either side of the match, not for
-    non-alphanumerics: both strings have already had their separators stripped
-    by _ident_norm (so "is SV-10245." normalizes to "issv10245" and there is no
-    surviving space to anchor against), and it is a longer RUN OF DIGITS that
-    signals a fragment. Adjacent letters are just the sentence's words.
-    """
-    n, ev = _ident_norm(value), _ident_norm(evidence)
-    if not n or not ev:
-        return False
-    start = 0
-    while True:
-        i = ev.find(n, start)
-        if i < 0:
-            return False
-        before = ev[i - 1] if i > 0 else ""
-        after = ev[i + len(n)] if i + len(n) < len(ev) else ""
-        if not before.isdigit() and not after.isdigit():
-            return True
-        start = i + 1
-
-
-# --- Spoken-digit normalization -------------------------------------------
-#
-# Speech-to-text writes dictated identifiers as WORDS: a site visit read aloud
-# as "S V one zero zero four" transcribes to "SV one zero zero four", and the
-# model faithfully extracts that (it is what the transcript says, so it passes
-# the grounding check above — correctly). But Salesforce stores "SV1004", so the
-# SOQL lookup finds nothing and the meeting silently fails to link.
-#
-# So the fix belongs HERE, between extraction and lookup, not in the prompt: the
-# model's job is to quote the transcript accurately, and it did.
-#
-# DELIBERATELY LIMITED to the ten single-digit words, and only where they form
-# a RUN. Identifiers get dictated digit-by-digit ("one zero zero four"), and it
-# is that run of consecutive digit words — not any one word alone — that marks a
-# spelled-out identifier. One "five" in isolation is ordinary speech ("phase
-# five", "five units"), so converting it would be a guess.
-#
-# Compound number words are never reinterpreted, and they BLOCK a run rather
-# than joining it: "twenty four" could mean the digits 2-4, the number 24, or a
-# year, and the identifier alone cannot say which. Guessing would turn a semantic
-# number into a wrong record reference — the exact failure this module exists to
-# prevent. An unconvertible value is left as-is; the lookup then reports
-# not_found, which the user can see and correct.
-_SPOKEN_DIGITS = {
-    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
-}
-
-# "oh"/"o" is how a zero gets voiced mid-sequence ("SV one oh oh four"). Only
-# ever read as a zero INSIDE a run of real digit words, never on its own.
-_SPOKEN_ZERO_ALIASES = {"oh", "o"}
-
-# Number words that are part of a compound/semantic number. Their presence next
-# to a digit word means "this is a quantity being spoken", not a dictated id, so
-# they terminate a run instead of extending it.
-_COMPOUND_NUMBER_WORDS = {
-    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
-    "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
-    "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million",
-    "billion", "dozen",
-}
-
-# A run of letters, a run of digits, a run of whitespace, or any single other
-# character. Splitting this way keeps every separator (hyphen, slash, "#")
-# exactly where it was — only whole words are ever candidates for conversion.
-_IDENT_TOKENS = re.compile(r"[A-Za-z]+|[0-9]+|\s+|.", re.DOTALL)
-
-# How many consecutive spoken digits it takes to call something dictated. Two:
-# "SV one two" is a spelled-out id, while a lone "five" is just a word.
-_SPOKEN_RUN_MIN = 2
-
-
-def normalize_crm_identifier(value):
-    """Spoken-digit words in an extracted identifier -> the digits they name.
-
-        "SV one zero zero four" -> "SV1004"
-        "ABC four five six"     -> "ABC456"
-        "SV1004"                -> "SV1004"        (already numeric: unchanged)
-        "SV twenty four"        -> "SV twenty four" (compound: never guessed)
-        "Priya Sharma"          -> "Priya Sharma"   (no digit words: unchanged)
-
-    Generic — no object, prefix or field name is known here. Alphabetic
-    prefixes, separators and letter case are all preserved exactly; only a RUN
-    of whole words naming single digits is replaced, and only the whitespace
-    inside and immediately around that run is closed up.
-
-    Returns the input unchanged (stripped) whenever there is nothing to convert,
-    so a caller can always use the result, and a value that was never dictated
-    digit-by-digit is never touched.
-    """
-    text = s(value)
-    if not text:
-        return text
-
-    tokens = _IDENT_TOKENS.findall(text)
-
-    # What each word token could be, ignoring position: a digit word, a zero
-    # alias, a compound number word, or none of those.
-    def _kind(tok):
-        if not tok.isalpha():
-            return None
-        low = tok.lower()
-        if low in _SPOKEN_DIGITS:
-            return "digit"
-        if low in _SPOKEN_ZERO_ALIASES:
-            return "alias"
-        if low in _COMPOUND_NUMBER_WORDS:
-            return "compound"
-        return None
-
-    kinds = [_kind(t) for t in tokens]
-    # Word tokens only, so "the next word" can be found past the whitespace and
-    # separators sitting between them.
-    words = [i for i, t in enumerate(tokens) if t.isalpha()]
-
-    # Locate the dictated RUNS as token spans. A run qualifies when it holds at
-    # least _SPOKEN_RUN_MIN real digit words and no compound number word touches
-    # either end ("twenty four", "four hundred" -> a quantity, not an id).
-    # Leading/trailing aliases are trimmed off: an "oh" is a zero only BETWEEN
-    # spoken digits.
-    spans = []
-    w = 0
-    while w < len(words):
-        if kinds[words[w]] not in ("digit", "alias"):
-            w += 1
-            continue
-        start = w
-        while w < len(words) and kinds[words[w]] in ("digit", "alias"):
-            w += 1
-        real = [i for i in words[start:w] if kinds[i] == "digit"]
-        before = kinds[words[start - 1]] if start > 0 else None
-        after = kinds[words[w]] if w < len(words) else None
-        if (len(real) >= _SPOKEN_RUN_MIN
-                and before != "compound" and after != "compound"):
-            spans.append((real[0], real[-1]))
-
-    if not spans:
-        return text  # nothing was dictated as digits — leave it entirely alone.
-
-    # Rebuild by walking the token list and emitting each span as one solid
-    # digit string. Everything outside a span is copied through byte-for-byte,
-    # so ordinary prose and spacing survive untouched.
-    #
-    # A span additionally absorbs the gap to an ALPHANUMERIC chunk directly
-    # beside it — the identifier's prefix ("SV one two" -> "SV12") or suffix
-    # ("one two A" -> "12A") — but only across a gap of pure separators, and
-    # only for the immediately neighbouring token. That is what keeps
-    # "Order five six for Priya" from collapsing into "Order56forPriya": the
-    # word "for" is the neighbour on the right, and a word is not a chunk to
-    # glue digits onto.
-    def _gap_is_separators(a, b):
-        """True when tokens strictly between a and b are all separators."""
-        return all(not tokens[j].isalnum() for j in range(a + 1, b))
-
-    def _absorbs(span_edge, other, step):
-        """Should the gap between the span edge and `other` be closed up?"""
-        if other < 0 or other >= len(tokens):
-            return False
-        if not tokens[other].isalnum():
-            return False
-        # Only a chunk that is NOT itself a plain word: digits, or a word that
-        # reads as an identifier prefix/suffix rather than prose. A single
-        # alphabetic token adjacent to the dictated digits is the prefix case.
-        if not _gap_is_separators(min(span_edge, other), max(span_edge, other)):
-            return False
-        if tokens[other].isdigit():
-            return True
-        # An alphabetic neighbour glues on only when it LOOKS like part of an
-        # identifier rather than prose. The signal is case: dictated ids carry a
-        # capitalised or all-caps code ("SV", "ABC", "OPP", a trailing "A"),
-        # while the ordinary words that surround a value in a sentence ("for",
-        # "visit", "is") are lower case. So "site visit SV one zero zero four"
-        # yields "site visit SV1004" — the code is absorbed, the prose is not.
-        #
-        # A lower-case PREFIX is still absorbed when it is the only thing to its
-        # left, which is the "sv one two three" case: a bare value the model
-        # extracted on its own, where casing is unreliable. Applied to the left
-        # only — a trailing lower-case word is prose ("five six today"), whereas
-        # a real suffix code is capitalised and already handled above.
-        word = tokens[other]
-        if word[:1].isupper():
-            return True
-        if step > 0:
-            return False
-        j = other - 1
-        while j >= 0 and not tokens[j].strip():
-            j -= 1
-        return j < 0
-
-    out, i = [], 0
-    while i < len(tokens):
-        span = next((sp for sp in spans if sp[0] == i), None)
-        if span is None:
-            out.append(tokens[i])
-            i += 1
-            continue
-        lo, hi = span
-        digits = "".join(_SPOKEN_DIGITS.get(tokens[j].lower(), "0")
-                         for j in range(lo, hi + 1) if tokens[j].isalpha())
-        # Trim the separator gap already emitted on the left, if it is absorbed.
-        prev = lo - 1
-        while prev >= 0 and not tokens[prev].strip():
-            prev -= 1
-        if prev >= 0 and _absorbs(lo, prev, -1):
-            while out and not out[-1].strip():
-                out.pop()
-        out.append(digits)
-        i = hi + 1
-        # And skip the gap on the right when a suffix chunk is absorbed.
-        nxt = i
-        while nxt < len(tokens) and not tokens[nxt].strip():
-            nxt += 1
-        if nxt < len(tokens) and _absorbs(hi, nxt, 1):
-            i = nxt
-    return "".join(out).strip()
-
-
-def empty_crm_identifier():
-    return {"value": None, "value_raw": None, "confidence": "none",
-            "confidence_score": 0.0, "evidence": ""}
-
-
-def coerce_crm_identifier(obj):
-    """Strict coerce a parsed Groq object into the CRM identifier schema.
-
-    Never raises (the module contract). Returns the empty shape for anything
-    that fails the grounding check, so a caller can treat "nothing mentioned"
-    and "an ungrounded value" identically — both mean "ask the user", which is
-    the safe outcome either way.
-
-    Accepts `value` (current) or `site_visit_number` (the key the first,
-    site-visit-only version of this prompt emitted) so a stored extraction or an
-    in-flight response from either shape still coerces.
-    """
-    if not isinstance(obj, dict):
-        return empty_crm_identifier()
-
-    value = s(obj.get("value")) or s(obj.get("site_visit_number"))
-    evidence = s(obj.get("evidence"))
-    confidence = clamp(obj.get("confidence"), set(CRM_IDENT_CONFIDENCE), "none")
-
-    # Nothing mentioned is the expected answer for most meetings — normalize
-    # every flavour of "nothing" (null, "", "null", "N/A") to the empty shape.
-    if not value or value.lower() in ("null", "none", "n/a", "na", "unknown"):
-        return empty_crm_identifier()
-
-    # THE grounding check: the value must appear in the model's own evidence
-    # quote, as a complete reference rather than a fragment. A model that
-    # invents "SV-10245" cannot also produce a transcript sentence containing
-    # it, so this catches the failure mode the prompt only discourages.
-    # Dropped rather than kept-with-low-confidence: a value the UI shows at all
-    # is a value a rushed user may confirm.
-    if not _ident_grounded(value, evidence):
-        return empty_crm_identifier()
-
-    # A value WITH grounding but labelled "none" is self-contradictory; trust
-    # the evidence over the label and call it probable rather than discarding.
-    if confidence == "none":
-        confidence = "probable"
-
-    # Spoken digits -> digits, AFTER grounding and never before: grounding
-    # compares what the model said against the transcript it quoted, and both
-    # sides are still in spoken form there ("SV one zero zero four" appears in
-    # the evidence; "SV1004" does not). Normalizing first would reject the
-    # extraction as ungrounded — the opposite of the intent.
-    #
-    # `value` is the normalized form because it is what every consumer looks up
-    # with; `value_raw` keeps exactly what the model extracted so the UI and any
-    # debugging can show what was actually said next to the evidence quote.
-    normalized = normalize_crm_identifier(value)
-    return {
-        "value": normalized or value,
-        "value_raw": value,
-        "confidence": confidence,
-        "confidence_score": Decimal(str(CRM_IDENT_CONFIDENCE_SCORE[confidence])),
-        "evidence": evidence[:500],
-    }
-
-
-def crm_identifier_found(ident):
-    """True when a usable identifier was extracted."""
-    return bool(isinstance(ident, dict) and ident.get("value"))
-
-
-# ---------------------------------------------------------------------------
 # THE UNIFIED ANALYSIS — one model reply, one transcript read.
 #
 # Shape (prompts.unified_analysis_system):
@@ -1124,15 +969,6 @@ def crm_identifier_found(ident):
 # section gets that section's documented empty value, exactly as if its own call
 # had failed — which is what keeps the unified call's failure modes a subset of
 # the old ones rather than a new set.
-#
-# CRM IDENTIFIER EXTRACTION WAS REMOVED from this path. It made every analysis
-# carry per-mapping extraction rules for a feature that is not yet built out,
-# and it is the one output whose failure mode is writing a real customer's
-# meeting onto a stranger's Salesforce record. The coercers below it
-# (coerce_crm_identifier, normalize_crm_identifier and their grounding checks)
-# are DELIBERATELY KEPT: the manual identifier path and the Salesforce push
-# still use them, and they are where the anti-hallucination work lives when
-# integration extraction is designed properly.
 # ---------------------------------------------------------------------------
 def empty_unified():
     """Fresh dict with every unified field; never shares mutable values."""
@@ -1140,18 +976,22 @@ def empty_unified():
             "meeting_highlights": empty_highlights()}
 
 
-def coerce_unified(obj, roster=None, valid_ids=None):
+def coerce_unified(obj, roster=None, valid_ids=None, speaker_names=None):
     """Strict coerce ONE unified Groq reply into its sub-schemas."""
     if not isinstance(obj, dict):
         return {**empty_unified(),
-                "participants": _roster_filtered([], roster or [])}
+                "participants": _roster_filtered([], roster or [],
+                                                 speaker_names)}
 
-    out = coerce_analysis(obj, roster, valid_ids)
-    out["meeting_highlights"] = coerce_highlights(obj.get("meeting_highlights"))
+    out = coerce_analysis(obj, roster, valid_ids, speaker_names)
+    # Roster-aware, so a decision's speaker_id lands as a canonical id for the
+    # same reason a task's does.
+    out["meeting_highlights"] = coerce_highlights(
+        obj.get("meeting_highlights"), roster, speaker_names)
     return out
 
 
-def merge_unified(partials, roster=None):
+def merge_unified(partials, roster=None, speaker_names=None):
     """Fold per-chunk unified analyses into one — the OVERFLOW path only.
 
     Reached only when a transcript exceeds the single-pass budget and
@@ -1161,7 +1001,7 @@ def merge_unified(partials, roster=None):
     correct and differ per section.
     """
     dicts = [p for p in partials if isinstance(p, dict)]
-    merged = merge_analyses(dicts, roster)
+    merged = merge_analyses(dicts, roster, speaker_names)
     merged["meeting_highlights"] = merge_highlights(
         [p.get("meeting_highlights") or {} for p in dicts])
     return merged

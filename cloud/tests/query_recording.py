@@ -56,8 +56,6 @@ def main() -> int:
     print(f"sync_status    : {field('sync_status')}")
     if field("sync_error"):
         print(f"sync_error     : {field('sync_error')}")
-    if field("salesforce_object"):
-        print(f"salesforce     : {field('salesforce_object')}/{field('salesforce_record_id')}")
     print("-" * 70)
     print("SUMMARY:")
     print(f"  {field('summary')}")

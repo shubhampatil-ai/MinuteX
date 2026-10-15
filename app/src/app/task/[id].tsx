@@ -1,8 +1,8 @@
 // src/app/task/[id].tsx — one task: who owes it, where it came from, and why.
 //
 // Reached from the Task Tracker, so it must stand on its own without a meeting
-// in context — hence getTaskDetail, which returns the task plus the contact,
-// folder and source meeting in one call.
+// in context — hence getTaskDetail, which returns the task plus the contact
+// and source meeting in one call.
 //
 // The important screen here is the RESOLUTION flow. When the AI extracts
 // "Rahul, send the proposal by Friday", it records the name and which speaker
@@ -14,8 +14,6 @@
 //     is exactly one candidate, because one name match is not proof of
 //     identity and quietly picking it is how a task ends up with the wrong
 //     person;
-//   * folder members are shown first (a hint), labelled as such, not ranked
-//     silently;
 //   * "Choose someone else" is always available, because the right person may
 //     not be a name match at all.
 //
@@ -32,17 +30,16 @@ import {
   S, R, ELEV, CAPS, FONT, useTheme, ColorScale,
 } from "../../../lib/theme";
 import {
-  Button, Card, ErrorText, Loading, SectionTitle,
+  Avatar, Button, Card, ErrorText, Loading, SectionTitle,
 } from "../../../lib/ui";
 import {
   ApiContact, ApiError, AssigneeCandidate, CREATOR_PERMISSIONS, TaskDetail,
   TaskStatusV2,
-  assigneeLabel, getAssigneeCandidates, getFolderContacts, getParticipants,
+  assigneeLabel, getAssigneeCandidates, getParticipants,
   getTaskDetail, needsAssigneeResolution, patchTaskById, resolveTaskAssignee,
 } from "../../../lib/api";
 import { ContactPicker } from "../../../lib/contact-picker";
 import { DueDatePicker, isPlottableDue } from "../../../lib/due-date-picker";
-import { avatarColorFor, initialsOf } from "../../../lib/task-model";
 import { dayHeading } from "../../../lib/task-insights";
 
 const STATUSES: TaskStatusV2[] = [
@@ -69,10 +66,9 @@ export default function TaskDetailScreen() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [dueOpen, setDueOpen] = useState(false);
   // Ranking context for the assignee picker: who was in this meeting, and who
-  // is in its folder. Fetched lazily when the picker opens rather than on every
+  // Fetched lazily when the picker opens rather than on every
   // task view — most visits never assign anyone.
   const [meetingContacts, setMeetingContacts] = useState<ApiContact[]>([]);
-  const [folderContacts, setFolderContacts] = useState<ApiContact[]>([]);
 
   const load = useCallback(
     async (isRefresh = false) => {
@@ -156,8 +152,8 @@ export default function TaskDetailScreen() {
     [taskId, load]
   );
 
-  // Pull the meeting's tagged people and the folder's contacts so the picker can
-  // rank "in this meeting" above "in this folder" above everyone else. Failures
+  // Pull the meeting's tagged people so the picker can rank "in this meeting"
+  // above everyone else. Failures
   // are swallowed on purpose: this only affects ORDERING, and a picker that
   // still lists every contact is far better than one that refuses to open.
   const openAssigneePicker = useCallback(async () => {
@@ -171,19 +167,8 @@ export default function TaskDetailScreen() {
             .map((x) => x.contact)
             .filter((c): c is ApiContact => !!c)
         );
-        // The participants call already returns the folder's contacts, so this
-        // costs nothing extra.
-        setFolderContacts(p.folder_contacts);
       } catch {
         setMeetingContacts([]);
-      }
-    }
-    // No meeting (or it had none) but the task is filed — still rank the folder.
-    if (!key && detail?.folder?.id) {
-      try {
-        setFolderContacts(await getFolderContacts(detail.folder.id));
-      } catch {
-        setFolderContacts([]);
       }
     }
   }, [detail]);
@@ -228,7 +213,7 @@ export default function TaskDetailScreen() {
     );
   }
 
-  const { task, contact, folder, recording, assigned_by: assignedBy } = detail;
+  const { task, contact, recording, assigned_by: assignedBy } = detail;
   // WHAT THIS USER MAY DO, decided by the backend and merely rendered here.
   //
   // The creator controls the task's configuration; the assignee executes it
@@ -367,14 +352,16 @@ export default function TaskDetailScreen() {
                     accessibilityRole="button"
                     accessibilityLabel={`Assign to ${c.name}`}
                   >
-                    <View
-                      style={[
-                        st.avatarSm,
-                        { backgroundColor: avatarColorFor(c.name) },
-                      ]}
-                    >
-                      <Text style={st.avatarSmTxt}>{initialsOf(c.name)}</Text>
-                    </View>
+                    {/* Their real photo when we have one — a candidate list
+                        is exactly where a face disambiguates two people with
+                        the same name. Avatar falls back to these same
+                        coloured initials otherwise. */}
+                    <Avatar
+                      name={c.name}
+                      photoUri={c.avatar_view_url}
+                      size={34}
+                      fontSize={12}
+                    />
                     <View style={{ flex: 1 }}>
                       <Text style={st.candidateName}>{c.name}</Text>
                       {!!(c.email || c.company) && (
@@ -383,13 +370,6 @@ export default function TaskDetailScreen() {
                         </Text>
                       )}
                     </View>
-                    {/* Being in this task's folder is a HINT for the human,
-                        labelled as such — it never auto-selects. */}
-                    {c.in_folder && !!folder && (
-                      <View style={st.inFolderPill}>
-                        <Text style={st.inFolderTxt}>{folder.name}</Text>
-                      </View>
-                    )}
                   </Pressable>
                 ))}
               </>
@@ -450,11 +430,12 @@ export default function TaskDetailScreen() {
               contact.id ? `Open ${contact.name}` : `Assigned to ${contact.name}`
             }
           >
-            <View
-              style={[st.avatar, { backgroundColor: avatarColorFor(contact.name) }]}
-            >
-              <Text style={st.avatarTxt}>{initialsOf(contact.name)}</Text>
-            </View>
+            <Avatar
+              name={contact.name}
+              photoUri={contact.avatar_view_url}
+              size={44}
+              fontSize={15}
+            />
             <View style={{ flex: 1 }}>
               <Text style={st.assigneeName}>{contact.name}</Text>
               {!!contact.email && (
@@ -652,7 +633,12 @@ export default function TaskDetailScreen() {
               question anyone asks of work that appeared in their list. */}
           {!!assignedBy?.name && (
             <View style={st.ctxRow}>
-              <Icon name="person.fill" size={15} tintColor={C.primary} />
+              <Avatar
+                name={assignedBy.name}
+                photoUri={assignedBy.avatar_view_url}
+                size={22}
+                fontSize={9}
+              />
               <View style={{ flex: 1 }}>
                 <Text style={st.ctxLabel}>Assigned by</Text>
                 <Text style={st.ctxValue}>{assignedBy.name}</Text>
@@ -740,26 +726,6 @@ export default function TaskDetailScreen() {
               </Pressable>
             );
           })()}
-          {!!folder && (
-            <Pressable
-              style={st.ctxRow}
-              onPress={() =>
-                router.push({
-                  pathname: "/folder/[id]",
-                  params: { id: folder.id },
-                } as any)
-              }
-              accessibilityRole="button"
-              accessibilityLabel="Open folder"
-            >
-              <Icon name="folder" size={15} tintColor={C.primary} />
-              <View style={{ flex: 1 }}>
-                <Text style={st.ctxLabel}>Folder</Text>
-                <Text style={st.ctxValue}>{folder.name}</Text>
-              </View>
-              <Icon name="chevron.right" size={14} tintColor={C.textFaint} />
-            </Pressable>
-          )}
           {/* The AI's own words. Showing the evidence is what makes an
               extracted task auditable rather than something to take on faith. */}
           {!!task.ai_evidence && (
@@ -814,9 +780,6 @@ export default function TaskDetailScreen() {
         onClose={() => setPickerOpen(false)}
         onPick={resolveTo}
         meetingContacts={meetingContacts}
-        folderContacts={folderContacts}
-        folderId={folder?.id}
-        folderName={folder?.name}
         title="Assign Task To"
       />
     </ScrollView>
@@ -896,11 +859,6 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     candidateSub: {
       fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 1,
     },
-    inFolderPill: {
-      paddingHorizontal: 8, paddingVertical: 3, borderRadius: R.pill,
-      backgroundColor: C.primarySoft,
-    },
-    inFolderTxt: { fontFamily: FONT.bold, fontSize: 10, color: C.primary },
     altLink: {
       fontFamily: FONT.medium, fontSize: 12.5, color: C.primary,
       lineHeight: 18,
@@ -910,16 +868,6 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
       backgroundColor: C.surface, borderRadius: R.card, padding: S.lg,
       shadowColor: C.shadow, ...ELEV.sm,
     },
-    avatar: {
-      width: 46, height: 46, borderRadius: 23, alignItems: "center" as const,
-      justifyContent: "center" as const,
-    },
-    avatarTxt: { fontFamily: FONT.bold, fontSize: 17, color: "#fff" },
-    avatarSm: {
-      width: 34, height: 34, borderRadius: 17, alignItems: "center" as const,
-      justifyContent: "center" as const,
-    },
-    avatarSmTxt: { fontFamily: FONT.bold, fontSize: 12.5, color: "#fff" },
     assigneeName: { fontFamily: FONT.bold, fontSize: 15.5, color: C.text },
     assigneeSub: {
       fontFamily: FONT.regular, fontSize: 12.5, color: C.textFaint,

@@ -8,6 +8,15 @@
 // default for nobody: participants are pre-selected (they were in the meeting)
 // but every one is visibly listed and can be removed before sending.
 //
+// OTHER PEOPLE CAN BE ADDED FROM CONTACTS. Sharing the minutes with someone
+// who was not in the meeting (a manager, a client's colleague) is routine.
+// "+ Add from contacts" opens the shared ContactPicker in requireEmail mode, so
+// whoever comes back — picked, created or imported — has an address. Added
+// people are never pre-selected from anywhere: each one is a deliberate pick.
+// The backend accepts any contact the caller may READ, not only participants
+// (_resolve_contact_recipients), and still resolves the address server-side
+// from contact_id, so this widens who can be chosen, not what can be forged.
+//
 // PARTICIPANTS WITHOUT AN EMAIL ADDRESS ARE SHOWN, NOT HIDDEN. The backend
 // returns them separately (`unresolved`) and refuses a send that includes one.
 // Dropping them silently would make "sent to 2 of 3 people" look identical to
@@ -36,13 +45,14 @@ import {
   TextInput, View,
 } from "react-native";
 import { useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "./icons";
 import { R, FONT, useTheme, ColorScale } from "./theme";
 import {
   Button, Divider, ErrorText, KeyboardAwareSheet, scrollFormProps,
 } from "./ui";
 import {
-  AiDocument, ApiError, EmailAttachment, Mom, ResolvedRecipient,
+  AiDocument, ApiContact, ApiError, EmailAttachment, Mom, ResolvedRecipient,
   getMeetingEmailRecipients, getMom, isIntegrationUnavailable, listAiDocuments,
   sendMeetingEmail,
 } from "./api";
@@ -50,6 +60,14 @@ import {
   FORMAT_LABEL, MAX_ATTACHMENTS, MeetingOutput, OutputFormat,
   buildOutputAttachment, defaultFormat, describeBuildFailure, meetingOutputs,
 } from "./meeting-outputs";
+import { ContactPicker } from "./contact-picker";
+
+/** Mirrors MAX_RECIPIENTS in cloud/shared/email_message.py. Checked here as
+ *  well so adding the 26th person fails at the tap, not after every
+ *  attachment has been rendered and uploaded. */
+export const MAX_RECIPIENTS = 25;
+
+const normEmail = (e?: string) => (e || "").trim().toLowerCase();
 
 export type GmailShareSheetProps = {
   visible: boolean;
@@ -131,7 +149,9 @@ function buildStyles(C: ColorScale) {
       lineHeight: 19, paddingVertical: 8,
     },
     link: { fontFamily: FONT.bold, fontSize: 13, color: C.primary },
-    footer: { paddingTop: 18, paddingBottom: 26, gap: 10 },
+    // flexShrink: 0 — the action row must never be the thing that gives
+    // way. The ScrollView above it is the designated flexible child.
+    footer: { paddingTop: 18, paddingBottom: 26, gap: 10, flexShrink: 0 },
     progress: {
       fontFamily: FONT.regular, fontSize: 12.5, color: C.textDim,
       textAlign: "center" as const,
@@ -144,6 +164,9 @@ export function GmailShareSheet({
 }: GmailShareSheetProps) {
   const { C } = useTheme();
   const router = useRouter();
+  // The home indicator / gesture bar. The footer holds Send, so it must
+  // clear it; the fixed paddingBottom below assumed no inset at all.
+  const insets = useSafeAreaInsets();
   const st = useMemo(() => buildStyles(C), [C]);
 
   const [loading, setLoading] = useState(true);
@@ -153,6 +176,10 @@ export function GmailShareSheet({
   // Selected by contact_id. Participants start selected — they were in the
   // meeting — but every one is listed and removable before Send.
   const [selected, setSelected] = useState<Record<string, boolean>>({});
+  // People added from contacts who were NOT participants. Same shape as a
+  // participant row (speaker_id ""), so selection and sending treat both alike.
+  const [extras, setExtras] = useState<ResolvedRecipient[]>([]);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [subject, setSubject] = useState("");
   const [body, setBody] = useState("");
   const [sending, setSending] = useState(false);
@@ -201,6 +228,9 @@ export function GmailShareSheet({
 
       setRecipients(res.recipients);
       setUnresolved(res.unresolved);
+      // Added people belong to ONE send. Reopening — possibly for another
+      // meeting — starts again from that meeting's participants only.
+      setExtras([]);
       setSelected(Object.fromEntries(
         res.recipients.map((r) => [r.contact_id, true])));
 
@@ -230,12 +260,47 @@ export function GmailShareSheet({
   // screen stays mounted behind it.
   useEffect(() => { if (visible) load(); }, [visible, load]);
 
-  const chosenRecipients = recipients.filter((r) => selected[r.contact_id]);
+  const allRecipients = [...recipients, ...extras];
+  const chosenRecipients = allRecipients.filter((r) => selected[r.contact_id]);
   const chosenFormatCount = Object.values(picked)
     .reduce((n, f) => n + f.length, 0);
 
-  const toggleRecipient = (contactId: string) =>
+  const toggleRecipient = (contactId: string) => {
+    if (!selected[contactId] && chosenRecipients.length >= MAX_RECIPIENTS) {
+      setError(`You can send to at most ${MAX_RECIPIENTS} people at a time.`);
+      return;
+    }
+    setError("");
     setSelected((prev) => ({ ...prev, [contactId]: !prev[contactId] }));
+  };
+
+  /** A contact chosen in the picker. Someone already on the list — the same
+   *  contact, or another contact with the same address — is just ticked: the
+   *  backend dedupes by address anyway, and a second row would make the
+   *  "Send to N people" count wrong. */
+  const addContact = (c: ApiContact) => {
+    const email = normEmail(c.email);
+    if (!email) {
+      // The picker runs in requireEmail mode, so this is a backstop — the
+      // backend would refuse the whole send (422) for this person.
+      setError(`${c.name || "This contact"} has no email address. `
+        + `Add one to their contact to send to them.`);
+      return;
+    }
+    const already = allRecipients.find(
+      (r) => r.contact_id === c.id || normEmail(r.email) === email);
+    const id = already ? already.contact_id : c.id;
+    if (!selected[id] && chosenRecipients.length >= MAX_RECIPIENTS) {
+      setError(`You can send to at most ${MAX_RECIPIENTS} people at a time.`);
+      return;
+    }
+    setError("");
+    if (!already) {
+      setExtras((prev) => [...prev,
+        { contact_id: c.id, name: c.name || "", email, speaker_id: "" }]);
+    }
+    setSelected((prev) => ({ ...prev, [id]: true }));
+  };
 
   /** Total files a selection would produce. The cap counts FILES, not
    *  documents — one output in three formats is three attachments. */
@@ -353,7 +418,16 @@ export function GmailShareSheet({
               <ActivityIndicator color={C.textFaint} />
             </View>
           ) : (
-            <ScrollView {...scrollFormProps} style={{ maxHeight: 430 }}>
+            // flexShrink, not a fixed maxHeight. The sheet is already
+            // bounded (maxHeight "90%") and the header/footer lay out at
+            // their natural size. A hard 430 made this list refuse to give
+            // any height back, so on a short phone head + 430 + footer
+            // exceeded the sheet and Send — the only way to finish — fell
+            // below the fold. flexShrink lets the LIST absorb the
+            // shortfall, which is right because it already scrolls. On a
+            // tall phone nothing changes: flexShrink only bites when there
+            // is a shortfall to absorb.
+            <ScrollView {...scrollFormProps} style={{ flexShrink: 1 }}>
               {/* ---- Documents ---- */}
               <Text style={st.sectionTitle}>Documents</Text>
               {!outputs.length ? (
@@ -414,30 +488,44 @@ export function GmailShareSheet({
               {/* ---- Recipients ---- */}
               <Text style={st.sectionTitle}>Recipients</Text>
 
-              {!recipients.length && !unresolved.length ? (
+              {!recipients.length && !unresolved.length && !extras.length ? (
                 <Text style={st.empty}>
                   No participants have been matched to a contact yet. Map
-                  speakers to contacts on this meeting, then share.
+                  speakers to contacts on this meeting, or add people from
+                  your contacts below.
                 </Text>
               ) : null}
 
-              {recipients.map((r) => {
+              {allRecipients.map((r) => {
                 const on = !!selected[r.contact_id];
+                const added = extras.includes(r);
                 return (
                   <Pressable key={r.contact_id} style={st.row}
                     onPress={() => toggleRecipient(r.contact_id)}
                     accessibilityRole="checkbox"
-                    accessibilityState={{ checked: on }}>
+                    accessibilityState={{ checked: on }}
+                    accessibilityLabel={`${r.name || r.email}${added ? ", added from contacts" : ""}`}>
                     <View style={[st.box, on && st.boxOn]}>
                       {on ? <Icon name="checkmark" tintColor={C.textOnPrimary} size={13} /> : null}
                     </View>
                     <View style={{ flex: 1 }}>
                       <Text style={st.rowName}>{r.name || r.email}</Text>
-                      <Text style={st.rowSub}>{r.email}</Text>
+                      <Text style={st.rowSub}>
+                        {added ? `${r.email} · Added from contacts` : r.email}
+                      </Text>
                     </View>
                   </Pressable>
                 );
               })}
+
+              <Pressable style={st.row} onPress={() => setPickerOpen(true)}
+                accessibilityRole="button"
+                accessibilityLabel="Add a recipient from your contacts">
+                <View style={st.box}>
+                  <Icon name="plus" tintColor={C.primary} size={12} />
+                </View>
+                <Text style={st.link}>Add from contacts</Text>
+              </Pressable>
 
               {/* Participants with no address. Shown, never silently dropped —
                   see the file header. */}
@@ -486,7 +574,7 @@ export function GmailShareSheet({
             </ScrollView>
           )}
 
-          <View style={st.footer}>
+          <View style={[st.footer, { paddingBottom: Math.max(insets.bottom, 12) + 14 }]}>
             {error ? <ErrorText>{error}</ErrorText> : null}
             {sending && progress ? <Text style={st.progress}>{progress}</Text> : null}
             <Button
@@ -507,6 +595,18 @@ export function GmailShareSheet({
         </View>
       </View>
       </KeyboardAwareSheet>
+
+      {/* Sibling of the sheet, inside this Modal — the add-task-sheet
+          pattern. The share sheet stays open underneath, so cancelling the
+          picker returns to the half-filled message rather than losing it.
+          requireEmail: everyone it returns must be mailable. */}
+      <ContactPicker
+        visible={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        onPick={addContact}
+        title="Add Recipient"
+        requireEmail
+      />
     </Modal>
   );
 }
@@ -529,13 +629,20 @@ export function GmailShareSheet({
  * to the surface, not to this component.
  */
 export function GmailShareRow({
-  usable, needsReauth, onPress, mode = "prompt", style,
+  usable, needsReauth, onPress, mode = "prompt", style, onPrompt,
 }: {
   usable: boolean;
   needsReauth: boolean;
   onPress: () => void;
   mode?: "prompt" | "hidden";
   style?: any;
+  /**
+   * Replaces the prompt's own navigation to the Gmail screen. A row rendered
+   * inside a Modal (the meeting-actions sheet) must close that Modal before
+   * navigating, or the Modal stays on top of the screen it just opened.
+   * Receives the navigation to run once the caller is ready.
+   */
+  onPrompt?: (go: () => void) => void;
 }) {
   const { C } = useTheme();
   const router = useRouter();
@@ -546,7 +653,10 @@ export function GmailShareRow({
   if (!usable) {
     return (
       <Pressable
-        onPress={() => router.push("/integrations/gmail" as any)}
+        onPress={() => {
+          const go = () => router.push("/integrations/gmail" as any);
+          if (onPrompt) onPrompt(go); else go();
+        }}
         style={({ pressed }) => [st.row, { opacity: pressed ? 0.6 : 0.75 }, style]}
         accessibilityRole="button"
         accessibilityLabel={needsReauth

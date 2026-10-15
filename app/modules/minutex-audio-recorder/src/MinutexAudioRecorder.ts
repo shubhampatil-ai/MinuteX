@@ -53,6 +53,12 @@ export type WavRecorderStatus = {
   /** Peak level 0..1 of the last buffer. Feeds the silence detector. */
   level: number;
   /**
+   * RMS level 0..1 of the last buffer. Feeds the live waveform ONLY — never
+   * the silence detector, which is defined on peak. Absent on builds that
+   * predate it; callers fall back to `level`.
+   */
+  rms?: number;
+  /**
    * The capture layer has seen enough consecutive digital silence to conclude
    * the microphone was taken (a call, or another app grabbing it exclusively).
    *

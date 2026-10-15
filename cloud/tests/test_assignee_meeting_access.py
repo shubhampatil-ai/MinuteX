@@ -135,13 +135,14 @@ class AssigneeAccessHarness(unittest.TestCase):
         self.patches = [
             mock.patch.object(api, "_recordings", self.t["recordings"]),
             mock.patch.object(api, "_contacts", self.t["contacts"]),
-            mock.patch.object(api, "_folders", self.t["folders"]),
-            mock.patch.object(api, "_folder_contacts",
-                              self.t["folder_contacts"]),
             mock.patch.object(api, "_meeting_participants",
                               self.t["participants"]),
             mock.patch.object(api, "_tasks", self.t["tasks"]),
             mock.patch.object(api, "_users", self.t["users"]),
+            # Participant grants: empty here, so every viewer in this suite
+            # is decided by the task-assignee rule alone.
+            mock.patch.object(api, "_meeting_access",
+                              self.t["meeting_access"]),
             mock.patch.object(api, "Key", fdb.Key),
             mock.patch.object(api, "_s3", self.s3),
             mock.patch.object(api, "_require_auth",
@@ -601,12 +602,10 @@ class TestTaskDetailIntegration(AssigneeAccessHarness):
         self.assertEqual(rec["access"], "assignee")
         self.assertEqual(rec["title"], "Fit-out quotation review")
 
-    def test_assignee_still_gets_no_folder_or_speaker_names(self):
-        """The folder is the owner's workspace and addresses a screen the
-        assignee cannot open; empty speaker_names is what keeps
-        _public_task_v2 on the stored assignee string."""
+    def test_assignee_still_gets_no_speaker_names(self):
+        """Empty speaker_names is what keeps _public_task_v2 on the stored
+        assignee string."""
         _, body = self.get_task_detail()
-        self.assertEqual(body["recording"]["folder_id"], "")
         self.assertEqual(body["recording"]["speaker_names"], {})
 
     def test_owner_is_marked_as_owner(self):

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Related_Person__c</fullName>
+    <description>Link to the Contact or Lead this meeting was with.</description>
+    <externalId>false</externalId>
+    <formula>IF(ISBLANK(Who_Record_Id__c), &quot;&quot;, HYPERLINK(&quot;/&quot; &amp; Who_Record_Id__c, BLANKVALUE(Who_Record_Name__c, Who_Record_Id__c), &quot;_self&quot;))</formula>
+    <formulaTreatBlanksAs>BlankAsZero</formulaTreatBlanksAs>
+    <label>Related Person</label>
+    <required>false</required>
+    <type>Text</type>
+    <unique>false</unique>
+</CustomField>

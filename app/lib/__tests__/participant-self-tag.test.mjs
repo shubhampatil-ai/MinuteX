@@ -40,7 +40,11 @@ const ROOT = new URL("../../", import.meta.url).pathname
 const read = (p) => readFileSync(join(ROOT, p), "utf8");
 
 const API = read("lib/api.ts");
-const SCREEN = read("src/app/recording/[key]/participants.tsx");
+// The Participants screen renders the SHARED tagging UI (lib/speaker-
+// tagging.tsx), which also owns the state and writes — so the surface under
+// test is the screen plus that module.
+const SCREEN = read("src/app/recording/[key]/participants.tsx")
+  + "\n" + read("lib/speaker-tagging.tsx");
 
 describe("the attendance API is distinct from speaker mapping", () => {
   it("exposes tagAttendee, which sends no speaker_id", () => {
@@ -79,7 +83,7 @@ describe("the attendance API is distinct from speaker mapping", () => {
 describe("the empty state tells the truth", () => {
   it("treats an unknown status as still processing", () => {
     assert.match(
-      SCREEN, /if \(!recordingStatus\) return true;/,
+      SCREEN, /stillProcessing = !recordingStatus\s*\|\|/,
       "an older backend must keep the behaviour it already had"
     );
     assert.match(
@@ -156,7 +160,11 @@ describe("mapping a speaker syncs every surface that shows the name", () => {
 
   it("the participants screen calls it after a mapping change", () => {
     assert.match(
-      SCREEN, /const \{ syncSpeakerNames \} = useMeeting\(\)/,
+      // Destructuring may pull in other fields alongside it (e.g. `rec`,
+      // added in Phase 2D.3 for organisation-meeting detection) — the
+      // invariant this pins is that syncSpeakerNames comes FROM the
+      // context, not the exact shape of the destructure.
+      SCREEN, /const \{[^}]*\bsyncSpeakerNames\b[^}]*\} = useMeeting\(\)/,
       "the screen must take the resync from the context"
     );
     assert.match(

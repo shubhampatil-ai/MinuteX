@@ -6,10 +6,10 @@
 // pill (src/app/(tabs)/index.tsx) where its live connection state is visible
 // without a trip. It still lives at /devices, also reachable from You.
 //
-// The bar sits on a white/light surface, separated from the page by a
-// hairline and a soft shadow. Labels are caps micro-labels. The active tab
-// is confident blue — the one raised element is the mic FAB, filled with the
-// same blue so it reads as the app's primary action, not a neutral utility.
+// The bar sits on the surface colour, separated from the page by a hairline
+// only — no shadow, so the ONE raised element is the record button, filled
+// with primary blue so it reads as the app's primary action. Labels are
+// sentence case; the active tab is primary.
 import { useMemo } from "react";
 import { Tabs, useRouter } from "expo-router";
 import { Pressable, StyleSheet, View } from "react-native";
@@ -17,6 +17,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Icon } from "../../../lib/icons";
 import { useTheme, ColorScale, ELEV, FONT } from "../../../lib/theme";
 import { useDevice } from "../../../lib/device-context";
+import { useIsRecording } from "../../../lib/use-recorder";
 
 function buildStyles(C: ColorScale, bottomInset: number) {
   return StyleSheet.create({
@@ -25,9 +26,8 @@ function buildStyles(C: ColorScale, bottomInset: number) {
       // and a soft shadow — matches every other card-like surface in the app.
       backgroundColor: C.surface,
       borderTopColor: C.border,
-      borderTopWidth: 1,
-      shadowColor: C.shadow,
-      ...ELEV.md,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      ...ELEV.none,
       // Respect the home-indicator / gesture-nav area instead of a fixed 66 —
       // on gesture phones the labels used to sit half-under the indicator.
       height: 60 + Math.max(bottomInset, 8),
@@ -80,11 +80,18 @@ function RecordButton({ tb }: { tb: ReturnType<typeof buildStyles> }) {
   const router = useRouter();
   const { C } = useTheme();
   const { status, connState } = useDevice();
-  const recording = connState === "connected" && status?.isRecording === true;
+  const deviceRecording = connState === "connected" && status?.isRecording === true;
+  // A phone recording survives leaving its screen; the button is the way back
+  // to it (including while paused), not a second recording.
+  const phoneRecording = useIsRecording();
+  const recording = deviceRecording || phoneRecording;
   return (
     <Pressable
-      onPress={() => router.navigate(recording ? "/record" : "/new-recording")}
+      onPress={() => router.navigate(
+        phoneRecording ? "/record-phone" : deviceRecording ? "/record" : "/new-recording"
+      )}
       style={({ pressed }) => [tb.recordBtnWrap, pressed && { opacity: 0.7 }]}
+      accessibilityRole="button"
       accessibilityLabel={recording ? "Recording in progress" : "New recording"}
     >
       <View style={tb.recordBtn}>
@@ -111,10 +118,8 @@ export default function TabsLayout() {
         tabBarInactiveTintColor: C.textFaint,
         tabBarShowLabel: true,
         tabBarLabelStyle: {
-          fontFamily: FONT.semibold,
-          fontSize: 10,
-          letterSpacing: 0.6,
-          textTransform: "uppercase",
+          fontFamily: FONT.medium,
+          fontSize: 11.5,
         },
       }}
     >

@@ -1,7 +1,6 @@
 // src/app/integrations-connected.tsx — the OAuth redirect landing route.
 //
-// WHY THIS FILE EXISTS. Exactly the reason crm-connected.tsx exists, and the
-// bug it fixes is the same one: openAuthSessionAsync does NOT intercept the
+// WHY THIS FILE EXISTS. openAuthSessionAsync does NOT intercept the
 // redirect itself. Per the Expo SDK 57 docs the OS delivers the deep link back
 // to the app, so the browser's final hop to
 //
@@ -28,9 +27,8 @@ import { FONT, S, useTheme, ColorScale } from "../../lib/theme";
 import { Loading } from "../../lib/ui";
 
 // Mirrors REASON_COPY in lib/integrations.tsx — the same backend ?reason=
-// codes. Kept in sync deliberately rather than shared, following the same
-// split crm-connected.tsx makes: that module owns the in-session browser
-// flow, this one owns the cold-start fallback.
+// codes. Kept in sync deliberately rather than shared: that module owns the
+// in-session browser flow, this one owns the cold-start fallback.
 const REASON_COPY: Record<string, string> = {
   denied: "Access was declined.",
   missing_params: "The provider didn’t return a valid response.",
@@ -40,12 +38,15 @@ const REASON_COPY: Record<string, string> = {
     "Google didn’t return a lasting connection. Try again and approve access "
     + "when the consent screen appears.",
   failed: "Couldn’t complete the connection.",
+  // Salesforce: an already-used sign-in page was opened again.
+  reused: "That sign-in was already used. If you're connected, there's nothing to do; otherwise tap Connect again.",
 };
 
 // The provider ids that have a screen of their own to land on. Anything else
 // goes to the Integrations list, which is always correct if less specific.
-const PROVIDER_ROUTE: Record<string, "/integrations/gmail"> = {
+const PROVIDER_ROUTE: Record<string, "/integrations/gmail" | "/salesforce"> = {
   gmail: "/integrations/gmail",
+  salesforce: "/salesforce",
 };
 
 function buildStyles(C: ColorScale) {

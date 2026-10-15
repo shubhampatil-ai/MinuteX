@@ -1,6 +1,7 @@
 // src/app/record-phone.tsx — in-app phone recording (source: MOBILE).
 // The phone-microphone sibling of record.tsx (which remote-controls the
-// hardware). Record / Pause / Resume / Stop / Cancel with a live timer.
+// hardware). Three distinct states — READY, RECORDING, PAUSED — plus the
+// transient ones the controller reports (finalizing, completed, error).
 //
 // THE SCREEN OWNS NO RECORDING STATE.
 // It reads lib/rec-controller.ts through useRecorder() and sends it commands.
@@ -12,17 +13,27 @@
 // against the native recorder, and this file is a view of it. Coming back to
 // this screen mid-recording paints the live state on the first frame.
 //
+// THE WAVEFORM IS REAL. It is drawn from the controller's input level
+// (lib/use-input-level.ts → lib/audio-level.ts → lib/waveform.tsx), sampled
+// only while audio is genuinely being captured. Silence draws flat; a paused
+// recorder shows its history frozen and dimmed. Nothing here animates for
+// decoration — see lib/waveform.tsx for what was removed and why.
+//
 // Stop finalizes the audio into the app's document directory and hands the
 // session to the shared UploadManager, which uploads it when there is a
-// network and keeps it safe when there isn't. The user lands back on Files,
-// where the upload banner tracks progress.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+// network and keeps it safe when there isn't. The user lands back where they
+// came from, where the upload banner tracks progress.
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
 import { Icon } from "../../lib/icons";
-import { S, R, CAPS, FONT, TABULAR } from "../../lib/theme";
-import { LiveWaveform } from "../../lib/waveform";
+import { FONT, GUTTER, R, S, STUDIO } from "../../lib/theme";
+import { MOTION, PulseDot, PressSpring } from "../../lib/motion";
+import { BottomSheet, IconButton, RoundControl, SheetAction } from "../../lib/kit";
+import { LevelWaveform } from "../../lib/waveform";
+import { useWaveformLevels } from "../../lib/use-input-level";
 import { openAppSettings } from "../../lib/permissions";
 import { startUpload } from "../../lib/uploads";
 import { canSilenceRinger, openSilenceRingerSettings } from "../../lib/audio-focus";
@@ -52,6 +63,10 @@ import { copyText } from "../../lib/clipboard";
 // "ask once" has to mean once ever, not once per app launch.
 const SILENCE_ASK_KEY = "minutex.silenceRingerAsked";
 
+// Bars in the live waveform. At 70ms per sample this is ~3.4s of history —
+// long enough to see the shape of a sentence, short enough to feel live.
+const WAVE_BARS = 48;
+
 function fmt(sec: number) {
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
@@ -61,129 +76,6 @@ function fmt(sec: number) {
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
-// "On the record" is the one screen that is always ink, in either theme — it
-// is a state, not a surface, and the dark ground is what makes it feel live.
-// INK/PAPER are the DARK scale's values, inlined so this screen doesn't flip
-// to paper in light mode.
-const INK = {
-  bg: "#16130F", text: "#F7F5F0", dim: "#C9C2B4",
-  faint: "#9C9488", rule: "#3A342B", rec: "#E5484D", ok: "#7FBFA8",
-  warn: "#E8B44A",
-};
-
-function buildStyles() {
-  return StyleSheet.create({
-    container: { flex: 1, backgroundColor: INK.bg, paddingHorizontal: 26 },
-    close: { padding: 4 },
-    topRow: {
-      flexDirection: "row" as const, alignItems: "center" as const,
-      justifyContent: "space-between" as const,
-    },
-    // Source chip: a soft pill, matching the rounded chip treatment.
-    sourceChip: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 7,
-      borderWidth: 1, borderColor: INK.rule, borderRadius: R.pill,
-      paddingHorizontal: 12, paddingVertical: 6,
-    },
-    sourceDot: { width: 6, height: 6, borderRadius: 3 },
-    sourceTxt: { fontFamily: FONT.semibold, fontSize: 10.5, color: INK.dim, letterSpacing: 1 },
-
-    center: { flex: 1, alignItems: "center" as const, justifyContent: "center" as const, gap: 22 },
-    kicker: { ...CAPS, fontSize: 10.5, letterSpacing: 2.6, color: INK.faint },
-    // The timer is the AI-facing numeral: extrabold sans, not a thin weight.
-    // TABULAR carries fontFamily (mono) — spread it FIRST so extrabold wins.
-    timer: {
-      ...TABULAR,
-      fontFamily: FONT.extrabold, fontSize: 84, lineHeight: 88,
-      color: INK.text, letterSpacing: -1,
-    },
-    state: { fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 20, color: INK.dim, textAlign: "center" as const },
-    error: {
-      fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 20,
-      color: INK.text, borderLeftWidth: 3, borderLeftColor: INK.rec,
-      paddingLeft: 13, marginBottom: S.md,
-    },
-    warnBand: {
-      fontFamily: FONT.regular, fontSize: 13, lineHeight: 19,
-      color: INK.text, borderLeftWidth: 3, borderLeftColor: INK.warn,
-      paddingLeft: 13, marginBottom: S.md,
-    },
-
-    // Diagnostics panel — deliberately plain. It is a debugging surface, not
-    // part of the product's visual language, and it should read as such.
-    logPanel: {
-      borderWidth: 1, borderColor: INK.rule, borderRadius: R.sm,
-      padding: 10, marginBottom: S.md,
-    },
-    logHead: {
-      flexDirection: "row" as const, alignItems: "center" as const,
-      justifyContent: "space-between" as const, marginBottom: 6,
-    },
-    logTitle: {
-      fontFamily: FONT.medium, fontSize: 11, color: INK.faint,
-      letterSpacing: CAPS.letterSpacing, textTransform: "uppercase" as const,
-    },
-    logCopy: { fontFamily: FONT.medium, fontSize: 12, color: INK.ok },
-    logBody: {
-      fontFamily: FONT.mono, fontSize: 10, lineHeight: 15, color: INK.dim,
-    },
-
-    // The live status band. Distinct from `state` prose: this is the one line
-    // that must never be ambiguous about whether audio is being captured, so
-    // it gets a dot whose colour IS the answer.
-    statusRow: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 9,
-      alignSelf: "center" as const,
-      borderWidth: 1, borderRadius: R.pill,
-      paddingHorizontal: 14, paddingVertical: 7,
-    },
-    statusDot: { width: 8, height: 8, borderRadius: 4 },
-    statusTxt: { fontFamily: FONT.semibold, fontSize: 12.5 },
-
-    routeRow: {
-      flexDirection: "row" as const, alignItems: "center" as const,
-      justifyContent: "center" as const, gap: 6,
-    },
-    routeTxt: { fontFamily: FONT.regular, fontSize: 11.5, color: INK.faint },
-
-    controls: { alignItems: "center" as const, gap: 12 },
-    controlsRow: {
-      flexDirection: "row" as const, alignItems: "center" as const,
-      justifyContent: "center" as const, gap: S.xxl,
-    },
-    // Secondary controls: outlined circles on ink, no fill, no shadow.
-    sideBtn: {
-      width: 52, height: 52, borderRadius: 26,
-      borderWidth: 1, borderColor: INK.rule,
-      alignItems: "center" as const, justifyContent: "center" as const,
-    },
-    sideBtnLabel: { ...CAPS, fontSize: 9.5, letterSpacing: 1.4, color: INK.faint, marginTop: 6, textAlign: "center" as const },
-    sideWrap: { alignItems: "center" as const, width: 72 },
-    // The record control: a thin ring holding a red square/disc.
-    recBtn: {
-      width: 104, height: 104, borderRadius: 52,
-      borderWidth: 1, borderColor: INK.rule,
-      alignItems: "center" as const, justifyContent: "center" as const,
-    },
-    recRing: {
-      position: "absolute" as const, top: -1, left: -1, right: -1, bottom: -1,
-      borderRadius: 52, borderWidth: 1, borderColor: INK.rec,
-    },
-    recDot: { width: 60, height: 60, borderRadius: 30, backgroundColor: INK.rec },
-    stopSquare: { width: 44, height: 44, borderRadius: R.sm, backgroundColor: INK.rec },
-    hint: { ...CAPS, fontSize: 10.5, letterSpacing: 2.2, color: INK.faint },
-
-    inputSheet: {
-      borderTopWidth: 1, borderTopColor: INK.rule, marginTop: S.md, paddingTop: S.md,
-    },
-    inputRow: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: S.md,
-      paddingVertical: 12,
-    },
-    inputName: { fontFamily: FONT.regular, fontSize: 13.5, color: INK.text, flex: 1 },
-  });
-}
-
 /**
  * The one line the user must be able to trust. Colour carries the meaning:
  * red = capturing, amber = paused for a reason outside the user's control,
@@ -191,35 +83,47 @@ function buildStyles() {
  */
 function statusChrome(state: string): { color: string; label: string } {
   switch (state) {
-    case "RECORDING": return { color: INK.rec, label: "Recording" };
-    case "PAUSED_BY_USER": return { color: INK.faint, label: "Paused" };
-    case "PAUSED_BY_CALL": return { color: INK.warn, label: "Paused because of a call" };
-    case "PAUSED_BY_AUDIO_INTERRUPTION": return { color: INK.warn, label: "Paused — audio interrupted" };
-    case "PAUSED_BY_MICROPHONE": return { color: INK.warn, label: "Microphone unavailable" };
-    case "FINALIZING": return { color: INK.dim, label: "Saving…" };
-    case "COMPLETED": return { color: INK.ok, label: "Saved" };
-    case "ERROR": return { color: INK.rec, label: "Couldn't record" };
-    default: return { color: INK.faint, label: "Ready" };
+    case "RECORDING": return { color: STUDIO.recording, label: "Recording" };
+    case "PAUSED_BY_USER": return { color: STUDIO.textDim, label: "Paused" };
+    case "PAUSED_BY_CALL": return { color: STUDIO.warn, label: "Paused because of a call" };
+    case "PAUSED_BY_AUDIO_INTERRUPTION": return { color: STUDIO.warn, label: "Paused — audio interrupted" };
+    case "PAUSED_BY_MICROPHONE": return { color: STUDIO.warn, label: "Microphone unavailable" };
+    case "FINALIZING": return { color: STUDIO.textDim, label: "Saving…" };
+    case "COMPLETED": return { color: STUDIO.ok, label: "Saved" };
+    case "ERROR": return { color: STUDIO.recording, label: "Couldn't record" };
+    default: return { color: STUDIO.textFaint, label: "Ready" };
+  }
+}
+
+/** The explanatory line under the timer, per state. */
+function stateCopy(state: string, denied: boolean): string {
+  if (denied) return "Microphone access is required to record.";
+  switch (state) {
+    case "RECORDING": return "Locking the screen or switching apps won't stop it.";
+    case "PAUSED_BY_CALL": return "We'll pick up again automatically when the call ends.";
+    case "PAUSED_BY_AUDIO_INTERRUPTION": return "Another app took the microphone. We'll resume when it's free.";
+    case "PAUSED_BY_MICROPHONE": return "The microphone isn't available right now. Everything recorded so far is safe.";
+    case "PAUSED_BY_USER": return "Resume when you're ready, or stop to file the brief.";
+    case "FINALIZING": return "Saving the recording to this phone…";
+    case "COMPLETED": return "Saved. It'll upload on its own.";
+    default: return "Record, transcribe and get a concise brief.";
   }
 }
 
 export default function RecordPhoneScreen() {
   const router = useRouter();
-  // Set when Record was opened from inside a folder (see the folder detail
-  // screen's record button). Threaded to startUpload so the recording is filed
-  // at presign time rather than landing in General and being moved after.
-  const { folderId: folderParam } = useLocalSearchParams<{ folderId?: string }>();
-  const folderId = String(folderParam || "");
-  // This screen is always ink (see INK above), so it takes no colours from
-  // the theme — only the safe-area insets and the controller's snapshot.
+  // This screen is always on the STUDIO ground (lib/theme.tsx), in either
+  // theme, so it takes no colours from useTheme — only the safe-area insets
+  // and the controller's snapshot.
   const insets = useSafeAreaInsets();
-  const st = useMemo(() => buildStyles(), []);
 
   const rec = useRecorder();
-  const [showInputs, setShowInputs] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(false);
+  const [inputsOpen, setInputsOpen] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [logText, setLogText] = useState("");
   const [copied, setCopied] = useState(false);
+  const [focused, setFocused] = useState(true);
 
   // Refresh the log while the panel is open. Cheap (a formatted read of a
   // bounded in-memory ring buffer) and only runs while the panel is visible,
@@ -244,10 +148,13 @@ export default function RecordPhoneScreen() {
 
   // Read the real permission whenever this screen becomes visible. A
   // permission revoked in Settings while we were backgrounded arrives with no
-  // event at all, so focus is the only reliable moment to notice.
+  // event at all, so focus is the only reliable moment to notice. Focus also
+  // gates the waveform sampler: a screen underneath another draws nothing.
   useFocusEffect(
     useCallback(() => {
       void refreshPermission();
+      setFocused(true);
+      return () => setFocused(false);
     }, [])
   );
 
@@ -262,10 +169,19 @@ export default function RecordPhoneScreen() {
   }, []);
 
   const recording = rec.state === "RECORDING";
-  const paused = isPaused(rec.state as any);
+  const paused = isPaused(rec.state);
   const live = recording || paused;
   const denied = rec.permission === "denied" || rec.permission === "blocked";
   const chrome = statusChrome(rec.state);
+  const controlsBusy = rec.busy || rec.state === "FINALIZING";
+
+  // The waveform's data. Sampled only while capture is live AND this screen
+  // is the one on top; a new session starts from an empty field.
+  const levels = useWaveformLevels({
+    active: recording && focused,
+    bars: WAVE_BARS,
+    resetKey: rec.sessionId,
+  });
 
   /**
    * Offer to silence the ringer, ONCE, ever — and RESOLVE before recording.
@@ -372,9 +288,9 @@ export default function RecordPhoneScreen() {
 
   // Stop -> the controller finalizes the file (verifying it holds real audio)
   // and returns the session. Hand it to the shared UploadManager, which owns
-  // retries and offline waiting, then return to Files where the banner takes
-  // over. The recording is on disk in the document directory before this
-  // function returns, so navigating away cannot lose it.
+  // retries and offline waiting, then return to where the user came from,
+  // where the banner takes over. The recording is on disk in the document
+  // directory before this function returns, so navigating away cannot lose it.
   const stopAndSave = async () => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
@@ -394,10 +310,7 @@ export default function RecordPhoneScreen() {
         duration: done.duration || undefined,
         size: done.size ?? undefined,
         sessionId: done.id,
-        // Set when the user hit Record from inside a folder — the recording is
-        // filed at presign time, so it never appears in General first.
-        folderId: folderId || undefined,
-      }).catch(() => { /* surfaced by the Files-screen upload banner */ });
+      }).catch(() => { /* surfaced by the Desk upload banner */ });
       reset();
       router.back();
     } finally {
@@ -423,86 +336,119 @@ export default function RecordPhoneScreen() {
     );
   };
 
+  // Leaving the phone recorder for another source. Only offered while nothing
+  // is being captured — switching source mid-recording would abandon it.
+  const switchSource = (href: "/record" | "/upload") => {
+    setSourceOpen(false);
+    reset();
+    router.replace(href);
+  };
+
   const inputs = live ? listInputs() : [];
 
   return (
-    <View style={[st.container, { paddingTop: insets.top + S.lg, paddingBottom: Math.max(insets.bottom, S.lg) + S.xl }]}>
+    <View style={[st.container, { paddingTop: insets.top + S.sm, paddingBottom: Math.max(insets.bottom, S.lg) + S.lg }]}>
+      {/* ---- Top bar: close · source ---- */}
       <View style={st.topRow}>
-        <Pressable style={st.close} onPress={cancel} accessibilityLabel="Close" hitSlop={8}>
-          <Icon name="chevron.down" tintColor={INK.faint} size={24} />
-        </Pressable>
-        <View style={st.sourceChip}>
-          <View style={[st.sourceDot, { backgroundColor: denied ? INK.rec : INK.ok }]} />
-          <Text style={st.sourceTxt}>THIS PHONE</Text>
-        </View>
-      </View>
-
-      <View style={st.center}>
-        <Text style={st.kicker}>
-          {recording ? "On the record" : paused ? "Held" : "Ready when you are"}
-        </Text>
-        <Pressable
-          onLongPress={() => setShowLog((v) => !v)}
-          delayLongPress={700}
-          accessibilityLabel="Show recording diagnostics"
-        >
-          <Text style={st.timer}>{fmt(rec.seconds)}</Text>
-        </Pressable>
-
-        {/* The unambiguous answer to "is it recording?" — always shown once a
-            session exists, in every state, including the ones the user didn't
-            ask for. */}
-        {rec.state !== "IDLE" ? (
-          <View
-            style={[st.statusRow, { borderColor: chrome.color }]}
-            accessibilityLabel={`Status: ${chrome.label}`}
-            accessibilityLiveRegion="polite"
-          >
-            <View style={[st.statusDot, { backgroundColor: chrome.color }]} />
-            <Text style={[st.statusTxt, { color: chrome.color }]}>{chrome.label}</Text>
-          </View>
-        ) : null}
-
-        <LiveWaveform
-          // Only animate while audio is genuinely being captured. A moving
-          // waveform over a paused recorder is the exact lie this audit set
-          // out to remove.
-          active={recording}
-          bars={46}
-          height={80}
-          color={recording ? INK.rec : INK.rule}
-          style={{ alignSelf: "stretch" }}
+        <IconButton
+          icon="xmark"
+          onPress={cancel}
+          accessibilityLabel={live ? "Close — asks before discarding" : "Close"}
+          tint={STUDIO.textDim}
         />
-
-        <Text style={st.state}>
-          {denied ? "Microphone access is required to record."
-            : recording ? "Keep going — locking the screen or switching apps won't stop it."
-            : rec.state === "PAUSED_BY_CALL" ? "We'll pick up again automatically when the call ends."
-            : rec.state === "PAUSED_BY_AUDIO_INTERRUPTION" ? "Another app took the microphone. We'll resume when it's free."
-            : rec.state === "PAUSED_BY_MICROPHONE" ? "The microphone isn't available right now. Everything recorded so far is safe."
-            : rec.state === "PAUSED_BY_USER" ? "Held. Resume, or stop to file the brief."
-            : rec.state === "COMPLETED" ? "Saved. It'll upload on its own."
-            : "Tap to start. You'll get a one-page brief when it's done."}
-        </Text>
-
-        {/* Which microphone is live. Shown while recording because a silent
-            switch to a Bluetooth headset that then disconnects is the classic
-            way to end up with an empty recording. */}
-        {live && rec.inputName ? (
-          <Pressable
-            style={st.routeRow}
-            onPress={() => setShowInputs((v) => !v)}
-            accessibilityLabel="Change microphone"
-          >
-            <Icon name="mic.fill" tintColor={INK.faint} size={12} />
-            <Text style={st.routeTxt}>{rec.inputName}</Text>
-            {inputs.length > 1 ? (
-              <Icon name="chevron.right" tintColor={INK.faint} size={12} />
-            ) : null}
-          </Pressable>
-        ) : null}
+        <Pressable
+          onPress={() => (live ? (inputs.length > 1 ? setInputsOpen(true) : undefined) : setSourceOpen(true))}
+          disabled={live && inputs.length <= 1}
+          accessibilityRole="button"
+          accessibilityLabel={
+            live
+              ? `Recording with ${rec.inputName ?? "this phone"}${inputs.length > 1 ? ". Change microphone" : ""}`
+              : "Recording source: this phone. Change source"
+          }
+          style={({ pressed }) => [st.sourceChip, pressed && { opacity: 0.7 }]}
+        >
+          <View style={[st.sourceDot, { backgroundColor: denied ? STUDIO.recording : STUDIO.ok }]} />
+          <Text style={st.sourceTxt} numberOfLines={1}>
+            {live && rec.inputName ? rec.inputName : "This phone"}
+          </Text>
+          {!live || inputs.length > 1 ? (
+            <Icon name="chevron.down" tintColor={STUDIO.textFaint} size={14} />
+          ) : null}
+        </Pressable>
       </View>
 
+      {/* ---- Centre: ready | live ---- */}
+      <View style={st.center}>
+        {live || rec.state === "FINALIZING" ? (
+          <Animated.View
+            key="live"
+            entering={FadeIn.duration(MOTION.standard)}
+            exiting={FadeOut.duration(MOTION.fast)}
+            style={st.liveBlock}
+          >
+            {/* The unambiguous answer to "is it recording?" — every state,
+                including the ones the user didn't ask for. */}
+            <View
+              style={st.statusRow}
+              accessibilityLabel={`Status: ${chrome.label}`}
+              accessibilityLiveRegion="polite"
+            >
+              <PulseDot active={recording} color={chrome.color} size={9} />
+              <Text style={[st.statusTxt, { color: chrome.color }]}>{chrome.label}</Text>
+            </View>
+
+            <Pressable
+              onLongPress={() => setShowLog((v) => !v)}
+              delayLongPress={700}
+              accessibilityRole="text"
+              accessibilityLabel={`Elapsed ${fmt(rec.seconds)}`}
+              accessibilityHint="Long press to show recording diagnostics"
+            >
+              <Text style={[st.timer, paused && { color: STUDIO.textDim }]}>{fmt(rec.seconds)}</Text>
+            </Pressable>
+
+            <LevelWaveform
+              levels={levels}
+              bars={WAVE_BARS}
+              height={112}
+              barWidth={3}
+              color={recording ? STUDIO.primary : STUDIO.waveIdle}
+              emptyColor={STUDIO.border}
+              style={st.wave}
+              accessibilityLabel={recording ? "Live input level" : "Input level, paused"}
+            />
+
+            <Text style={st.state}>{stateCopy(rec.state, denied)}</Text>
+          </Animated.View>
+        ) : (
+          <Animated.View
+            key="ready"
+            entering={FadeIn.duration(MOTION.standard)}
+            exiting={FadeOut.duration(MOTION.fast)}
+            style={st.readyBlock}
+          >
+            <Text style={st.readyTitle} accessibilityRole="header">
+              {rec.state === "COMPLETED" ? "Saved" : "Ready when you are"}
+            </Text>
+            <Text style={st.readySub}>{stateCopy(rec.state, denied)}</Text>
+
+            <View style={st.micHalo}>
+              <PressSpring
+                onPress={begin}
+                disabled={denied || controlsBusy}
+                accessibilityLabel="Start recording"
+                pressedScale={MOTION.pressScale}
+                style={[st.micBtn, (denied || controlsBusy) && { opacity: 0.4 }]}
+              >
+                <Icon name="mic.fill" tintColor="#FFFFFF" size={34} />
+              </PressSpring>
+            </View>
+            <Text style={st.readyHint}>{denied ? "Microphone blocked" : "Tap to start"}</Text>
+          </Animated.View>
+        )}
+      </View>
+
+      {/* ---- Warnings / errors — above the controls, never over them ---- */}
       {rec.lowStorage ? (
         <Text style={st.warnBand}>
           Storage is running low. The recording will be saved automatically if
@@ -511,7 +457,7 @@ export default function RecordPhoneScreen() {
       ) : null}
 
       {rec.error ? (
-        <Pressable onPress={clearError} accessibilityLabel="Dismiss error">
+        <Pressable onPress={clearError} accessibilityRole="button" accessibilityLabel={`${rec.error}. Dismiss`}>
           <Text style={st.error}>{rec.error}</Text>
         </Pressable>
       ) : null}
@@ -528,6 +474,8 @@ export default function RecordPhoneScreen() {
             <Text style={st.logTitle}>Diagnostics</Text>
             <Pressable
               onPress={() => { void copyDiagnostics(); }}
+              hitSlop={12}
+              accessibilityRole="button"
               accessibilityLabel="Copy diagnostics"
             >
               <Text style={st.logCopy}>{copied ? "Copied" : "Copy"}</Text>
@@ -539,103 +487,223 @@ export default function RecordPhoneScreen() {
         </View>
       ) : null}
 
-      {/* Input picker — only when there's a real choice to make. */}
-      {showInputs && inputs.length > 1 ? (
-        <ScrollView style={{ maxHeight: 180 }} contentContainerStyle={st.inputSheet}>
-          {inputs.map((inp) => (
-            <Pressable
-              key={inp.uid}
-              style={({ pressed }) => [st.inputRow, pressed && { opacity: 0.6 }]}
-              onPress={async () => { await selectInput(inp.uid); setShowInputs(false); }}
-              accessibilityLabel={`Use ${inp.name}`}
-            >
-              <Icon
-                name={inp.name === rec.inputName ? "checkmark" : "mic.fill"}
-                tintColor={inp.name === rec.inputName ? INK.ok : INK.faint}
-                size={15}
-              />
-              <Text style={st.inputName}>{inp.name}</Text>
-            </Pressable>
-          ))}
-        </ScrollView>
-      ) : null}
-
-      <View style={st.controls}>
+      {/* ---- Controls ---- */}
+      {live || rec.state === "FINALIZING" ? (
         <View style={st.controlsRow}>
-          {/* Pause / Resume — only meaningful mid-recording */}
-          <View style={st.sideWrap}>
-            {live ? (
-              <>
-                <Pressable
-                  onPress={recording ? pauseByUser : () => void resumeByUser()}
-                  disabled={rec.busy}
-                  style={({ pressed }) => [
-                    st.sideBtn,
-                    rec.busy && { opacity: 0.4 },
-                    pressed && { opacity: 0.6 },
-                  ]}
-                  accessibilityLabel={recording ? "Pause recording" : "Resume recording"}
-                >
-                  <Icon name={recording ? "pause.fill" : "play.fill"} tintColor={INK.text} size={20} />
-                </Pressable>
-                <Text style={st.sideBtnLabel}>{recording ? "Hold" : "Resume"}</Text>
-              </>
-            ) : null}
-          </View>
-
-          {/* Record / Stop */}
-          <Pressable
-            onPress={live ? stopAndSave : begin}
-            disabled={denied || rec.busy || rec.state === "FINALIZING"}
-            style={({ pressed }) => [
-              st.recBtn,
-              (denied || rec.busy || rec.state === "FINALIZING") && { opacity: 0.4 },
-              pressed && { opacity: 0.7 },
-            ]}
-            accessibilityLabel={live ? "Stop and file the brief" : "Start recording"}
+          <RoundControl
+            onPress={recording ? pauseByUser : () => void resumeByUser()}
+            disabled={controlsBusy}
+            accessibilityLabel={recording ? "Pause recording" : "Resume recording"}
+            bg={STUDIO.surfaceRaised}
+            border={STUDIO.border}
+            caption={recording ? "Pause" : "Resume"}
+            captionColor={STUDIO.textDim}
           >
-            {/* A second ring, drawn in recording-red, marks the live state. */}
-            {recording ? <View style={st.recRing} /> : null}
-            <View style={live ? st.stopSquare : st.recDot} />
-          </Pressable>
+            <Icon name={recording ? "pause.fill" : "play.fill"} tintColor={STUDIO.text} size={22} />
+          </RoundControl>
 
-          {/* Cancel — discard without uploading */}
-          <View style={st.sideWrap}>
-            {live ? (
-              <>
-                <Pressable
-                  onPress={cancel}
-                  style={({ pressed }) => [st.sideBtn, pressed && { opacity: 0.6 }]}
-                  accessibilityLabel="Discard recording"
-                >
-                  <Icon name="trash" tintColor={INK.rec} size={19} />
-                </Pressable>
-                <Text style={st.sideBtnLabel}>Discard</Text>
-              </>
-            ) : null}
-          </View>
+          {/* Stop is the dominant control: largest, and the only one in
+              recording red. The square glyph is the universal "stop". */}
+          <RoundControl
+            onPress={stopAndSave}
+            disabled={controlsBusy}
+            accessibilityLabel="Stop and file the brief"
+            size={80}
+            bg={STUDIO.recording}
+            caption="Stop"
+            captionColor={STUDIO.text}
+          >
+            <View style={st.stopSquare} />
+          </RoundControl>
+
+          <RoundControl
+            onPress={cancel}
+            disabled={controlsBusy}
+            accessibilityLabel="Discard recording"
+            bg={STUDIO.surfaceRaised}
+            border={STUDIO.border}
+            caption="Discard"
+            captionColor={STUDIO.textDim}
+          >
+            <Icon name="trash" tintColor={STUDIO.recording} size={20} />
+          </RoundControl>
         </View>
-        <Text style={st.hint}>
-          {live ? "Stop & file the brief" : "Tap to record"}
-        </Text>
-      </View>
-
-      {/* Not <Button variant="secondary"> — that outlines itself in C.text,
-          which is near-black in light mode and would vanish on this ink
-          ground. Drawn locally against the INK palette instead. */}
-      {denied ? (
+      ) : denied ? (
+        // Drawn locally against STUDIO rather than <Button variant="secondary">,
+        // which outlines itself in the THEME's text colour — near-black in
+        // light mode, and invisible on this ground.
         <Pressable
           onPress={rec.permission === "blocked" ? openAppSettings : () => void requestPermission()}
-          style={({ pressed }) => [{
-            borderWidth: 1, borderColor: INK.text, borderRadius: R.pill,
-            paddingVertical: 14, alignItems: "center", marginTop: S.lg,
-          }, pressed && { opacity: 0.7 }]}
+          accessibilityRole="button"
+          style={({ pressed }) => [st.pillBtn, pressed && { opacity: 0.7 }]}
         >
-          <Text style={{ fontFamily: FONT.bold, fontSize: 14, color: INK.text }}>
+          <Text style={st.pillBtnTxt}>
             {rec.permission === "blocked" ? "Open settings" : "Allow microphone"}
           </Text>
         </Pressable>
-      ) : null}
+      ) : (
+        <Pressable
+          onPress={() => setSourceOpen(true)}
+          accessibilityRole="button"
+          accessibilityLabel="Choose a different recording source"
+          style={({ pressed }) => [st.sourcePill, pressed && { opacity: 0.7 }]}
+        >
+          <Icon name="dot.radiowaves.left.and.right" tintColor={STUDIO.textDim} size={16} />
+          <Text style={st.sourcePillTxt}>Select source</Text>
+          <Icon name="chevron.right" tintColor={STUDIO.textFaint} size={14} />
+        </Pressable>
+      )}
+
+      {/* ---- Source sheet (before recording) ---- */}
+      <BottomSheet
+        visible={sourceOpen}
+        onClose={() => setSourceOpen(false)}
+        title="Record from"
+        dark={{ bg: STUDIO.surface, text: STUDIO.text, textDim: STUDIO.textDim, handle: STUDIO.border }}
+      >
+        <SheetAction
+          label="This phone"
+          description="Best on a table, in a quiet room"
+          icon="mic.fill"
+          selected
+          onPress={() => setSourceOpen(false)}
+          color={STUDIO.text}
+          dimColor={STUDIO.textDim}
+        />
+        <SheetAction
+          label="Your MinuteX device"
+          description="Records on the device; handles rooms and corridors"
+          icon="dot.radiowaves.left.and.right"
+          onPress={() => switchSource("/record")}
+          color={STUDIO.text}
+          dimColor={STUDIO.textDim}
+        />
+        <SheetAction
+          label="An audio file"
+          description="wav, mp3, m4a, flac"
+          icon="doc.text.fill"
+          onPress={() => switchSource("/upload")}
+          color={STUDIO.text}
+          dimColor={STUDIO.textDim}
+        />
+      </BottomSheet>
+
+      {/* ---- Microphone sheet (while recording, only with a real choice) ---- */}
+      <BottomSheet
+        visible={inputsOpen && inputs.length > 1}
+        onClose={() => setInputsOpen(false)}
+        title="Microphone"
+        subtitle="Switching keeps the same recording going."
+        dark={{ bg: STUDIO.surface, text: STUDIO.text, textDim: STUDIO.textDim, handle: STUDIO.border }}
+      >
+        {inputs.map((inp) => (
+          <SheetAction
+            key={inp.uid}
+            label={inp.name}
+            icon="mic.fill"
+            selected={inp.name === rec.inputName}
+            onPress={async () => { await selectInput(inp.uid); setInputsOpen(false); }}
+            color={STUDIO.text}
+            dimColor={STUDIO.textDim}
+          />
+        ))}
+      </BottomSheet>
     </View>
   );
 }
+
+const st = StyleSheet.create({
+  container: { flex: 1, backgroundColor: STUDIO.bg, paddingHorizontal: GUTTER },
+  topRow: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    marginLeft: -S.md, gap: S.md,
+  },
+  // flexShrink so a long OS-supplied route name ("Jabra Evolve2 65 Hands-Free
+  // AG Audio") yields instead of pushing the chip off the row.
+  sourceChip: {
+    flexDirection: "row", alignItems: "center", gap: S.sm, flexShrink: 1,
+    borderWidth: 1, borderColor: STUDIO.border, borderRadius: R.pill,
+    paddingHorizontal: S.md, minHeight: 36,
+  },
+  sourceDot: { width: 7, height: 7, borderRadius: 4 },
+  sourceTxt: { fontFamily: FONT.medium, fontSize: 13, color: STUDIO.text, flexShrink: 1 },
+
+  center: { flex: 1, justifyContent: "center" },
+
+  readyBlock: { alignItems: "center" },
+  readyTitle: {
+    fontFamily: FONT.bold, fontSize: 26, lineHeight: 32, color: STUDIO.text,
+    textAlign: "center", letterSpacing: -0.3,
+  },
+  readySub: {
+    fontFamily: FONT.regular, fontSize: 14.5, lineHeight: 21, color: STUDIO.textDim,
+    textAlign: "center", marginTop: S.sm, maxWidth: 300,
+  },
+  // A still, concentric halo — the mic's resting state. It does not pulse:
+  // nothing is being captured yet, and motion here would say otherwise.
+  micHalo: {
+    marginTop: S.x4, width: 176, height: 176, borderRadius: 88,
+    borderWidth: 1, borderColor: STUDIO.border, backgroundColor: STUDIO.surface,
+    alignItems: "center", justifyContent: "center",
+  },
+  micBtn: {
+    width: 112, height: 112, borderRadius: 56, backgroundColor: STUDIO.primary,
+    alignItems: "center", justifyContent: "center",
+  },
+  readyHint: { fontFamily: FONT.medium, fontSize: 14, color: STUDIO.textDim, marginTop: S.lg },
+
+  liveBlock: { alignItems: "center", alignSelf: "stretch" },
+  statusRow: { flexDirection: "row", alignItems: "center", gap: S.sm, minHeight: 24 },
+  statusTxt: { fontFamily: FONT.semibold, fontSize: 14 },
+  timer: {
+    fontFamily: FONT.bold, fontSize: 64, lineHeight: 74, color: STUDIO.text,
+    fontVariant: ["tabular-nums"], letterSpacing: -1, marginTop: S.md,
+  },
+  wave: { alignSelf: "stretch", marginTop: S.xl },
+  state: {
+    fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 20, color: STUDIO.textDim,
+    textAlign: "center", marginTop: S.xl, maxWidth: 320,
+  },
+
+  error: {
+    fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 20,
+    color: STUDIO.text, borderLeftWidth: 3, borderLeftColor: STUDIO.recording,
+    paddingLeft: 13, marginBottom: S.md,
+  },
+  warnBand: {
+    fontFamily: FONT.regular, fontSize: 13, lineHeight: 19,
+    color: STUDIO.text, borderLeftWidth: 3, borderLeftColor: STUDIO.warn,
+    paddingLeft: 13, marginBottom: S.md,
+  },
+
+  // Diagnostics panel — deliberately plain. It is a debugging surface, not
+  // part of the product's visual language, and it should read as such.
+  logPanel: {
+    borderWidth: 1, borderColor: STUDIO.border, borderRadius: R.sm,
+    padding: 10, marginBottom: S.md,
+  },
+  logHead: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 6,
+  },
+  logTitle: { fontFamily: FONT.medium, fontSize: 11, color: STUDIO.textFaint, letterSpacing: 0.6, textTransform: "uppercase" },
+  logCopy: { fontFamily: FONT.medium, fontSize: 12, color: STUDIO.ok },
+  logBody: { fontFamily: FONT.mono, fontSize: 10, lineHeight: 15, color: STUDIO.textDim },
+
+  controlsRow: {
+    flexDirection: "row", alignItems: "flex-start", justifyContent: "space-evenly",
+    paddingTop: S.md,
+  },
+  stopSquare: { width: 26, height: 26, borderRadius: 6, backgroundColor: "#FFFFFF" },
+
+  sourcePill: {
+    flexDirection: "row", alignItems: "center", gap: S.sm, alignSelf: "center",
+    borderWidth: 1, borderColor: STUDIO.border, borderRadius: R.pill,
+    paddingHorizontal: S.lg, minHeight: 48,
+  },
+  sourcePillTxt: { fontFamily: FONT.semibold, fontSize: 14, color: STUDIO.text },
+  pillBtn: {
+    borderWidth: 1, borderColor: STUDIO.text, borderRadius: R.pill,
+    minHeight: 48, alignItems: "center", justifyContent: "center",
+  },
+  pillBtnTxt: { fontFamily: FONT.semibold, fontSize: 15, color: STUDIO.text },
+});

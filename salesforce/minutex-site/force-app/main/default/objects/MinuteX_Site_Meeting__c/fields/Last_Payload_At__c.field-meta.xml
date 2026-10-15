@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Last_Payload_At__c</fullName>
+    <description>When MinuteX generated the content currently on this record. An older delivery arriving late is ignored rather than overwriting newer content.</description>
+    <label>Last Payload Generated At</label>
+    <required>false</required>
+    <type>DateTime</type>
+</CustomField>

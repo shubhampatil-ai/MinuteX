@@ -1,13 +1,13 @@
-// src/app/contact/[id].tsx — one person: their details, their folders, their
+// src/app/contact/[id].tsx — one person: their details, their
 // open work.
 //
 // Editing here edits them EVERYWHERE. That follows from the model — one global
 // contact per person — and the screen says so, because a user who thinks they
-// are editing a folder-local copy will be surprised later.
+// are editing a local copy will be surprised later.
 //
 // Deleting a contact is the one destructive action, and it deliberately does
 // NOT delete their work: tasks assigned to them survive and revert to
-// unresolved (with the name kept), folder associations go, and the confirm
+// unresolved (with the name kept), and the confirm
 // dialog states exactly that. Losing a person's task list because someone
 // tidied up a contact would be unforgivable.
 import { useCallback, useMemo, useState } from "react";
@@ -19,12 +19,13 @@ import { Icon } from "../../../lib/icons";
 import {
   S, R, ELEV, CAPS, FONT, useTheme, ColorScale,
 } from "../../../lib/theme";
+import { roleLabel, useWorkspace } from "../../../lib/workspace-context";
 import {
   Avatar, Button, Card, ErrorText, KeyboardAware, Loading, SectionTitle,
   TextField, scrollFormProps,
 } from "../../../lib/ui";
 import {
-  ApiContact, ApiError, ApiFolder, ApiTask, deleteContact, getAllTasks,
+  ApiContact, ApiError, ApiTask, deleteContact, getAllTasks,
   getContact, updateContact,
 } from "../../../lib/api";
 import { PhotoPicker } from "../../../lib/photo-picker";
@@ -32,17 +33,33 @@ import { canPickImage } from "../../../lib/avatars";
 
 export default function ContactDetailScreen() {
   const { C, T } = useTheme();
+  // Presentation gating for the shared-contact rules (§4/§14). A PERSONAL
+  // contact is always manageable by its owner; a SHARED organisation contact
+  // needs the manage_contacts capability, which the server supplies alongside
+  // the role so the UI and the backend cannot disagree about the rule.
+  const { active: activeWorkspace, isOrganisation } = useWorkspace();
+  const canManageWorkspaceContacts = !isOrganisation
+    || !!activeWorkspace?.capabilities?.manage_contacts;
   const st = useMemo(() => buildStyles(C, T), [C, T]);
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
   const contactId = String(id || "");
 
   const [contact, setContact] = useState<ApiContact | null>(null);
-  const [folders, setFolders] = useState<ApiFolder[]>([]);
   const [tasks, setTasks] = useState<ApiTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
+
+  // AN ORGANISATION MEMBER'S ENTRY IS NOT EDITABLE, whatever the caller's
+  // role. It mirrors that person's own MinuteX profile, so an edit here would
+  // be replaced by the live projection on the next read and the name shown
+  // would depend on which copy won; deleting would unassign their tasks and
+  // unlink every meeting they were tagged in, then project them straight
+  // back. The API answers 409 `contact_is_member` for both — this only saves
+  // the round trip.
+  const isMemberContact = !!contact?.is_member;
+  const canManageContact = canManageWorkspaceContacts && !isMemberContact;
 
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState("");
@@ -62,7 +79,6 @@ export default function ContactDetailScreen() {
       try {
         const res = await getContact(contactId);
         setContact(res.contact);
-        setFolders(res.folders);
         // Their open work — server-filtered by assignee, never by pulling
         // every task down and filtering here.
         const t = await getAllTasks({
@@ -154,10 +170,10 @@ export default function ContactDetailScreen() {
       // Every clause here is a promise the backend actually keeps — see
       // delete_contact. Vague reassurance would be worse than none.
       openTasks > 0
-        ? `They will be removed from your contacts and from every folder. Their ${openTasks} open task${
+        ? `They will be removed from your contacts. Their ${openTasks} open task${
             openTasks === 1 ? "" : "s"
           } will stay, marked as needing a new assignee.`
-        : "They will be removed from your contacts and from every folder. Any tasks assigned to them will stay, marked as needing a new assignee.",
+        : "They will be removed from your contacts. Any tasks assigned to them will stay, marked as needing a new assignee.",
       [
         { text: "Cancel", style: "cancel" },
         {
@@ -217,7 +233,10 @@ export default function ContactDetailScreen() {
       }
       {...scrollFormProps}
     >
-      <Stack.Screen options={{ title: contact.name || "Contact" }} />
+      {/* Constant, for the same reason as the meeting screen: a long
+          contact name centre-elides to a stub in the native header, and
+          the name is already displayed in full in the hero below. */}
+      <Stack.Screen options={{ title: "Contact" }} />
 
       <View style={st.hero}>
         <Pressable
@@ -295,7 +314,7 @@ export default function ContactDetailScreen() {
         <Card style={{ gap: S.md }}>
           <SectionTitle>Edit Contact</SectionTitle>
           <Text style={st.editNote}>
-            This person is shared across every folder and meeting, so these
+            This person is shared across every meeting, so these
             changes apply everywhere.
           </Text>
           <TextField
@@ -347,41 +366,22 @@ export default function ContactDetailScreen() {
           {!!contact.notes && (
             <DetailRow label="Notes" value={contact.notes} C={C} st={st} />
           )}
-          <View style={{ marginTop: S.md }}>
-            <Button label="Edit" variant="secondary" onPress={beginEdit} />
-          </View>
+          {canManageContact ? (
+            <View style={{ marginTop: S.md }}>
+              <Button label="Edit" variant="secondary" onPress={beginEdit} />
+            </View>
+          ) : isMemberContact ? (
+            <Text style={[T.caption, { marginTop: S.md }]}>
+              {contact.name.split(" ")[0]} is
+              {contact.workspace_role
+                ? ` ${roleLabel(contact.workspace_role).toLowerCase()} of`
+                : " a member of"}{" "}
+              your organisation. Their name and photo come from their own
+              MinuteX profile.
+            </Text>
+          ) : null}
         </Card>
       )}
-
-      <View style={{ marginTop: S.lg }}>
-        <SectionTitle>Folders</SectionTitle>
-        {folders.length === 0 ? (
-          <Text style={st.emptyLine}>
-            Not in any folder. Add them from a folder to have them offered
-            first when mapping that folder&apos;s speakers.
-          </Text>
-        ) : (
-          <View style={st.chips}>
-            {folders.map((f) => (
-              <Pressable
-                key={f.id}
-                style={st.chip}
-                onPress={() =>
-                  router.push({
-                    pathname: "/folder/[id]",
-                    params: { id: f.id },
-                  } as any)
-                }
-                accessibilityRole="button"
-                accessibilityLabel={`Open folder ${f.name}`}
-              >
-                <Icon name="folder" size={12} tintColor={C.primary} />
-                <Text style={st.chipTxt}>{f.name}</Text>
-              </Pressable>
-            ))}
-          </View>
-        )}
-      </View>
 
       <View style={{ marginTop: S.lg }}>
         <SectionTitle>Open Tasks ({openTasks.length})</SectionTitle>
@@ -415,13 +415,29 @@ export default function ContactDetailScreen() {
         )}
       </View>
 
-      <View style={{ marginTop: S.xl }}>
-        <Button
-          label="Delete Contact"
-          variant="danger"
-          onPress={confirmDelete}
-        />
-      </View>
+      {/* Editing and deleting a SHARED organisation contact is
+          owner/manager-only. Hiding the control saves a member a rejected
+          request; it is NOT the enforcement — _owned_contact(write=True)
+          refuses it server-side regardless of what the app draws. A personal
+          contact is always its owner's to delete. */}
+      {canManageContact ? (
+        <View style={{ marginTop: S.xl }}>
+          <Button
+            label="Delete Contact"
+            variant="danger"
+            onPress={confirmDelete}
+          />
+        </View>
+      ) : isMemberContact ? (
+        <Text style={[T.caption, { marginTop: S.xl, textAlign: "center" }]}>
+          Organisation members stay in Contacts automatically. To remove them,
+          remove them from the organisation.
+        </Text>
+      ) : (
+        <Text style={[T.caption, { marginTop: S.xl, textAlign: "center" }]}>
+          Shared organisation contact. Ask an owner or manager to change it.
+        </Text>
+      )}
     </ScrollView>
 
     <PhotoPicker

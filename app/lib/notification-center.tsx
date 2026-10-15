@@ -41,12 +41,12 @@ import {
   AppNotification,
   getNotifications,
   getToken,
-  getUnreadNotificationCount,
   markAllNotificationsRead,
   markNotificationRead,
   onSignIn,
   onSignOut,
 } from "./api";
+import { fetchUnreadCount } from "./shared-data";
 
 // One page. Matches the backend default; the centre pages with "Load more"
 // rather than loading a user's whole history (which is the requirement's
@@ -152,7 +152,9 @@ export function NotificationsProvider({
 
   const refreshCount = useCallback(async () => {
     try {
-      const count = await getUnreadNotificationCount();
+      // Shared with any count request already in flight (the bell asks at
+      // the same moment on start-up); never served from an old answer.
+      const count = await fetchUnreadCount();
       if (alive.current) setUnreadCount(count);
     } catch {
       // Deliberately silent. The badge is ambient: a failed count must not

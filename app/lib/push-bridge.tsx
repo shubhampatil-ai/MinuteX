@@ -25,7 +25,8 @@ import { useCallback, useEffect, useRef } from "react";
 import { usePathname, useRootNavigationState, useRouter } from "expo-router";
 import { useNotifications } from "./notification-center";
 import { Notifications, configureForegroundHandler, onDevicePushToken, syncThisDevice } from "./push";
-import { PendingTap, briefHref } from "./push-logic";
+import { PendingTap, briefHref, briefTargetFrom } from "./push-logic";
+import { refreshMeetingLists } from "./shared-data";
 
 export function PushBridge({ ready }: { ready: boolean }) {
   const router = useRouter();
@@ -62,8 +63,11 @@ export function PushBridge({ ready }: { ready: boolean }) {
   useEffect(() => {
     if (!Notifications) return;
     configureForegroundHandler(() => pathRef.current);
-    const received = Notifications.addNotificationReceivedListener(() => {
+    const received = Notifications.addNotificationReceivedListener((n) => {
       refreshCount().catch(() => { /* best-effort */ });
+      // A brief is ready: that meeting's status, title and summary changed
+      // on the server, so the saved meetings lists are stale.
+      if (briefTargetFrom(n.request.content.data)) void refreshMeetingLists();
     });
     return () => received.remove();
   }, [refreshCount]);

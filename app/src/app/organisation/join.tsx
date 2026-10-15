@@ -17,7 +17,7 @@ import { ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { S, FONT, useTheme, ColorScale } from "../../../lib/theme";
 import {
-  Button, Card, ErrorText, SectionRule, TextField, scrollFormProps,
+  Button, Card, ErrorText, KeyboardAware, SectionRule, TextField, scrollFormProps,
 } from "../../../lib/ui";
 import {
   ApiError, acceptInvitation, isOrganisationEmailConflict,
@@ -109,7 +109,7 @@ export default function JoinOrganisationScreen() {
   }, [raw, refresh, switchTo, router]);
 
   return (
-    <View style={st.screen}>
+    <KeyboardAware style={st.screen}>
       <Stack.Screen options={{ title: "Join organisation" }} />
       <ScrollView contentContainerStyle={st.body} {...scrollFormProps}>
         <Text style={st.intro}>
@@ -145,6 +145,6 @@ export default function JoinOrganisationScreen() {
           />
         </View>
       </ScrollView>
-    </View>
+    </KeyboardAware>
   );
 }

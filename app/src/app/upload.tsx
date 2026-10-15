@@ -82,8 +82,11 @@ export default function UploadScreen() {
     const res = await DocumentPicker.getDocumentAsync({
       // The picker filters by MIME; extension is validated again below
       // (Android providers sometimes report generic types). audio/* covers
-      // anything a provider types generically as audio.
-      type: ["audio/*", ...new Set(Object.values(UPLOAD_FORMATS))],
+      // anything a provider types generically as audio. An .mp4 is almost
+      // always typed video/mp4 (a screen/meeting recording), so it has to be
+      // listed explicitly or the picker hides it; the STT service reads the
+      // audio track of a video container directly.
+      type: ["audio/*", "video/mp4", ...new Set(Object.values(UPLOAD_FORMATS))],
       copyToCacheDirectory: true, // local copy -> uploadable file:// URI
       multiple: false,
     });
@@ -142,7 +145,7 @@ export default function UploadScreen() {
             <Text style={st.pickTitle}>Choose an audio file</Text>
             <Text style={st.pickSub}>
               Any audio format ({Object.keys(UPLOAD_FORMATS).slice(0, 6).join(" · ")} …)
-              — up to {MAX_UPLOAD_BYTES / 1e9} GB
+              or MP4 video — up to {MAX_UPLOAD_BYTES / 1e9} GB
             </Text>
           </Pressable>
         ) : (

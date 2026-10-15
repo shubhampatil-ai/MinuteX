@@ -36,6 +36,15 @@ export function normalizeSiteUrl(input: string): { url: string; error: string } 
   return { url: `https://${parsed.host.toLowerCase()}${path}${RECEIVER_PATH}`, error: "" };
 }
 
+/** The Salesforce org's name as a person reads it, or "" when Salesforce
+ *  has none worth showing. Orgs created without a company name report it as
+ *  the literal text "None" (or "null"), which must never read as
+ *  "Connected to: None". */
+export function orgDisplayName(name?: string | null): string {
+  const n = (name || "").trim();
+  return /^(none|null|undefined)$/i.test(n) ? "" : n;
+}
+
 /** The receiver URL shown back as the Site URL the tester entered. */
 export function displaySiteUrl(receiverUrl: string | undefined): string {
   const u = String(receiverUrl || "");
@@ -47,7 +56,7 @@ export function displaySiteUrl(receiverUrl: string | undefined): string {
 // kept for any code not listed (it is already user-facing; it never carries
 // a stack trace or a secret).
 // ---------------------------------------------------------------------------
-const SITE_UNAVAILABLE = "Salesforce Site is unavailable. Check the Site URL and try again.";
+const SITE_UNAVAILABLE = "Salesforce isn't reachable right now. Try again in a moment.";
 const OBJECT_UNAVAILABLE = "This Salesforce object is no longer available. Refresh Salesforce metadata.";
 const RECORD_UNAVAILABLE = "The selected Salesforce record could not be found.";
 const PERMISSION_DENIED = "You do not have permission to create a Task for this Salesforce record.";
@@ -56,15 +65,25 @@ export const SITE_ERROR_MESSAGES: Record<string, string> = {
   timeout: SITE_UNAVAILABLE,
   network_error: SITE_UNAVAILABLE,
   receiver_unavailable: SITE_UNAVAILABLE,
-  endpoint_not_found: "No MinuteX receiver was found at this Site URL. Check the URL and that the receiver is installed.",
-  site_requires_login: "That URL needs a Salesforce login. Use the public Site URL, not the org's My Domain.",
-  site_redirected: "The Site redirected MinuteX. Check that the Site guest user has the MinuteX Site Guest Access permission set.",
-  invalid_response: "The Site answered, but not as the MinuteX receiver. Check the Site URL.",
-  invalid_endpoint: "That is not a Salesforce Site URL.",
+  endpoint_not_found: "MinuteX isn't installed at that connection link. Check the link with your Salesforce admin.",
+  site_requires_login: "That link needs a Salesforce login. Use the MinuteX connection link from your Salesforce admin.",
+  site_redirected: "Salesforce isn't set up for MinuteX yet. Ask your Salesforce admin to finish the MinuteX setup.",
+  invalid_response: "That link isn't a MinuteX connection. Check it with your Salesforce admin.",
+  invalid_endpoint: "That isn't a Salesforce connection link.",
   auth_failed: "The Salesforce Site rejected MinuteX's request signature.",
   receiver_disabled: "The MinuteX receiver is turned off in Salesforce (MinuteX Site Settings > Enabled).",
   receiver_misconfigured: "The MinuteX receiver's settings in Salesforce are incomplete.",
-  site_delivery_not_configured: "Enter and connect your Salesforce Site URL first.",
+  site_delivery_not_configured: "Connect Salesforce first.",
+  destination_unavailable: "That Salesforce destination isn't available anymore. Choose another one.",
+  install_unavailable: "Installing MinuteX in Salesforce isn't available right now. Try again later.",
+  install_not_finished: "Finish installing MinuteX in Salesforce first, then enter the setup code in MinuteX Setup.",
+  install_expired: "This setup code expired. Start again.",
+  invalid_setup_code: "This setup code isn't valid or has expired. Start again.",
+  destination_not_allowed: "You don't have permission to push meetings there. Ask your Salesforce admin.",
+  record_not_editable: "You don't have access to update that Salesforce record.",
+  acting_user_invalid: "Your Salesforce user is inactive. Ask your Salesforce admin.",
+  meeting_not_pushed: "Push the meeting to Salesforce first.",
+  salesforce_rejected: "Salesforce didn't accept the update. Check the record in Salesforce and try again.",
   salesforce_not_connected: "Connect Salesforce first.",
   integration_user_not_configured:
     "Set the Integration Username in Salesforce (Custom Settings > MinuteX Site Settings).",
@@ -82,7 +101,6 @@ export const SITE_ERROR_MESSAGES: Record<string, string> = {
   forbidden: PERMISSION_DENIED,
   task_in_flight: "This Task is still being sent to Salesforce. Try again in a moment.",
   record_required: "Tag a Salesforce Contact in this meeting, or choose the Salesforce record these tasks belong to.",
-  meeting_not_pushed: "Push the meeting to Salesforce first — its Tasks are attached to the meeting's Salesforce record.",
   invalid_person: "Choose a Salesforce Contact from the synced people.",
   invalid_relationship: "A Salesforce Task can be related to one person and one record, and a Lead cannot also have a record.",
   transcript_too_large: "This meeting's transcript is too long for Salesforce (131,072 characters).",
@@ -269,7 +287,31 @@ export function relationSourceNote(rel: RelationLike): string {
 /** The badge for a contact linked to a Salesforce person, or "". */
 export function salesforceBadge(c: { people_provider?: string; people_type?: string } | null | undefined): string {
   if (!c || c.people_provider !== "salesforce") return "";
-  return c.people_type === "user" ? "Salesforce User" : c.people_type === "contact" ? "Salesforce Contact" : "Salesforce";
+  return c.people_type === "user" ? "Salesforce User"
+    : c.people_type === "contact" ? "Salesforce Contact"
+      : c.people_type === "lead" ? "Salesforce Lead" : "Salesforce";
+}
+
+/** The short tag on a Salesforce person row: SF USER / SF LEAD / SF CONTACT. */
+export function salesforceTypeTag(type: string | undefined): string {
+  return type === "user" ? "SF USER" : type === "lead" ? "SF LEAD" : "SF CONTACT";
+}
+
+/** Live search runs only once the term is long enough for the org's search. */
+export const LIVE_PEOPLE_MIN_CHARS = 2;
+export function shouldSearchLive(term: string): boolean {
+  return term.trim().length >= LIVE_PEOPLE_MIN_CHARS;
+}
+
+/** Live results first, then any stored match the live search didn't return,
+ *  one row per person. */
+export function mergePeople<T extends { person_key: string }>(live: T[], stored: T[]): T[] {
+  const seen = new Set<string>();
+  return [...live, ...stored].filter((p) => {
+    if (seen.has(p.person_key)) return false;
+    seen.add(p.person_key);
+    return true;
+  });
 }
 
 export function isIsoDate(s: string): boolean {
@@ -355,10 +397,32 @@ export function sharedRelationship(pushed: PushedLike[]):
                   recordName: first.related_record_name || "" } : null;
 }
 
-/** "MinuteX Meeting · Client Discussion" — where the meeting is in Salesforce. */
-export function meetingRecordLine(rec: { object_label: string; name: string } | null | undefined): string {
+/** Where the meeting is in Salesforce, for a person: "Site Visit · Mumbai
+ *  Tower A" when it was pushed to a destination, else "This meeting". */
+export function meetingRecordLine(rec: {
+  object_label: string; name: string;
+  destination?: { name: string; record_name: string } | null;
+} | null | undefined): string {
   if (!rec) return "";
-  return rec.name ? `${rec.object_label} · ${rec.name}` : rec.object_label;
+  if (rec.destination) return [rec.destination.name, rec.destination.record_name].filter(Boolean).join(" · ");
+  return "This meeting in Salesforce";
+}
+
+/** The main button on the meeting's Salesforce card. */
+export function pushButtonLabel(o: { pushed: boolean; failed: boolean }): string {
+  if (o.failed) return "Try again";
+  return o.pushed ? "Update Salesforce" : "Push to Salesforce";
+}
+
+const SKIP_REASONS: Record<string, string> = {
+  no_access: "no access", missing: "field missing", not_empty: "already filled", no_value: "no data",
+};
+
+/** "Not updated: Transcript (no access), Visit Date (no data)" — or "". */
+export function skippedLine(skipped: { field: string; reason: string }[] | undefined): string {
+  const worth = (skipped || []).filter((x) => x.reason !== "no_value" && x.reason !== "not_empty");
+  if (!worth.length) return "";
+  return `Not updated: ${worth.map((x) => `${x.field} (${SKIP_REASONS[x.reason] || x.reason})`).join(", ")}`;
 }
 
 /** What a meeting's Task is attached to, in words: Related To = the

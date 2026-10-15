@@ -45,19 +45,22 @@ import {
 import { Stack, useRouter } from "expo-router";
 import { Icon } from "../../../../lib/icons";
 import { S, R, FONT, useTheme, ColorScale } from "../../../../lib/theme";
-import { Button, SegmentedTabs, Skeleton } from "../../../../lib/ui";
+import { Button, SegmentedTabs, Skeleton, Toast } from "../../../../lib/ui";
 import { BottomSheet, ProgressSteps, SheetAction } from "../../../../lib/kit";
 import { pipelineSteps } from "../../../../lib/processing";
 import { AudioPlayer, AudioPlayerProvider } from "../../../../lib/audio-player";
-import { useMeeting } from "../../../../lib/meeting-context";
+import { useMeeting, useSyncTasksOnFocus } from "../../../../lib/meeting-context";
+import {
+  applyMeetingChange, dropMeetingFromLists, forgetMeetingHighlights,
+} from "../../../../lib/shared-data";
 import { sourceMeta, statusMeta, speakerName, normalizeSpeakerLabel, fmtDuration } from "../../../../lib/sources";
 import { MeetingSummary, Highlights, Participants } from "../../../../lib/meeting-summary";
 import { MeetingOverviewView, hasOverview } from "../../../../lib/meeting-overview";
 import { buildSpeakerBlocks, buildSpeakerColors } from "../../../../lib/transcript-view";
 // Salesforce (Site) — NEW architecture, behind EXPO_PUBLIC_SITE_SALESFORCE.
-import { SiteSalesforceMeetingBlock } from "../../../../lib/site-salesforce-meeting";
-import { SITE_SALESFORCE_ENABLED } from "../../../../lib/site-salesforce-ui";
-import { invalidateSiteSalesforce } from "../../../../lib/site-salesforce-events";
+// Salesforce WEBHOOK (Webhook Contract v2) — behind EXPO_PUBLIC_WEBHOOK_V2.
+import { WebhookMeetingBlock } from "../../../../lib/webhook-meeting";
+import { SALESFORCE_COMING_SOON, WEBHOOK_V2_ENABLED } from "../../../../lib/webhook-ui";
 import { Tasks } from "../../../../lib/meeting-tasks";
 import { AddTaskSheet } from "../../../../lib/add-task-sheet";
 import { DocumentsList, CreateDocumentSheet } from "../../../../lib/meeting-documents";
@@ -66,11 +69,11 @@ import { GmailShareRow, GmailShareSheet } from "../../../../lib/gmail-share";
 import { useGmail } from "../../../../lib/integrations";
 import { MomEditorScreen } from "../../../../lib/mom-editor";
 import { AssistantButton } from "../../../../lib/assistant-button";
-import { ContactPicker } from "../../../../lib/contact-picker";
-import { avatarColorFor, initialsOf } from "../../../../lib/task-model";
+// Identifying a speaker: the SAME card, picker and access control the
+// Participants screen and the Transcript use — one tagging UI everywhere.
+import { SpeakerTagSheet, useSpeakerTagging } from "../../../../lib/speaker-tagging";
 import {
   ApiError, isAlreadyRunning, isStillUploading, reprocessRecording, trashRecording,
-  ApiContact, getParticipants, setParticipant,
 } from "../../../../lib/api";
 
 // The four ANALYSIS tabs. "transcript" is deliberately NOT among them — it is
@@ -109,30 +112,6 @@ function buildStyles(C: ColorScale) {
     nameInput: {
       backgroundColor: C.surface2, borderRadius: R.md, borderWidth: 1, borderColor: C.border,
       fontFamily: FONT.regular, fontSize: 17, color: C.text, paddingVertical: 12, paddingHorizontal: 14, marginTop: 18,
-    },
-    // Tag-a-contact row inside the rename sheet. Reads as a tappable list row
-    // rather than a button, because it leads to a picker rather than acting.
-    tagRow: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: S.md,
-      marginTop: 14, padding: 12, borderRadius: R.md,
-      borderWidth: 1, borderColor: C.border, backgroundColor: C.surface2,
-    },
-    tagAvatar: {
-      width: 36, height: 36, borderRadius: 18,
-      alignItems: "center" as const, justifyContent: "center" as const,
-    },
-    tagAvatarTxt: { fontFamily: FONT.bold, fontSize: 13, color: "#fff" },
-    tagName: { fontFamily: FONT.semibold, fontSize: 14, color: C.text },
-    tagHint: {
-      fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint,
-      marginTop: 2,
-    },
-    tagAction: { fontFamily: FONT.bold, fontSize: 12.5, color: C.primary },
-    // Separates the two ways of answering "who is this?" so neither looks like
-    // a sub-field of the other.
-    orRule: {
-      fontFamily: FONT.regular, fontSize: 11.5, color: C.textFaint,
-      textAlign: "center" as const, marginTop: 14, marginBottom: 2,
     },
     menuRow: {
       flexDirection: "row" as const, alignItems: "center" as const, gap: 12,
@@ -222,10 +201,13 @@ export default function MeetingDetailScreen() {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
   const {
-    key, rec, loading, error, reload, documents, addDocument, setDocuments,
-    renameMeeting, renameSpeaker, tasks,
+    key, rec, loading, error, savedNote, reload, documents, addDocument, setDocuments,
+    renameMeeting, tasks,
     documentsNeedingUpdate, updateAllDocuments, addTask,
   } = useMeeting();
+  // Tasks changed on the Task dashboard or /task/[id] (reassign, status,
+  // due) must show here when the user comes back to this meeting.
+  useSyncTasksOnFocus();
   const [tab, setTab] = useState<Tab>("overview");
 
   const [renaming, setRenaming] = useState(false);
@@ -256,9 +238,6 @@ export default function MeetingDetailScreen() {
   // without this screen being remounted.
   const gmail = useGmail();
 
-  const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
-  const [speakerDraft, setSpeakerDraft] = useState("");
-  const [savingSpeaker, setSavingSpeaker] = useState(false);
 
   const [search, setSearch] = useState("");
 
@@ -281,6 +260,10 @@ export default function MeetingDetailScreen() {
             setRetryNote("");
             try {
               await reprocessRecording(key);
+              // Every saved copy now says "transcribing" (the Desk starts its
+              // progress poll), and the old highlights are about to change.
+              applyMeetingChange(key, { status: "transcribing" });
+              forgetMeetingHighlights(key);
               setRetryNote("Started — this can take a few minutes.");
               // The row is now "transcribing"; reload so the screen switches to
               // the progress UI it already shows for a first-time upload.
@@ -328,6 +311,7 @@ export default function MeetingDetailScreen() {
             setDeleting(true);
             try {
               await trashRecording(key);
+              dropMeetingFromLists(key);
               router.back();
             } catch (e) {
               setDeleting(false);
@@ -365,91 +349,17 @@ export default function MeetingDetailScreen() {
     }
   };
 
-  // Contact tagging inside the rename sheet.
-  //
-  // Renaming a speaker used to write a free-text NAME only, which is a display
-  // label and nothing more: no contact, so no task could be assigned to that
-  // person and nothing could notify them. Tagging a real contact here does both
-  // at once — the backend's setParticipant writes the participant row AND syncs
-  // speaker_names, so the transcript reads the same either way.
-  //
-  // Typing a name is still allowed. Some speakers genuinely aren't contacts
-  // (a receptionist, a one-off attendee), and forcing a contact record for them
-  // would be worse than a plain label.
   // Manual task entry, for what the AI did not extract.
   const [addTaskOpen, setAddTaskOpen] = useState(false);
-  const [speakerPickerOpen, setSpeakerPickerOpen] = useState(false);
-  const [speakerContacts, setSpeakerContacts] = useState<ApiContact[]>([]);
-  const [taggedContact, setTaggedContact] = useState<ApiContact | null>(null);
 
+  // WHO IS THIS SPEAKER — opened from the People tab (and the Transcript
+  // screen opens the same sheet). Tagging a real contact lets tasks be
+  // assigned and the person be notified and given access; a plain name is
+  // still offered for someone who isn't a contact.
+  const speakerTagging = useSpeakerTagging(String(key));
+  const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
   const openRenameSpeaker = (label: string) => {
-    const raw = normalizeSpeakerLabel(label);
-    setEditingSpeaker(raw);
-    setSpeakerDraft(speakerNames?.[raw] ?? "");
-    setTaggedContact(null);
-    // Load who is already tagged in this meeting so the picker can rank
-    // them first. Best-effort: a failure only affects ORDERING, never
-    // whether the sheet works.
-    void getParticipants(String(key))
-      .then((p) => {
-        setSpeakerContacts(
-          p.participants
-            .map((x) => x.contact)
-            .filter((c): c is ApiContact => !!c)
-        );
-        // Show what this speaker is CURRENTLY tagged as, so the sheet reflects
-        // reality rather than looking untagged every time it opens.
-        const mine = p.participants.find((x) => x.speaker_id === raw);
-        if (mine?.contact) setTaggedContact(mine.contact);
-      })
-      .catch(() => {
-        setSpeakerContacts([]);
-      });
-  };
-
-  /** Tag this speaker as a real contact. */
-  const tagSpeakerContact = async (contact: ApiContact) => {
-    if (!editingSpeaker) return;
-    setSavingSpeaker(true);
-    try {
-      const res = await setParticipant(String(key), editingSpeaker, contact.id);
-      // A tagged Salesforce Contact relates this meeting to Salesforce.
-      invalidateSiteSalesforce("relation");
-      setTaggedContact(contact);
-      setSpeakerDraft(contact.name);
-      // Re-read the meeting so the transcript and Participants list pick up the
-      // speaker_names the backend just synced.
-      await reload();
-      setEditingSpeaker(null);
-      const n = res.tasks_resolved ?? 0;
-      if (n > 0) {
-        Alert.alert(
-          "Speaker tagged",
-          `${contact.name} is now Speaker ${editingSpeaker}. ` +
-          `${n} task${n === 1 ? "" : "s"} from this meeting ${n === 1 ? "is" : "are"} ` +
-          `now assigned to them.`
-        );
-      }
-    } catch (e) {
-      Alert.alert(
-        "Couldn't tag that contact",
-        e instanceof ApiError ? e.message : "Something went wrong."
-      );
-    } finally {
-      setSavingSpeaker(false);
-    }
-  };
-  const saveSpeaker = async () => {
-    if (!editingSpeaker) return;
-    setSavingSpeaker(true);
-    try {
-      await renameSpeaker(editingSpeaker, speakerDraft);
-      setEditingSpeaker(null);
-    } catch {
-      // renameSpeaker already alerted
-    } finally {
-      setSavingSpeaker(false);
-    }
+    setEditingSpeaker(normalizeSpeakerLabel(label));
   };
 
   const speakerColors = useMemo(
@@ -523,7 +433,9 @@ export default function MeetingDetailScreen() {
     Date.now() - createdMs > LIKELY_STUCK_AFTER_MS;
   const srcMeta = sourceMeta(rec);
   const duration = fmtDuration(rec.duration);
-  const hasTranscript = !!rec.transcript;
+  // A copy saved on the phone leaves the transcript out but records that one
+  // exists (transcript_withheld), so the tabs still show offline.
+  const hasTranscript = !!rec.transcript || !!rec.transcript_withheld;
   const showTabs = hasTranscript;
 
   // "Is there an analysis to show?" — the overview is the primary output, and
@@ -596,6 +508,9 @@ export default function MeetingDetailScreen() {
               </Text>
             </Pressable>
             <Text style={st.dateline}>{datelineParts.join(" · ")}</Text>
+            {savedNote ? (
+              <Text style={[st.dateline, { marginTop: S.xs }]} accessibilityRole="text">{savedNote}</Text>
+            ) : null}
 
             {rec.audio_url ? (
               <View style={{ marginTop: S.lg }}>
@@ -782,13 +697,18 @@ export default function MeetingDetailScreen() {
           {/* Salesforce (Site) — the NEW, isolated integration, only when the
               build enables it:
               Push Meeting and Create Salesforce Task for THIS meeting. */}
-          {SITE_SALESFORCE_ENABLED && rec?.workspace_id && !failed && !stillProcessing
-            && hasTranscript && tab === "overview" ? (
+          {WEBHOOK_V2_ENABLED && rec?.workspace_id && !failed
+            && !stillProcessing && hasTranscript && tab === "overview" ? (
             <View style={st.section}>
-              <SiteSalesforceMeetingBlock
+              {/* THE Salesforce section: interactive when connected; a
+                  read-only "sent" card when it was sent but Salesforce is
+                  not connected now (or this is a coming-soon build);
+                  nothing when never sent and not connected. */}
+              <WebhookMeetingBlock
+                enabled={WEBHOOK_V2_ENABLED}
+                readOnly={SALESFORCE_COMING_SOON}
                 meetingKey={key}
                 workspaceId={rec.workspace_id}
-                title={rec.title || "Untitled meeting"}
               />
             </View>
           ) : null}
@@ -954,95 +874,14 @@ export default function MeetingDetailScreen() {
           </KeyboardAvoidingView>
         </Modal>
 
-        {/* ---- Rename a speaker (opened from the transcript or the
-             Participants list — both feed the same openRenameSpeaker) ---- */}
-        <Modal visible={editingSpeaker !== null} transparent animationType="fade" onRequestClose={() => setEditingSpeaker(null)}>
-          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
-            <Pressable style={st.sheetBackdrop} onPress={() => setEditingSpeaker(null)}>
-              <Pressable style={st.sheet} onPress={() => { }}>
-                <Text style={{ fontFamily: FONT.semibold, fontSize: 11, color: C.textFaint, textTransform: "uppercase", letterSpacing: 0.6 }}>
-                  {editingSpeaker != null ? speakerName(editingSpeaker, speakerNames) : ""}
-                </Text>
-                <Text style={st.sheetTitle}>Who is this?</Text>
+        {/* ---- Who is this speaker — the shared tagging sheet ---- */}
+        <SpeakerTagSheet
+          tagging={speakerTagging}
+          speakerId={editingSpeaker}
+          onClose={() => setEditingSpeaker(null)}
+        />
+        <Toast visible={!!speakerTagging.toast} label={speakerTagging.toast} />
 
-                {/* TAG A CONTACT — the preferred path, offered first.
-                    A tagged contact is a real person the system can assign
-                    tasks to and notify; a typed name is only a display label.
-                    Both are legitimate, so both are here, with the one that
-                    does more listed above. */}
-                <Pressable
-                  style={st.tagRow}
-                  onPress={() => setSpeakerPickerOpen(true)}
-                  disabled={savingSpeaker}
-                  accessibilityRole="button"
-                  accessibilityLabel={
-                    taggedContact
-                      ? `Tagged as ${taggedContact.name}. Change contact`
-                      : "Tag a contact"
-                  }
-                >
-                  {taggedContact ? (
-                    <>
-                      <View style={[st.tagAvatar, { backgroundColor: avatarColorFor(taggedContact.name) }]}>
-                        <Text style={st.tagAvatarTxt}>{initialsOf(taggedContact.name)}</Text>
-                      </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={st.tagName}>{taggedContact.name}</Text>
-                        <Text style={st.tagHint}>
-                          Tagged — tasks can be assigned to them
-                        </Text>
-                      </View>
-                      <Text style={st.tagAction}>Change</Text>
-                    </>
-                  ) : (
-                    <>
-                      <View style={[st.tagAvatar, { backgroundColor: C.primarySoft }]}>
-                        <Icon name="person.2.fill" size={17} tintColor={C.primary} />
-                      </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={st.tagName}>Tag a contact</Text>
-                        <Text style={st.tagHint}>
-                          So tasks can be assigned to this person
-                        </Text>
-                      </View>
-                      <Icon name="chevron.right" size={15} tintColor={C.textFaint} />
-                    </>
-                  )}
-                </Pressable>
-
-                <Text style={st.orRule}>or just set a name</Text>
-
-                <TextInput
-                  style={st.nameInput}
-                  value={speakerDraft}
-                  onChangeText={setSpeakerDraft}
-                  placeholder="Their name"
-                  placeholderTextColor={C.textFaint}
-                  autoCapitalize="words"
-                  maxLength={60}
-                  returnKeyType="done"
-                  onSubmitEditing={saveSpeaker}
-                />
-                <Text style={{ fontFamily: FONT.regular, fontSize: 12, color: C.textFaint, marginTop: 8 }}>
-                  Updates the transcript and participants immediately. Generated
-                  documents that mention this speaker will be flagged for an update.
-                </Text>
-                <View style={{ flexDirection: "row", gap: S.sm, marginTop: 22 }}>
-                  <Button label="Cancel" variant="secondary" style={{ flex: 1 }} onPress={() => setEditingSpeaker(null)} disabled={savingSpeaker} />
-                  <Button label="Save" style={{ flex: 1 }} onPress={saveSpeaker} loading={savingSpeaker} />
-                </View>
-              </Pressable>
-            </Pressable>
-          </KeyboardAvoidingView>
-        </Modal>
-
-        {/* The contact picker for speaker tagging. Mounted as its own Modal
-            OUTSIDE the rename sheet: nesting one Modal inside another is
-            unreliable on Android (the inner one can render behind), and this
-            way the rename sheet stays open underneath so cancelling the picker
-            returns to it rather than losing the user's place.
-            Ordering: people already tagged in this meeting, then everyone
-            — plus create-new and phone import. */}
         <AddTaskSheet
           visible={addTaskOpen}
           onClose={() => setAddTaskOpen(false)}
@@ -1076,22 +915,6 @@ export default function MeetingDetailScreen() {
           onSent={(count) => Alert.alert(
             "Sent",
             `Your email was sent to ${count} ${count === 1 ? "person" : "people"}.`)}
-        />
-
-        <ContactPicker
-          visible={speakerPickerOpen}
-          onClose={() => setSpeakerPickerOpen(false)}
-          onPick={(c) => {
-            setSpeakerPickerOpen(false);
-            void tagSpeakerContact(c);
-          }}
-          meetingContacts={speakerContacts}
-          salesforceWorkspaceId={rec?.workspace_id}
-          title={
-            editingSpeaker != null
-              ? `Who is Speaker ${editingSpeaker}?`
-              : "Select Contact"
-          }
         />
       </View>
     </AudioPlayerProvider>

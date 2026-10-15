@@ -174,12 +174,14 @@ describe("Connected Apps vs Organisation Integrations scope split (source-level)
     assert.doesNotMatch(orgBlock, /SECTIONS\.map/,
       "Organisation mode must not render the Personal per-category catalog loop");
   });
-  it("Organisation mode renders the Gmail card, and Salesforce only as the gated Site entry", () => {
+  it("Organisation mode renders the Gmail card, and Salesforce as its one card", () => {
     const { orgBlock } = splitBranches();
     assert.match(orgBlock, /<OrgGmailCard/);
     assert.doesNotMatch(orgBlock, /<IntegrationCard/,
       "Organisation mode must not render the generic Personal IntegrationCard");
-    assert.match(orgBlock, /SITE_SALESFORCE_ENABLED \? \([\s\S]*?<SiteSalesforceEntry/);
+    // ONE Salesforce card (Webhook Contract v2); the retired package card is gone.
+    assert.match(orgBlock, /WEBHOOK_V2_ENABLED \? \([\s\S]*?<WebhookIntegrationCard \/>/);
+    assert.doesNotMatch(orgBlock, /SalesforceCard|SiteSalesforceEntry/);
   });
 
   it("the Personal (non-organisation) branch still maps every catalog category, unchanged", () => {

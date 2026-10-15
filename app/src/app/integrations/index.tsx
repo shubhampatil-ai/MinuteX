@@ -10,7 +10,7 @@
 //   personal/user-level connected applications."
 //
 //   ORGANISATION: shows ONLY what is relevant to the active organisation —
-//   the Salesforce (Site) entry when the build enables it, and Gmail (the
+//   the Salesforce card when the build enables it, and Gmail (the
 //   SAME per-user connection Personal already shows, re-labelled here as "Your Gmail account" / "used for
 //   organisation actions" — never a second OAuth connection, never a
 //   shared organisation mailbox). Every other personal-only provider
@@ -59,9 +59,14 @@ import { IntegrationLogo } from "../../../lib/integration-logos";
 import { Integration } from "../../../lib/api";
 import { useGmail, useIntegrations } from "../../../lib/integrations";
 import { useWorkspace, workspaceLabel } from "../../../lib/workspace-context";
-// Salesforce (Site + Apex REST): a separate entry, shown only when the build
-// enables it (EXPO_PUBLIC_SITE_SALESFORCE=1).
-import { SITE_SALESFORCE_ENABLED, SiteSalesforceEntry } from "../../../lib/site-salesforce-ui";
+// Salesforce: a card like Gmail's, shown only when the build enables it
+// (EXPO_PUBLIC_SITE_SALESFORCE=1). The connection belongs to the WORKSPACE
+// (one Salesforce org per workspace), not to the person, so it is read from
+// the workspace's Salesforce connection rather than the Integrations table.
+// Salesforce: ONE connection (Webhook Contract v2 underneath). The retired
+// MinuteX Salesforce package has no card here — not behind a flag, removed —
+// so no build setting or stale bundle can show a second Salesforce.
+import { WEBHOOK_V2_ENABLED, WebhookIntegrationCard } from "../../../lib/webhook-ui";
 
 // The logo tile sits on a neutral surface rather than a per-brand tinted one.
 // With real multi-colour marks a tinted backdrop fights the artwork — Gmail's
@@ -209,10 +214,10 @@ export default function IntegrationsScreen() {
             </View>
           ) : (
             <>
-              {SITE_SALESFORCE_ENABLED ? (
+              {WEBHOOK_V2_ENABLED ? (
                 <>
                   <SectionRule>CRM</SectionRule>
-                  <SiteSalesforceEntry onPress={() => router.push("/site-salesforce" as never)} />
+                  <WebhookIntegrationCard />
                 </>
               ) : null}
 
@@ -268,10 +273,10 @@ export default function IntegrationsScreen() {
                 );
               })}
 
-              {SITE_SALESFORCE_ENABLED ? (
+              {WEBHOOK_V2_ENABLED ? (
                 <View>
-                  <SectionRule>Salesforce (Site)</SectionRule>
-                  <SiteSalesforceEntry onPress={() => router.push("/site-salesforce" as never)} />
+                  <SectionRule>CRM</SectionRule>
+                  <WebhookIntegrationCard />
                 </View>
               ) : null}
 

@@ -12,16 +12,16 @@
 // AsyncStorage and NetInfo are NATIVE modules: an older dev client built
 // without them must not crash. They are loaded defensively, like
 // lib/storage.ts does; without them the cache still works, in memory only.
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
 import { AppState } from "react-native";
 import { QueryClient, QueryClientProvider, focusManager, onlineManager } from "@tanstack/react-query";
 import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 import { createAsyncStoragePersister } from "@tanstack/query-async-storage-persister";
-import { getActiveWorkspaceId, getToken, onSignOut } from "./api";
+import { getActiveWorkspaceId, getToken, onSignOut, setKnownOffline } from "./api";
 import { useWorkspace } from "./workspace-context";
 import {
   CACHE_BUSTER, CACHE_MAX_AGE_MS, CACHE_STORAGE_KEY, FRESH_FOR_MS,
-  retryDelay, shouldPersist, shouldRetry, userIdFromToken, type CacheScope,
+  fitToBudget, retryDelay, shouldPersist, shouldRetry, userIdFromToken, type CacheScope,
 } from "./offline-cache-rules";
 
 type KV = {
@@ -55,8 +55,19 @@ const storage = (() => {
   return s ? safeStorage(s) : null;
 })();
 
+// Every save is cut to the storage budget (offline-cache-rules fitToBudget):
+// an oversized value fails on Android and would lose the WHOLE saved cache.
 const persister = storage
-  ? createAsyncStoragePersister({ storage, key: CACHE_STORAGE_KEY, throttleTime: 1000 })
+  ? createAsyncStoragePersister({
+      storage, key: CACHE_STORAGE_KEY, throttleTime: 1000,
+      serialize: (client) => {
+        const { client: fitted, dropped } = fitToBudget(client);
+        if (dropped && typeof __DEV__ !== "undefined" && __DEV__) {
+          console.warn(`[cache] storage budget: ${dropped} saved answer(s) left out`);
+        }
+        return JSON.stringify(fitted);
+      },
+    })
   : null;
 
 export const queryClient = new QueryClient({
@@ -80,7 +91,12 @@ try {
   const NetInfo = require("@react-native-community/netinfo").default;
   if (NetInfo?.addEventListener) {
     onlineManager.setEventListener((setOnline) =>
-      NetInfo.addEventListener((s: { isConnected: boolean | null }) => setOnline(s.isConnected !== false)));
+      NetInfo.addEventListener((s: { isConnected: boolean | null }) => {
+        // Offline only when NetInfo is SURE (false, not null/unknown).
+        const online = s.isConnected !== false;
+        setKnownOffline(!online);
+        setOnline(online);
+      }));
   }
 } catch { /* old dev client: TanStack's default (always online) */ }
 
@@ -89,6 +105,15 @@ focusManager.setEventListener((handleFocus) => {
   const sub = AppState.addEventListener("change", (s) => handleFocus(s === "active"));
   return () => sub.remove();
 });
+
+/** Is the phone online? (NetInfo; always true without it.) For screens that
+ *  show saved data offline and want to say that edits need a connection. */
+export function useIsOnline(): boolean {
+  return useSyncExternalStore(
+    (cb) => onlineManager.subscribe(cb),
+    () => onlineManager.isOnline(),
+  );
+}
 
 /** Drop every cached answer, in memory and on the phone. */
 export async function wipeQueryCache(): Promise<void> {

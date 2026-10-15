@@ -15,7 +15,7 @@ import { ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
 import { S, FONT, useTheme, ColorScale } from "../../../lib/theme";
 import {
-  Button, Card, ErrorText, SectionRule, TextField, scrollFormProps,
+  Button, Card, ErrorText, KeyboardAware, SectionRule, TextField, scrollFormProps,
 } from "../../../lib/ui";
 import {
   ApiError, createOrganisation, isPersonalWorkspaceInUse,
@@ -102,7 +102,7 @@ export default function CreateOrganisationScreen() {
       refresh, switchTo, router]);
 
   return (
-    <View style={st.screen}>
+    <KeyboardAware style={st.screen}>
       <Stack.Screen options={{ title: "Create organisation" }} />
       <ScrollView contentContainerStyle={st.body} {...scrollFormProps}>
         <Text style={st.intro}>
@@ -185,6 +185,6 @@ export default function CreateOrganisationScreen() {
           />
         </View>
       </ScrollView>
-    </View>
+    </KeyboardAware>
   );
 }

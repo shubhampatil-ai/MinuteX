@@ -45,6 +45,19 @@ module.exports = ({ config }) => {
       : p
   );
 
+  // Continue with Google (lib/google-signin.ts). The plugin's only native job
+  // without Firebase is registering the iOS URL scheme — the REVERSED iOS
+  // client id — and it throws when given none. So it is added only when that
+  // id is configured; Android needs no plugin (its OAuth client is matched by
+  // package name + signing SHA-1 in the Google Cloud console), and an iOS
+  // build without the id simply reports Google sign-in as unavailable.
+  const iosClientId = process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID || "";
+  if (iosClientId) {
+    const suffix = ".apps.googleusercontent.com";
+    const iosUrlScheme = "com.googleusercontent.apps." + iosClientId.replace(suffix, "");
+    plugins.push(["@react-native-google-signin/google-signin", { iosUrlScheme }]);
+  }
+
   return {
     ...config,
     plugins,

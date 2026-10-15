@@ -13,9 +13,12 @@ import {
 import { JetBrainsMono_500Medium } from "@expo-google-fonts/jetbrains-mono";
 import { FONT, ThemeProvider, useTheme } from "../../lib/theme";
 import { Splash } from "../../lib/splash";
-import { getMe, getToken } from "../../lib/api";
+import { getToken } from "../../lib/api";
+import { fetchMe } from "../../lib/shared-data";
 import { DeviceProvider } from "../../lib/device-context";
 import { WorkspaceProvider } from "../../lib/workspace-context";
+import { QueryProvider } from "../../lib/query-client";
+import { OfflineBanner } from "../../lib/offline-banner";
 import { onProfileNameSaved } from "../../lib/profile-gate";
 import { IntegrationsProvider } from "../../lib/integrations";
 import { NotificationsProvider } from "../../lib/notification-center";
@@ -66,7 +69,7 @@ export function ErrorBoundary({ error, retry }: ErrorBoundaryProps) {
 const SPLASH_MIN_MS = 1200;
 
 // Route groups that do NOT require auth.
-const PUBLIC_SEGMENTS = ["login", "signup"];
+const PUBLIC_SEGMENTS = ["login", "signup", "forgot-password"];
 
 // The profile gate's OWN route. Requires auth (so it is not public) but must
 // be exempt from the gate below, or the redirect would target the screen it is
@@ -189,7 +192,7 @@ function RootContent() {
     let cancelled = false;
     (async () => {
       try {
-        const me = await getMe();
+        const me = await fetchMe();
         if (cancelled || nameSatisfied.current) return;
         // name_set is authoritative: `name` on /me is the RAW stored value, so
         // an older server that predates the flag still resolves correctly via
@@ -302,6 +305,9 @@ function RootContent() {
           the recording banner disagree with the list it was started from.
           UI state only — the backend re-resolves membership every request. */}
       <WorkspaceProvider>
+      {/* On-device cache (local-first): screens that opt in show their last
+          good answer at once, also offline. Wiped on sign-out. */}
+      <QueryProvider>
       {/* OS push: tap routing, foreground rule, registration refresh. Inside
           NotificationsProvider so a tapped push marks its in-app row read. */}
       <PushBridge ready={pushReady} />
@@ -318,6 +324,7 @@ function RootContent() {
         }}
       >
         <Stack.Screen name="login" options={{ headerShown: false }} />
+        <Stack.Screen name="forgot-password" options={{ headerShown: false }} />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         {/* The profile gate. No header and no back gesture — the only way
             out is saving a name (see the gate in RootContent). */}
@@ -382,6 +389,9 @@ function RootContent() {
         <Stack.Screen name="calendar" options={{ title: "Calendar" }} />
         <Stack.Screen name="notifications" options={{ title: "Notifications" }} />
       </Stack>
+      {/* After the Stack so it draws on top; never takes a tap. */}
+      <OfflineBanner />
+      </QueryProvider>
       </WorkspaceProvider>
       </NotificationsProvider>
       </IntegrationsProvider>

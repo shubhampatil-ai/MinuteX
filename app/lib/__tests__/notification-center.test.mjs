@@ -43,6 +43,9 @@ const ROOT = new URL("../../", import.meta.url).pathname
 function destinationFor(n) {
   const id = (n.entity_id ?? "").trim();
   if (!id) return null;
+  if (n.type === "MEETING_ACCESS_GRANTED") {
+    return { pathname: "/meeting/[key]/shared", params: { key: id } };
+  }
   switch (n.entity_type) {
     case "task":
       return { pathname: "/task/[id]", params: { id } };
@@ -54,25 +57,69 @@ function destinationFor(n) {
   }
 }
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"];
+
+function dayLabel(d, now = new Date()) {
+  const base = `${d.getDate()} ${MONTHS[d.getMonth()]}`;
+  return d.getFullYear() === now.getFullYear() ? base : `${base} ${d.getFullYear()}`;
+}
+
 function groupNotifications(items, now = new Date()) {
   const startOfToday = new Date(
     now.getFullYear(), now.getMonth(), now.getDate()
   ).getTime();
   const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000;
 
-  const today = [], yesterday = [], earlier = [];
+  const groups = [];
+  const byTitle = new Map();
+  const unreadable = [];
   for (const n of items) {
     const t = Date.parse(n.created_at);
-    if (!Number.isFinite(t)) earlier.push(n);
-    else if (t >= startOfToday) today.push(n);
-    else if (t >= startOfYesterday) yesterday.push(n);
-    else earlier.push(n);
+    if (!Number.isFinite(t)) { unreadable.push(n); continue; }
+    const title = t >= startOfToday ? "Today"
+      : t >= startOfYesterday ? "Yesterday"
+        : dayLabel(new Date(t), now);
+    let g = byTitle.get(title);
+    if (!g) {
+      g = { title, items: [] };
+      byTitle.set(title, g);
+      groups.push(g);
+    }
+    g.items.push(n);
   }
-  const groups = [];
-  if (today.length) groups.push({ title: "Today", items: today });
-  if (yesterday.length) groups.push({ title: "Yesterday", items: yesterday });
-  if (earlier.length) groups.push({ title: "Earlier", items: earlier });
+  if (unreadable.length) groups.push({ title: "Earlier", items: unreadable });
   return groups;
+}
+
+function clockTime(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "";
+  const d = new Date(t);
+  const h = d.getHours();
+  const m = String(d.getMinutes()).padStart(2, "0");
+  return `${h % 12 || 12}:${m} ${h < 12 ? "AM" : "PM"}`;
+}
+
+function filterForNotification(type) {
+  switch (type) {
+    case "MEETING_PROCESSING_COMPLETED":
+    case "MEETING_PROCESSING_FAILED":
+    case "MEETING_DOCUMENT_READY":
+    case "MEETING_OUTPUT_SHARED":
+    case "MEETING_ACCESS_GRANTED":
+      return "meetings";
+    case "AI_OUTPUT_READY":
+    case "AI_ACTION_REQUIRED":
+      return "ai";
+    default:
+      return "system";
+  }
+}
+
+function filterNotifications(items, filter) {
+  if (filter === "all") return items;
+  return items.filter((n) => filterForNotification(n.type) === filter);
 }
 
 function relativeTime(iso, now = new Date()) {
@@ -152,6 +199,18 @@ describe("deep linking", () => {
     );
   });
 
+  it("opens a meeting-access notification on the READ-ONLY shared view", () => {
+    // The recipient is a participant, not the recorder: the owner screen
+    // 404s for them, so routing there would be a dead tap.
+    const key = "recordings/u-1/mobile/abc_123.m4a";
+    assert.deepEqual(
+      destinationFor(notification({
+        type: "MEETING_ACCESS_GRANTED", entity_type: "meeting", entity_id: key,
+      })),
+      { pathname: "/meeting/[key]/shared", params: { key } }
+    );
+  });
+
   it("every task notification type resolves to the task screen", () => {
     for (const type of ["TASK_ASSIGNED", "TASK_REASSIGNED", "TASK_DUE_TODAY",
                         "TASK_OVERDUE", "AI_ACTION_REQUIRED"]) {
@@ -185,15 +244,23 @@ describe("deep linking", () => {
 describe("grouping", () => {
   const now = NOW;
 
-  it("buckets into Today / Yesterday / Earlier", () => {
+  it("buckets into Today / Yesterday / one group per earlier day", () => {
     const groups = groupNotifications([
       notification({ notification_id: "a", created_at: localIso(now, { hours: 3 }) }),
       notification({ notification_id: "b", created_at: localIso(now, { days: 1 }) }),
-      notification({ notification_id: "c", created_at: localIso(now, { days: 28 }) }),
+      notification({ notification_id: "c", created_at: localIso(now, { days: 2 }) }),
+      notification({ notification_id: "d", created_at: localIso(now, { days: 2, hours: 1 }) }),
+      notification({ notification_id: "e", created_at: localIso(now, { days: 28 }) }),
     ], now);
+    // NOW is 29 Aug 2026 (local).
     assert.deepEqual(groups.map((g) => g.title),
-                     ["Today", "Yesterday", "Earlier"]);
-    assert.deepEqual(groups.map((g) => g.items.length), [1, 1, 1]);
+                     ["Today", "Yesterday", "27 Aug", "1 Aug"]);
+    assert.deepEqual(groups.map((g) => g.items.length), [1, 1, 2, 1]);
+  });
+
+  it("names a day in another year with its year, and September as Sept", () => {
+    assert.equal(dayLabel(new Date(2026, 8, 28), now), "28 Sept");
+    assert.equal(dayLabel(new Date(2025, 11, 31), now), "31 Dec 2025");
   });
 
   it("omits empty groups entirely", () => {
@@ -232,6 +299,90 @@ describe("grouping", () => {
     const groups = groupNotifications(
       [notification({ created_at: "not-a-date" })], now);
     assert.deepEqual(groups.map((g) => g.title), ["Earlier"]);
+  });
+
+  it("files unreadable timestamps LAST, after every dated day", () => {
+    const groups = groupNotifications([
+      notification({ notification_id: "x", created_at: "not-a-date" }),
+      notification({ notification_id: "a", created_at: localIso(now, { hours: 3 }) }),
+    ], now);
+    assert.deepEqual(groups.map((g) => g.title), ["Today", "Earlier"]);
+  });
+});
+
+describe("row time", () => {
+  it("is the clock time, 12-hour with AM/PM", () => {
+    assert.equal(clockTime(new Date(2026, 8, 30, 9, 24).toISOString()), "9:24 AM");
+    assert.equal(clockTime(new Date(2026, 8, 30, 18, 41).toISOString()), "6:41 PM");
+    assert.equal(clockTime(new Date(2026, 8, 30, 0, 5).toISOString()), "12:05 AM");
+    assert.equal(clockTime(new Date(2026, 8, 30, 12, 0).toISOString()), "12:00 PM");
+    assert.equal(clockTime("nonsense"), "");
+  });
+});
+
+describe("filters", () => {
+  const TYPES = ["MEETING_PROCESSING_COMPLETED", "MEETING_PROCESSING_FAILED",
+    "AI_OUTPUT_READY", "AI_ACTION_REQUIRED", "TASK_ASSIGNED", "TASK_REASSIGNED",
+    "TASK_DUE_TODAY", "TASK_OVERDUE", "MEETING_DOCUMENT_READY",
+    "MEETING_OUTPUT_SHARED", "MEETING_ACCESS_GRANTED"];
+
+  it("mirror matches the source", () => {
+    const src = readFileSync(join(ROOT, "lib", "notification-center.tsx"), "utf8");
+    const body = (name) => src.slice(src.indexOf(`export function ${name}`)).split("\n}\n")[0];
+    for (const t of TYPES) {
+      const want = filterForNotification(t);
+      const block = body("filterForNotification");
+      const at = block.indexOf(`"${t}"`);
+      const ret = at < 0 ? "system" : block.slice(at).match(/return "(\w+)"/)[1];
+      assert.equal(ret, want, t);
+    }
+  });
+
+  it("every backend type lands in exactly one tab, and All shows everything", () => {
+    const items = TYPES.map((type, i) => notification({ notification_id: `n${i}`, type }));
+    const tabs = ["meetings", "ai", "system"].map((f) => filterNotifications(items, f));
+    assert.equal(tabs.reduce((a, t) => a + t.length, 0), items.length);
+    assert.equal(filterNotifications(items, "all").length, items.length);
+    assert.deepEqual(tabs[1].map((n) => n.type), ["AI_OUTPUT_READY", "AI_ACTION_REQUIRED"]);
+    // A type a newer backend adds is still reachable from a tab.
+    assert.equal(filterForNotification("SOMETHING_NEW"), "system");
+  });
+
+  it("the backend's type list is the one these tabs cover", () => {
+    const schema = readFileSync(join(ROOT, "..", "cloud", "shared", "notification_schema.py"), "utf8");
+    const backend = [...schema.matchAll(/^TYPE_\w+ = "(\w+)"/gm)].map((m) => m[1]);
+    assert.deepEqual([...backend].sort(), [...TYPES].sort());
+  });
+});
+
+describe("list design", () => {
+  const screen = readFileSync(join(ROOT, "src", "app", "notifications.tsx"), "utf8");
+  const center = readFileSync(join(ROOT, "lib", "notification-center.tsx"), "utf8");
+
+  it("rows, not cards: no card radius, icon tile or per-row background", () => {
+    assert.doesNotMatch(screen, /R\.card|iconWrap|iconForNotification|SkeletonCard/);
+    assert.doesNotMatch(screen, /LinearGradient|BlurView|shadow/i);
+  });
+
+  it("no Summary / Highlights / Transcript chips on the list", () => {
+    assert.doesNotMatch(screen, /"(Summary|Highlights|Transcript)"/);
+  });
+
+  it("AI output is purple, processing done is green, action required is amber", () => {
+    const tone = (t) => center.slice(center.indexOf("export function toneForNotification"))
+      .split("\n}\n")[0].split(`"${t}"`)[1].match(/return "(\w+)"/)[1];
+    assert.equal(tone("AI_OUTPUT_READY"), "accent");
+    assert.equal(tone("MEETING_PROCESSING_COMPLETED"), "success");
+    assert.equal(tone("AI_ACTION_REQUIRED"), "warn");
+  });
+
+  it("the four tabs, and the tabs only narrow what is loaded", () => {
+    for (const label of ["All", "Meetings", "AI Output", "System"]) {
+      assert.match(center, new RegExp(`label: "${label}"`));
+    }
+    assert.match(screen, /filterNotifications\(notifications, filter\)/);
+    assert.match(screen, /markAllRead/);
+    assert.match(screen, /router\.push\(to as never\)/);
   });
 });
 

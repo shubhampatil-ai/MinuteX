@@ -26,6 +26,7 @@ import {
 } from "react-native";
 import Animated, { FadeInDown, LinearTransition } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { refreshSalesforceMomPdf } from "./salesforce-pdfs";
 import {
   ApiError, deleteMom, generateMom, getMom, isNotReady, isRetryable, saveMom,
   type AiDocument, type Mom, type MomSection, type MomSectionKind,
@@ -305,6 +306,8 @@ export function MomEditorScreen({
     try {
       const res = await saveMom(recordingKey, doc);
       setMom(res.mom);
+      // Salesforce gets the MoM as a PDF only: send the new one.
+      void refreshSalesforceMomPdf(recordingKey, res.mom);
       setDirty(false);
       if (res.document) onDocumentChange?.(res.document);
       flash("Saved");
@@ -335,6 +338,7 @@ export function MomEditorScreen({
         setMom(res.mom);
         setDirty(false);
         if (res.document) onDocumentChange?.(res.document);
+        void refreshSalesforceMomPdf(recordingKey, res.mom);
         flash("Regenerated");
       } catch (e) {
         report(e, run);
@@ -375,6 +379,7 @@ export function MomEditorScreen({
              setMom(built.mom);
              setDirty(false);
              if (built.document) onDocumentChange?.(built.document);
+             void refreshSalesforceMomPdf(recordingKey, built.mom);
              flash("Reset");
            } catch (e) {
              report(e, () => {});

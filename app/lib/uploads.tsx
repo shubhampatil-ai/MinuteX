@@ -274,12 +274,12 @@ function phaseFor(s: RecSession): UploadPhase {
 }
 
 function jobForSession(s: RecSession, input?: StartUploadInput): UploadJob {
-  const source: Exclude<RecordingSource, "DEVICE"> = input?.source ?? "MOBILE";
+  const source: Exclude<RecordingSource, "DEVICE"> = input?.source ?? s.source ?? "MOBILE";
   return {
     id: s.id,
     sessionId: s.id,
     source,
-    title: input?.title || (source === "MOBILE" ? "Phone recording" : "Uploaded audio"),
+    title: input?.title || s.title || (source === "MOBILE" ? "Phone recording" : "Uploaded audio"),
     phase: phaseFor(s),
     status: s.upload,
     key: s.key,
@@ -304,6 +304,11 @@ export async function startUpload(input: StartUploadInput): Promise<string> {
 
   if (!session) {
     session = await adoptFile(input);
+  } else if (!session.source) {
+    // A phone recording's session was created by the recorder, which knows
+    // nothing of uploads. Stamp it now so a relaunch recovers it as itself.
+    session = { ...session, source: input.source, title: input.title || undefined };
+    saveSession(session);
   }
 
   const job = jobForSession(session, input);
@@ -365,6 +370,8 @@ async function adoptFile(input: StartUploadInput): Promise<RecSession> {
     format: input.format,
     duration: input.duration ?? 0,
     size,
+    source: input.source,
+    title: input.title || undefined,
   };
   saveSession(adopted);
   return adopted;
@@ -430,9 +437,17 @@ async function driveSession(sessionId: string): Promise<string> {
     if (!s.key || !s.uploadUrl || urlExpired(s)) {
       patchJob(jobId, { phase: "requesting", status: "UPLOADING", error: undefined });
       const ticket = await requestUpload({
-        source: input?.source ?? "MOBILE",
+        source: input?.source ?? s.source ?? "MOBILE",
         format: s.format,
-        title: input?.title,
+        title: input?.title || s.title || undefined,
+        // Makes even the FIRST presign idempotent. The key below only
+        // reaches the sidecar after the backend has already written the row,
+        // so an app killed in between (or a sidecar lost to a crash) used to
+        // re-presign with no key and mint a second row: one recording, two
+        // briefs stuck at "Uploading". With these the backend derives the key
+        // from the session, so a repeat lands on the same row.
+        client_ref: s.id,
+        recorded_at: Math.floor(s.createdAt / 1000),
         duration: s.duration || undefined,
         size: size || undefined,
         // The key from an earlier attempt, when this is a re-presign after
@@ -703,10 +718,13 @@ export async function recoverUploads(): Promise<{
   // included — they are now COMPLETED sessions with real audio.
   const queue = [...interrupted, ...pendingUpload];
   for (const s of queue) {
+    // Source and title come from the session itself — an imported file must
+    // be recovered as UPLOAD, not relabelled as a phone recording.
     const input: StartUploadInput = {
-      source: "MOBILE",
+      source: s.source ?? "MOBILE",
       fileUri: s.fileUri!,
       format: s.format,
+      title: s.title,
       duration: s.duration || undefined,
       sessionId: s.id,
     };

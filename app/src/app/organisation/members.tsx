@@ -20,8 +20,8 @@ import { Alert, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
 import { S, FONT, R, useTheme, ColorScale } from "../../../lib/theme";
 import {
-  Button, Card, Chip, EmptyState, ErrorBlock, ListRow, Loading, SectionRule,
-  TextField, scrollFormProps,
+  Button, Card, Chip, EmptyState, ErrorBlock, KeyboardAware, ListRow, Loading,
+  SectionRule, TextField, scrollFormProps,
 } from "../../../lib/ui";
 import { copyText } from "../../../lib/clipboard";
 import {
@@ -184,7 +184,7 @@ export default function MembersScreen() {
   }
 
   return (
-    <View style={st.screen}>
+    <KeyboardAware style={st.screen}>
       <Stack.Screen options={{ title: "Members" }} />
       <ScrollView contentContainerStyle={st.body} {...scrollFormProps}>
         {loading ? <Loading label="Loading members" /> : null}
@@ -279,6 +279,6 @@ export default function MembersScreen() {
           </Card>
         ) : null}
       </ScrollView>
-    </View>
+    </KeyboardAware>
   );
 }

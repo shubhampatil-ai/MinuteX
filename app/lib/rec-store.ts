@@ -153,6 +153,17 @@ export type RecSession = {
    * which is why every read treats undefined as "aac".
    */
   engine?: "aac" | "wav";
+  /**
+   * Where the audio came from, and the title the user typed (if any).
+   *
+   * Persisted because launch recovery has no caller to ask: without these a
+   * recovered IMPORTED file was re-presigned as source MOBILE with no title —
+   * a "Phone" row for an uploaded file. Absent on sessions written before
+   * this existed, which every read treats as MOBILE (the only source that
+   * used to create sessions).
+   */
+  source?: "MOBILE" | "UPLOAD";
+  title?: string;
   /** Best-known duration in seconds (see reconcileDuration). */
   duration: number;
   /** Bytes on disk at last check — for the low-storage + sanity checks. */
@@ -702,7 +713,11 @@ export function sweepOrphanAudio(): RecSession[] {
         try { entry.delete(); } catch { /* best effort */ }
         continue;
       }
-      const created = entry.lastModified ?? Date.now();
+      // The ORIGINAL creation time when the id still carries it, not the
+      // file's mtime: the upload pipeline sends createdAt as part of the
+      // idempotent presign, so a rescued session must reproduce it exactly or
+      // its retry mints a second row beside the one already created.
+      const created = sessionIdCreatedAt(id) ?? entry.lastModified ?? Date.now();
       const s: RecSession = {
         id,
         createdAt: created,
@@ -741,6 +756,19 @@ export function sweepOrphanAudio(): RecSession[] {
 // ---------------------------------------------------------------------------
 
 let counter = 0;
+
+/**
+ * The epoch-ms creation time encoded in a newSessionId() id, or null for an id
+ * of any other shape. Bounded to a sane range so an arbitrary filename stem
+ * that happens to parse as base-36 is not mistaken for a timestamp.
+ */
+export function sessionIdCreatedAt(id: string): number | null {
+  const m = /^([0-9a-z]{6,10})-[0-9a-z]{2}-[0-9a-z]{1,8}$/.exec(id);
+  if (!m) return null;
+  const ms = parseInt(m[1], 36);
+  const MIN = Date.UTC(2024, 0, 1);
+  return Number.isFinite(ms) && ms >= MIN && ms <= Date.now() + 86_400_000 ? ms : null;
+}
 
 /** Collision-resistant, sortable, filename-safe. */
 export function newSessionId(): string {

@@ -26,6 +26,13 @@ export const BREAKER_MAX_OPEN_MS = 5 * 60_000;
 export const CALL_COUNTER_WINDOW_MS = 10_000;
 export const CALL_COUNTER_WARN_AT = 50;
 
+/** Refuse this call before the network because the phone is offline? Only
+ *  writes, and only when the phone is KNOWN to be offline: reads go ahead
+ *  (the cache answers them), and an unknown state never blocks anything. */
+export function refusedOffline(method: string, knownOffline: boolean): boolean {
+  return knownOffline && (method || "GET").toUpperCase() !== "GET";
+}
+
 /** The answers that mean "the server is overloaded", not "your request is
  *  wrong": throttled (429), and the gateway's 502/503/504. */
 export function isOverloadStatus(status: number): boolean {
@@ -120,6 +127,29 @@ export class CircuitBreaker {
     const s = this.routes.get(key);
     return !!s && s.openUntil > now;
   }
+}
+
+/**
+ * Run `fn` over `items` with at most `limit` calls in flight, results in input
+ * order. A screen that needs N per-item requests must not fire them all at
+ * once: the Calendar's 12 parallel highlight calls alone outnumbered the
+ * account's 10 Lambda slots. A rejected call rejects the whole batch, like
+ * Promise.all — callers that want best-effort catch inside `fn`.
+ */
+export async function mapLimit<T, R>(
+  items: readonly T[], limit: number, fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  const n = Math.max(1, Math.min(Math.floor(limit) || 1, items.length));
+  await Promise.all(Array.from({ length: n }, worker));
+  return out;
 }
 
 /**

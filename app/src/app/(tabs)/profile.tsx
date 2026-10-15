@@ -26,9 +26,9 @@ import { unregisterThisDevice } from "../../../lib/push";
 import { useDevice } from "../../../lib/device-context";
 import { useWorkspace, workspaceLabel, roleLabel } from "../../../lib/workspace-context";
 import {
-  getMe, updateMe, changePassword, clearToken, getRecordings,
-  RecordingSummary, UserProfile, ApiError,
+  changePassword, clearToken, UserProfile, ApiError,
 } from "../../../lib/api";
+import { fetchMe, saveMe, useRecordings } from "../../../lib/shared-data";
 
 function buildStyles(C: ColorScale) {
   return StyleSheet.create({
@@ -99,12 +99,15 @@ export default function ProfileScreen() {
   // "Since you started" — derived from the recordings list, the only source
   // of usage data the API exposes. Failing to load them must not block the
   // profile itself, so the strip just hides if this call fails.
-  const [items, setItems] = useState<RecordingSummary[]>([]);
+  // The Desk's own list (lib/shared-data.ts), so opening Profile costs no
+  // second /recordings request while the Desk's copy is fresh.
+  const recordings = useRecordings("").query.data;
+  const items = useMemo(() => recordings ?? [], [recordings]);
 
   const load = useCallback(async () => {
     setError("");
     try {
-      const u = await getMe();
+      const u = await fetchMe();
       setMe(u);
       setName(u.name);
     } catch (e) {
@@ -113,9 +116,6 @@ export default function ProfileScreen() {
     } finally {
       setLoading(false);
     }
-    try {
-      setItems(await getRecordings());
-    } catch { /* the figures are optional — leave them hidden */ }
   }, [router]);
 
   const stats = useMemo(() => {
@@ -143,7 +143,7 @@ export default function ProfileScreen() {
   const saveName = async () => {
     setSaving(true);
     try {
-      const u = await updateMe({ name: name.trim() });
+      const u = await saveMe({ name: name.trim() });
       setMe(u); setEditing(false);
       showToast("Profile updated");
     } catch (e) {
@@ -154,7 +154,7 @@ export default function ProfileScreen() {
   const savePhoto = async (avatarKey: string) => {
     // Errors are re-thrown, not swallowed: the sheet is still open and shows
     // the message, which is better than closing on a save that did not happen.
-    const u = await updateMe({ avatar_url: avatarKey });
+    const u = await saveMe({ avatar_url: avatarKey });
     setMe(u);
     showToast(avatarKey ? "Photo updated" : "Photo removed");
   };
@@ -275,7 +275,15 @@ export default function ProfileScreen() {
         <SettingGroup title="Account">
           <SettingRow title="Email" value={me?.email ?? "—"} />
           {!editing ? <SettingRow title="Edit your name" onPress={() => setEditing(true)} /> : null}
-          {!pwOpen ? <SettingRow title="Change password" onPress={() => setPwOpen(true)} /> : null}
+          {/* A Google-only account has no current password to type, so the
+              change form could never succeed — say how to add one instead.
+              `has_password` is absent on an older backend: treat as true. */}
+          {me?.has_password === false ? (
+            <SettingRow
+              title="Password"
+              description="You sign in with Google. To add a password, sign out and use Forgot password."
+            />
+          ) : !pwOpen ? <SettingRow title="Change password" onPress={() => setPwOpen(true)} /> : null}
         </SettingGroup>
         {pwOpen ? (
           <View style={st.form}>

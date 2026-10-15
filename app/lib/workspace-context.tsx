@@ -39,6 +39,16 @@ import {
   rememberWorkspaceFor,
   setActiveWorkspace as persistActiveWorkspace,
 } from "./api";
+import { userIdFromToken } from "./offline-cache-rules";
+
+/** Whose account this is. The token's `sub` IS the user id (the backend
+ *  authenticates with it), so no /me round trip is needed; /me only when the
+ *  token is unreadable. Start-up used to spend a GET /me here. */
+async function resolveUserId(): Promise<string> {
+  const fromToken = userIdFromToken(await getToken());
+  if (fromToken) return fromToken;
+  return (await getMe()).user_id || "";
+}
 
 type Ctx = {
   /** Every workspace the user may act in, personal first. */
@@ -110,7 +120,7 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
       // behaviour.
       if (!userIdRef.current) {
         try {
-          userIdRef.current = (await getMe()).user_id || "";
+          userIdRef.current = await resolveUserId();
         } catch {
           /* fall through: the live pointer below still scopes this session */
         }
@@ -198,7 +208,7 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
     let uid = userIdRef.current;
     if (!uid) {
       try {
-        uid = (await getMe()).user_id || "";
+        uid = await resolveUserId();
         userIdRef.current = uid;
       } catch {
         // Genuinely offline: the live pointer is already persisted above, so

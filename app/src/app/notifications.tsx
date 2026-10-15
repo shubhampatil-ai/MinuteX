@@ -2,7 +2,8 @@
 //
 // One screen: a grouped, paginated list of what MinuteX has told this user,
 // with the unread ones marked and every actionable row opening the thing it
-// is about.
+// is about. Flat list rows (not cards): a thin coloured bar and dot for the
+// kind of notification, title and message, then the time and a chevron.
 //
 // THE READ RULE (requirement section 17). Opening the CENTRE does not mark
 // anything read — that would empty the badge without the user having seen a
@@ -13,8 +14,9 @@
 // STATE COMES FROM THE CONTEXT, not from this screen. The badge in the header
 // and this list are the same data; if this screen fetched its own, marking a
 // row read here would leave the bell showing the old number until it happened
-// to refetch. See lib/notification-center.tsx.
-import { useCallback } from "react";
+// to refetch. See lib/notification-center.tsx. The filter tabs narrow the
+// loaded rows on the device; they never fetch.
+import { useCallback, useState } from "react";
 import {
   ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View,
 } from "react-native";
@@ -23,11 +25,11 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { AppNotification } from "../../lib/api";
 import { Icon } from "../../lib/icons";
 import {
-  destinationFor, groupNotifications, iconForNotification, isActionable,
-  relativeTime, toneForNotification, useNotifications,
+  NOTIFICATION_FILTERS, NotificationFilter, clockTime, destinationFor, filterNotifications,
+  groupNotifications, isActionable, toneForNotification, useNotifications,
 } from "../../lib/notification-center";
-import { ColorScale, FONT, R, S, useTheme } from "../../lib/theme";
-import { Button, EmptyState, ErrorText, SkeletonCard } from "../../lib/ui";
+import { ColorScale, FONT, GUTTER, S, useTheme } from "../../lib/theme";
+import { Button, EmptyState, ErrorText } from "../../lib/ui";
 
 export default function NotificationsScreen() {
   const { C } = useTheme();
@@ -37,6 +39,7 @@ export default function NotificationsScreen() {
     notifications, unreadCount, loading, loadingMore, error, hasMore,
     refresh, loadMore, markRead, markAllRead,
   } = useNotifications();
+  const [filter, setFilter] = useState<NotificationFilter>("all");
 
   // Refetched on every focus rather than only on mount: coming back from a
   // task or a meeting is exactly when a new notification may have landed, and
@@ -56,13 +59,26 @@ export default function NotificationsScreen() {
   );
 
   const st = buildStyles(C);
-  const groups = groupNotifications(notifications);
+  const visible = filterNotifications(notifications, filter);
+  const groups = groupNotifications(visible);
+  const filterLabel = NOTIFICATION_FILTERS.find((f) => f.key === filter)?.label ?? "";
 
   return (
     <View style={{ flex: 1, backgroundColor: C.bg }}>
       <Stack.Screen
         options={{
           title: "Notifications",
+          headerTitle: () => (
+            <View style={st.titleRow}>
+              <Text style={st.screenTitle} numberOfLines={1}>Notifications</Text>
+              {unreadCount > 0 ? (
+                <View style={st.countBadge}
+                  accessibilityLabel={`${unreadCount} unread`}>
+                  <Text style={st.countText}>{unreadCount > 99 ? "99+" : unreadCount}</Text>
+                </View>
+              ) : null}
+            </View>
+          ),
           // Offered ONLY when there is something to mark — a permanently
           // visible control that does nothing teaches people to ignore it.
           headerRight: () =>
@@ -80,10 +96,27 @@ export default function NotificationsScreen() {
         }}
       />
 
+      {/* Filter tabs: fixed above the list, text + underline only. Scrolls
+          sideways rather than squeezing on the narrowest phones. */}
+      <View style={st.tabsBar}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}
+          contentContainerStyle={st.tabs}>
+          {NOTIFICATION_FILTERS.map((f) => {
+            const on = f.key === filter;
+            return (
+              <Pressable key={f.key} onPress={() => setFilter(f.key)}
+                style={[st.tab, on && st.tabOn]}
+                accessibilityRole="tab" accessibilityState={{ selected: on }}>
+                <Text style={[st.tabText, on && st.tabTextOn]}>{f.label}</Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      </View>
+
       <ScrollView
         contentContainerStyle={{
-          paddingHorizontal: 20,
-          paddingTop: S.lg,
+          paddingHorizontal: GUTTER,
           paddingBottom: insets.bottom + S.xxl,
         }}
         keyboardShouldPersistTaps="handled"
@@ -92,17 +125,15 @@ export default function NotificationsScreen() {
             already have sits above them, because stale-but-labelled beats
             blanking content the user was reading. */}
         {error ? (
-          <View style={{ marginBottom: S.md }}>
+          <View style={{ marginTop: S.lg }}>
             <ErrorText>{error}</ErrorText>
             <Button label="Try again" variant="ghost" onPress={refresh} />
           </View>
         ) : null}
 
         {loading && notifications.length === 0 ? (
-          <View style={{ gap: S.md }}>
-            <SkeletonCard />
-            <SkeletonCard />
-            <SkeletonCard />
+          <View style={{ marginTop: S.lg }}>
+            {[0, 1, 2].map((i) => <SkeletonRow key={i} st={st} />)}
           </View>
         ) : null}
 
@@ -114,27 +145,29 @@ export default function NotificationsScreen() {
           />
         ) : null}
 
+        {!loading && notifications.length > 0 && visible.length === 0 ? (
+          <Text style={st.filterEmpty}>No {filterLabel} notifications.</Text>
+        ) : null}
+
         {groups.map((group) => (
           <View key={group.title}>
             <Text style={st.groupTitle}>{group.title}</Text>
-            <View style={{ gap: S.sm }}>
-              {group.items.map((n) => (
-                <NotificationRow
-                  key={n.notification_id}
-                  n={n}
-                  C={C}
-                  st={st}
-                  onPress={() => open(n)}
-                />
-              ))}
-            </View>
+            {group.items.map((n) => (
+              <NotificationRow
+                key={n.notification_id}
+                n={n}
+                C={C}
+                st={st}
+                onPress={() => open(n)}
+              />
+            ))}
           </View>
         ))}
 
         {hasMore ? (
           <View style={{ marginTop: S.lg }}>
             {loadingMore ? (
-              <ActivityIndicator color={C.primary} />
+              <ActivityIndicator color={C.accent} />
             ) : (
               <Button label="Load more" variant="ghost" onPress={loadMore} />
             )}
@@ -160,51 +193,39 @@ function NotificationRow({
         : tone === "success" ? C.success
           : tone === "accent" ? C.accent
             : C.primary;
-  const soft =
-    tone === "danger" ? C.dangerSoft
-      : tone === "warn" ? C.warnSoft
-        : tone === "success" ? C.successSoft
-          : tone === "accent" ? C.accentSoft
-            : C.primarySoft;
 
   const actionable = isActionable(n);
-  const when = relativeTime(n.created_at);
+  const when = clockTime(n.created_at);
 
   const body = (
-    <View
-      style={[
-        st.row,
-        // Unread rows are tinted and keep a leading dot. Read rows drop BOTH
-        // rather than only dimming the text: on a list of twenty, a difference
-        // in text colour alone is not reliably visible.
-        !n.is_read && { backgroundColor: C.surface, borderColor: C.borderStrong },
-      ]}
-    >
-      <View style={[st.iconWrap, { backgroundColor: soft }]}>
-        <Icon name={iconForNotification(n.type) as any} tintColor={tint} size={18} />
+    <View style={st.row}>
+      {/* The bar and dot carry the kind of notification; unread is the dot.
+          A read row keeps a faint bar so the list's rhythm doesn't change. */}
+      <View style={[st.bar, { backgroundColor: n.is_read ? C.border : tint }]} />
+      <View style={st.dotSlot}>
+        {!n.is_read ? <View style={[st.dot, { backgroundColor: tint }]} /> : null}
       </View>
 
-      <View style={{ flex: 1, gap: 2 }}>
-        <View style={st.titleLine}>
-          {!n.is_read ? <View style={[st.unreadDot, { backgroundColor: tint }]} /> : null}
-          <Text
-            style={[st.title, n.is_read && { fontFamily: FONT.medium, color: C.textDim }]}
-            numberOfLines={1}
-          >
-            {n.title}
-          </Text>
-        </View>
+      <View style={st.content}>
+        <Text
+          style={[st.title, n.is_read && { fontFamily: FONT.medium, color: C.textDim }]}
+          numberOfLines={2}
+        >
+          {n.title}
+        </Text>
         {n.message ? (
-          <Text style={st.message} numberOfLines={2}>
+          <Text style={st.message} numberOfLines={3}>
             {n.message}
           </Text>
         ) : null}
-        {when ? <Text style={st.when}>{when}</Text> : null}
       </View>
 
-      {actionable ? (
-        <Icon name="chevron.right" tintColor={C.textFaint} size={16} />
-      ) : null}
+      <View style={st.trailing}>
+        {when ? <Text style={st.when}>{when}</Text> : null}
+        {actionable ? (
+          <Icon name="chevron.right" tintColor={C.textFaint} size={18} />
+        ) : null}
+      </View>
     </View>
   );
 
@@ -215,7 +236,7 @@ function NotificationRow({
   return (
     <Pressable
       onPress={onPress}
-      style={({ pressed }) => pressed && { opacity: 0.7 }}
+      style={({ pressed }) => pressed && { opacity: 0.6 }}
       accessibilityRole="button"
       accessibilityLabel={`${n.title}. ${n.message}${n.is_read ? "" : ". Unread"}`}
     >
@@ -224,33 +245,74 @@ function NotificationRow({
   );
 }
 
+function SkeletonRow({ st }: { st: ReturnType<typeof buildStyles> }) {
+  return (
+    <View style={st.row}>
+      <View style={[st.bar, st.skeleton]} />
+      <View style={st.dotSlot} />
+      <View style={st.content}>
+        <View style={[st.skeleton, { height: 14, width: "55%", borderRadius: 4 }]} />
+        <View style={[st.skeleton, { height: 12, width: "85%", borderRadius: 4, marginTop: 8 }]} />
+      </View>
+    </View>
+  );
+}
+
 function buildStyles(C: ColorScale) {
   return StyleSheet.create({
-    headerAction: {
-      fontFamily: FONT.semibold, fontSize: 14, color: C.primary,
+    titleRow: { flexDirection: "row", alignItems: "center", gap: S.sm, flexShrink: 1 },
+    screenTitle: { fontFamily: FONT.bold, fontSize: 20, color: C.text, flexShrink: 1 },
+    countBadge: {
+      minWidth: 24, height: 22, paddingHorizontal: 7, borderRadius: 11,
+      backgroundColor: C.accentSoft, alignItems: "center", justifyContent: "center",
     },
+    countText: { fontFamily: FONT.semibold, fontSize: 12.5, color: C.accent },
+    headerAction: {
+      fontFamily: FONT.semibold, fontSize: 14, color: C.accent,
+    },
+
+    tabsBar: {
+      borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.border,
+    },
+    tabs: { paddingHorizontal: GUTTER, gap: S.xl },
+    tab: {
+      paddingTop: S.md, paddingBottom: S.md - 2, paddingHorizontal: 2,
+      borderBottomWidth: 2, borderBottomColor: "transparent",
+      minHeight: 44, justifyContent: "center",
+    },
+    tabOn: { borderBottomColor: C.accent },
+    tabText: { fontFamily: FONT.medium, fontSize: 14.5, color: C.textFaint },
+    tabTextOn: { fontFamily: FONT.semibold, color: C.accent },
+
     groupTitle: {
-      fontFamily: FONT.bold, fontSize: 11, letterSpacing: 1.2,
+      fontFamily: FONT.semibold, fontSize: 12, letterSpacing: 0.8,
       textTransform: "uppercase",
       color: C.textFaint,
-      marginTop: S.lg, marginBottom: S.sm,
+      marginTop: S.xl, marginBottom: S.xs,
     },
+    filterEmpty: {
+      fontFamily: FONT.regular, fontSize: 13.5, color: C.textDim,
+      textAlign: "center", marginTop: S.xxl,
+    },
+
     row: {
-      flexDirection: "row", alignItems: "flex-start", gap: S.md,
-      backgroundColor: C.surface2,
-      borderRadius: R.card, borderWidth: 1, borderColor: C.border,
-      padding: S.md,
+      flexDirection: "row", alignItems: "flex-start",
+      paddingVertical: S.lg,
+      borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.border,
     },
-    iconWrap: {
-      width: 36, height: 36, borderRadius: R.md,
-      alignItems: "center", justifyContent: "center",
+    bar: { width: 3, height: 38, borderRadius: 2, marginTop: 1 },
+    dotSlot: { width: 26, alignItems: "center", paddingTop: 7 },
+    dot: { width: 8, height: 8, borderRadius: 4 },
+    content: { flex: 1, minWidth: 0 },
+    title: { fontFamily: FONT.semibold, fontSize: 15.5, lineHeight: 21, color: C.text },
+    message: {
+      fontFamily: FONT.regular, fontSize: 13.5, lineHeight: 19, color: C.textDim, marginTop: 3,
     },
-    titleLine: { flexDirection: "row", alignItems: "center", gap: 6 },
-    unreadDot: { width: 7, height: 7, borderRadius: 4 },
-    title: {
-      flex: 1, fontFamily: FONT.semibold, fontSize: 15, color: C.text,
+    trailing: {
+      flexDirection: "row", alignItems: "center", gap: 6,
+      marginLeft: S.md, paddingTop: 1,
     },
-    message: { fontFamily: FONT.regular, fontSize: 13, color: C.textDim },
-    when: { fontFamily: FONT.medium, fontSize: 11, color: C.textFaint, marginTop: 2 },
+    when: { fontFamily: FONT.regular, fontSize: 12, color: C.textFaint },
+    skeleton: { backgroundColor: C.border },
   });
 }

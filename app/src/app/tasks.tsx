@@ -51,10 +51,11 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { S, useTheme, ColorScale } from "../../lib/theme";
 import { Button, EmptyState, ErrorText } from "../../lib/ui";
 import {
-  ApiError, ApiTask, RecordingSummary, TaskFilters, TaskIntelRow,
-  getAllTasks, getMe, getRecordings, getTaskIntelligence,
+  ApiError, ApiTask, TaskFilters, TaskIntelRow,
+  getAllTasks, getTaskIntelligence,
   isRetryable, patchTaskById,
 } from "../../lib/api";
+import { fetchMe, fetchUnfilteredTasks, useRecordings } from "../../lib/shared-data";
 import {
   ActionCenterSkeleton, AttentionFilters, HealthKey,
   MeetingTaskInsight,
@@ -216,7 +217,10 @@ export default function TasksScreen() {
 
   // Context for the derived sections.
   const [insightTasks, setInsightTasks] = useState<ApiTask[]>([]);
-  const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
+  // The Desk's own list (lib/shared-data.ts): no second /recordings request
+  // while that copy is fresh.
+  const recordingsData = useRecordings("").query.data;
+  const recordings = useMemo(() => recordingsData ?? [], [recordingsData]);
   const [me, setMe] = useState<{ name: string; avatar_url: string } | null>(null);
   const [myUserId, setMyUserId] = useState("");
   const [quickAdd, setQuickAdd] = useState(false);
@@ -267,7 +271,12 @@ export default function TasksScreen() {
       else setLoading(true);
       setError("");
       try {
-        const res = await getAllTasks({ ...filters, limit: PAGE_SIZE });
+        // No server filter: the SAME read the summary cards make below, so
+        // the two share one request (fetchUnfilteredTasks) instead of asking
+        // for 50 and then 100 of the same rows.
+        const res = Object.keys(filters).length === 0
+          ? await fetchUnfilteredTasks(INSIGHT_PAGE)
+          : await getAllTasks({ ...filters, limit: PAGE_SIZE });
         setTasks(res.tasks);
         setCursor(res.next_cursor);
       } catch (e) {
@@ -289,15 +298,12 @@ export default function TasksScreen() {
   // never take the task list down with it.
   const loadInsights = useCallback(async () => {
     try {
-      const res = await getAllTasks({ limit: INSIGHT_PAGE });
+      const res = await fetchUnfilteredTasks(INSIGHT_PAGE);
       setInsightTasks(res.tasks);
     } catch {
       setInsightTasks([]);
     }
-    getRecordings()
-      .then(setRecordings)
-      .catch(() => setRecordings([]));
-    getMe()
+    fetchMe()
       .then((u) => {
         setMe({ name: u.name, avatar_url: u.avatar_url });
         // Kept so "Assigned to others" can be expressed as "has a real

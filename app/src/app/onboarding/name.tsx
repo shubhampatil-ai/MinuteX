@@ -25,7 +25,8 @@ import {
 } from "../../../lib/ui";
 import { PhotoPicker } from "../../../lib/photo-picker";
 import { canPickImage } from "../../../lib/avatars";
-import { getMe, updateMe, UserProfile } from "../../../lib/api";
+import { UserProfile } from "../../../lib/api";
+import { fetchMe, saveMe } from "../../../lib/shared-data";
 import { notifyProfileNameSaved } from "../../../lib/profile-gate";
 
 // Matches the server's own clamp in patch_me ([:100]), so the field cannot
@@ -77,7 +78,7 @@ export default function OnboardingNameScreen() {
     let cancelled = false;
     (async () => {
       try {
-        const u = await getMe();
+        const u = await fetchMe();
         if (cancelled) return;
         setMe(u);
         setName((u.name || u.suggested_name || "").trim());
@@ -92,7 +93,7 @@ export default function OnboardingNameScreen() {
   const savePhoto = useCallback(async (avatarKey: string) => {
     setPhotoOpen(false);
     try {
-      const u = await updateMe({ avatar_url: avatarKey });
+      const u = await saveMe({ avatar_url: avatarKey });
       setMe(u);
     } catch (e: any) {
       setError(e?.message || "Could not save the photo.");
@@ -108,7 +109,7 @@ export default function OnboardingNameScreen() {
     setError("");
     setSaving(true);
     try {
-      await updateMe({ name: clean });
+      await saveMe({ name: clean });
       // Tell the gate BEFORE navigating. The gate asks /me once per sign-in,
       // so without this it still believes this user is nameless and redirects
       // straight back here — which is why saving used to appear to do nothing

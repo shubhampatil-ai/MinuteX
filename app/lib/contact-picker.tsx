@@ -24,6 +24,14 @@
 // caller — speaker tagging, attendance, task assignment — works unchanged.
 // Tagging a Salesforce Contact this way is what relates the meeting to it.
 // People already shown as a linked contact are not listed twice.
+//
+// REQUIRE EMAIL (opt-in). A caller that will EMAIL the person it gets back —
+// the Gmail share sheet — passes `requireEmail`, and then every route out of
+// this sheet ends at a contact with an address: no-email rows are shown but
+// disabled, the create form refuses a blank email, a phone contact without
+// one is routed to the create form to add it, and an existing match that has
+// no address gets the typed one filled in (only ever into an EMPTY field).
+// Every other caller leaves it off, so email stays optional for them.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "expo-router";
 import {
@@ -37,11 +45,15 @@ import {
 } from "./ui";
 import {
   ApiContact, ApiError, SitePerson, ambiguousCandidates, contactForSitePerson, createContact,
-  getContacts, getMe, isAmbiguousContact, searchSitePeoplePage,
+  getContacts, getMe, getRelatedPeople, isAmbiguousContact, searchLivePeople, searchSitePeoplePage,
+  updateContact,
 } from "./api";
 import { useWorkspace } from "./workspace-context";
 import { SITE_SALESFORCE_ENABLED, useSiteSalesforceVersion } from "./site-salesforce-ui";
-import { salesforceBadge } from "./site-salesforce-flow";
+import { WEBHOOK_V2_ENABLED } from "./webhook-ui";
+import {
+  mergePeople, salesforceBadge, salesforceTypeTag, shouldSearchLive,
+} from "./site-salesforce-flow";
 import { invalidateSiteSalesforce } from "./site-salesforce-events";
 import {
   ContactPickResult, requestContactsPermissionDetailed, searchPhoneContacts,
@@ -51,6 +63,12 @@ import { uploadPhoneContactPhoto } from "./avatars";
 
 const SEARCH_DEBOUNCE_MS = 300;
 const PAGE_SIZE = 50;
+
+// Shape check only — the backend validates properly (contact_create answers
+// 400 "email is not a valid address"). This just catches the obvious typo
+// before a round trip.
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const hasEmail = (email?: string) => !!(email || "").trim();
 
 type Section =
   | { kind: "heading"; label: string; hint?: string }
@@ -98,12 +116,23 @@ export type ContactPickerProps = {
    * Salesforce People Store simply shows no Salesforce tier.
    */
   salesforceWorkspaceId?: string;
+  /**
+   * Only hand back contacts that HAVE an email address — for callers that
+   * will mail the person (see the file header). Off by default.
+   */
+  requireEmail?: boolean;
+  /**
+   * The meeting being tagged. When it's linked to a Salesforce record, the
+   * people on that record (an Account's contacts, the Lead itself...) are
+   * suggested before anyone types.
+   */
+  meetingKey?: string;
 };
 
 export function ContactPicker({
   visible, onClose, onPick, meetingContacts = [],
   title = "Select Contact", onClear,
-  allowSelf = false, salesforceWorkspaceId,
+  allowSelf = false, salesforceWorkspaceId, requireEmail = false, meetingKey,
 }: ContactPickerProps) {
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C, T), [C, T]);
@@ -121,6 +150,10 @@ export function ContactPicker({
   const { activeId } = useWorkspace();
   const sfWorkspace = salesforceWorkspaceId || activeId;
   const [sfPeople, setSfPeople] = useState<SitePerson[]>([]);
+  // Keys of people that came from LIVE search (not yet saved in MinuteX).
+  const [livePeopleKeys, setLivePeopleKeys] = useState<Set<string>>(new Set());
+  // People on the meeting's linked Salesforce record(s), fetched once per open.
+  const [relatedPeople, setRelatedPeople] = useState<SitePerson[]>([]);
   const [resolving, setResolving] = useState("");
   const peopleVersion = useSiteSalesforceVersion("people", "connection");
 
@@ -221,16 +254,41 @@ export function ContactPicker({
     if (visible) load(debounced);
   }, [visible, debounced, load]);
 
-  // Salesforce tier: the local People Store only (no Salesforce call). A
-  // failure or a workspace without Salesforce just means no tier.
+  // Salesforce tier. Browsing (no search term): the people MinuteX already
+  // knows (synced, or tagged before), from the local People Store. Searching:
+  // a LIVE search of the customer's org as well, so anyone in their
+  // Salesforce can be found however many contacts they have. A receiver
+  // without live search yet, or any failure, leaves just the stored matches.
+  // A workspace without Salesforce simply has no tier.
   useEffect(() => {
-    if (!visible || !SITE_SALESFORCE_ENABLED || !sfWorkspace) { setSfPeople([]); return; }
+    if (!visible || !(SITE_SALESFORCE_ENABLED || WEBHOOK_V2_ENABLED) || !sfWorkspace) {
+      setSfPeople([]); setLivePeopleKeys(new Set()); return;
+    }
     let alive = true;
-    searchSitePeoplePage(sfWorkspace, { q: debounced, limit: debounced ? 20 : 15 })
-      .then((r) => { if (alive) setSfPeople(r.people); })
-      .catch(() => { if (alive) setSfPeople([]); });
+    const stored = searchSitePeoplePage(sfWorkspace, { q: debounced, limit: debounced ? 20 : 15 })
+      .then((r) => r.people).catch(() => [] as SitePerson[]);
+    const live = WEBHOOK_V2_ENABLED && shouldSearchLive(debounced)
+      ? searchLivePeople(sfWorkspace, debounced, { limit: 20 }).catch(() => [] as SitePerson[])
+      : Promise.resolve([] as SitePerson[]);
+    void Promise.all([live, stored]).then(([l, s]) => {
+      if (!alive) return;
+      const storedKeys = new Set(s.map((p) => p.person_key));
+      setLivePeopleKeys(new Set(l.filter((p) => !storedKeys.has(p.person_key)).map((p) => p.person_key)));
+      setSfPeople(mergePeople(l, s));
+    });
     return () => { alive = false; };
   }, [visible, debounced, sfWorkspace, peopleVersion]);
+
+  // Suggestions from the meeting's linked record. Any failure (not linked, an
+  // older receiver, Salesforce down) just means no suggestions.
+  useEffect(() => {
+    if (!visible || !WEBHOOK_V2_ENABLED || !meetingKey) { setRelatedPeople([]); return; }
+    let alive = true;
+    getRelatedPeople(meetingKey)
+      .then((p) => { if (alive) setRelatedPeople(p); })
+      .catch(() => { if (alive) setRelatedPeople([]); });
+    return () => { alive = false; };
+  }, [visible, meetingKey]);
 
   /** A Salesforce person -> their MinuteX contact -> the ordinary onPick. */
   const pickSalesforcePerson = useCallback(async (p: SitePerson) => {
@@ -238,7 +296,12 @@ export function ContactPicker({
     setResolving(p.person_key);
     setCreateError("");
     try {
-      const contact = await contactForSitePerson(sfWorkspace, p.person_key);
+      // Live and related people may not be saved in MinuteX yet: send the
+      // person so the pick can save them.
+      const fromSalesforceNow = livePeopleKeys.has(p.person_key)
+        || relatedPeople.some((r) => r.person_key === p.person_key);
+      const contact = await contactForSitePerson(
+        sfWorkspace, p.person_key, fromSalesforceNow ? p : undefined);
       onPick(contact);
       onClose();
       // A tagged Salesforce Contact is what relates a meeting to Salesforce.
@@ -248,7 +311,7 @@ export function ContactPicker({
     } finally {
       setResolving("");
     }
-  }, [sfWorkspace, resolving, onPick, onClose]);
+  }, [sfWorkspace, resolving, onPick, onClose, livePeopleKeys, relatedPeople]);
 
   // Reset the create form each time the sheet opens, so a half-typed contact
   // from a previous open never reappears attached to a different speaker.
@@ -340,11 +403,22 @@ export function ContactPicker({
 
     // Salesforce people not already on screen as their linked contact.
     const shownIds = new Set([...seen, ...rest.map((c) => c.id)]);
+    // Browsing: the people on the meeting's linked record come right after
+    // this meeting's own people. Searching: live search covers them.
+    const relatedKeys = new Set(relatedPeople.map((p) => p.person_key));
+    const relatedTier: Section[] = needle ? [] : relatedPeople
+      .map((p) => ({ kind: "person" as const, person: p }));
+    if (relatedTier.length) {
+      out.push({ kind: "heading", label: "On this meeting's Salesforce record",
+                 hint: "Suggested from what the meeting is linked to" }, ...relatedTier);
+    }
     const sfTier: Section[] = sfPeople
       .filter((p) => !p.linked_contact_id || !shownIds.has(p.linked_contact_id))
+      .filter((p) => needle || !relatedKeys.has(p.person_key))
       .map((p) => ({ kind: "person" as const, person: p }));
     const sfHeading: Section = {
-      kind: "heading", label: "From Salesforce", hint: "Synced Contacts & Users",
+      kind: "heading", label: "From Salesforce",
+      hint: needle ? "Contacts, Leads & Users in your Salesforce" : "People you've used before",
     };
     // Searching: Salesforce matches right after this meeting's people, so a
     // typed name finds its Salesforce Contact without scrolling. Browsing:
@@ -367,7 +441,25 @@ export function ContactPicker({
     }
     if (!needle && sfTier.length) out.push(sfHeading, ...sfTier);
     return out;
-  }, [all, meetingContacts, debounced, sfPeople]);
+  }, [all, meetingContacts, debounced, sfPeople, relatedPeople]);
+
+  /** In requireEmail mode, make sure the contact handed back HAS an address.
+   *
+   * createContact can resolve to an EXISTING person matched by phone, and the
+   * backend then returns that row as stored — the email the user just typed
+   * is dropped (contact_create only fills a gap for the avatar). For a caller
+   * about to email them, that would be a contact the send refuses. So the
+   * typed address fills the gap here, and ONLY a gap: an existing address is
+   * the person's real one and is never overwritten. A failed update (a member
+   * contact, an org row this user cannot edit) throws into the caller's catch,
+   * so the pick does not happen and the reason is shown. */
+  const ensureEmail = useCallback(
+    async (contact: ApiContact, typedEmail: string): Promise<ApiContact> => {
+      if (!requireEmail || hasEmail(contact.email) || !typedEmail) return contact;
+      return updateContact(contact.id, { email: typedEmail });
+    },
+    [requireEmail]
+  );
 
   const submitNew = useCallback(
     async (force: boolean) => {
@@ -376,15 +468,25 @@ export function ContactPicker({
         setCreateError("Enter a name.");
         return;
       }
+      const email = newEmail.trim();
+      if (requireEmail && !email) {
+        setCreateError("Enter an email address — it’s where the documents will be sent.");
+        return;
+      }
+      if (email && !EMAIL_SHAPE.test(email)) {
+        setCreateError("Enter a valid email address.");
+        return;
+      }
       setSaving(true);
       setCreateError("");
       try {
-        const { contact, existing } = await createContact({
+        const { contact: created, existing } = await createContact({
           name,
-          email: newEmail.trim() || undefined,
+          email: email || undefined,
           phone: newPhone.trim() || undefined,
           force: force || undefined,
         });
+        const contact = await ensureEmail(created, email);
         // `existing` means a strong identifier matched — the right outcome is
         // to use that person, and to say so rather than implying we made one.
         setCandidates([]);
@@ -409,7 +511,7 @@ export function ContactPicker({
         setSaving(false);
       }
     },
-    [newName, newEmail, newPhone, onPick, onClose]
+    [newName, newEmail, newPhone, onPick, onClose, requireEmail, ensureEmail]
   );
 
   /** Pick the signed-in user, creating their self-contact once if needed.
@@ -497,6 +599,19 @@ export function ContactPicker({
    * the user say "that's them" or "different person". */
   const importFromPhone = useCallback(
     async (pick: ContactPickResult) => {
+      // No address in the phone book, and the caller needs one: hand over to
+      // the create form, pre-filled, so the user only has to add the email.
+      // Nothing has left the device yet at this point.
+      if (requireEmail && !hasEmail(pick.email)) {
+        setNewName(pick.name);
+        setNewEmail("");
+        setNewPhone(pick.phone || "");
+        setCandidates([]);
+        setCreateError("Add an email address to send to this person.");
+        setPhoneMode(false);
+        setCreating(true);
+        return;
+      }
       setPhoneBusy(true);
       setCreateError("");
       try {
@@ -509,12 +624,13 @@ export function ContactPicker({
         // The device URI itself is never stored. It is local to this phone and
         // the OS can revoke it, so it would be a dangling path everywhere else.
         const avatarKey = await uploadPhoneContactPhoto(pick.photoUri);
-        const { contact } = await createContact({
+        const { contact: created } = await createContact({
           name: pick.name,
           email: pick.email || undefined,
           phone: pick.phone || undefined,
           avatar_url: avatarKey || undefined,
         });
+        const contact = await ensureEmail(created, (pick.email || "").trim());
         onPick(contact);
         onClose();
       } catch (e) {
@@ -540,7 +656,7 @@ export function ContactPicker({
         setPhoneBusy(false);
       }
     },
-    [onPick, onClose]
+    [onPick, onClose, requireEmail, ensureEmail]
   );
 
   const renderRow = (item: Section) => {
@@ -555,25 +671,29 @@ export function ContactPicker({
     if (item.kind === "person") {
       const p = item.person;
       const busy = resolving === p.person_key;
+      const noEmail = requireEmail && !hasEmail(p.email);
       return (
         <Pressable
-          style={st.row}
+          style={[st.row, noEmail && st.rowDisabled]}
           onPress={() => { void pickSalesforcePerson(p); }}
-          disabled={!!resolving}
+          disabled={!!resolving || noEmail}
           accessibilityRole="button"
-          accessibilityLabel={`Select ${p.name}, Salesforce ${p.type === "user" ? "User" : "Contact"}`}
+          accessibilityState={{ disabled: !!resolving || noEmail }}
+          accessibilityLabel={`Select ${p.name}, Salesforce ${p.type === "user" ? "User" : p.type === "lead" ? "Lead" : "Contact"}${noEmail ? ", no email address" : ""}`}
         >
           <Avatar name={p.name} size={36} fontSize={13} />
           <View style={{ flex: 1 }}>
             <View style={st.nameRow}>
               <Text style={st.name} numberOfLines={1}>{p.name}</Text>
               <View style={st.roleTag}>
-                <Text style={st.roleTagTxt}>{p.type === "user" ? "SF USER" : "SF CONTACT"}</Text>
+                <Text style={st.roleTagTxt}>{salesforceTypeTag(p.type)}</Text>
               </View>
             </View>
-            {!!(p.email || p.company) && (
+            {noEmail ? (
+              <Text style={st.sub} numberOfLines={1}>No email address</Text>
+            ) : !!(p.relation || p.email || p.company) && (
               <Text style={st.sub} numberOfLines={1}>
-                {[p.email, p.company].filter(Boolean).join(" · ")}
+                {[p.relation, p.email, p.relation ? "" : p.company].filter(Boolean).join(" · ")}
               </Text>
             )}
           </View>
@@ -582,16 +702,21 @@ export function ContactPicker({
       );
     }
     const c = item.contact;
-    const sub = c.email || c.phone || c.company || "";
+    // Shown, not hidden: the user should see the person exists and WHY they
+    // cannot be chosen here, rather than wonder where they went.
+    const noEmail = requireEmail && !hasEmail(c.email);
+    const sub = noEmail ? "No email address" : c.email || c.phone || c.company || "";
     return (
       <Pressable
-        style={st.row}
+        style={[st.row, noEmail && st.rowDisabled]}
         onPress={() => {
           onPick(c);
           onClose();
         }}
+        disabled={noEmail}
         accessibilityRole="button"
-        accessibilityLabel={`Select ${c.name}`}
+        accessibilityState={{ disabled: noEmail }}
+        accessibilityLabel={`Select ${c.name}${noEmail ? ", no email address" : ""}`}
       >
         <Avatar name={c.name} photoUri={c.avatar_view_url} size={36}
           fontSize={13} />
@@ -611,7 +736,7 @@ export function ContactPicker({
             {!c.workspace_role && !!salesforceBadge(c) && (
               <View style={st.roleTag}>
                 <Text style={st.roleTagTxt}>
-                  {c.people_type === "user" ? "SF USER" : "SF CONTACT"}
+                  {salesforceTypeTag(c.people_type)}
                 </Text>
               </View>
             )}
@@ -744,17 +869,21 @@ export function ContactPicker({
               </>
             ) : creating ? (
               <View style={st.form}>
+                {/* When the email is the field that matters and the name is
+                    already filled (a phone import, or a typed search), focus
+                    goes straight to the email. */}
                 <TextField
                   placeholder="Full name"
                   value={newName}
                   onChangeText={setNewName}
-                  autoFocus
+                  autoFocus={!(requireEmail && newName)}
                   autoCapitalize="words"
                 />
                 <TextField
-                  placeholder="Email (optional)"
+                  placeholder={requireEmail ? "Email" : "Email (optional)"}
                   value={newEmail}
                   onChangeText={setNewEmail}
+                  autoFocus={requireEmail && !!newName}
                   autoCapitalize="none"
                   keyboardType="email-address"
                 />
@@ -765,21 +894,27 @@ export function ContactPicker({
                   keyboardType="phone-pad"
                 />
                 <Text style={st.formHint}>
-                  An email lets MinuteX link this person to their account, so
-                  tasks assigned to them can reach them in the app.
+                  {requireEmail
+                    ? "An email is required — it’s the address the documents will be sent to."
+                    : "An email lets MinuteX link this person to their account, so "
+                      + "tasks assigned to them can reach them in the app."}
                 </Text>
                 {!!createError && <ErrorText>{createError}</ErrorText>}
 
                 {/* The ambiguity fork: pick an existing person, or say this is
                     genuinely someone else. Never decided for the user. */}
-                {candidates.map((c) => (
+                {candidates.map((c) => {
+                  const noEmail = requireEmail && !hasEmail(c.email);
+                  return (
                   <Pressable
                     key={c.id}
-                    style={st.candidate}
+                    style={[st.candidate, noEmail && st.rowDisabled]}
                     onPress={() => {
                       onPick(c);
                       onClose();
                     }}
+                    disabled={noEmail}
+                    accessibilityState={{ disabled: noEmail }}
                   >
                     <Avatar name={c.name} photoUri={c.avatar_view_url}
                       size={36} fontSize={13} />
@@ -787,15 +922,20 @@ export function ContactPicker({
                         already truncate — this one was the odd one out. */}
                     <View style={{ flex: 1, minWidth: 0 }}>
                       <Text style={st.name} numberOfLines={1}>{c.name}</Text>
-                      {!!(c.email || c.company) && (
+                      {noEmail ? (
+                        <Text style={st.sub} numberOfLines={1}>No email address</Text>
+                      ) : !!(c.email || c.company) && (
                         <Text style={st.sub} numberOfLines={1}>
                           {c.email || c.company}
                         </Text>
                       )}
                     </View>
-                    <Text style={[st.useTxt, { flexShrink: 0 }]}>Use this</Text>
+                    {!noEmail && (
+                      <Text style={[st.useTxt, { flexShrink: 0 }]}>Use this</Text>
+                    )}
                   </Pressable>
-                ))}
+                  );
+                })}
 
                 <Button
                   label={
@@ -951,6 +1091,7 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
       flexDirection: "row", alignItems: "center", gap: S.md,
       paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: C.border,
     },
+    rowDisabled: { opacity: 0.45 },
     // flexShrink so a long name yields to the role tag / badges beside it
     // rather than pushing them off the sheet (numberOfLines alone does not
     // constrain width in RN). Mirrors src/app/contacts.tsx, which renders

@@ -16,7 +16,7 @@ import * as DocumentPicker from "expo-document-picker";
 import { FONT, R, S, useTheme, ColorScale } from "../../../../../../lib/theme";
 import { Button, KeyboardAwareSheet, StatusPill } from "../../../../../../lib/ui";
 import { Icon } from "../../../../../../lib/icons";
-import { useMeeting } from "../../../../../../lib/meeting-context";
+import { useMeeting, useSyncTasksOnFocus } from "../../../../../../lib/meeting-context";
 import { DueDatePicker, isPlottableDue } from "../../../../../../lib/due-date-picker";
 import { initialsOf, nextId, type Task, type TaskStatus } from "../../../../../../lib/task-model";
 import { Pop, PressSpring } from "../../../../../../lib/motion";
@@ -112,6 +112,8 @@ export default function TaskDetailScreen() {
     rec, getTask, setTaskStatus, addSubtask, toggleSubtask,
     addAttachment, removeAttachment, updateTask,
   } = useMeeting();
+  // A reassignment made on the Task dashboard or /task/[id] must show here.
+  useSyncTasksOnFocus();
 
   const task = getTask(taskId);
 

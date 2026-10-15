@@ -5,37 +5,26 @@
 // rounded boxes inside a soft card, not underlined rules. Email/password
 // against the userApi backend; JWT stored via lib/api. Per-field validation,
 // show/hide password, signup confirm + strength meter, remember-me (prefills
-// the email — the session token itself is always secure-stored), and a
-// Google button that is honestly labeled Coming Soon (no backend yet).
+// the email — the session token itself is always secure-stored), a Forgot
+// password link to the emailed-code reset (forgot-password.tsx).
+// Continue with Google was removed from this screen (not working end to end);
+// lib/google-signin.ts and POST /auth/google remain for a later return.
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Animated, Easing, KeyboardAvoidingView, Modal, Pressable,
-  ScrollView, StyleSheet, Text, TextInput, TextInputProps, View,
+  Animated, Easing, KeyboardAvoidingView, Pressable,
+  ScrollView, StyleSheet, Text, View,
 } from "react-native";
 import { Icon } from "../../lib/icons";
 import { useRouter } from "expo-router";
 import { APP_NAME, COMPANY, TAGLINE, R, S, CAPS, FONT, ELEV, useTheme, ColorScale } from "../../lib/theme";
-import { Button, ErrorText, GoogleButton } from "../../lib/ui";
-import { login, signup, restoreWorkspaceFor, ApiError } from "../../lib/api";
-import { useWorkspace } from "../../lib/workspace-context";
+import { Button, ErrorText } from "../../lib/ui";
+import { login, signup, ApiError } from "../../lib/api";
+import { AuthField, EMAIL_RE, StrengthMeter, useFinishSignIn } from "../../lib/auth-ui";
 import { store } from "../../lib/storage";
 
 type Mode = "login" | "signup";
 
 const REMEMBER_KEY = "minutex.remember_email";
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-// ---- password strength: 0..4 (length, case mix, digit, symbol) ----
-function strengthOf(pw: string): number {
-  if (!pw) return 0;
-  let s = 0;
-  if (pw.length >= 8) s++;
-  if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) s++;
-  if (/\d/.test(pw)) s++;
-  if (/[^a-zA-Z0-9]/.test(pw)) s++;
-  return s;
-}
-const STRENGTH_LABEL = ["", "Weak", "Fair", "Good", "Strong"];
 
 function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
   return StyleSheet.create({
@@ -54,19 +43,6 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
       marginTop: 28, backgroundColor: C.surface, borderRadius: R.card, borderWidth: 1,
       borderColor: C.border, padding: S.lg, gap: S.md, shadowColor: C.shadow, ...ELEV.sm,
     },
-    fieldWrap: {
-      flexDirection: "row" as const, alignItems: "center" as const, gap: 10,
-      backgroundColor: C.surface2, borderRadius: R.md, borderWidth: 1, borderColor: C.border,
-      paddingVertical: 13, paddingHorizontal: 14,
-    },
-    fieldWrapError: { borderColor: C.danger },
-    fieldInput: { flex: 1, color: C.text, fontFamily: FONT.regular, fontSize: 15.5, paddingVertical: 0 },
-    fieldError: { fontFamily: FONT.regular, fontSize: 12.5, color: C.danger, marginTop: 5, marginLeft: 2 },
-    // strength
-    strengthRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: S.sm, marginTop: 2, marginLeft: 2 },
-    strengthTrack: { flexDirection: "row" as const, gap: 4, flex: 1 },
-    strengthSeg: { flex: 1, height: 3, borderRadius: 2, backgroundColor: C.border },
-    strengthLabel: { fontFamily: FONT.bold, fontSize: 12, width: 48, textAlign: "right" as const },
     // remember / forgot row
     metaRow: { flexDirection: "row" as const, alignItems: "center" as const, justifyContent: "space-between" as const, marginTop: 16 },
     remember: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8 },
@@ -77,62 +53,15 @@ function buildStyles(C: ColorScale, T: ReturnType<typeof useTheme>["T"]) {
     checkboxOn: { backgroundColor: C.primary, borderColor: C.primary },
     rememberTxt: { fontFamily: FONT.regular, fontSize: 12.5, color: C.textDim },
     forgot: { fontFamily: FONT.semibold, fontSize: 12.5, color: C.primary },
-    // divider
-    orRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: S.md, marginVertical: S.lg },
-    orLine: { flex: 1, height: 1, backgroundColor: C.border },
-    orTxt: { ...CAPS, fontSize: 10, letterSpacing: 1.8, color: C.textFaint },
     link: { fontFamily: FONT.regular, fontSize: 13.5, color: C.textDim, textAlign: "center" as const },
     linkStrong: { fontFamily: FONT.bold, color: C.primary },
     footer: { alignItems: "center" as const, marginTop: S.xxl },
     company: { ...CAPS, fontSize: 10, letterSpacing: 1.8, color: C.textFaint },
-    // forgot-password sheet
-    sheetBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", justifyContent: "flex-end" as const },
-    sheet: {
-      backgroundColor: C.surface, borderTopLeftRadius: R.xl, borderTopRightRadius: R.xl,
-      padding: S.xl, paddingBottom: S.xxl, gap: S.md,
-    },
-    sheetHandle: { alignSelf: "center" as const, width: 40, height: 4, borderRadius: 2, backgroundColor: C.border, marginBottom: S.sm },
-    sheetTitle: { ...T.h3 },
-    sheetBody: { ...T.bodyDim, lineHeight: 22 },
   });
 }
 
-// ---- AuthField: input with leading icon, optional eye toggle, inline error ----
-function AuthField({
-  icon, error, secure, ...rest
-}: TextInputProps & { icon: string; error?: string; secure?: boolean }) {
-  const { C, T } = useTheme();
-  const st = useMemo(() => buildStyles(C, T), [C, T]);
-  const [hidden, setHidden] = useState(!!secure);
-  return (
-    <View>
-      <View style={[st.fieldWrap, !!error && st.fieldWrapError]}>
-        <Icon name={icon as any} tintColor={error ? C.danger : C.textFaint} size={18} />
-        <TextInput
-          style={st.fieldInput}
-          placeholderTextColor={C.textFaint}
-          secureTextEntry={hidden}
-          {...rest}
-        />
-        {secure ? (
-          <Pressable onPress={() => setHidden(!hidden)} hitSlop={10}
-            accessibilityLabel={hidden ? "Show password" : "Hide password"}>
-            <Icon name={hidden ? "eye.slash" : "eye"} tintColor={C.textFaint} size={18} />
-          </Pressable>
-        ) : null}
-      </View>
-      {error ? <Text style={st.fieldError}>{error}</Text> : null}
-    </View>
-  );
-}
-
 export default function LoginScreen() {
-  // WorkspaceProvider sits ABOVE the auth gate, so its one-shot mount
-  // fetch already ran while this screen was signed out and found no
-  // token. Nothing re-runs it on its own, so the list has to be pulled
-  // again HERE, once the token exists — otherwise the user lands on the
-  // tabs with an empty workspace list and their organisation missing.
-  const { refresh: refreshWorkspaces } = useWorkspace();
+  const finishSignIn = useFinishSignIn();
   const router = useRouter();
   const { C, T } = useTheme();
   const st = useMemo(() => buildStyles(C, T), [C, T]);
@@ -144,7 +73,6 @@ export default function LoginScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [fieldErr, setFieldErr] = useState<{ email?: string; password?: string; confirm?: string }>({});
-  const [forgotOpen, setForgotOpen] = useState(false);
 
   // Cross-fade the form when switching login <-> signup.
   const fade = useRef(new Animated.Value(1)).current;
@@ -163,10 +91,6 @@ export default function LoginScreen() {
       if (saved) { setEmail(saved); setRemember(true); }
     })();
   }, []);
-
-  const strength = strengthOf(password);
-  // Weak -> danger, Fair -> warn, Good -> primary, Strong -> success.
-  const strengthColor = [C.danger, C.danger, C.warn, C.primary, C.success][strength] ?? C.danger;
 
   const validate = (): boolean => {
     const errs: typeof fieldErr = {};
@@ -191,19 +115,7 @@ export default function LoginScreen() {
         : await signup(em, password);
       if (remember) await store.setItemAsync(REMEMBER_KEY, em);
       else await store.deleteItemAsync(REMEMBER_KEY);
-      // Put them back in the workspace they signed out of. Done BEFORE the
-      // list is fetched so the very first request is already scoped there,
-      // and it is only a hint — the provider re-validates it against the
-      // fresh list and falls back to Personal if the membership is gone.
-      await restoreWorkspaceFor(res.user_id);
-      // Load the workspaces for the account that just authenticated, BEFORE
-      // navigating: the tabs render against this list, and arriving with a
-      // stale empty one is what made an owner's organisation disappear.
-      // Deliberately awaited but non-fatal — refresh() swallows its own
-      // errors into context state, and a slow list must not block login.
-      await refreshWorkspaces();
-      // Replace so the back button doesn't return to login. Land on the tabs.
-      router.replace("/");
+      await finishSignIn(res.user_id);
     } catch (e) {
       const msg = e instanceof ApiError ? e.message : "Something went wrong.";
       setError(msg);
@@ -270,16 +182,7 @@ export default function LoginScreen() {
             />
 
             {/* Signup: strength meter + confirm password */}
-            {mode === "signup" && password ? (
-              <View style={st.strengthRow}>
-                <View style={st.strengthTrack}>
-                  {[1, 2, 3, 4].map((i) => (
-                    <View key={i} style={[st.strengthSeg, i <= strength && { backgroundColor: strengthColor }]} />
-                  ))}
-                </View>
-                <Text style={[st.strengthLabel, { color: strengthColor }]}>{STRENGTH_LABEL[strength]}</Text>
-              </View>
-            ) : null}
+            {mode === "signup" && password ? <StrengthMeter password={password} /> : null}
             {mode === "signup" ? (
               <AuthField
                 icon="lock.shield"
@@ -303,7 +206,12 @@ export default function LoginScreen() {
               <Text style={st.rememberTxt}>Keep me signed in</Text>
             </Pressable>
             {mode === "login" ? (
-              <Pressable onPress={() => setForgotOpen(true)} hitSlop={8}>
+              <Pressable
+                onPress={() => router.push({
+                  pathname: "/forgot-password",
+                  params: EMAIL_RE.test(email.trim()) ? { email: email.trim().toLowerCase() } : {},
+                })}
+                hitSlop={8} accessibilityRole="link">
                 <Text style={st.forgot}>Forgot password</Text>
               </Pressable>
             ) : null}
@@ -317,20 +225,6 @@ export default function LoginScreen() {
             loading={busy}
             style={{ marginTop: S.xl }}
           />
-
-          <View style={st.orRow}>
-            <View style={st.orLine} />
-            <Text style={st.orTxt}>OR</Text>
-            <View style={st.orLine} />
-          </View>
-
-          {/* Google sign-in — UI ready, backend not wired yet. Kept honest. */}
-          <View>
-            <GoogleButton
-              label={mode === "login" ? "Continue with Google" : "Sign up with Google"}
-              onPress={() => setError("Google sign-in is coming soon — use email for now.")}
-            />
-          </View>
 
           <Pressable
             onPress={() => switchMode(mode === "login" ? "signup" : "login")}
@@ -351,22 +245,6 @@ export default function LoginScreen() {
         </View>
       </ScrollView>
 
-      {/* Forgot password — no reset endpoint exists yet, so this stays an
-          honest explanation instead of a fake email flow. */}
-      <Modal visible={forgotOpen} transparent animationType="fade" onRequestClose={() => setForgotOpen(false)}>
-        <Pressable style={st.sheetBackdrop} onPress={() => setForgotOpen(false)}>
-          <Pressable style={st.sheet} onPress={() => {}}>
-            <View style={st.sheetHandle} />
-            <Text style={st.sheetTitle}>Reset your password</Text>
-            <Text style={st.sheetBody}>
-              Self-serve password reset is coming soon. For now, contact us at
-              {" "}support@exceller.tech from your account email and we'll reset
-              it for you.
-            </Text>
-            <Button label="Got it" variant="secondary" onPress={() => setForgotOpen(false)} style={{ marginTop: S.sm }} />
-          </Pressable>
-        </Pressable>
-      </Modal>
     </KeyboardAvoidingView>
   );
 }

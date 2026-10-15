@@ -8,7 +8,7 @@ import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { FONT, S, useTheme, ColorScale } from "../../../../../lib/theme";
 import { Button, Card, EmptyState, StatusPill } from "../../../../../lib/ui";
 import { Icon } from "../../../../../lib/icons";
-import { useMeeting } from "../../../../../lib/meeting-context";
+import { useMeeting, useSyncTasksOnFocus } from "../../../../../lib/meeting-context";
 import { initialsOf, type Task } from "../../../../../lib/task-model";
 import { AddTaskSheet } from "../../../../../lib/add-task-sheet";
 
@@ -57,6 +57,7 @@ export default function TaskListScreen() {
   const { C } = useTheme();
   const st = useMemo(() => buildStyles(C), [C]);
   const { tasks, setTaskStatus, addTask } = useMeeting();
+  useSyncTasksOnFocus();
   const [addOpen, setAddOpen] = useState(false);
 
   const groups: { label: string; items: Task[] }[] = [

@@ -9,9 +9,6 @@
       "distribution": "internal",
       "android": {
         "buildType": "apk"
-      },
-      "env": {
-        "EXPO_PUBLIC_SITE_SALESFORCE": "1"
       }
     },
     "preview": {
@@ -20,7 +17,7 @@
         "buildType": "apk"
       },
       "env": {
-        "EXPO_PUBLIC_SITE_SALESFORCE": "1"
+        "EXPO_PUBLIC_SALESFORCE_COMING_SOON": "1"
       }
     },
     "sideload": {
@@ -31,7 +28,7 @@
       },
       "env": {
         "ORG_GRADLE_PROJECT_reactNativeArchitectures": "arm64-v8a",
-        "EXPO_PUBLIC_SITE_SALESFORCE": "1"
+        "EXPO_PUBLIC_SALESFORCE_COMING_SOON": "1"
       }
     },
     "production": {

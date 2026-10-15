@@ -1,4 +1,12 @@
-// src/app/meeting/[key]/shared.tsx — a meeting, READ-ONLY, for a task assignee.
+// src/app/meeting/[key]/shared.tsx — a meeting, READ-ONLY, for someone who
+// is not its recorder: a participant the recorder gave access to, or a task
+// assignee.
+//
+// WHAT EACH VIEWER GETS is decided by the backend, never here:
+//   participant, level "notes" -> notes only
+//   participant, level "full"  -> notes + transcript + audio (still read-only)
+//   assignee                   -> notes only
+// "Full" is never a write permission. This screen renders what it is sent.
 //
 // WHY THIS IS A SEPARATE SCREEN AND NOT A FLAG ON THE REAL ONE.
 //
@@ -22,8 +30,8 @@
 // 404 for the very users this screen exists for.
 //
 // THE BACKEND IS THE ENFORCEMENT POINT. Everything here assumes the response
-// is already filtered — no transcript, no audio, no S3 key. This file never
-// decides what an assignee may see; it renders what it is given.
+// is already filtered — no transcript or audio below "full", never an S3 key.
+// This file never decides what a viewer may see; it renders what it is given.
 import { useCallback, useEffect, useState } from "react";
 import { RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useLocalSearchParams } from "expo-router";
@@ -32,9 +40,11 @@ import { Button, Card, Loading } from "../../../../lib/ui";
 import { Icon } from "../../../../lib/icons";
 import { MeetingOverviewView, hasOverview } from "../../../../lib/meeting-overview";
 import { fmtDuration } from "../../../../lib/sources";
+import { AudioPlayer } from "../../../../lib/audio-player";
+import { fmtTs } from "../../../../lib/transcript-view";
 import {
   getSharedMeeting, ApiError,
-  type SharedMeeting, type SharedMeetingSection,
+  type SharedMeeting, type SharedMeetingSection, type SharedMeetingResponse,
 } from "../../../../lib/api";
 
 function buildStyles(C: ColorScale) {
@@ -118,7 +128,39 @@ function buildStyles(C: ColorScale) {
       fontFamily: FONT.medium, fontSize: 14, lineHeight: 21, color: C.textDim,
       textAlign: "center" as const,
     },
+    // Read-only transcript: speaker, timecode, text. No rename, no seek — the
+    // owner's TranscriptView carries a rename affordance this screen must not.
+    block: { paddingVertical: S.sm, gap: 3 },
+    blockHead: {
+      flexDirection: "row" as const, alignItems: "center" as const, gap: S.sm,
+    },
+    speakerDot: { width: 8, height: 8, borderRadius: 4 },
+    speakerName: { fontFamily: FONT.semibold, fontSize: 13.5, color: C.text },
+    timecode: { fontFamily: FONT.medium, fontSize: 12, color: C.textFaint },
   });
+}
+
+/** Banner copy per access. Stated rather than implied by missing buttons, so
+ *  a notes-only viewer does not read "no transcript" as a broken product. */
+function bannerFor(res: Pick<SharedMeetingResponse, "access" | "level" | "shared_by_name">) {
+  const by = res.shared_by_name?.trim();
+  const title = by ? `Shared with you by ${by}` : "Shared with you";
+  if (res.access === "participant" && res.level === "full") {
+    return {
+      title,
+      body: "You can read this meeting\u2019s notes and transcript and play the recording. It\u2019s read-only: only the recorder can make changes.",
+    };
+  }
+  if (res.access === "participant") {
+    return {
+      title,
+      body: "You were tagged in this meeting, so you can read its notes. The recording and full transcript stay with the recorder.",
+    };
+  }
+  return {
+    title,
+    body: "You can read this meeting\u2019s notes because a task from it is assigned to you. The recording and full transcript stay with the meeting\u2019s owner.",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +261,9 @@ export default function SharedMeetingScreen() {
   const key = Array.isArray(params.key) ? params.key.join("/") : (params.key ?? "");
 
   const [meeting, setMeeting] = useState<SharedMeeting | null>(null);
+  const [viewer, setViewer] = useState<
+    Pick<SharedMeetingResponse, "access" | "level" | "shared_by_name">
+  >({ access: "assignee" });
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
@@ -228,14 +273,16 @@ export default function SharedMeetingScreen() {
       setError("");
       const res = await getSharedMeeting(key);
       setMeeting(res.meeting);
+      setViewer({ access: res.access, level: res.level,
+                  shared_by_name: res.shared_by_name });
     } catch (e) {
-      // A 404 here is the ordinary consequence of losing the task — it is
-      // reassigned, deleted, or the meeting went to Trash — not a fault. Said
-      // plainly, because "Something went wrong" would send the user to support
-      // for a system working exactly as designed.
+      // A 404 here is the ordinary consequence of losing access — the
+      // recorder removed it, the task was reassigned, or the meeting went to
+      // Trash — not a fault. Said plainly, because "Something went wrong"
+      // would send the user to support for a system working as designed.
       setError(
         e instanceof ApiError && e.status === 404
-          ? "This meeting is no longer shared with you. It usually means the task was reassigned or removed."
+          ? "This meeting is no longer shared with you. The recorder may have removed your access, or the meeting was deleted."
           : "Couldn't load this meeting. Please try again."
       );
       setMeeting(null);
@@ -285,6 +332,10 @@ export default function SharedMeetingScreen() {
   const showOverview = hasOverview({ sections: meeting.overview ?? [] });
   const momSections = meeting.sections ?? [];
   const hasBody = showOverview || momSections.length > 0;
+  const banner = bannerFor(viewer);
+  // Present only when the server sent them — i.e. at level "full".
+  const blocks = meeting.speaker_blocks ?? [];
+  const plainTranscript = !blocks.length ? (meeting.transcript ?? "").trim() : "";
 
   return (
     <View style={st.container}>
@@ -308,12 +359,8 @@ export default function SharedMeetingScreen() {
         <View style={st.banner}>
           <Icon name="lock" size={15} tintColor={C.primary} />
           <View style={{ flex: 1 }}>
-            <Text style={st.bannerTitle}>Shared with you</Text>
-            <Text style={st.bannerBody}>
-              You can read this meeting&rsquo;s notes because a task from it is
-              assigned to you. The recording and full transcript stay with the
-              meeting&rsquo;s owner.
-            </Text>
+            <Text style={st.bannerTitle}>{banner.title}</Text>
+            <Text style={st.bannerBody}>{banner.body}</Text>
           </View>
         </View>
 
@@ -331,6 +378,32 @@ export default function SharedMeetingScreen() {
             <Text style={st.empty}>
               No notes have been generated for this meeting yet.
             </Text>
+          </Card>
+        )}
+
+        {!!meeting.audio_url && (
+          <AudioPlayer url={meeting.audio_url} variant="card" />
+        )}
+
+        {(blocks.length > 0 || !!plainTranscript) && (
+          <Card>
+            <Text style={st.sectionTitle}>Transcript</Text>
+            {blocks.length > 0 ? (
+              blocks.map((b, i) => (
+                <View key={i} style={st.block}>
+                  <View style={st.blockHead}>
+                    <View style={[st.speakerDot, {
+                      backgroundColor: C.speakers[b.colour % C.speakers.length],
+                    }]} />
+                    <Text style={st.speakerName}>{b.speaker}</Text>
+                    <Text style={st.timecode}>{fmtTs(b.start)}</Text>
+                  </View>
+                  <Text style={st.text} selectable>{b.text}</Text>
+                </View>
+              ))
+            ) : (
+              <Text style={st.text} selectable>{plainTranscript}</Text>
+            )}
           </Card>
         )}
       </ScrollView>

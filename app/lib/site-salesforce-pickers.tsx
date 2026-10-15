@@ -200,7 +200,8 @@ export function ObjectPicker({
         ) : null}
         {short !== null && !error && short.length === 0 ? (
           <Text style={st.note}>
-            No Salesforce objects yet. An admin runs Discover Salesforce Objects first.
+            No Salesforce objects yet. A workspace admin can refresh them in Settings → Integrations →
+            Salesforce → Advanced.
           </Text>
         ) : null}
         {visibleObjectSections(short || []).map((g) => (

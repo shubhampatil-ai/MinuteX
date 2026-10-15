@@ -13,7 +13,7 @@ import { join } from "node:path";
 import {
   BREAKER_MAX_OPEN_MS, BREAKER_OPEN_MS, BREAKER_THRESHOLD, BREAKER_WINDOW_MS,
   CALL_COUNTER_WARN_AT, CircuitBreaker, REQUEST_TIMEOUT_MS, isOverloadStatus,
-  retryAfterMs, routeKey, summarizeCalls,
+  refusedOffline, retryAfterMs, routeKey, summarizeCalls,
 } from "../request-guard.ts";
 
 const ROOT = new URL("../../", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
@@ -241,4 +241,53 @@ describe("providers above the auth gate make no call while signed out", () => {
       assert.doesNotMatch(src, new RegExp(`useEffect\\(\\(\\) => \\{ ${call}\\(\\); \\}`), "no unconditional mount fetch");
     });
   }
+});
+
+describe("offline: edits need a connection (no queue, no guessing)", () => {
+  it("refuses writes only when the phone is KNOWN to be offline", () => {
+    for (const m of ["POST", "PUT", "PATCH", "DELETE", "post"]) {
+      assert.equal(refusedOffline(m, true), true, m);
+      assert.equal(refusedOffline(m, false), false, m);
+    }
+  });
+
+  it("never refuses a read: the cache answers it", () => {
+    assert.equal(refusedOffline("GET", true), false);
+    assert.equal(refusedOffline("", true), false, "a missing method is a GET");
+  });
+
+  const api = read("lib/api.ts");
+  const fn = api.slice(api.indexOf("async function request<T>"));
+
+  it("request() refuses before the network and before the breaker, with one message", () => {
+    const at = fn.indexOf("if (refusedOffline(method, knownOffline))");
+    assert.ok(at > 0);
+    assert.ok(at < fn.indexOf("fetch(") && at < fn.indexOf("breaker.check("));
+    assert.match(fn, /throw new ApiError\(0, OFFLINE_WRITE_MESSAGE, "offline"\)/);
+    assert.match(api, /export const OFFLINE_WRITE_MESSAGE = "You're offline\. This change needs a connection\.";/);
+  });
+
+  it("the flag starts false and only NetInfo sets it (api.ts imports no native module)", () => {
+    assert.match(api, /let knownOffline = false;/);
+    assert.doesNotMatch(api, /(from|require\()\s*["']@react-native-community\/netinfo["']/);
+    const qc = read("lib/query-client.tsx");
+    assert.match(qc, /const online = s\.isConnected !== false;\s*setKnownOffline\(!online\);\s*setOnline\(online\);/);
+  });
+
+  it("one banner for the whole app, drawn over the screens, never blocking a tap", () => {
+    const layout = read("src/app/_layout.tsx");
+    assert.ok(layout.indexOf("<OfflineBanner />") > layout.indexOf("</Stack>"));
+    const banner = read("lib/offline-banner.tsx");
+    assert.match(banner, /if \(online\) return null;/);
+    assert.match(banner, /pointerEvents="none"/);
+    assert.match(banner, /changes need a connection/);
+  });
+
+  it("the Desk's Move to Trash waits for the server before touching the saved list", () => {
+    const desk = read("src/app/(tabs)/index.tsx");
+    const body = desk.slice(desk.indexOf("const confirmDelete = useCallback"));
+    const handler = body.slice(0, body.indexOf("}, []);"));
+    assert.ok(handler.indexOf("await trashRecording(key);") < handler.indexOf("dropMeetingFromLists(key);"));
+    assert.doesNotMatch(handler, /setQueryData/, "no optimistic removal");
+  });
 });

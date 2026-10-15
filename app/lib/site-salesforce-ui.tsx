@@ -1,11 +1,10 @@
 // lib/site-salesforce-ui.tsx — small shared pieces for the Salesforce Site
 // screens (src/app/site-salesforce/*).
 import { useEffect, useRef, useState } from "react";
-import { Text, View } from "react-native";
+import { AppState, Text, View } from "react-native";
 import { ApiError } from "./api";
 import { IN_FLIGHT_STATUSES, siteErrorMessage } from "./site-salesforce-flow";
 import { SiteSalesforceDataKind, subscribeSiteSalesforce } from "./site-salesforce-events";
-import { ListRow } from "./ui";
 import { FONT, R, useTheme } from "./theme";
 
 // Same conversion lib/ui.tsx uses privately for StatusPill.
@@ -53,15 +52,6 @@ export function siteSfError(e: unknown): string {
   return e instanceof Error ? e.message : "Something went wrong.";
 }
 
-/** The single entry point other screens render (behind SITE_SALESFORCE_ENABLED). */
-export function SiteSalesforceEntry({ onPress }: { onPress: () => void }) {
-  return (
-    <ListRow icon="link" label="Salesforce (Site connection)"
-      sub="Through your Salesforce Site: objects, Task mappings, Tasks"
-      onPress={onPress} />
-  );
-}
-
 export const IN_FLIGHT = new Set(IN_FLIGHT_STATUSES);
 
 export function syncLabel(status?: string): string {
@@ -87,13 +77,15 @@ export function useSiteSalesforceVersion(...kinds: SiteSalesforceDataKind[]): nu
   return version;
 }
 
-/** Calls `tick` every `ms` while `active`; stops as soon as it is not. */
+/** Calls `tick` every `ms` while `active`; stops as soon as it is not.
+ *  Ticks are skipped while the app is in the background: a screen left open
+ *  must not keep asking the server every few seconds. */
 export function usePolling(active: boolean, tick: () => void, ms = 3000) {
   const ref = useRef(tick);
   useEffect(() => { ref.current = tick; });
   useEffect(() => {
     if (!active) return;
-    const id = setInterval(() => ref.current(), ms);
+    const id = setInterval(() => { if (AppState.currentState === "active") ref.current(); }, ms);
     return () => clearInterval(id);
   }, [active, ms]);
 }

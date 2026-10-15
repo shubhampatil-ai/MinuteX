@@ -23,12 +23,13 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  RECEIVER_PATH, normalizeSiteUrl, displaySiteUrl, siteErrorMessage, siteStage, STAGE_LABELS,
+  RECEIVER_PATH, SITE_ERROR_MESSAGES, normalizeSiteUrl, displaySiteUrl, siteErrorMessage, siteStage, STAGE_LABELS,
   healthLine, peopleSummary, filterObjects, taskRelatable, isIsoDate, meetingPushLine, isInFlight,
   pushedRowFor, salesforceStateOf, defaultPushSelection, suggestSalesforceUser, sharedRelationship,
   pushProblem, salesforceDue, objectGroups, relationKindLabel, relationSummary, relationLines,
-  hasRelation, relationSourceNote, salesforceBadge, peopleTabLabel, taskRelationOf, objectUseLabel,
-  meetingRecordLine, taskTargetLines, visibleObjectSections,
+  hasRelation, relationSourceNote, salesforceBadge, salesforceTypeTag, shouldSearchLive, mergePeople, peopleTabLabel, taskRelationOf, objectUseLabel,
+  meetingRecordLine, taskTargetLines, visibleObjectSections, pushButtonLabel, skippedLine,
+  orgDisplayName,
 } from "../site-salesforce-flow.ts";
 import {
   invalidateSiteSalesforce, subscribeSiteSalesforce, siteSalesforceVersion, completedRuns,
@@ -75,7 +76,7 @@ describe("Health check", () => {
     assert.deepEqual(healthLine({ ok: true }), { ok: true, title: "Connected", detail: "" });
     const bad = healthLine({ ok: false, code: "receiver_unavailable", message: "HTTP 503; will retry." });
     assert.equal(bad.title, "Connection failed");
-    assert.equal(bad.detail, "Salesforce Site is unavailable. Check the Site URL and try again.");
+    assert.equal(bad.detail, "Salesforce isn't reachable right now. Try again in a moment.");
     assert.equal(healthLine(null), null, "no check run yet -> nothing shown");
   });
 
@@ -224,7 +225,7 @@ describe("Pushing the meeting's existing tasks", () => {
 describe("Errors a tester can act on", () => {
   it("Site, object, record and permission errors use the agreed wording", () => {
     for (const code of ["timeout", "network_error", "receiver_unavailable"]) {
-      assert.equal(siteErrorMessage(code), "Salesforce Site is unavailable. Check the Site URL and try again.");
+      assert.equal(siteErrorMessage(code), "Salesforce isn't reachable right now. Try again in a moment.");
     }
     for (const code of ["mapping_invalid", "unknown_object", "invalid_object"]) {
       assert.equal(siteErrorMessage(code), "This Salesforce object is no longer available. Refresh Salesforce metadata.");
@@ -260,12 +261,11 @@ const PUSH = read("src/app/site-salesforce/push-tasks.tsx");
 const INDEX = read("src/app/site-salesforce/index.tsx");
 const BLOCK = read("lib/site-salesforce-meeting.tsx");
 const MEETING = read("src/app/recording/[key]/index.tsx");
+const TAGGING = read("lib/speaker-tagging.tsx");
 const API = read("lib/api.ts");
 const SITE_API = API.slice(API.indexOf("// Salesforce Site — org connection (NEW architecture)"));
 const SITE_FILES = [
   "src/app/site-salesforce/index.tsx", "src/app/site-salesforce/push-tasks.tsx",
-  "src/app/site-salesforce/objects.tsx", "src/app/site-salesforce/fields.tsx",
-  "src/app/site-salesforce/mappings.tsx", "src/app/site-salesforce/mapping-edit.tsx",
   "lib/site-salesforce-meeting.tsx", "lib/site-salesforce-pickers.tsx",
   "lib/site-salesforce-ui.tsx", "lib/site-salesforce-flow.ts",
 ];
@@ -304,10 +304,12 @@ describe("Push Meeting and Push tasks are separate actions", () => {
 });
 
 describe("Meeting screen: only behind the flag, nothing else changed", () => {
-  it("renders the Site block only when SITE_SALESFORCE_ENABLED", () => {
+  it("the retired package block is not rendered on the meeting screen", () => {
+    // Salesforce is ONE connection now (the webhook; see webhook-flow.test).
+    // The package's block is removed from the screen, not hidden behind a
+    // flag, so no build setting or stale bundle can show a second Salesforce.
     const uses = MEETING.match(/<SiteSalesforceMeetingBlock/g) || [];
-    assert.equal(uses.length, 1);
-    assert.match(MEETING, /\{SITE_SALESFORCE_ENABLED && rec\?\.workspace_id[\s\S]{0,200}<SiteSalesforceMeetingBlock/);
+    assert.equal(uses.length, 0);
   });
 
   it("carries no trace of the removed OAuth CRM blocks", () => {
@@ -317,14 +319,25 @@ describe("Meeting screen: only behind the flag, nothing else changed", () => {
 
 describe("No Salesforce credentials in the Site flow", () => {
   it("no client id/secret, token, OAuth or External Client App UI", () => {
-    const banned = /client_secret|client_id|consumer key|consumer secret|External Client App|access_token|refresh_token|shared_secret|WebBrowser|openAuthSession/i;
+    const banned = /client_secret|client_id|consumer key|consumer secret|External Client App|access_token|refresh_token|WebBrowser|openAuthSession/i;
     for (const f of SITE_FILES) assert.doesNotMatch(code(read(f)), banned, f);
-    assert.doesNotMatch(code(SITE_API), /shared_secret|client_secret|client_id/, "the Site API section");
+    assert.doesNotMatch(code(SITE_API), /client_secret|client_id/, "the Site API section");
   });
 
-  it("connect saves only the Site URL and auth mode, then pins the org", () => {
-    assert.match(INDEX, /saveSiteDelivery\(activeId, \{\s*url, auth_mode: endpoint\?\.auth_mode \|\| "none", enabled: true,/);
-    assert.match(INDEX, /connectSiteSalesforce\(activeId, \{ allow_org_change: allowOrgChange \}\)/);
+  it("no secret, link or package id passes through the app: Salesforce pairs with MinuteX directly", () => {
+    const CONNECT = read("src/app/site-salesforce/connect.tsx");
+    for (const src of [code(INDEX), code(CONNECT), code(read("src/app/integrations/index.tsx"))]) {
+      assert.doesNotMatch(src, /shared_secret|secureTextEntry|TextField|mxc1|packageId|04t/,
+        "nothing technical is typed into or shown by the app");
+    }
+    for (const f of SITE_FILES) {
+      assert.doesNotMatch(code(read(f)), /AsyncStorage|SecureStore/, `${f}: nothing Salesforce is persisted on the device`);
+    }
+  });
+
+  it("reconnecting goes through the same install flow", () => {
+    assert.match(INDEX, /Reinstall or reconnect/);
+    assert.match(INDEX, /router\.push\("\/site-salesforce\/connect"/);
   });
 });
 
@@ -338,23 +351,22 @@ describe("Buttons are disabled while an operation runs", () => {
   it("the push screen disables Push until ready and while a push is running", () => {
     assert.match(PUSH, /disabled=\{!!problem \|\| pushing \|\| inFlight\}/);
     assert.match(PUSH, /disabled=\{pushing\}/, "checkboxes lock while pushing");
-    assert.match(BLOCK, /disabled=\{busy \|\| pushing \|\| !endpointEnabled\}/);
+    assert.match(BLOCK, /disabled=\{busy \|\| pushing \|\| !endpointEnabled \|\| !canPush\}/);
   });
 });
 
 describe("Loading and empty states", () => {
   it("each list says what to do when it is empty", () => {
     assert.match(PUSH, /No tasks in this meeting/);
-    assert.match(read("src/app/site-salesforce/objects.tsx"), /Discover Salesforce Objects/);
     const pickers = read("lib/site-salesforce-pickers.tsx");
     assert.match(pickers, /No synced Salesforce Users match/);
     assert.match(pickers, /records match/);
-    assert.match(pickers, /Discover Salesforce Objects first/);
+    assert.match(pickers, /refresh them in Settings → Integrations →/);
   });
 
   it("the meeting block shows nothing while loading and a retry when loading fails", () => {
     assert.match(BLOCK, /if \(!loaded\) return null;/);
-    assert.match(BLOCK, /Could not load the Salesforce status\./);
+    assert.match(BLOCK, /Couldn't load Salesforce\./);
   });
 });
 
@@ -362,7 +374,6 @@ describe("Loading and empty states", () => {
 // Phase 2: People, filtered objects, the meeting relationship, inheritance
 // ===========================================================================
 const PICKERS = read("lib/site-salesforce-pickers.tsx");
-const OBJECTS_SCREEN = read("src/app/site-salesforce/objects.tsx");
 const CONTACTS = read("src/app/contacts.tsx");
 const CONTACT_PICKER = read("lib/contact-picker.tsx");
 const PARTICIPANTS = read("src/app/recording/[key]/participants.tsx");
@@ -390,8 +401,7 @@ describe("Objects: grouped, labelled, no API names", () => {
     assert.equal(relationKindLabel({ task_relation: "what" }), "Record");
   });
   it("no screen or picker renders an object API name, a record id or WhoId/WhatId", () => {
-    for (const [name, src] of [["pickers", PICKERS], ["objects", OBJECTS_SCREEN], ["block", BLOCK],
-                               ["push", PUSH], ["fields", read("src/app/site-salesforce/fields.tsx")]]) {
+    for (const [name, src] of [["pickers", PICKERS], ["block", BLOCK], ["push", PUSH]]) {
       const ui = code(src);
       // Rendered text only: `key={o.api_name}` is a React key, not text.
       assert.doesNotMatch(ui, /(?<!=)\{\s*(o|obj|chosen)\??\.api_name\s*\}/, `${name}: API name shown`);
@@ -421,18 +431,22 @@ describe("The meeting's Salesforce relationship", () => {
     assert.match(relationSourceNote({ ...AUTO, automatic: false }), /Chosen/);
     assert.match(relationSourceNote(null), /Tag a synced Salesforce Contact/);
   });
-  it("the block shows the link first and hides the pickers behind Link to a Salesforce record", () => {
-    assert.match(BLOCK, /Linked to: \$\{summary\}/);
-    assert.match(BLOCK, /always creates a new MinuteX Meeting record/, "says what the picker is for");
-    const before = BLOCK.slice(0, BLOCK.indexOf("Link to a Salesforce record"));
-    assert.ok(before.length > 0, "the Change link exists");
+  it("the meeting card is Destination -> Record -> Push, with nothing technical", () => {
     const ui = code(BLOCK);
-    const pickerAt = ui.indexOf("<ObjectPicker");
-    const changingAt = ui.indexOf("!changing ?");
-    assert.ok(changingAt > 0 && pickerAt > changingAt, "ObjectPicker only in the changing branch");
-    assert.match(BLOCK, /setSiteMeetingRelation\(workspaceId, meetingKey, change\)/);
-    assert.match(BLOCK, /reset: "who"/);
-    assert.match(BLOCK, /reset: "what"/);
+    assert.match(ui, />Destination</);
+    assert.match(ui, />Record</);
+    assert.match(ui, /setSiteMeetingDestination\(workspaceId, meetingKey,/);
+    assert.match(ui, /searchSiteDestinationRecords\(workspaceId, destination\.destination_id/);
+    assert.match(ui, /Search Salesforce destinations/);
+    assert.match(ui, /✓ Synced to Salesforce/);
+    assert.match(ui, /Change destination/);
+    assert.match(ui, /Open in Salesforce/);
+    for (const banned of ["always creates", "Linked to", "Chosen for this meeting", "Related To",
+                          "MinuteX Meeting", "link to an existing record", "Change linked record",
+                          "api_name", "Apex", "record_id}"]) {
+      assert.ok(!ui.includes(banned), `meeting card must not say "${banned}"`);
+    }
+    assert.doesNotMatch(ui, /<ObjectPicker/, "no object/API picker on the meeting card");
   });
   it("the push screen inherits by default and pickers appear only after Change related Salesforce record", () => {
     const ui = code(PUSH);
@@ -463,17 +477,24 @@ describe("People: Contacts and Users, with counts, never stale", () => {
   });
   it("every choose-a-person sheet offers synced Salesforce people and resolves them to a contact", () => {
     assert.match(CONTACT_PICKER, /From Salesforce/);
-    assert.match(CONTACT_PICKER, /contactForSitePerson\(sfWorkspace, p\.person_key\)/);
+    assert.match(CONTACT_PICKER, /contactForSitePerson\(\s*sfWorkspace, p\.person_key/);
     assert.match(CONTACT_PICKER, /onPick\(contact\)/);
-    assert.match(PARTICIPANTS, /salesforceWorkspaceId=\{rec\?\.workspace_id\}/);
-    assert.match(MEETING, /salesforceWorkspaceId=\{rec\?\.workspace_id\}/);
+    // Speaker tagging on every surface goes through the shared module, whose
+    // picker is scoped to the MEETING's workspace.
+    assert.match(TAGGING, /salesforceWorkspaceId=\{tagging\.workspaceId\}/);
+    assert.match(TAGGING, /workspaceId: rec\?\.workspace_id/);
+    assert.match(PARTICIPANTS, /<SpeakerContactPicker/);
+    assert.match(MEETING, /<SpeakerTagSheet/);
+    // The attendance picker on Participants is its own, and scoped the same.
+    assert.match(PARTICIPANTS, /salesforceWorkspaceId=\{workspaceId\}/);
   });
   it("a finished sync/connect/disconnect is broadcast, and tagging refreshes the relationship", () => {
     assert.match(INDEX, /completedRuns\(lastRun\.current, next\)/);
-    assert.match(INDEX, /invalidateSiteSalesforce\("connection", "objects", "relation"\)/);
+    assert.match(read("src/app/site-salesforce/connect.tsx"),
+      /invalidateSiteSalesforce\("connection", "objects", "people", "relation"\)/, "connecting");
     assert.match(INDEX, /invalidateSiteSalesforce\("connection", "objects", "people", "relation"\)/);
-    assert.match(PARTICIPANTS, /invalidateSiteSalesforce\("relation"\)/);
-    assert.match(MEETING, /invalidateSiteSalesforce\("relation"\)/);
+    // Every tag write (speaker, attendee, clear) lives in the shared module.
+    assert.equal((TAGGING.match(/invalidateSiteSalesforce\("relation"\)/g) || []).length, 3);
   });
 });
 
@@ -493,46 +514,74 @@ describe("Custom objects without activities: meetings yes, Tasks no", () => {
     assert.deepEqual(taskRelationOf(null), { relation: null, skipped: [] });
   });
   it("the meeting card offers every object; Task pickers only Task-capable ones", () => {
-    assert.match(BLOCK, /<ObjectPicker workspaceId=\{workspaceId\} value=\{obj\} onChange=\{setObj\} capability="meeting" \/>/);
+    assert.doesNotMatch(BLOCK, /<ObjectPicker/, "the meeting card uses destinations, not raw objects");
     assert.match(PUSH, /<ObjectPicker workspaceId=\{ws\} value=\{obj\} capability="task"/);
     assert.match(PICKERS, /scope: "visible", capability/);
     assert.match(PICKERS, /scope: "all", capability, q: term/);
   });
 });
 
-describe("Tasks are attached to the pushed meeting record", () => {
-  const REC = { object_label: "MinuteX Meeting", name: "Client Discussion" };
-  it("names where the meeting is in Salesforce", () => {
-    assert.equal(meetingRecordLine(REC), "MinuteX Meeting · Client Discussion");
+describe("Pushing to a destination record", () => {
+  const PUSHED = { object_label: "MinuteX Meeting", name: "Client Discussion",
+                   destination: { name: "Site Visit", record_name: "Mumbai Tower A" } };
+  it("names where the meeting is, in the customer's words", () => {
+    assert.equal(meetingRecordLine(PUSHED), "Site Visit · Mumbai Tower A");
+    assert.equal(meetingRecordLine({ object_label: "MinuteX Meeting", name: "x" }), "This meeting in Salesforce");
     assert.equal(meetingRecordLine(null), "");
   });
-  it("Related To = the meeting record, Name = the Contact; an override replaces one side", () => {
-    assert.deepEqual(taskTargetLines({ meetingRecord: REC, who: { name: "Asha Rao" } }), [
-      { label: "Related To", name: "MinuteX Meeting · Client Discussion" },
+  it("Push to Salesforce first, then Update Salesforce; a failure offers Try again", () => {
+    assert.equal(pushButtonLabel({ pushed: false, failed: false }), "Push to Salesforce");
+    assert.equal(pushButtonLabel({ pushed: true, failed: false }), "Update Salesforce");
+    assert.equal(pushButtonLabel({ pushed: true, failed: true }), "Try again");
+  });
+  it("says which mapped fields were not updated, and why, in plain words", () => {
+    assert.equal(skippedLine([{ field: "Transcript", reason: "no_access" }, { field: "Visit Date", reason: "no_value" }]),
+      "Not updated: Transcript (no access)");
+    assert.equal(skippedLine([]), "");
+  });
+  it("Task targets: Related To = the destination record, Name = the Contact; an override replaces one side", () => {
+    assert.deepEqual(taskTargetLines({ meetingRecord: PUSHED, who: { name: "Asha Rao" } }), [
+      { label: "Related To", name: "Site Visit · Mumbai Tower A" },
       { label: "Name", name: "Asha Rao" }]);
-    assert.deepEqual(taskTargetLines({ meetingRecord: REC, who: { name: "Asha Rao" },
+    assert.deepEqual(taskTargetLines({ meetingRecord: PUSHED, who: { name: "Asha Rao" },
       override: { relation: "what", objectApiName: "Account", name: "Acme" } }), [
       { label: "Related To", name: "Acme" }, { label: "Name", name: "Asha Rao" }]);
-    assert.deepEqual(taskTargetLines({ meetingRecord: REC, who: null,
+    assert.deepEqual(taskTargetLines({ meetingRecord: PUSHED, who: null,
       override: { relation: "who", objectApiName: "Lead", name: "Lead One" } }),
       [{ label: "Name", name: "Lead One" }], "a Lead cannot have a Related To");
   });
-  it("nothing can be pushed until the meeting is", () => {
+  it("tasks wait for the meeting unless the destination record takes Tasks", () => {
     assert.match(pushProblem({ selected: ["t1"], objectApiName: "", recordId: "", meetingPushed: false,
                                assigneeFor: () => "k" }), /Push the meeting to Salesforce first/);
-  });
-  it("the card shows where the meeting went and gates Push tasks on it", () => {
-    assert.match(BLOCK, /IN SALESFORCE/);
-    assert.match(BLOCK, /meetingRecordLine\(meetingRecord\)/);
-    assert.match(BLOCK, /Open in Salesforce/);
-    assert.match(BLOCK, /disabled=\{!conn\?\.connected \|\| !conn\.task_permissions\?\.createable \|\| !meetingRecord\}/);
-    assert.match(BLOCK, /Push the meeting first/);
-  });
-  it("the push screen blocks without the meeting record and shows the target", () => {
-    assert.match(PUSH, /relation\?\.meeting_record/);
-    assert.match(PUSH, /Push the meeting first/);
+    assert.match(BLOCK, /disabled=\{!tasksReady\}/);
+    assert.match(BLOCK, /!!chosenDest\?\.task_supported \|\| !!meetingRecord/);
+    assert.match(PUSH, /relation\.what\?\.tasks_supported !== false/);
     assert.match(PUSH, /Each Salesforce Task is attached to/);
-    assert.match(PUSH, /meetingPushed: !!meetingRecord/);
+  });
+});
+
+describe("Integrations: Salesforce is a normal card", () => {
+  const INTEGRATIONS = read("src/app/integrations/index.tsx");
+  const CONNECT = read("src/app/site-salesforce/connect.tsx");
+  it("the package card is retired: Integrations shows the ONE Salesforce card", () => {
+    // Salesforce is one connection now (webhook-flow.test.mjs pins its card).
+    // The package card is removed from the screen, not hidden behind a flag.
+    assert.doesNotMatch(INTEGRATIONS, /function SalesforceCard\(\)|<SalesforceCard \/>/);
+    assert.doesNotMatch(INTEGRATIONS, /SiteSalesforceEntry|Salesforce \(Site\)|Install MinuteX in Salesforce/);
+    assert.equal((INTEGRATIONS.match(/<WebhookIntegrationCard \/>/g) || []).length, 2, "personal and organisation views");
+  });
+  it("installing is a few taps; nothing technical on the way", () => {
+    for (const src of [code(INTEGRATIONS), code(CONNECT), code(BLOCK)]) {
+      for (const banned of ["Site URL", "Apex", "receiver", "api_name", "Org ID", "sf project"]) {
+        assert.ok(!src.includes(banned), `must not show "${banned}"`);
+      }
+    }
+    assert.match(CONNECT, /Install MinuteX in Salesforce/);
+    assert.match(CONNECT, /✓ MinuteX installed/);
+    assert.match(CONNECT, />Connect Salesforce|label="Connect Salesforce"/);
+    // Objects and people start syncing server-side when the install connects.
+    assert.match(CONNECT, /finishSiteSalesforceInstall\(/);
+    assert.match(CONNECT, /can\("manage_integrations"\)/);
   });
 });
 
@@ -552,13 +601,55 @@ describe("Object catalog: recommended, added, then search", () => {
     assert.match(PICKERS, /<ActivityIndicator/, "loading state");
     assert.match(PICKERS, /meetings only/, "a meetings-only object says so in the meeting picker");
   });
-  it("the objects screen adds from search and removes (managers) — persisted for the workspace", () => {
-    assert.match(OBJECTS_SCREEN, /setSiteSalesforceObjectPrefs\(activeId, add \? \{ enable: \[o\.api_name\] \} : \{ disable: \[o\.api_name\] \}\)/);
-    assert.match(OBJECTS_SCREEN, /canRemove = can\("manage_integrations"\)/);
-    assert.match(OBJECTS_SCREEN, /scope: "all", q: term/);
-    assert.match(OBJECTS_SCREEN, /invalidateSiteSalesforce\("objects"\)/);
-    assert.match(OBJECTS_SCREEN, /label="Meetings"/);
-    assert.match(OBJECTS_SCREEN, /label="Tasks"/);
+  it("Settings shows where meetings go, not Salesforce's objects, fields or Task templates", () => {
+    for (const gone of ["objects", "fields", "mappings", "mapping-edit"]) {
+      assert.ok(!existsSync(join(ROOT, `src/app/site-salesforce/${gone}.tsx`)), `${gone} screen removed`);
+    }
+    const ui = code(INDEX);
+    assert.doesNotMatch(ui, /Salesforce objects|Task templates|site-salesforce\/(objects|mappings)/);
+    assert.match(ui, /<SectionRule>Where meetings go<\/SectionRule>/);
+    // Refreshing (new fields, picklist values) stays, for admins, under Advanced.
+    const advancedAt = ui.indexOf("{advanced ? (");
+    assert.ok(ui.indexOf('"Refresh from Salesforce"') > advancedAt && advancedAt > 0);
+  });
+});
+
+describe("Install MinuteX from the app", () => {
+  const CONNECT = read("src/app/site-salesforce/connect.tsx");
+  const CARD = read("src/app/integrations/index.tsx");
+  it("Install -> Salesforce -> back -> ✓ installed -> Connect", () => {
+    assert.match(CONNECT, /startSiteSalesforceInstall\(activeId, sandbox\)/);
+    assert.match(CONNECT, /WebBrowser\.openBrowserAsync\(url\)/, "the install page opens in the browser");
+    assert.match(CONNECT, /Your setup code/);
+    assert.match(CONNECT, /Waiting for Salesforce/);
+    assert.match(CONNECT, /status === "installed"/);
+    assert.match(CONNECT, /finishSiteSalesforceInstall\(activeId, allowOrgChange\)/);
+    assert.match(CONNECT, /router\.replace\("\/site-salesforce"/, "then Manage: people, destinations");
+  });
+  it("re-checks on return, while waiting, and handles cancel, failure, expiry and the wrong org", () => {
+    assert.match(CONNECT, /AppState\.addEventListener\("change"/, "back from Salesforce -> check again");
+    assert.match(CONNECT, /usePolling\(install\?\.status === "waiting"/);
+    assert.match(CONNECT, /Open Salesforce again/, "cancelled or not finished");
+    assert.match(CONNECT, /Installation didn&apos;t finish\?/, "failed installation");
+    assert.match(CONNECT, /Your last setup code expired/, "expired");
+    assert.match(CONNECT, /e\.code === "org_mismatch"/, "wrong Salesforce org");
+    assert.match(CONNECT, /Use a different Salesforce org\?/);
+    assert.match(CONNECT, /My Salesforce org is a sandbox/);
+  });
+  it("the Integrations screen no longer leads into the package install", () => {
+    // The install screens remain in the codebase (retired, unreachable from
+    // Integrations) until they are deleted with the rest of the package path.
+    assert.doesNotMatch(CARD, /site-salesforce\/connect|Install MinuteX in Salesforce|Continue setup/);
+  });
+  it("disconnecting is a visible button, not hidden under Advanced", () => {
+    const disconnectAt = INDEX.indexOf('label="Disconnect Salesforce"');
+    const advancedAt = INDEX.indexOf("{advanced ? (");
+    assert.ok(disconnectAt > 0 && disconnectAt < advancedAt, "Disconnect is before (outside) Advanced");
+  });
+  it("friendly wording for every install outcome", () => {
+    for (const c of ["install_unavailable", "install_not_finished", "install_expired", "invalid_setup_code"]) {
+      assert.ok(SITE_ERROR_MESSAGES[c], c);
+    }
   });
 });
 
@@ -602,5 +693,83 @@ describe("The old OAuth Salesforce integration is gone", () => {
     for (const f of SITE_FILES) {
       assert.doesNotMatch(code(read(f)), /getOrgSalesforceStatus|lib\/salesforce"|from "\.\/salesforce"|crm\/salesforce/, f);
     }
+  });
+});
+
+describe("The connected org's name", () => {
+  it("never reads as 'Connected to: None'", () => {
+    assert.equal(orgDisplayName("Acme Realty"), "Acme Realty");
+    for (const empty of ["None", "none", "null", "", "  ", undefined, null]) {
+      assert.equal(orgDisplayName(empty), "", String(empty));
+    }
+    for (const src of [INDEX, read("src/app/integrations/index.tsx"), read("src/app/site-salesforce/connect.tsx")]) {
+      assert.doesNotMatch(code(src), /\{\s*(conn|install)\??\.org_name\s*(\|\||\})/, "raw org_name is never rendered");
+    }
+    assert.match(INDEX, /"Connected to Salesforce"/);
+  });
+});
+
+describe("One Salesforce record per meeting (destination write mode)", () => {
+  const src = code(BLOCK);
+  it("choosing a per-meeting destination saves it at once: no record to pick", () => {
+    assert.match(src, /d\.write_mode === "meeting_record"\) \{ void chooseRecord\(d, null\)/);
+    assert.match(src, /: \{ destination_id: dest\.destination_id \}\)/, "no record id is sent");
+    assert.match(BLOCK, /Salesforce keeps one \{destForRecord\.name\} for this meeting and updates it each time you push\./);
+    assert.match(src, /destForRecord\.write_mode !== "meeting_record" \? \(/, "the record list never opens for it");
+  });
+  it("after the push it counts as synced to the record Salesforce created", () => {
+    assert.match(src, /\(perMeeting \|\| placed\.record_name === chosen\?\.record_name\)/);
+  });
+  it("the API allows a destination without a record", () => {
+    assert.match(read("lib/api.ts"), /change: \{ destination_id: string; record_id\?: string; record_name\?: string \}/);
+    assert.match(read("lib/api.ts"), /write_mode\?: "update_record" \| "meeting_record";/);
+  });
+});
+
+describe("live Salesforce people search in the picker", () => {
+  it("labels Leads as well as Contacts and Users", () => {
+    assert.equal(salesforceTypeTag("lead"), "SF LEAD");
+    assert.equal(salesforceTypeTag("user"), "SF USER");
+    assert.equal(salesforceTypeTag("contact"), "SF CONTACT");
+    assert.equal(salesforceBadge({ people_provider: "salesforce", people_type: "lead" }), "Salesforce Lead");
+  });
+
+  it("searches live only from 2 characters", () => {
+    assert.equal(shouldSearchLive(""), false);
+    assert.equal(shouldSearchLive(" r "), false);
+    assert.equal(shouldSearchLive("ra"), true);
+  });
+
+  it("puts live results first and never shows a person twice", () => {
+    const live = [{ person_key: "a" }, { person_key: "b" }];
+    const stored = [{ person_key: "b" }, { person_key: "c" }];
+    assert.deepEqual(mergePeople(live, stored).map((p) => p.person_key), ["a", "b", "c"]);
+  });
+
+  it("the picker searches live, falls back to stored people, and saves only the picked person", () => {
+    const picker = read("lib/contact-picker.tsx");
+    assert.match(picker, /shouldSearchLive\(debounced\)\s*\?\s*searchLivePeople\(/);
+    assert.match(picker, /searchLivePeople\([^)]*\)\.catch\(\(\) => \[\]/);
+    assert.match(picker, /livePeopleKeys\.has\(p\.person_key\)/);
+    assert.match(picker, /fromSalesforceNow \? p : undefined/);
+    assert.doesNotMatch(picker, /"SF CONTACT"/);
+  });
+});
+
+describe("people on the meeting's linked Salesforce record", () => {
+  it("are suggested right after this meeting's people, only while browsing", () => {
+    const picker = read("lib/contact-picker.tsx");
+    assert.match(picker, /getRelatedPeople\(meetingKey\)[\s\S]{0,120}\.catch\(\(\) => \{ if \(alive\) setRelatedPeople\(\[\]\)/);
+    assert.match(picker, /const relatedTier: Section\[\] = needle \? \[\] :/);
+    const order = ["In this meeting", "On this meeting's Salesforce record", "Your organisation"];
+    const at = order.map((label) => picker.indexOf(`"${label}"`));
+    assert.ok(at.every((i) => i > 0) && at[0] < at[1] && at[1] < at[2], at.join(","));
+    // A suggested person may not be saved yet, so the pick sends them.
+    assert.match(picker, /relatedPeople\.some\(\(r\) => r\.person_key === p\.person_key\)/);
+  });
+
+  it("both speaker pickers pass the meeting", () => {
+    assert.match(read("lib/speaker-tagging.tsx"), /meetingKey=\{tagging\.recordingKey\}/);
+    assert.match(read("src/app/recording/[key]/participants.tsx"), /meetingKey=\{recordingKey\}/);
   });
 });

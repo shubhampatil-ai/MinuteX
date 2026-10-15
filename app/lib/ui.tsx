@@ -1031,23 +1031,31 @@ export function Toast({ visible, label, icon = "checkmark" }: {
 }
 
 // ---- GoogleButton ----------------------------------------------------------
-export function GoogleButton({ label, onPress, disabled }: {
-  label: string; onPress?: () => void; disabled?: boolean;
+export function GoogleButton({ label, onPress, disabled, loading }: {
+  label: string; onPress?: () => void; disabled?: boolean; loading?: boolean;
 }) {
   const { C } = useTheme();
+  const isOff = disabled || loading;
   return (
     <Pressable
       onPress={onPress}
-      disabled={disabled}
+      disabled={isOff}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityState={{ disabled: !!isOff, busy: !!loading }}
       style={({ pressed }) => [{
         flexDirection: "row", alignItems: "center", justifyContent: "center", gap: S.sm,
         borderWidth: 1, borderColor: C.border, backgroundColor: C.surface,
-        borderRadius: R.pill, paddingVertical: 14,
+        borderRadius: R.pill, paddingVertical: 14, minHeight: 48,
         opacity: disabled ? 0.4 : pressed ? 0.8 : 1,
       }]}
     >
-      <Text style={{ fontFamily: FONT.bold, fontSize: 15, color: "#4285F4" }}>G</Text>
-      <Text style={{ fontFamily: FONT.bold, fontSize: 14, color: C.text }}>{label}</Text>
+      {loading ? <ActivityIndicator color={C.text} /> : (
+        <>
+          <Text style={{ fontFamily: FONT.bold, fontSize: 15, color: "#4285F4" }}>G</Text>
+          <Text style={{ fontFamily: FONT.bold, fontSize: 14, color: C.text }}>{label}</Text>
+        </>
+      )}
     </Pressable>
   );
 }

@@ -673,3 +673,21 @@ describe("orphan sweep vs. merged files", () => {
     assert.equal(adopted[0].format, "aac");
   });
 });
+
+// The upload presign is idempotent on (session id, createdAt). A session the
+// orphan sweep rebuilds must therefore reproduce the ORIGINAL createdAt, which
+// the id itself carries — the file's mtime would mint a second server row.
+describe("session id carries its creation time", () => {
+  it("round-trips a fresh id", () => {
+    const before = Date.now();
+    const id = store.newSessionId();
+    const at = store.sessionIdCreatedAt(id);
+    assert.ok(at >= before && at <= Date.now(), `${id} -> ${at}`);
+  });
+
+  it("rejects stems that are not session ids", () => {
+    for (const stem of ["abc_final", "merged", "zzzzzzzzzz-01-abc", "recording", "1-01-a"]) {
+      assert.equal(store.sessionIdCreatedAt(stem), null, stem);
+    }
+  });
+});

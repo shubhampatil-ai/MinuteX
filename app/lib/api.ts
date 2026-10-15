@@ -17,8 +17,8 @@
 import { store } from "./storage";
 import { googleSignOut } from "./google-signin";
 import {
-  CALL_COUNTER_WINDOW_MS, CircuitBreaker, REQUEST_TIMEOUT_MS, isOverloadStatus, retryAfterMs,
-  routeKey, summarizeCalls,
+  CALL_COUNTER_WINDOW_MS, CircuitBreaker, REQUEST_TIMEOUT_MS, isOverloadStatus, refusedOffline,
+  retryAfterMs, routeKey, summarizeCalls,
 } from "./request-guard";
 import type {
   WebhookConfiguration, WebhookContext, WebhookEarlierRecord, WebhookEndpoint, WebhookJob, WebhookMode,
@@ -544,6 +544,16 @@ export async function restoreWorkspaceFor(
 // One breaker for the app, keyed per route (lib/request-guard.ts).
 const breaker = new CircuitBreaker();
 
+// CONNECTIVITY. Set by lib/query-client.tsx from NetInfo (api.ts imports no
+// native module). True only when the phone is KNOWN to be offline — a build
+// without NetInfo never sets it, so it can never block a write by mistake.
+let knownOffline = false;
+export function setKnownOffline(offline: boolean): void { knownOffline = offline; }
+
+/** What every refused write says. Edits need a connection and the server's
+ *  confirmation (docs/LOCAL_FIRST_AUDIT.md §3); nothing is queued. */
+export const OFFLINE_WRITE_MESSAGE = "You're offline. This change needs a connection.";
+
 // DEVELOPMENT-ONLY call counter: every CALL_COUNTER_WINDOW_MS, one log line of
 // the calls per route, and a warning naming any route called often enough to
 // be a loop. This is what identified the push-token flood; kept so the next
@@ -596,6 +606,11 @@ async function request<T>(
   const { method = "GET", body, auth = true, sessionExpiryOn401 = true } = opts;
   const route = routeKey(method, path);
   countCall(route);
+  // OFFLINE, A WRITE IS REFUSED AT ONCE with one clear message, instead of a
+  // network error after a wait. Reads go ahead: the cache answers them.
+  if (refusedOffline(method, knownOffline)) {
+    throw new ApiError(0, OFFLINE_WRITE_MESSAGE, "offline");
+  }
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (auth) {
     const token = await getToken();
@@ -1315,6 +1330,13 @@ export async function requestUpload(params: {
   // Honoured only for the caller's own row that is still "uploading"; a stale
   // or foreign key is ignored and a new recording is issued.
   key?: string;
+  // IDEMPOTENT FIRST PRESIGN. The on-device session id, plus the session's
+  // creation time (epoch seconds). The backend derives the recording's key
+  // from them, so a presign repeated before the first key reached the
+  // session sidecar (app killed mid-request, sidecar lost) lands on the SAME
+  // row instead of minting a duplicate. Older backends ignore both.
+  client_ref?: string;
+  recorded_at?: number;
 }): Promise<UploadTicket> {
   return request<UploadTicket>("/recordings/upload-request", {
     method: "POST",
@@ -3716,6 +3738,12 @@ export type SalesforceOrgConnection = {
   connected_at?: string;
   connected_by?: string;
   status_message?: string;
+  /** The MinuteX Salesforce package to install, or null when none is
+   *  configured. `released` false = a beta: sandboxes and Developer Edition
+   *  orgs only. */
+  install?: {
+    version_id: string; released: boolean; production_url: string; sandbox_url: string;
+  } | null;
 };
 
 export async function getSalesforceOrgConnection(workspaceId: string): Promise<SalesforceOrgConnection> {
@@ -3726,6 +3754,18 @@ export async function getSalesforceOrgConnection(workspaceId: string): Promise<S
 
 /** The Salesforce sign-in page to open (the backend signs the state and
  *  holds the PKCE verifier). */
+/** One-click setup's outcome (POST …/salesforce/setup and the login's
+ *  return link): "ready" | "no_receiver" | "not_allowed" | "manual" | "failed". */
+export type SalesforceSetupResult = { status: string; code?: string; namespace?: string };
+
+/** "Finish setup": find the MinuteX receiver in the connected org and set
+ *  its signing secret, without logging in again. */
+export async function setupSalesforceReceiver(workspaceId: string): Promise<SalesforceSetupResult> {
+  const r = await request<{ setup: SalesforceSetupResult }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/salesforce/setup`, { method: "POST", body: {} });
+  return r.setup;
+}
+
 export async function startSalesforceOrgConnect(
   workspaceId: string, environment: "production" | "sandbox" | "my_domain", myDomain = "",
 ): Promise<string> {
@@ -3750,6 +3790,9 @@ export type StoredMeetingLinks = {
   links: { object: string; id: string; name: string; primary: boolean }[];
   included_outputs: LinkOutputName[];
   task_relations: Record<string, { object: string; id: string }>;
+  /** The documents (by type) that go when Documents is included; null or
+   *  absent means every document. */
+  included_documents?: string[] | null;
   selected_at: string;
   /** Only from getMeetingLinks: generated documents whose PDF is missing or
    *  was made from older text (empty unless Documents is included). */
@@ -3817,6 +3860,8 @@ export async function setMeetingLinks(
     links: { object: string; id: string; name: string; primary: boolean }[];
     included_outputs: LinkOutputName[];
     task_relations: Record<string, { object: string; id: string }>;
+    /** Only the documents ticked one by one; omit to send every document. */
+    included_documents?: string[];
   },
 ): Promise<StoredMeetingLinks> {
   const r = await request<{ links: StoredMeetingLinks }>(

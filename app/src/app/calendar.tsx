@@ -35,9 +35,11 @@ import { Icon } from "../../lib/icons";
 import { S, R, ELEV, CAPS, FONT, useTheme, ColorScale } from "../../lib/theme";
 import { Button, EmptyState, ErrorText } from "../../lib/ui";
 import {
-  ApiError, ApiTask, RecordingSummary, getAllTasks,
-  getMeetingHighlights, getRecordings, patchTaskById,
+  ApiError, ApiTask, getAllTasks, patchTaskById,
 } from "../../lib/api";
+import { fetchMeetingHighlights, useRecordings } from "../../lib/shared-data";
+import { hasReadableHighlights } from "../../lib/offline-cache-rules";
+import { mapLimit } from "../../lib/request-guard";
 import { TaskCard, SectionHeader } from "../../lib/task-action-center";
 import {
   AgendaEntry, CalendarCell, GRID_DAY_LABELS, MeetingDeadline, addDays,
@@ -70,6 +72,8 @@ const RANGE_MAX_PAGES = 5;
 // calendar is actually likely to show. Older meetings' dates surface on the
 // meeting itself, where they always have.
 const HIGHLIGHT_MEETINGS = 12;
+// How many of those requests may be in flight at once.
+const HIGHLIGHT_CONCURRENCY = 3;
 
 export default function TaskCalendarScreen() {
   const { C, T, mode } = useTheme();
@@ -85,7 +89,10 @@ export default function TaskCalendarScreen() {
   const [selected, setSelected] = useState(() => day || toDayKey(new Date()));
 
   const [tasks, setTasks] = useState<ApiTask[]>([]);
-  const [meetings, setMeetings] = useState<RecordingSummary[]>([]);
+  // The Desk's own list (lib/shared-data.ts): no second /recordings request
+  // while that copy is fresh.
+  const recordingsQuery = useRecordings("").query;
+  const meetings = useMemo(() => recordingsQuery.data ?? [], [recordingsQuery.data]);
   const [deadlines, setDeadlines] = useState<MeetingDeadline[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -155,59 +162,47 @@ export default function TaskCalendarScreen() {
     []
   );
 
-  // Meetings are a cheap, whole-list read and not month-scoped:
-  // the recordings list is the app's one meeting collection, filtered by day
-  // here. Best-effort — a failure costs the meeting markers, and must never
-  // take the task grid down with it.
-  const loadContext = useCallback(() => {
-    getRecordings()
-      .then(async (rs) => {
-        setMeetings(rs);
-
-        // The dates those meetings MENTIONED. Highlights are stored per
-        // recording and returned cached (regenerate: false), so this is a
-        // batch of cheap reads — but it is still N requests, hence the bound.
-        // Newest first: a calendar is read forward from now.
-        const recent = [...rs]
-          .sort((a, b) =>
-            String(b.recorded_at || b.created_at || "").localeCompare(
-              String(a.recorded_at || a.created_at || "")
-            )
-          )
-          .slice(0, HIGHLIGHT_MEETINGS);
-
-        const results = await Promise.all(
-          recent.map(async (r) => {
-            try {
-              const h = await getMeetingHighlights(r.audio_s3_key);
-              return deadlinesFromHighlights(
-                r.audio_s3_key,
-                r.title || "Untitled meeting",
-                String(r.recorded_at || r.created_at || ""),
-                h.meeting_highlights?.deadlines ?? [],
-                resolveSpokenDate
-              );
-            } catch {
-              // A meeting whose highlights are missing or still generating
-              // contributes nothing. It must not fail the calendar.
-              return [];
-            }
-          })
+  // The dates the recent meetings MENTIONED, from their highlights.
+  //
+  // Each answer is remembered per meeting for a day, empty ones included
+  // (fetchMeetingHighlights): the route generates with AI when nothing is
+  // stored and never stores an empty result, so asking on every visit cost
+  // one AI call per such meeting. Only processed meetings are asked, at most
+  // HIGHLIGHT_CONCURRENCY at a time — twelve at once outnumbered the
+  // account's Lambda slots. Best-effort: a failure costs that meeting's
+  // markers, never the grid.
+  useEffect(() => {
+    let alive = true;
+    const recent = meetings
+      .filter((r) => hasReadableHighlights(r.status))
+      .sort((a, b) =>
+        String(b.recorded_at || b.created_at || "").localeCompare(
+          String(a.recorded_at || a.created_at || "")
+        )
+      )
+      .slice(0, HIGHLIGHT_MEETINGS);
+    void mapLimit(recent, HIGHLIGHT_CONCURRENCY, async (r) => {
+      try {
+        const h = await fetchMeetingHighlights(r.audio_s3_key);
+        return deadlinesFromHighlights(
+          r.audio_s3_key,
+          r.title || "Untitled meeting",
+          String(r.recorded_at || r.created_at || ""),
+          h?.deadlines ?? [],
+          resolveSpokenDate
         );
-        setDeadlines(results.flat());
-      })
-      .catch(() => {
-        setMeetings([]);
-        setDeadlines([]);
-      });
-  }, []);
+      } catch {
+        return [];
+      }
+    }).then((results) => { if (alive) setDeadlines(results.flat()); });
+    return () => { alive = false; };
+  }, [meetings]);
 
   useFocusEffect(
     useCallback(() => {
       setNow(new Date());
       load(month);
-      loadContext();
-    }, [load, loadContext, month])
+    }, [load, month])
   );
 
   // ---- Derived ------------------------------------------------------------
@@ -668,7 +663,7 @@ export default function TaskCalendarScreen() {
             refreshing={refreshing}
             onRefresh={() => {
               load(month, true);
-              loadContext();
+              void recordingsQuery.refetch();
             }}
             tintColor={C.primary}
           />

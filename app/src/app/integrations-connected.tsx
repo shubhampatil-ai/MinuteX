@@ -38,12 +38,15 @@ const REASON_COPY: Record<string, string> = {
     "Google didn’t return a lasting connection. Try again and approve access "
     + "when the consent screen appears.",
   failed: "Couldn’t complete the connection.",
+  // Salesforce: an already-used sign-in page was opened again.
+  reused: "That sign-in was already used. If you're connected, there's nothing to do; otherwise tap Connect again.",
 };
 
 // The provider ids that have a screen of their own to land on. Anything else
 // goes to the Integrations list, which is always correct if less specific.
-const PROVIDER_ROUTE: Record<string, "/integrations/gmail"> = {
+const PROVIDER_ROUTE: Record<string, "/integrations/gmail" | "/salesforce"> = {
   gmail: "/integrations/gmail",
+  salesforce: "/salesforce",
 };
 
 function buildStyles(C: ColorScale) {

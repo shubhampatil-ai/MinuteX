@@ -27,7 +27,7 @@
 // uploaded file) appear together.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert, Pressable, RefreshControl, ScrollView, SectionList,
+  Alert, AppState, Pressable, RefreshControl, ScrollView, SectionList,
   StyleSheet, Text, View,
 } from "react-native";
 import Reanimated, {
@@ -50,11 +50,14 @@ import { useDevice } from "../../../lib/device-context";
 import { useRecorder } from "../../../lib/use-recorder";
 import { isPaused } from "../../../lib/rec-store";
 import {
-  getRecordings, clearToken, trashRecording, isStillUploading,
-  RecordingSummary, ApiError, getAllTasks, getWorkspaceMembers, getMe,
-  ApiMember, UserProfile,
+  trashRecording, isStillUploading,
+  RecordingSummary, ApiError, getAllTasks, getWorkspaceMembers,
+  ApiMember, getSharedWithMe, type SharedRecordingSummary,
 } from "../../../lib/api";
 import { useWorkspace } from "../../../lib/workspace-context";
+import { useQueryClient } from "@tanstack/react-query";
+import { savedAtLabel } from "../../../lib/offline-cache-rules";
+import { dropMeetingFromLists, useMe, useRecordings } from "../../../lib/shared-data";
 import { fmtDuration, sourceMeta, statusMeta } from "../../../lib/sources";
 import { stageLabel } from "../../../lib/processing";
 import { offerBriefReadyPrompt } from "../../../lib/push";
@@ -244,10 +247,6 @@ export default function DeskScreen() {
   const st = useMemo(() => buildStyles(C), [C]);
   const { device, status, connState } = useDevice();
   const phone = useRecorder();
-  const [items, setItems] = useState<RecordingSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   // WHOSE meetings — the "per user" filter, for OWNER and MANAGER only.
@@ -269,10 +268,38 @@ export default function DeskScreen() {
   const { isOrganisation, activeId, active } = useWorkspace();
   const canSeeEveryones = !!active?.capabilities?.view_all_meetings;
   const [whose, setWhose] = useState("");
+
+  // THE MEETINGS LIST, through the on-device cache (lib/query-client.tsx,
+  // local-first phase 1): the last good list paints at once — also offline —
+  // and the server is asked again in the background. Keyed on the account,
+  // the workspace and the filter, so one account never sees another's list;
+  // wiped on sign-out.
+  const queryClient = useQueryClient();
+  // Shared with Profile (lib/shared-data.ts): one request, one saved copy.
+  const { query: list, key: listKey } = useRecordings(whose);
+  const items = useMemo(() => list.data ?? [], [list.data]);
+  // Offline with nothing saved: the request waits ("paused") — say so
+  // rather than showing skeletons forever.
+  const offlineEmpty = !list.data && list.fetchStatus === "paused";
+  const loading = !list.data && !list.isError && !offlineEmpty;
+  const error = list.data ? "" : offlineEmpty
+    ? "You're offline. Your briefs will appear when you're back online."
+    : list.isError
+      ? (list.error instanceof ApiError ? list.error.message : "Could not load your briefs.")
+      : "";
+  // Showing the saved list because the server couldn't be reached.
+  const savedNote = list.data && (list.isError || list.fetchStatus === "paused")
+    ? `Offline · ${savedAtLabel(list.dataUpdatedAt)}` : "";
+  const [refreshing, setRefreshing] = useState(false);
   const [members, setMembers] = useState<ApiMember[]>([]);
-  const [me, setMe] = useState<UserProfile | null>(null);
+  // Who the caller IS — for the header avatar, and so their own meetings are
+  // not labelled with their own name on every row. Shared, cached (/me once).
+  const me = useMe().data ?? null;
   const myUserId = me?.user_id ?? "";
   const [openTasks, setOpenTasks] = useState<number | null>(null);
+  // Meetings shared with this user by other recorders. Loaded in its own
+  // request: a failure leaves the section off and never blanks the Desk.
+  const [shared, setShared] = useState<SharedRecordingSummary[]>([]);
 
   // The people filter lives in a sheet rather than a permanent chip row.
   const [whoseOpen, setWhoseOpen] = useState(false);
@@ -291,32 +318,38 @@ export default function DeskScreen() {
   const [labelW, setLabelW] = useState<Record<string, number>>({});
   const [filterW, setFilterW] = useState(0);
 
+  // Ask the server again. Joins a request already in flight instead of
+  // starting a second one (the screen's first fetch and its focus refresh
+  // land together).
   const load = useCallback(async () => {
-    setError("");
     try {
-      // `whose` is only ever set on an organisation, and the server ignores
-      // it on a personal workspace, so this is safe to pass unconditionally.
-      setItems(await getRecordings({ userId: whose }));
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 401) { await clearToken(); router.replace("/login"); return; }
-      setError(e instanceof ApiError ? e.message : "Could not load your briefs.");
+      if (listKey) await queryClient.refetchQueries({ queryKey: listKey, exact: true }, { cancelRefetch: false });
     } finally {
-      setLoading(false);
       setRefreshing(false);
     }
-  }, [router, whose]);
+  }, [queryClient, listKey]);
 
-  useFocusEffect(useCallback(() => { load(); }, [load]));
+  // ON FOCUS, only a STALE list is re-read. Every change made in the app now
+  // updates the saved list itself once the server confirms it (rename, Trash,
+  // restore, reprocess — lib/shared-data.ts), and a finished brief marks it
+  // stale; so a list read in the last 30 s is what the server would say.
+  // Pull-to-refresh, the processing poll and "Try again" still always ask.
+  const refreshIfStale = useCallback(() => {
+    if (listKey) void queryClient.refetchQueries({ queryKey: listKey, exact: true, stale: true }, { cancelRefetch: false });
+  }, [queryClient, listKey]);
+  useFocusEffect(useCallback(() => { refreshIfStale(); }, [refreshIfStale]));
 
-  // Who the caller IS — for the header avatar, and so their own meetings are
-  // not labelled with their own name on every row.
-  useEffect(() => {
-    let alive = true;
-    getMe()
-      .then((u) => { if (alive) setMe(u); })
-      .catch(() => { /* initials fall back; attribution shows on every row */ });
-    return () => { alive = false; };
+  const loadShared = useCallback(async () => {
+    try {
+      setShared(await getSharedWithMe());
+    } catch {
+      // Silent by design: the Desk's own list is unaffected, and a missing
+      // "Shared with you" section is the honest state when it can't load.
+      setShared([]);
+    }
   }, []);
+
+  useFocusEffect(useCallback(() => { loadShared(); }, [loadShared]));
 
   // The people to offer in the "whose meetings" filter. Skipped entirely
   // unless the caller may actually see everyone's meetings; `whose` is cleared
@@ -366,10 +399,13 @@ export default function DeskScreen() {
           onPress: async () => {
             const key = item.audio_s3_key;
             setDeletingKey(key);
-            // Optimistic: drop the row immediately; a failure puts it back.
-            setItems((prev) => prev.filter((r) => r.audio_s3_key !== key));
+            // NOT optimistic: the row stays (with its spinner) until the
+            // server confirms, then leaves every saved list. Removing it
+            // first left it missing from the saved list whenever the request
+            // failed offline — the cache must only ever say what AWS said.
             try {
               await trashRecording(key);
+              dropMeetingFromLists(key);
             } catch (e) {
               Alert.alert(
                 "Couldn't move to Trash",
@@ -379,7 +415,6 @@ export default function DeskScreen() {
                     ? e.message
                     : "Something went wrong. Please try again."
               );
-              load();
             } finally {
               setDeletingKey(null);
             }
@@ -387,7 +422,7 @@ export default function DeskScreen() {
         },
       ]
     );
-  }, [load]);
+  }, []);
 
   // In-flight phone/upload jobs from the shared UploadManager. Refresh the
   // list whenever a job lands so its row flips from "Uploading" on its own.
@@ -411,11 +446,13 @@ export default function DeskScreen() {
   const hasProcessing = items.some((r) => statusMeta(r.status).kind === "processing");
   useFocusEffect(useCallback(() => {
     if (!hasProcessing) return;
-    const t = setInterval(load, 20_000);
+    // Only while the app is in the foreground: a phone left in a pocket on
+    // this screen must not keep asking the server.
+    const t = setInterval(() => { if (AppState.currentState === "active") load(); }, 20_000);
     return () => clearInterval(t);
   }, [hasProcessing, load]));
 
-  const sections = useMemo(() => {
+  const { sections, sharedKeys } = useMemo(() => {
     const q = query.trim().toLowerCase();
     const filtered = items.filter((r) => {
       const kind = statusMeta(r.status).kind;
@@ -428,8 +465,34 @@ export default function DeskScreen() {
         (r.language || "").toLowerCase().includes(q)
       );
     });
-    return groupByDate(filtered);
-  }, [items, query, filter]);
+    // SHARED WITH YOU — meetings another recorder gave this user READ-ONLY
+    // access to. They sit in the same day groups as the user's own briefs
+    // (tagged "Shared" on the card, not pinned in a section of their own), with
+    // the same search and status filter, deduplicated against the main list (an
+    // org manager may already see the meeting there), and hidden while
+    // filtering by person, which is a filter over this workspace's recorders
+    // only.
+    let sharedRows: SharedRecordingSummary[] = [];
+    if (!whose) {
+      const own = new Set(items.map((r) => r.audio_s3_key));
+      sharedRows = shared.filter((r) => {
+        if (own.has(r.audio_s3_key)) return false;
+        const kind = statusMeta(r.status).kind;
+        if (filter === "ready" && kind !== "ready") return false;
+        if (filter === "processing" && kind === "ready") return false;
+        if (!q) return true;
+        return (
+          (r.title || "").toLowerCase().includes(q) ||
+          (r.summary || "").toLowerCase().includes(q) ||
+          (r.recorded_by_name || "").toLowerCase().includes(q)
+        );
+      });
+    }
+    return {
+      sections: groupByDate([...filtered, ...sharedRows]),
+      sharedKeys: new Set(sharedRows.map((r) => r.audio_s3_key)),
+    };
+  }, [items, shared, query, filter, whose]);
 
   const connected = connState === "connected";
   const deviceRecording = connected && status?.isRecording === true;
@@ -481,6 +544,10 @@ export default function DeskScreen() {
 
   const header = (
     <View style={st.gutter}>
+      {savedNote ? (
+        <Text style={{ fontFamily: FONT.medium, fontSize: 12, color: C.textFaint, marginBottom: S.sm }}
+          accessibilityRole="text">{savedNote}</Text>
+      ) : null}
       {/* A recording in progress outranks everything below it. */}
       {phoneLive ? (
         <Pressable
@@ -732,7 +799,7 @@ export default function DeskScreen() {
         contentContainerStyle={{ paddingBottom: 60 + Math.max(insets.bottom, 8) + 40 }}
         refreshControl={
           <RefreshControl refreshing={refreshing}
-            onRefresh={() => { setRefreshing(true); load(); }} tintColor={C.primary} />
+            onRefresh={() => { setRefreshing(true); load(); loadShared(); }} tintColor={C.primary} />
         }
         ListEmptyComponent={
           loading ? (
@@ -744,7 +811,7 @@ export default function DeskScreen() {
           ) : error ? (
             <View style={[st.listState, { marginTop: S.xl }]}>
               <ErrorText>{error}</ErrorText>
-              <Button label="Try again" variant="secondary" onPress={() => { setLoading(true); load(); }}
+              <Button label="Try again" variant="secondary" onPress={() => { void load(); }}
                 style={{ marginTop: S.md, alignSelf: "flex-start", paddingHorizontal: S.xl }} />
             </View>
           ) : (
@@ -773,6 +840,37 @@ export default function DeskScreen() {
           );
         }}
         renderItem={({ item, index, section }) => {
+          if (sharedKeys.has(item.audio_s3_key)) {
+            // Someone else's meeting, shared with this user. The "Shared" tag
+            // is what sets it apart from their own briefs in the same day group;
+            // the access level rides in the meta line.
+            const row = item as SharedRecordingSummary;
+            return (
+              <View style={st.itemWrap}>
+                <BriefCard
+                  title={row.title || "Untitled meeting"}
+                  meta={[
+                    fmtTime(row.created_at), fmtDuration(row.duration),
+                    row.access_level === "full" ? "Full access" : "Notes only",
+                  ]}
+                  preview={statusMeta(row.status).kind === "ready"
+                    ? row.summary || undefined : undefined}
+                  status={{ label: "Shared", tone: "info" }}
+                  byline={row.recorded_by_name ? (
+                    <View style={st.recordedBy}>
+                      <Avatar name={row.recorded_by_name} photoUri={row.recorded_by_avatar} size={16} fontSize={8} />
+                      <Text style={st.recordedByText} numberOfLines={1}>{row.recorded_by_name}</Text>
+                    </View>
+                  ) : undefined}
+                  position={positionIn(index, (section as Section).data.length)}
+                  // READ-ONLY view. The owner screen would 404 for a grantee,
+                  // and there is deliberately no Trash action here.
+                  onPress={() => router.push({ pathname: "/meeting/[key]/shared", params: { key: row.audio_s3_key } })}
+                  accessibilityHint="Opens a read-only view shared with you"
+                />
+              </View>
+            );
+          }
           const meta = statusMeta(item.status);
           const failed = meta.kind === "failed";
           const processing = meta.kind === "processing";

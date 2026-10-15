@@ -17,20 +17,24 @@
 // MeetingProvider is mounted by the parent _layout.tsx, so this screen shares
 // the same recording and the same speaker map as Meeting Detail — a rename made
 // here is already applied when the user navigates back.
+//
+// Tapping a speaker opens the SAME tagging sheet as the People tab and the
+// Participants screen (lib/speaker-tagging.tsx): tag a contact, "That's me",
+// meeting access, or just a name. It used to offer a name only.
 import { useMemo, useRef, useState } from "react";
 import {
-  ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text,
-  TextInput, View,
+  ActivityIndicator, ScrollView, StyleSheet, Text, View,
 } from "react-native";
 import { Stack, useLocalSearchParams } from "expo-router";
-import { S, R, FONT, useTheme, ColorScale } from "../../../../lib/theme";
-import { Button, KeyboardAwareSheet } from "../../../../lib/ui";
+import { S, FONT, useTheme, ColorScale } from "../../../../lib/theme";
+import { Button, Toast } from "../../../../lib/ui";
 import { AudioPlayerProvider } from "../../../../lib/audio-player";
 import { useMeeting } from "../../../../lib/meeting-context";
 import { speakerName } from "../../../../lib/sources";
 import {
   TranscriptView, buildSpeakerBlocks, buildSpeakerColors,
 } from "../../../../lib/transcript-view";
+import { SpeakerTagSheet, useSpeakerTagging } from "../../../../lib/speaker-tagging";
 
 function buildStyles(C: ColorScale) {
   return StyleSheet.create({
@@ -42,23 +46,6 @@ function buildStyles(C: ColorScale) {
     empty: {
       fontFamily: FONT.medium, fontSize: 14.5, lineHeight: 21, color: C.textDim,
       textAlign: "center" as const,
-    },
-    modalWrap: {
-      flex: 1, backgroundColor: "rgba(0,0,0,0.45)",
-      justifyContent: "center" as const, padding: 24,
-    },
-    modalCard: {
-      backgroundColor: C.surface, borderRadius: R.card, padding: S.lg,
-      borderWidth: 1, borderColor: C.border,
-    },
-    modalTitle: {
-      fontFamily: FONT.bold, fontSize: 16, color: C.text, marginBottom: S.sm,
-    },
-    input: {
-      fontFamily: FONT.medium, fontSize: 15, color: C.text,
-      backgroundColor: C.bg, borderRadius: R.md, borderWidth: 1,
-      borderColor: C.border, paddingHorizontal: S.md, paddingVertical: 11,
-      marginBottom: S.md,
     },
   });
 }
@@ -77,12 +64,12 @@ export default function TranscriptScreen() {
   // to scroll away and stay there.
   const scrolled = useRef(false);
   const st = useMemo(() => buildStyles(C), [C]);
-  const { rec, loading, error, reload, renameSpeaker } = useMeeting();
+  const { key, rec, loading, error, reload } = useMeeting();
 
   const [search, setSearch] = useState("");
+  // The speaker whose tagging sheet is open.
   const [editing, setEditing] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
-  const [saving, setSaving] = useState(false);
+  const tagging = useSpeakerTagging(String(key));
 
   const speakerNames = rec?.speaker_names ?? undefined;
   const speakerBlocks = useMemo(
@@ -92,23 +79,7 @@ export default function TranscriptScreen() {
     [rec?.timestamps, C.speakers]);
   const resolveName = (label: string) => speakerName(label, speakerNames);
 
-  const openRename = (raw: string) => {
-    setDraft(speakerNames?.[raw] ?? "");
-    setEditing(raw);
-  };
-
-  const save = async () => {
-    if (!editing) return;
-    setSaving(true);
-    try {
-      await renameSpeaker(editing, draft);
-      setEditing(null);
-    } catch {
-      // renameSpeaker already alerted
-    } finally {
-      setSaving(false);
-    }
-  };
+  const openRename = (raw: string) => setEditing(raw);
 
   if (loading) {
     return (
@@ -135,7 +106,9 @@ export default function TranscriptScreen() {
       <View style={[st.container, st.center]}>
         <Stack.Screen options={{ title: "Transcript" }} />
         <Text style={st.empty}>
-          There&apos;s no transcript for this meeting yet.
+          {rec.transcript_withheld
+            ? "The transcript isn't saved on this phone. Connect to the internet to read it."
+            : "There’s no transcript for this meeting yet."}
         </Text>
       </View>
     );
@@ -174,40 +147,14 @@ export default function TranscriptScreen() {
         />
       </ScrollView>
 
-      {/* Rename a speaker — the same mapping Meeting Detail's Speakers tab
-          edits, so one rename updates every surface. */}
-      <Modal visible={editing !== null} transparent animationType="fade"
-             onRequestClose={() => setEditing(null)}>
-        {/* Inside the Modal and around the backdrop — a Modal on Android is
-            its own window and needs "height" behaviour, which is exactly what
-            KeyboardAwareSheet encapsulates (see lib/ui.tsx). */}
-        <KeyboardAwareSheet>
-        <Pressable style={st.modalWrap} onPress={() => setEditing(null)}>
-          <Pressable style={st.modalCard} onPress={(e) => e.stopPropagation()}>
-            <Text style={st.modalTitle}>
-              {editing != null ? speakerName(editing, speakerNames) : ""}
-            </Text>
-            <TextInput
-              style={st.input}
-              value={draft}
-              onChangeText={setDraft}
-              placeholder="Name this speaker"
-              placeholderTextColor={C.textFaint}
-              autoFocus
-              editable={!saving}
-              returnKeyType="done"
-              onSubmitEditing={save}
-            />
-            <View style={{ flexDirection: "row", gap: S.sm }}>
-              <Button label="Cancel" variant="secondary" style={{ flex: 1 }}
-                      onPress={() => setEditing(null)} disabled={saving} />
-              <Button label="Save" style={{ flex: 1 }} onPress={save}
-                      loading={saving} />
-            </View>
-          </Pressable>
-        </Pressable>
-        </KeyboardAwareSheet>
-      </Modal>
+      {/* Who is this speaker — the same sheet the People tab opens, so one
+          mapping updates every surface. */}
+      <SpeakerTagSheet
+        tagging={tagging}
+        speakerId={editing}
+        onClose={() => setEditing(null)}
+      />
+      <Toast visible={!!tagging.toast} label={tagging.toast} />
     </AudioPlayerProvider>
   );
 }

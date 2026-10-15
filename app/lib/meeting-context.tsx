@@ -18,15 +18,23 @@
 // notes/activity remain client-side-only local-state mutations, same as
 // before, since no backend concept exists for them.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { Alert } from "react-native";
-import { useRouter } from "expo-router";
+import { Alert, AppState } from "react-native";
+import { useFocusEffect, useRouter } from "expo-router";
 import {
   getRecording, updateRecording, clearToken, ApiError, RecordingDetail,
   getTasks, createTask as apiCreateTask, updateTask as apiUpdateTask,
   deleteTask as apiDeleteTask, listAiDocuments, updateStaleDocuments,
   assignTaskToContact as apiAssignTaskToContact,
-  type ApiContact,
+  type ApiContact, type ApiTask,
 } from "./api";
+import { useQueryClient } from "@tanstack/react-query";
+import { useCacheScope } from "./query-client";
+import { applyMeetingChange } from "./shared-data";
+import { refreshSalesforceDocumentPdfs } from "./salesforce-pdfs";
+import {
+  meetingKey as savedMeetingKey, meetingsToEvict, offlineMeetingCopy, savedAtLabel,
+} from "./offline-cache-rules";
+
 import type { GeneratedDoc } from "./meeting-documents";
 import {
   taskFromApiTask, assigneeToApi, apiAssigneeToAssignee, avatarColorFor, nextId,
@@ -34,11 +42,17 @@ import {
   type Assignee, type NotifyChannel, type Attachment,
 } from "./task-model";
 
+/** What is kept on the phone for one meeting (see offlineMeetingCopy). */
+type SavedMeeting = { rec: RecordingDetail; tasks: ApiTask[] };
+
 type MeetingCtxValue = {
   key: string;
   rec: RecordingDetail | null;
   loading: boolean;
   error: string;
+  /** "Offline · saved 8 Oct, 10:42" while the saved copy is shown because
+   *  the server couldn't be reached; "" otherwise. */
+  savedNote: string;
   reload: () => void;
   documents: GeneratedDoc[];
   addDocument: (doc: GeneratedDoc) => void;
@@ -78,6 +92,11 @@ type MeetingCtxValue = {
   updateAllDocuments: () => Promise<{ updated: number; remaining: number }>;
   // ---- Tasks (client-side; see lib/task-model.ts) ----
   tasks: Task[];
+  /** Re-read the tasks and merge server-owned fields (assignee, status, due,
+   *  priority, title) into the local list. For changes made OUTSIDE this
+   *  provider — the Task dashboard and /task/[id] write through /tasks/{id}.
+   *  Meeting screens call it on focus. Keeps client-only fields. */
+  syncTasks: () => Promise<void>;
   getTask: (id: string) => Task | undefined;
   updateTask: (id: string, patch: Partial<Task>) => void;
   setTaskStatus: (id: string, status: TaskStatus) => void;
@@ -103,11 +122,25 @@ export function useMeeting(): MeetingCtxValue {
   return ctx;
 }
 
+/** Re-read the meeting's tasks whenever the calling screen gains focus, so a
+ *  reassignment (or status / due change) made on the Task dashboard or
+ *  /task/[id] shows here on the way back. One GET per focus; merged, so
+ *  client-only task fields survive. */
+export function useSyncTasksOnFocus(): void {
+  const { syncTasks } = useMeeting();
+  useFocusEffect(useCallback(() => { syncTasks(); }, [syncTasks]));
+}
+
 export function MeetingProvider({ meetingKey, children }: { meetingKey: string; children: React.ReactNode }) {
   const router = useRouter();
   const [rec, setRec] = useState<RecordingDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [savedNote, setSavedNote] = useState("");
+  // The saved copy on the phone (lib/query-client.tsx, local-first phase 1):
+  // shown at once, then replaced by the server's answer.
+  const queryClient = useQueryClient();
+  const scope = useCacheScope();
   const [documents, setDocuments] = useState<GeneratedDoc[]>([]);
   const [documentsNeedingUpdate, setDocumentsNeedingUpdate] = useState<string[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -140,41 +173,71 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
     }
   }, [meetingKey]);
 
-  // Re-read the tasks' ASSIGNEE ONLY, after a rename.
+  // Re-read this meeting's tasks from the server and merge them into the
+  // local copy.
   //
-  // A rename writes nothing to any task — the backend resolves the display
-  // name per request from the meeting's speaker_names (see
-  // _public_task_v2 / ApiTask.speaker_name). So the tasks already on screen
-  // are correct everywhere EXCEPT in this app's own local copy, which was
-  // built from the pre-rename response. Re-fetching is how that copy catches
-  // up; nothing is written back.
+  // WHY THIS EXISTS. The list is fetched once per meeting (tasksLoadedRef),
+  // but a task can change from OUTSIDE this provider: the Task dashboard and
+  // /task/[id] reassign, unassign, complete and re-date tasks through
+  // /tasks/{id}, and a speaker rename changes the assignee the backend
+  // resolves per request (_public_task_v2). Without a re-read, the meeting
+  // kept showing the old assignee while the dashboard showed the new one.
+  // Called after a rename / speaker mapping, and on focus of every meeting
+  // screen that shows tasks (see syncTasks).
   //
   // MERGED, never replaced: `tasks` carries client-only fields (notes,
-  // subtasks, attachments, activity — see lib/task-model.ts) that exist
-  // nowhere on the server, so mapping the fetch straight into state the way
-  // load() does on first fetch would silently discard them. Only the assignee
-  // is taken from the response, because only the assignee can have changed.
+  // subtasks, attachments, activity, the local description — see
+  // lib/task-model.ts) that exist nowhere on the server, so mapping the fetch
+  // straight into state would silently discard them. Only server-owned fields
+  // are taken from the response. Tasks created elsewhere are appended; tasks
+  // deleted elsewhere are dropped.
   const refreshTaskAssignees = useCallback(async () => {
+    if (!tasksLoadedRef.current) return; // load() owns the first fetch
     try {
       const apiTasks = await getTasks(meetingKey);
       const byId = new Map(apiTasks.map((t) => [t.id, t]));
-      setTasks((prev) =>
-        prev.map((t) => {
+      setTasks((prev) => {
+        const known = new Set(prev.map((t) => t.id));
+        const merged = prev.flatMap((t) => {
           const fresh = byId.get(t.id);
-          if (!fresh) return t;
-          const next = apiAssigneeToAssignee(fresh.assignee);
-          // Same object identity when the name did not move, so a task whose
-          // assignee is unaffected by this rename does not re-render.
-          if (next?.name === t.assignee?.name) return t;
-          return { ...t, assignee: next };
-        })
-      );
+          if (!fresh) return []; // deleted elsewhere
+          const assignee = apiAssigneeToAssignee(fresh.assignee);
+          const notifiedVia = (fresh.notified_via || []) as NotifyChannel[];
+          const sameAssignee =
+            (assignee?.name ?? "") === (t.assignee?.name ?? "")
+            && (assignee?.email ?? "") === (t.assignee?.email ?? "")
+            && (assignee?.phone ?? "") === (t.assignee?.phone ?? "");
+          const unchanged = sameAssignee
+            && fresh.task === t.task
+            && (fresh.due || "") === t.due
+            && fresh.priority === t.priority
+            && fresh.status === t.status
+            && notifiedVia.join(",") === t.notifiedVia.join(",");
+          // Same object identity when nothing moved, so untouched tasks do
+          // not re-render.
+          if (unchanged) return [t];
+          return [{
+            ...t,
+            task: fresh.task,
+            due: fresh.due || "",
+            priority: fresh.priority,
+            status: fresh.status,
+            assignee,
+            notifiedVia,
+          }];
+        });
+        const title = rec?.title || "Meeting";
+        const added = apiTasks
+          .filter((t) => !known.has(t.id))
+          .map((t) => taskFromApiTask(t, title));
+        return [...merged, ...added];
+      });
     } catch {
       // Best-effort, exactly like refreshDocumentStatus: the tasks on screen
-      // keep the previous name until the next load() rather than erroring out
-      // a rename that has already succeeded.
+      // keep their previous values until the next sync rather than erroring
+      // out over a read.
     }
-  }, [meetingKey]);
+  }, [meetingKey, rec?.title]);
 
   const load = useCallback(async () => {
     if (!meetingKey) { setError("Missing recording id."); setLoading(false); return; }
@@ -187,10 +250,24 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
       tasksLoadedRef.current = false;
       setTasks([]);
     }
-    setError(""); setLoading(true);
+    setError("");
+    const key = scope ? savedMeetingKey(scope, meetingKey) : null;
+    const saved = key ? queryClient.getQueryData<SavedMeeting>(key) : undefined;
+    if (saved) {
+      // Paint the saved copy now; the server's answer replaces it below.
+      setRec((prev) => prev ?? saved.rec);
+      setDocuments((prev) => (prev.length ? prev : Object.values(saved.rec.documents ?? {})));
+      if (!tasksLoadedRef.current) {
+        const t = saved.rec.title || "Meeting";
+        setTasks((prev) => (prev.length ? prev : saved.tasks.map((x) => taskFromApiTask(x, t))));
+      }
+    }
+    setLoading(!saved);
+    let freshTasks: ApiTask[] | null = null;
     try {
       const data = await getRecording(meetingKey);
       setRec(data);
+      setSavedNote("");
       setDocuments(Object.values(data.documents ?? {}));
       refreshDocumentStatus();
       // Tasks are fetched from the backend (getTasks seeds from ai_tasks
@@ -213,6 +290,7 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
         tasksLoadedRef.current = true;
         try {
           const apiTasks = await getTasks(meetingKey);
+          freshTasks = apiTasks;
           setTasks(apiTasks.map((t) => taskFromApiTask(t, title)));
         } catch {
           // Let a failed fetch be retryable on the next load() rather than
@@ -220,18 +298,56 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
           tasksLoadedRef.current = false;
         }
       }
+      if (key) {
+        // Save (without the transcript) for next time and for offline; keep
+        // the last MAX_SAVED_MEETINGS.
+        queryClient.setQueryData<SavedMeeting>(key, {
+          rec: offlineMeetingCopy(data),
+          tasks: freshTasks ?? saved?.tasks ?? [],
+        });
+        const all = queryClient.getQueryCache()
+          .findAll({ queryKey: ["meeting", key[1], key[2]] })
+          .map((q) => ({ q, dataUpdatedAt: q.state.dataUpdatedAt }));
+        for (const { q } of meetingsToEvict(all)) {
+          queryClient.removeQueries({ queryKey: q.queryKey, exact: true });
+        }
+      }
     } catch (e) {
       if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
         await clearToken(); router.replace("/login"); return;
       }
-      if (e instanceof ApiError && e.status === 404) setError("This meeting was not found.");
-      else setError(e instanceof ApiError ? e.message : "Could not load this meeting.");
+      if (e instanceof ApiError && e.status === 404) {
+        if (key) queryClient.removeQueries({ queryKey: key, exact: true });
+        setError("This meeting was not found.");
+      } else if (saved) {
+        // Unreachable (offline, or the server failed): keep the saved copy.
+        setSavedNote(`Offline · ${savedAtLabel(queryClient.getQueryState(key!)?.dataUpdatedAt ?? 0)}`);
+      } else {
+        setError(e instanceof ApiError ? e.message : "Could not load this meeting.");
+      }
     } finally {
       setLoading(false);
     }
-  }, [meetingKey, router]);
+  }, [meetingKey, router, scope, queryClient]);
 
-  useEffect(() => { load(); }, [load]);
+  // Wait for the account (a few ms) so the saved copy can be found first.
+  useEffect(() => { if (scope) load(); }, [load, scope]);
+
+  // Generated documents go to Salesforce as PDFs only. When their text
+  // changes, make the PDFs Salesforce lacks; the server says which are
+  // missing or outdated, so an unchanged meeting sends nothing.
+  const docsFingerprint = useMemo(() => {
+    let h = 5381;
+    for (const d of documents) {
+      const t = `${d.type} ${d.content}`;
+      for (let i = 0; i < t.length; i++) h = ((h * 33) ^ t.charCodeAt(i)) >>> 0;
+    }
+    return documents.length ? `${documents.length}:${h}` : "";
+  }, [documents]);
+  const meetingTitle = rec?.title || "";
+  useEffect(() => {
+    if (docsFingerprint) void refreshSalesforceDocumentPdfs(meetingKey, meetingTitle);
+  }, [docsFingerprint, meetingKey, meetingTitle]);
 
   const processing = !!rec && (
     rec.status === "uploading" || rec.status === "uploaded" ||
@@ -240,6 +356,9 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
   useEffect(() => {
     if (!processing) return;
     const t = setInterval(async () => {
+      // Foreground only: the provider stays mounted under every meeting
+      // sub-screen, including while the app sits in the background.
+      if (AppState.currentState !== "active") return;
       try {
         const data = await getRecording(meetingKey);
         setRec(data);
@@ -254,6 +373,9 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
     try {
       const updated = await updateRecording(meetingKey, { title: trimmed });
       setRec(updated);
+      // The Desk (and every other saved copy) shows the new title at once,
+      // without re-reading the list.
+      applyMeetingChange(meetingKey, { title: updated.title || trimmed });
       logActivity(`Meeting renamed to "${trimmed}"`);
     } catch (e) {
       Alert.alert("Couldn't rename", e instanceof ApiError ? e.message : "Something went wrong.");
@@ -521,19 +643,20 @@ export function MeetingProvider({ meetingKey, children }: { meetingKey: string; 
   }, []);
 
   const value = useMemo<MeetingCtxValue>(() => ({
-    key: meetingKey, rec, loading, error, reload: load,
+    key: meetingKey, rec, loading, error, savedNote, reload: load,
     documents, addDocument, setDocuments, renameMeeting, renameSpeaker,
     syncSpeakerNames,
     documentsNeedingUpdate, updateAllDocuments,
-    tasks, getTask, addTask, updateTask, setTaskStatus, assignTask,
+    tasks, syncTasks: refreshTaskAssignees,
+    getTask, addTask, updateTask, setTaskStatus, assignTask,
     assignTaskToContact, recordNotification,
     addSubtask, toggleSubtask, addAttachment, removeAttachment,
     activity, logActivity,
   }), [
-    meetingKey, rec, loading, error, load, documents, addDocument, renameMeeting, renameSpeaker,
+    meetingKey, rec, loading, error, savedNote, load, documents, addDocument, renameMeeting, renameSpeaker,
     syncSpeakerNames,
     documentsNeedingUpdate, updateAllDocuments,
-    tasks, getTask, addTask, updateTask, setTaskStatus, assignTask,
+    tasks, refreshTaskAssignees, getTask, addTask, updateTask, setTaskStatus, assignTask,
     assignTaskToContact, recordNotification,
     addSubtask, toggleSubtask, addAttachment, removeAttachment, activity, logActivity,
   ]);

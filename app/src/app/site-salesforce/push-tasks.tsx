@@ -180,8 +180,13 @@ export default function PushTasksToSalesforce() {
   if (tasks === null || selected === null) return <Loading />;
 
   const inFlight = pushed.some((p) => isInFlight(p.sync_status));
-  // Tasks are attached to the pushed meeting record; null until it is pushed.
-  const meetingRecord = relation?.meeting_record ?? null;
+  // What Tasks go onto: the meeting's destination record when Salesforce
+  // allows Tasks there (no meeting push needed), else the pushed meeting.
+  const destinationForTasks = relation?.destination && relation.what?.tasks_supported !== false
+    ? { object_label: relation.destination.object_label, name: "",
+        destination: { name: relation.destination.name, record_name: relation.destination.record_name } }
+    : null;
+  const meetingRecord = destinationForTasks ?? relation?.meeting_record ?? null;
   const problem = pushProblem({
     selected, meetingRelated: !!meetingRecord, meetingPushed: !!meetingRecord,
     objectApiName: changing ? obj?.api_name || "" : "", recordId: changing ? record?.id || "" : "",
@@ -209,8 +214,8 @@ export default function PushTasksToSalesforce() {
           <Card style={{ marginTop: S.md }}>
             <Text style={st.relation}>Push the meeting first</Text>
             <Text style={st.help}>
-              Salesforce Tasks are attached to this meeting&apos;s Salesforce record. Go back and tap
-              Push Meeting; once it is in Salesforce, its tasks can be pushed here.
+              Go back and tap Push to Salesforce. Once the meeting is in Salesforce, its tasks can
+              be pushed here.
             </Text>
             <Button label="Back to meeting" variant="secondary" onPress={() => router.back()}
               style={{ marginTop: S.md }} />

@@ -151,7 +151,11 @@ describe("Task Details renders by relationship", () => {
   it("the meeting row shows provenance without offering navigation", () => {
     // The backend sends an assignee the title and date but no audio key.
     assert.match(
-      DETAIL, /disabled=\{!recording\.audio_s3_key\}/,
+      DETAIL, /const canOpen = !!recording\.audio_s3_key;/,
+      "whether the row can open must come from the audio key"
+    );
+    assert.match(
+      DETAIL, /disabled=\{!canOpen\}/,
       "the meeting row must not be tappable without a key"
     );
     assert.match(

@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / "shared"))
 sys.path.insert(0, str(ROOT / "functions/userapi"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_site_delivery import MEMBER, MANAGER, ORG, OWNER, SiteHarness, call, event, worker  # noqa: E402
+from salesforce_harness import MEMBER, MANAGER, ORG, OWNER, SalesforceHarness, call, event, worker  # noqa: E402
 import fake_dynamodb as fdb  # noqa: E402
 import salesforce_oauth as so  # noqa: E402
 import webhook_client as whc  # noqa: E402
@@ -89,7 +89,7 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, "bad_signature")
 
 
-class ConnectionTests(SiteHarness):
+class ConnectionTests(SalesforceHarness):
     def setUp(self):
         super().setUp()
         self.t["sf_oauth"] = fdb.FakeTable("SalesforceOAuthConnections", "workspace_id")

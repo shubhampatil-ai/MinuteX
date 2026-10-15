@@ -415,7 +415,7 @@ describe("meeting screen: the Salesforce block survives tab switches", () => {
 describe("wiring: the Salesforce block and polling", () => {
   const block = read("lib/webhook-meeting.tsx");
   const shared = read("lib/shared-data.ts");
-  const polling = read("lib/site-salesforce-ui.tsx");
+  const polling = read("lib/salesforce-hooks.ts");
 
   it("reads through the shared cache, never the API directly", () => {
     assert.doesNotMatch(block, /\b(getWebhookMeeting|getLinkConfig)\(/);

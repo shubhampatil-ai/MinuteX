@@ -99,9 +99,6 @@ const DELEGATES = new Map([
   // render it inside their own KeyboardAvoidingView (behavior="padding").
   ["lib/auth-ui.tsx", "component; login/forgot-password screens wrap it"],
   ["src/app/recording/[key]/participants.tsx", "inputs live in ContactPicker"],
-  // Salesforce Site pickers: rendered only inside site-salesforce screens
-  // that are themselves wrapped in <KeyboardAware>.
-  ["lib/site-salesforce-pickers.tsx", "rendered inside KeyboardAware site-salesforce screens"],
   // A card, not a screen: rendered only inside src/app/salesforce/index.tsx,
   // which wraps its ScrollView in <KeyboardAware>.
   ["lib/salesforce-login-card.tsx", "card inside the KeyboardAware Salesforce screen"],

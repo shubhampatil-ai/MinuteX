@@ -30,8 +30,8 @@ sys.path.insert(0, str(ROOT / "shared"))
 sys.path.insert(0, str(ROOT / "functions/userapi"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_site_delivery import (  # noqa: E402
-    KEY, MEMBER, NOW, ORG, OUTSIDER, OWNER, SiteHarness, call, event, worker)
+from salesforce_harness import (  # noqa: E402
+    KEY, MEMBER, NOW, ORG, OUTSIDER, OWNER, SalesforceHarness, call, event, worker)
 import site_contract as sc  # noqa: E402
 import webhook_client as whc  # noqa: E402
 import webhook_contract as wc  # noqa: E402
@@ -46,7 +46,7 @@ MUMBAI = {"id": "a0P123", "display_name": "PV-2026-00452 — Mumbai Heights",
           "secondary_text": "Property · Pune"}
 
 
-class WebhookHarness(SiteHarness):
+class WebhookHarness(SalesforceHarness):
     def setUp(self):
         super().setUp()
         self.now = T0
@@ -582,30 +582,28 @@ class DeliveryTests(WebhookHarness):
 # ===========================================================================
 class PeopleAndContextSeparationTests(WebhookHarness):
     def tag(self, key, speaker_id="0"):
-        return call(api.site_participant_tag, event(
-            "PUT", "/recordings/site-participants/{key+}", {"key": key},
-            {"speaker_id": speaker_id, "person_key": JOHN_KEY}))
+        """The app's path: live search -> resolve the pick to a contact
+        (saving that one person) -> tag the speaker with the contact."""
+        _, found = self.ws(api.webhook_people_search, "GET", "/people", qs={"q": "John"})
+        person = next(p for p in found["people"] if p["person_key"] == JOHN_KEY)
+        status, body = call(api.people_contact, event(
+            "POST", "/workspaces/{workspace_id}/people/contact", {"workspace_id": ORG},
+            {"person_key": JOHN_KEY, "person": person}))
+        self.assertEqual(status, 200)
+        return call(api.set_participant, event(
+            "PUT", "/recordings/participants/{key+}", {"key": key},
+            {"speaker_id": speaker_id, "contact_id": body["contact"]["id"]}))
 
-    def test_people_sync_over_v2_fills_the_people_store(self):
+    def test_picking_a_live_person_saves_only_that_person(self):
         self.connect()
-        status, _ = call(api.site_people_sync_start, event(
-            "POST", "/workspaces/{workspace_id}/site-delivery/people-sync",
-            {"workspace_id": ORG}))
-        self.assertEqual(status, 202)
-        self.pump()
-        person = self.t["people"].get_item(
-            Key={"workspace_id": ORG, "person_key": JOHN_KEY})["Item"]
-        self.assertEqual(person["name"], "John Smith")
-        self.assertTrue(any(p.endswith("/people") for p, _b, _h in self.rx.requests))
         self.assertEqual(self.tag(KEY)[0], 200)
+        people = self.t["people"].scan()["Items"]
+        self.assertEqual([p["person_key"] for p in people], [JOHN_KEY])
+        self.assertEqual(people[0]["name"], "John Smith")
 
     def test_contact_and_record_are_independent(self):
         self.put_meeting(key=KEY2)
         self.connect()
-        call(api.site_people_sync_start, event(
-            "POST", "/workspaces/{workspace_id}/site-delivery/people-sync",
-            {"workspace_id": ORG}))
-        self.pump()
         self.tag(KEY)
         self.tag(KEY2)
         self.choose("internal_meeting", None, KEY)
@@ -634,8 +632,12 @@ class PeopleAndContextSeparationTests(WebhookHarness):
 
 # ===========================================================================
 class GuardAndFlagTests(WebhookHarness):
-    def test_v1_then_v2_needs_replace_site(self):
-        self.assertEqual(self.configure()[0], 200)  # v1 package endpoint
+    def test_an_old_site_endpoint_needs_replace_site(self):
+        # A row left by the retired Salesforce Site path.
+        self.t["site_endpoints"].put_item(Item={
+            "workspace_id": ORG, "delivery_type": sc.DELIVERY_TYPE_SALESFORCE_SITE,
+            "url": "https://acme.my.salesforce-sites.com/services/apexrest/minutex/v1/",
+            "auth_mode": "none", "enabled": True, "created_at": NOW, "updated_at": NOW})
         status, body = self.connect()
         self.assertEqual((status, body["code"]), (409, "site_mode_active"))
         status, body = self.connect(replace_site=True)
@@ -643,22 +645,13 @@ class GuardAndFlagTests(WebhookHarness):
         self.assertEqual(self.t["site_endpoints"].get_item(
             Key={"workspace_id": ORG})["Item"]["delivery_type"], "webhook")
 
-    def test_v2_refuses_every_v1_writer(self):
-        self.connect()
-        status, body = self.configure()
-        self.assertEqual((status, body["code"]), (409, "webhook_mode_active"))
-        with self.assertRaises(api.SiteDeliveryApiError) as cm:  # the install flow's save
-            api._site_save_endpoint(ORG, OWNER, "https://x.my.salesforce-sites.com"
-                                    "/services/apexrest/minutex/v1/", "hmac_sha256", "k" * 40)
-        self.assertEqual(cm.exception.code, "webhook_mode_active")
-        status, body = call(api.site_delivery_delete, event(
-            "DELETE", "/workspaces/{workspace_id}/site-delivery", {"workspace_id": ORG}))
-        self.assertEqual((status, body["code"]), (409, "webhook_mode_active"))
-        status, _ = call(api.site_delivery_health, event(
-            "POST", "/workspaces/{workspace_id}/site-delivery/health", {"workspace_id": ORG}))
-        self.assertEqual(status, 409)
-        self.assertEqual(self.t["site_endpoints"].get_item(
-            Key={"workspace_id": ORG})["Item"]["delivery_type"], "webhook")
+    def test_the_site_routes_are_gone(self):
+        site = [k for k in api._ROUTES
+                if "/site-delivery" in k[1] or "/site-salesforce" in k[1]
+                or "/site-participants" in k[1] or k[1] == "/salesforce/pair"]
+        self.assertEqual(site, [])
+        # The worker runs webhook events only; a leftover Site job is dropped.
+        self.assertEqual(api.SITE_DELIVERY_OPERATIONS, frozenset({api.SITE_OP_WEBHOOK_EVENT}))
 
     def test_flag_off_disables_routes_and_hooks(self):
         self.delivered_meeting()

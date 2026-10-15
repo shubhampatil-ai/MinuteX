@@ -1,9 +1,7 @@
 // lib/webhook-ui.tsx — shared pieces for THE Salesforce connection (Webhook
 // Contract v2 underneath — never called "webhook" on screen): the build flag,
-// error wording, and the card on the Integrations screen. Not the retired
-// MinuteX Salesforce package
-// (lib/site-salesforce-*); a workspace uses one or the other, and the
-// server's `mode` says which — the app never guesses.
+// error wording, and the card on the Integrations screen. The server's `mode`
+// says whether a workspace is connected — the app never guesses.
 import { useCallback, useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { useFocusEffect, useRouter } from "expo-router";

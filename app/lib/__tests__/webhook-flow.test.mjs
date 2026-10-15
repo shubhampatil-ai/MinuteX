@@ -4,7 +4,7 @@
 //
 // Run:  node --test lib/__tests__/webhook-flow.test.mjs
 //
-// TWO LEVELS, like site-salesforce-flow.test.mjs:
+// TWO LEVELS, like salesforce-people.test.mjs:
 //   1. LOGIC — lib/webhook-flow.ts imported directly: record field per
 //      meeting type (Site Visit required / Internal hidden / Customer Call
 //      optional), Push readiness, the delivery status wording (both FAILED
@@ -252,9 +252,9 @@ describe("source-level invariants", () => {
     assert.match(meeting, /readOnly=\{SALESFORCE_COMING_SOON\}/);
   });
 
-  it("the contact picker offers Salesforce people for webhook workspaces too", () => {
+  it("the contact picker offers Salesforce people for webhook workspaces", () => {
     const picker = read("lib/contact-picker.tsx");
-    assert.match(picker, /SITE_SALESFORCE_ENABLED \|\| WEBHOOK_V2_ENABLED/);
+    assert.match(picker, /if \(!visible \|\| !WEBHOOK_V2_ENABLED \|\| !sfWorkspace\)/);
   });
 
   it("the meeting shows Salesforce only when connected, or when it was already sent", () => {

@@ -49,12 +49,12 @@ import {
   updateContact,
 } from "./api";
 import { useWorkspace } from "./workspace-context";
-import { SITE_SALESFORCE_ENABLED, useSiteSalesforceVersion } from "./site-salesforce-ui";
+import { useSalesforceVersion } from "./salesforce-hooks";
 import { WEBHOOK_V2_ENABLED } from "./webhook-ui";
 import {
   mergePeople, salesforceBadge, salesforceTypeTag, shouldSearchLive,
-} from "./site-salesforce-flow";
-import { invalidateSiteSalesforce } from "./site-salesforce-events";
+} from "./salesforce-people";
+import { invalidateSalesforce } from "./salesforce-events";
 import {
   ContactPickResult, requestContactsPermissionDetailed, searchPhoneContacts,
 } from "./contacts";
@@ -155,7 +155,7 @@ export function ContactPicker({
   // People on the meeting's linked Salesforce record(s), fetched once per open.
   const [relatedPeople, setRelatedPeople] = useState<SitePerson[]>([]);
   const [resolving, setResolving] = useState("");
-  const peopleVersion = useSiteSalesforceVersion("people", "connection");
+  const peopleVersion = useSalesforceVersion("people", "connection");
 
   // Create-new state.
   const [creating, setCreating] = useState(false);
@@ -261,7 +261,7 @@ export function ContactPicker({
   // without live search yet, or any failure, leaves just the stored matches.
   // A workspace without Salesforce simply has no tier.
   useEffect(() => {
-    if (!visible || !(SITE_SALESFORCE_ENABLED || WEBHOOK_V2_ENABLED) || !sfWorkspace) {
+    if (!visible || !WEBHOOK_V2_ENABLED || !sfWorkspace) {
       setSfPeople([]); setLivePeopleKeys(new Set()); return;
     }
     let alive = true;
@@ -305,7 +305,7 @@ export function ContactPicker({
       onPick(contact);
       onClose();
       // A tagged Salesforce Contact is what relates a meeting to Salesforce.
-      invalidateSiteSalesforce("relation");
+      invalidateSalesforce("relation");
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Could not use that Salesforce person.");
     } finally {

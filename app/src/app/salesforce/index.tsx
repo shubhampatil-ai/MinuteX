@@ -14,7 +14,6 @@
 // The manual "Salesforce address" field and the People section were removed
 // (user request, 2026-10-15): the login's Finish setup finds the receiver.
 //
-// (The retired MinuteX Salesforce package, site-salesforce/*, is not shown.)
 // The secret lives in this screen's memory only — never stored on the
 // device, never shown again — and the server never returns it after the
 // response that created it.

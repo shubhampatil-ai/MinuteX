@@ -34,7 +34,7 @@ import {
 } from "./webhook-flow";
 import { MeetingTypeSheet, RecordSearchSheet } from "./webhook-pickers";
 import { webhookError } from "./webhook-ui";
-import { usePolling } from "./site-salesforce-ui";
+import { usePolling } from "./salesforce-hooks";
 
 function buildStyles(C: ColorScale) {
   return StyleSheet.create({

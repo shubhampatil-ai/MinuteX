@@ -4,9 +4,9 @@
 // lib/__tests__/webhook-flow.test.mjs. The screens (lib/webhook-meeting.tsx,
 // src/app/salesforce/index.tsx) only render what these return.
 //
-// A SEPARATE PATH from the MinuteX Salesforce package (site-salesforce-*):
-// the customer's endpoint owns meeting types, record search and every
-// business rule; MinuteX sends signed events (docs/webhook-contract-v2.md).
+// The MinuteX managed package is the customer's endpoint: it owns meeting
+// types, record search and every business rule; MinuteX sends signed events
+// (docs/webhook-contract-v2.md).
 //
 // Three things on a meeting stay separate, here as in the contract:
 //   the people in it   -> participant tagging (unchanged, elsewhere)

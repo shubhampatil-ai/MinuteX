@@ -41,8 +41,8 @@ import { speakerName } from "./sources";
 import { useMeeting } from "./meeting-context";
 import { avatarColorFor, initialsOf } from "./task-model";
 // Tagging a synced Salesforce Contact relates the meeting to it: tell the
-// meeting's Salesforce card (and the push screen) to reload.
-import { invalidateSiteSalesforce } from "./site-salesforce-events";
+// meeting's Salesforce card to reload.
+import { invalidateSalesforce } from "./salesforce-events";
 
 // ===========================================================================
 // Access vocabulary.
@@ -156,7 +156,7 @@ export function useSpeakerTagging(recordingKey: string) {
     try {
       const res = await setParticipant(
         recordingKey, speakerId, contact ? contact.id : null);
-      invalidateSiteSalesforce("relation");
+      invalidateSalesforce("relation");
       await load(true);
       await syncSpeakerNames();
       const n = res.tasks_resolved ?? 0;
@@ -195,7 +195,7 @@ export function useSpeakerTagging(recordingKey: string) {
     setError("");
     try {
       await tagAttendee(recordingKey, contact.id);
-      invalidateSiteSalesforce("relation");
+      invalidateSalesforce("relation");
       await load(true);
       showToast(`${contact.name} marked as a participant`);
     } catch (e) {
@@ -210,7 +210,7 @@ export function useSpeakerTagging(recordingKey: string) {
     setAttendeeBusy(true);
     try {
       await setParticipant(recordingKey, p.speaker_id, null);
-      invalidateSiteSalesforce("relation");
+      invalidateSalesforce("relation");
       await load(true);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Could not remove that.");

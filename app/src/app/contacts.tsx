@@ -18,8 +18,8 @@
 // SALESFORCE. When the active workspace has synced Salesforce people (the
 // Site People Store), a "Salesforce" segment lists them: Contacts (people you
 // meet and tag) and Users (colleagues Tasks can be assigned to), with counts
-// from the store itself. It reloads the moment a People Sync finishes
-// anywhere (site-salesforce-events), so a sync never leaves this list stale.
+// from the store itself. It reloads the moment Salesforce people change
+// anywhere (salesforce-events), so a change never leaves this list stale.
 // Opening one resolves it to its MinuteX contact (found or created once).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -40,8 +40,8 @@ import {
 } from "../../lib/api";
 import { roleLabel, useWorkspace } from "../../lib/workspace-context";
 import { ContactPicker } from "../../lib/contact-picker";
-import { useSiteSalesforceVersion } from "../../lib/site-salesforce-ui";
-import { peopleTabLabel, salesforceBadge } from "../../lib/site-salesforce-flow";
+import { useSalesforceVersion } from "../../lib/salesforce-hooks";
+import { peopleTabLabel, salesforceBadge } from "../../lib/salesforce-people";
 
 const SEARCH_DEBOUNCE_MS = 300;
 const PAGE_SIZE = 50;
@@ -72,7 +72,7 @@ export default function ContactsScreen() {
   const [sfTruncated, setSfTruncated] = useState(false);
   const [sfError, setSfError] = useState("");
   const [opening, setOpening] = useState("");
-  const peopleVersion = useSiteSalesforceVersion("people", "connection");
+  const peopleVersion = useSalesforceVersion("people", "connection");
   const hasSalesforce = !!sfCounts && sfCounts.contacts + sfCounts.users > 0;
 
   const loadSalesforce = useCallback(async () => {

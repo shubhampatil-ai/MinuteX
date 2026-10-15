@@ -11,6 +11,16 @@ Routes (HTTP API, payload format v2.0):
   POST   /avatars/upload-request {format, scope?, contact_id?, size?} (JWT)
                                                           -> {upload_url, key}
   POST   /me/password          {current_password, new_password} (JWT) -> {changed}
+  POST   /password/forgot      {email}  (NO JWT)          -> {sent, expires_in}
+  POST   /password/reset       {email, code, new_password} (NO JWT)
+                                                          -> {token, user_id, email}
+         Self-serve reset: a 6-digit code is emailed through Amazon SES and
+         exchanged for a new password. See the PASSWORD RESET section.
+  POST   /auth/google          {id_token} (NO JWT)
+                               -> {token, user_id, email, name, created,
+                                   password_disabled}   (201 when created)
+         "Continue with Google": sign in, link, or sign up. See the GOOGLE
+         SIGN-IN section.
   POST   /me/push-tokens       {token, installation_id, platform, app_version?,
                                 enabled?} (JWT)             -> {push_token:{...}}
   DELETE /me/push-tokens/{installation_id} (JWT)           -> {removed}
@@ -118,7 +128,10 @@ Recording sources (one AI pipeline, three ways in — see README):
 
 Identity model (user-owned architecture):
   - Users table:        PK user_id (uuid). GSI email-index on email (login).
-                        Attrs: user_id, email, password_hash, salt, created_at.
+                        Attrs: user_id, email, password_hash, salt, created_at,
+                        plus the transient reset_code_hash /
+                        reset_expires_at / reset_attempts / reset_sent_at
+                        while a password reset is pending.
   - Devices table:      PK device_id. THE source of truth for device ownership.
                         Attrs: device_id, status (UNPAIRED|PAIRING|PAIRED),
                         paired_user_id (absent unless PAIRED), paired_at,
@@ -224,6 +237,11 @@ import site_salesforce_schema
 import speaker_identity
 import stt_result
 import transcript_store
+import webhook_client
+import webhook_contract
+import contract_v3
+import salesforce_oauth
+import meeting_files
 import workspace_schema
 
 REGION = os.environ.get("AWS_REGION")
@@ -326,6 +344,43 @@ TASKS_WORKSPACE_INDEX = os.environ.get("TASKS_WORKSPACE_INDEX",
                                        "workspace-index")
 JWT_TTL = int(os.environ.get("JWT_TTL", "86400"))  # seconds (default 24h)
 PAIRING_CODE_TTL = int(os.environ.get("PAIRING_CODE_TTL", "300"))  # seconds
+
+# --- Password reset (see the PASSWORD RESET section) ---
+# The SES-verified sender. Empty = the feature is not configured, and both
+# reset routes answer 503 rather than pretending an email went out.
+PASSWORD_RESET_FROM_EMAIL = os.environ.get("PASSWORD_RESET_FROM_EMAIL", "")
+# SES is regional and the verified identity lives in ONE region; defaults to
+# the Lambda's own.
+SES_REGION = os.environ.get("SES_REGION", "") or REGION
+PASSWORD_RESET_CODE_TTL = int(os.environ.get("PASSWORD_RESET_CODE_TTL", "900"))
+PASSWORD_RESET_MAX_ATTEMPTS = int(os.environ.get("PASSWORD_RESET_MAX_ATTEMPTS", "5"))
+PASSWORD_RESET_RESEND_SECONDS = int(os.environ.get("PASSWORD_RESET_RESEND_SECONDS", "60"))
+# TEST MODE — for testing before email delivery exists. For these addresses
+# /password/forgot RETURNS the code in its response (`dev_code`) instead of
+# emailing it. Comma-separated; each entry is an exact address or
+# "*@domain". A bare "*" or anything without "@" is IGNORED, so this can
+# never be widened to "every account" by a typo: whoever can call the API
+# can reset any listed account while it is set. Empty (the default) = off.
+# List test accounts only, and unset it before launch.
+def _parse_reset_dev_emails(raw: str) -> tuple:
+    return tuple(
+        e for e in (x.strip().lower() for x in (raw or "").split(","))
+        if "@" in e and "*" not in e.split("@", 1)[1] and e.split("@", 1)[1].strip("."))
+
+
+PASSWORD_RESET_DEV_EMAILS = _parse_reset_dev_emails(
+    os.environ.get("PASSWORD_RESET_DEV_EMAILS", ""))
+
+# --- Continue with Google (see the GOOGLE SIGN-IN section) ---
+# The OAuth client ids an ID token's `aud` may name, comma-separated. The app
+# asks Google for a token minted for the WEB client (webClientId), so that is
+# normally the one id needed — and it is the same client Gmail already uses,
+# hence the fallback. Empty = the route answers 503.
+GOOGLE_SIGNIN_CLIENT_IDS = frozenset(
+    c.strip() for c in (os.environ.get("GOOGLE_SIGNIN_CLIENT_IDS", "")
+                        or os.environ.get("GOOGLE_CLIENT_ID", "")).split(",")
+    if c.strip())
+GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 BUCKET_NAME = os.environ.get("BUCKET_NAME")
 AUDIO_URL_EXPIRY = int(os.environ.get("AUDIO_URL_EXPIRY", "3600"))  # seconds
 
@@ -498,6 +553,8 @@ _workspaces = _ddb.Table(WORKSPACES_TABLE)
 _memberships = _ddb.Table(WORKSPACE_MEMBERSHIPS_TABLE)
 _invitations = _ddb.Table(WORKSPACE_INVITATIONS_TABLE)
 _meeting_access = _ddb.Table(MEETING_ACCESS_TABLE)
+# Only the password-reset email uses it. Constructing a client is local.
+_ses = boto3.client("sesv2", region_name=SES_REGION)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -601,6 +658,16 @@ class ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class CodedApiError(ApiError):
+    """An ApiError with a stable `code` the app branches on (the router puts
+    it in the body). For errors whose wording may change but whose meaning
+    a client must act on."""
+
+    def __init__(self, status, message, code):
+        super().__init__(status, message)
+        self.code = code
 
 
 def _body(event):
@@ -723,8 +790,9 @@ def _user_email_claim(email):
 
 
 def _is_user_claim(item):
-    """True for an email-uniqueness claim row rather than a real account."""
-    return str((item or {}).get("user_id", "")).startswith("email#")
+    """True for a uniqueness claim row rather than a real account — an
+    email claim (signup) or a Google-identity claim (_google_claim_id)."""
+    return str((item or {}).get("user_id", "")).startswith(("email#", "google#"))
 
 
 def login(event):
@@ -742,6 +810,15 @@ def login(event):
         _hash_password(password)  # burn time, then fail
         raise ApiError(401, "invalid credentials")
     user = items[0]
+    if not user.get("password_hash"):
+        # Created with Google, or its unverified password was cleared when
+        # Google was linked (see _link_google). Saying so is what lets the
+        # app point at the right button; /signup's 409 already reveals that
+        # the address has an account, so this discloses nothing new.
+        _hash_password(password)
+        raise CodedApiError(401, "This account uses Google sign-in. Continue "
+                                 "with Google, or use Forgot password to set "
+                                 "a password.", AUTH_ERR_USE_GOOGLE)
     if not _verify_password(password, user["salt"], user["password_hash"]):
         raise ApiError(401, "invalid credentials")
     return _resp(200, {"token": _mint_for(user["user_id"], user["email"]),
@@ -918,6 +995,10 @@ def _public_user(item):
         "avatar_url": item.get("avatar_url", ""),
         "avatar_view_url": _avatar_view_url(item.get("avatar_url", "")),
         "created_at": item.get("created_at", ""),
+        # Sign-in methods, so Settings can offer "set a password" instead of
+        # a change-password form that would need a current one.
+        "has_password": bool(item.get("password_hash")),
+        "google_linked": bool(item.get("google_sub")),
     }
 
 
@@ -985,6 +1066,11 @@ def change_password(event):
     item = _users.get_item(Key={"user_id": user_id}).get("Item")
     if not item:
         raise ApiError(404, "user not found")
+    if not item.get("password_hash"):
+        raise CodedApiError(400, "This account has no password yet — it signs "
+                                 "in with Google. Use Forgot password on the "
+                                 "sign-in screen to set one.",
+                            AUTH_ERR_NO_PASSWORD)
     if not _verify_password(current, item["salt"], item["password_hash"]):
         raise ApiError(401, "current password is incorrect")
     salt_b64, hash_b64 = _hash_password(new)
@@ -994,6 +1080,501 @@ def change_password(event):
         ExpressionAttributeValues={":h": hash_b64, ":s": salt_b64},
     )
     return _resp(200, {"changed": True})
+
+
+# ---------------------------------------------------------------------------
+# PASSWORD RESET — self-serve, by an emailed 6-digit code.
+#
+# A CODE, NOT A LINK. The app is native and the code is typed into the same
+# screen that asked for it, so there is no web page to host, no deep link that
+# a mail client may open in the wrong browser, and nothing that breaks when the
+# email is read on a laptop and the app is on a phone.
+#
+# THE CODE IS STORED KEYED-HASHED on the Users row (reset_code_hash), with the
+# JWT secret as the HMAC key. A plain sha256 of a 6-digit code — what pairing
+# stores — falls to a million guesses offline; with a server-side key a leaked
+# table row reveals nothing.
+#
+# WHAT BOUNDS GUESSING:
+#   * PASSWORD_RESET_MAX_ATTEMPTS per issued code, counted BEFORE comparing,
+#     with an atomic increment. Counting after the comparison would let a
+#     burst of parallel requests all read "0 attempts" and each get a guess.
+#   * One code per PASSWORD_RESET_RESEND_SECONDS per account, and every
+#     reissue lands in the owner's inbox — a guessing campaign is loud.
+#   * PASSWORD_RESET_CODE_TTL expiry, and single use (the password write is
+#     conditional on the code it verified).
+#
+# ENUMERATION. /password/forgot answers the same 200 whether or not an account
+# exists, so it is not an oracle for "is this email registered". (/signup's
+# 409 already is one; that is not a reason to add a second.) /password/reset
+# folds "no such account" into the same "invalid or expired" error a wrong code
+# gets.
+#
+# NOT DONE HERE: revoking sessions already signed in elsewhere. JWTs are
+# stateless (see _jwt_verify) and live JWT_TTL; nothing in this API can
+# invalidate one before it expires, for /me/password either.
+# ---------------------------------------------------------------------------
+_RESET_CODE_RE = re.compile(r"^\d{6}$")
+RESET_ERR_INVALID = "reset_code_invalid"
+RESET_ERR_LOCKED = "reset_code_locked"
+RESET_ERR_UNAVAILABLE = "password_reset_unavailable"
+RESET_ERR_SEND_FAILED = "password_reset_send_failed"
+
+
+def _hash_reset_code(user_id: str, code: str) -> str:
+    key = _jwt_secret().encode("utf-8")
+    return hmac.new(key, f"pwreset:{user_id}:{code}".encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _require_reset_configured():
+    if not PASSWORD_RESET_FROM_EMAIL and not PASSWORD_RESET_DEV_EMAILS:
+        raise CodedApiError(503, "Password reset by email isn't available yet.",
+                         RESET_ERR_UNAVAILABLE)
+
+
+def _is_reset_test_address(email: str) -> bool:
+    """True when `email` is on the PASSWORD_RESET_DEV_EMAILS allowlist."""
+    email = (email or "").strip().lower()
+    for entry in PASSWORD_RESET_DEV_EMAILS:
+        if entry.startswith("*@"):
+            if email.endswith(entry[1:]):
+                return True
+        elif email == entry:
+            return True
+    return False
+
+
+def _find_user_by_email(email: str):
+    """The account row for an email, or None. Claim rows never match: they
+    carry claims_email, not email, so they are absent from email-index."""
+    res = _users.query(IndexName=EMAIL_INDEX,
+                       KeyConditionExpression=Key("email").eq(email))
+    items = res.get("Items") or []
+    return items[0] if items else None
+
+
+def _password_reset_email(code: str, minutes: int):
+    """(subject, text, html). Pure — no network — so it is testable."""
+    subject = f"Your MinuteX password reset code: {code}"
+    text = (
+        f"Use this code to reset your MinuteX password:\n\n"
+        f"    {code}\n\n"
+        f"It expires in {minutes} minutes and can be used once.\n\n"
+        f"If you didn't ask to reset your password, you can ignore this "
+        f"email — your password stays the same.\n"
+    )
+    html = (
+        '<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
+        'max-width:480px;margin:0 auto;padding:24px;color:#111">'
+        '<p style="font-size:13px;letter-spacing:2px;color:#888;margin:0">MINUTEX</p>'
+        '<h1 style="font-size:20px;margin:16px 0 8px">Reset your password</h1>'
+        '<p style="font-size:15px;line-height:22px;margin:0 0 20px">'
+        'Enter this code in the MinuteX app:</p>'
+        '<p style="font-size:32px;font-weight:700;letter-spacing:8px;'
+        f'margin:0 0 20px;font-family:Menlo,Consolas,monospace">{code}</p>'
+        '<p style="font-size:14px;line-height:21px;color:#555;margin:0 0 8px">'
+        f'It expires in {minutes} minutes and can be used once.</p>'
+        '<p style="font-size:14px;line-height:21px;color:#555;margin:0">'
+        "If you didn't ask to reset your password, you can ignore this email "
+        "&mdash; your password stays the same.</p></div>"
+    )
+    return subject, text, html
+
+
+def _send_password_reset_email(to_email: str, code: str) -> None:
+    subject, text, html = _password_reset_email(
+        code, max(1, PASSWORD_RESET_CODE_TTL // 60))
+    _ses.send_email(
+        FromEmailAddress=f"MinuteX <{PASSWORD_RESET_FROM_EMAIL}>",
+        Destination={"ToAddresses": [to_email]},
+        Content={"Simple": {
+            "Subject": {"Data": subject, "Charset": "UTF-8"},
+            "Body": {"Text": {"Data": text, "Charset": "UTF-8"},
+                     "Html": {"Data": html, "Charset": "UTF-8"}},
+        }},
+    )
+
+
+def forgot_password(event):
+    """POST /password/forgot {email} -> {sent, expires_in}. No JWT.
+
+    Same 200 whether or not the account exists (see the section header).
+    """
+    _require_reset_configured()
+    data = _body(event)
+    email = (data.get("email") or "").strip().lower()
+    if not _EMAIL_RE.match(email):
+        raise ApiError(400, "valid email required")
+    ok = _resp(200, {"sent": True, "expires_in": PASSWORD_RESET_CODE_TTL})
+    test_address = _is_reset_test_address(email)
+    # Test mode only: with no sender configured, an address that is not on
+    # the allowlist has no way to receive a code.
+    if not test_address and not PASSWORD_RESET_FROM_EMAIL:
+        raise CodedApiError(503, "Password reset by email isn't available yet.",
+                            RESET_ERR_UNAVAILABLE)
+
+    user = _find_user_by_email(email)
+    if not user:
+        return ok
+    user_id = user["user_id"]
+    now = int(time.time())
+    # Resend cooldown. Silent on purpose: an error here would confirm the
+    # account exists. The code already sent is still valid, and the app
+    # enforces the same cooldown on its Resend button.
+    if now - int(user.get("reset_sent_at") or 0) < PASSWORD_RESET_RESEND_SECONDS:
+        return ok
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    # Issuing a new code replaces the old one and resets its attempt count.
+    _users.update_item(
+        Key={"user_id": user_id},
+        UpdateExpression=("SET reset_code_hash = :h, reset_expires_at = :exp, "
+                          "reset_attempts = :zero, reset_sent_at = :now"),
+        ConditionExpression="attribute_exists(user_id)",
+        ExpressionAttributeValues={
+            ":h": _hash_reset_code(user_id, code),
+            ":exp": now + PASSWORD_RESET_CODE_TTL,
+            ":zero": 0,
+            ":now": now,
+        },
+    )
+    if test_address:
+        # TEST MODE: hand the code back instead of emailing it. Logged
+        # WITHOUT the code — the log line only proves the mode was used.
+        print(f"[password-reset] TEST MODE: code returned in response for user={user_id}")
+        return _resp(200, {"sent": True, "expires_in": PASSWORD_RESET_CODE_TTL,
+                           "dev_code": code})
+    try:
+        _send_password_reset_email(user["email"], code)
+    except Exception as e:  # noqa: BLE001
+        # The user would otherwise wait for an email that is never coming.
+        # Saying so reveals the account exists only while SES is failing,
+        # which is not a lookup an attacker can trigger at will. Clearing the
+        # cooldown lets them retry immediately. Never log the code or address.
+        print(f"[password-reset] SES send failed for user={user_id}: "
+              f"{type(e).__name__}")
+        _users.update_item(Key={"user_id": user_id},
+                           UpdateExpression="REMOVE reset_sent_at")
+        raise CodedApiError(502, "We couldn't send the email right now. "
+                              "Try again in a minute.", RESET_ERR_SEND_FAILED)
+    return ok
+
+
+def _clear_reset(user_id: str) -> None:
+    _users.update_item(
+        Key={"user_id": user_id},
+        UpdateExpression=("REMOVE reset_code_hash, reset_expires_at, "
+                          "reset_attempts, reset_sent_at"))
+
+
+def reset_password(event):
+    """POST /password/reset {email, code, new_password} -> {token, user_id, email}.
+
+    No JWT — the emailed code is the credential. Success signs the user in.
+    """
+    _require_reset_configured()
+    data = _body(event)
+    email = (data.get("email") or "").strip().lower()
+    code = str(data.get("code") or "").strip()
+    new = data.get("new_password") or ""
+    if not _EMAIL_RE.match(email):
+        raise ApiError(400, "valid email required")
+    if not _RESET_CODE_RE.match(code):
+        raise ApiError(400, "code must be 6 digits")
+    if len(new) < 8:
+        raise ApiError(400, "new password must be at least 8 characters")
+
+    invalid = CodedApiError(400, "That code is invalid or has expired.",
+                         RESET_ERR_INVALID)
+    user = _find_user_by_email(email)
+    if not user or not user.get("reset_code_hash"):
+        raise invalid
+    user_id = user["user_id"]
+    if int(user.get("reset_expires_at") or 0) < int(time.time()):
+        _clear_reset(user_id)
+        raise invalid
+
+    # Claim the attempt BEFORE comparing — see the section header. The
+    # condition fails only if the reset was cleared or reissued in between.
+    try:
+        claimed = _users.update_item(
+            Key={"user_id": user_id},
+            UpdateExpression=("SET reset_attempts = "
+                              "if_not_exists(reset_attempts, :zero) + :one"),
+            ConditionExpression="reset_code_hash = :h",
+            ExpressionAttributeValues={":zero": 0, ":one": 1,
+                                       ":h": user["reset_code_hash"]},
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise invalid
+        raise
+    if int(claimed.get("reset_attempts") or 0) > PASSWORD_RESET_MAX_ATTEMPTS:
+        _clear_reset(user_id)
+        raise CodedApiError(429, "Too many attempts. Request a new code.",
+                         RESET_ERR_LOCKED)
+    stored_hash = claimed["reset_code_hash"]
+    if not hmac.compare_digest(_hash_reset_code(user_id, code), stored_hash):
+        raise invalid
+
+    salt_b64, hash_b64 = _hash_password(new)
+    try:
+        # Conditional on the code just verified: two concurrent submissions
+        # of the same code cannot both succeed.
+        _users.update_item(
+            Key={"user_id": user_id},
+            # A correct emailed code proves the inbox: the account's email is
+            # verified from here on, which _link_google relies on.
+            UpdateExpression=("SET password_hash = :ph, salt = :s, "
+                              "password_changed_at = :now, "
+                              "email_verified_at = :now "
+                              "REMOVE reset_code_hash, reset_expires_at, "
+                              "reset_attempts, reset_sent_at"),
+            ConditionExpression="reset_code_hash = :h",
+            ExpressionAttributeValues={":ph": hash_b64, ":s": salt_b64,
+                                       ":now": _now_iso(), ":h": stored_hash},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise invalid
+        raise
+    return _resp(200, {"token": _mint_for(user_id, user["email"]),
+                       "user_id": user_id, "email": user["email"]})
+
+
+# ---------------------------------------------------------------------------
+# GOOGLE SIGN-IN — "Continue with Google" for both login and signup.
+#
+# THE FLOW. The app signs in with Google natively and receives a Google ID
+# token (a JWT minted for our web OAuth client). It posts that token here; we
+# verify it, then sign in, link, or create — and answer with OUR JWT, exactly
+# like /login. Google's token is never stored.
+#
+# VERIFICATION goes through Google's tokeninfo endpoint, which checks the
+# signature and expiry server-side. That keeps this file dependency-free (no
+# RSA in the stdlib) at the cost of one HTTPS call per Google sign-in, which
+# is rare. We still check what tokeninfo does not decide for us: `aud` is one
+# of OUR client ids (a token minted for some other app must not work here),
+# the issuer, expiry, and that Google has verified the email.
+#
+# IDENTITY is Google's `sub`, not the email — an address can be renamed or
+# reassigned, `sub` cannot. It is claimed with a "google#{sub}" row in the
+# Users table, the same atomic-uniqueness pattern signup uses for emails, so
+# no GSI is needed and two racing first sign-ins cannot create two accounts.
+#
+# LINKING an existing account with the same email is automatic, because
+# Google has proven the caller owns that inbox. One guard: /signup never
+# verifies email ownership, so someone could register a victim's address
+# with a password BEFORE the victim ever arrives ("pre-account takeover").
+# If the account's email was never proven (no email_verified_at — set by a
+# password reset or by Google), linking DISABLES that unproven password. The
+# real owner keeps the account through Google and can set a fresh password
+# with Forgot password; a squatter's password stops working.
+# ---------------------------------------------------------------------------
+AUTH_ERR_USE_GOOGLE = "use_google_sign_in"
+AUTH_ERR_NO_PASSWORD = "no_password_set"
+GOOGLE_ERR_INVALID = "google_token_invalid"
+GOOGLE_ERR_EMAIL_UNVERIFIED = "google_email_unverified"
+GOOGLE_ERR_UNAVAILABLE = "google_sign_in_unavailable"
+GOOGLE_ERR_CONFLICT = "google_account_conflict"
+_GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
+
+
+def _google_claim_id(sub: str) -> str:
+    """The identity-claim row id for a Google account. Never a uuid4 shape,
+    so it cannot collide with an account row (see _is_user_claim)."""
+    return f"google#{sub}"
+
+
+def _fetch_google_tokeninfo(id_token: str) -> dict:
+    url = GOOGLE_TOKENINFO_URL + "?" + urllib.parse.urlencode({"id_token": id_token})
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        if 400 <= e.code < 500:
+            # Malformed, expired or badly signed. The body is not logged: it
+            # can echo the token.
+            raise CodedApiError(401, "Google sign-in failed. Please try again.",
+                                GOOGLE_ERR_INVALID)
+        print(f"[google-signin] tokeninfo HTTP {e.code}")
+        raise ApiError(502, "Couldn't reach Google. Please try again.")
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        print(f"[google-signin] tokeninfo error: {type(e).__name__}")
+        raise ApiError(502, "Couldn't reach Google. Please try again.")
+
+
+def _verify_google_id_token(id_token: str) -> dict:
+    """{sub, email, name} from a VERIFIED Google ID token, or raises."""
+    info = _fetch_google_tokeninfo(id_token)
+    invalid = CodedApiError(401, "Google sign-in failed. Please try again.",
+                            GOOGLE_ERR_INVALID)
+    if info.get("aud") not in GOOGLE_SIGNIN_CLIENT_IDS:
+        print("[google-signin] rejected: aud is not one of our client ids")
+        raise invalid
+    if info.get("iss") not in _GOOGLE_ISSUERS:
+        raise invalid
+    try:
+        if int(info.get("exp") or 0) < int(time.time()):
+            raise invalid
+    except (TypeError, ValueError):
+        raise invalid
+    sub = str(info.get("sub") or "").strip()
+    email = str(info.get("email") or "").strip().lower()
+    if not sub or not _EMAIL_RE.match(email):
+        raise invalid
+    # tokeninfo returns the boolean as a STRING.
+    if str(info.get("email_verified")).lower() != "true":
+        raise CodedApiError(403, "Your Google account's email address isn't "
+                                 "verified yet.", GOOGLE_ERR_EMAIL_UNVERIFIED)
+    return {"sub": sub, "email": email,
+            "name": str(info.get("name") or "").strip()[:100]}
+
+
+def _user_id_for_email(email: str):
+    """The account id for an address. The signup claim row is read first
+    because it is strongly consistent; the GSI covers accounts created
+    before claim rows existed."""
+    claim = _users.get_item(Key={"user_id": _user_email_claim(email)}).get("Item")
+    if claim and claim.get("claims_user_id"):
+        return claim["claims_user_id"]
+    user = _find_user_by_email(email)
+    return user["user_id"] if user else None
+
+
+def _google_signed_in(user: dict, created: bool, password_disabled=False):
+    return _resp(201 if created else 200, {
+        "token": _mint_for(user["user_id"], user["email"]),
+        "user_id": user["user_id"], "email": user["email"],
+        "name": user.get("name", ""), "created": created,
+        "password_disabled": password_disabled,
+    })
+
+
+def _link_google(user: dict, g: dict):
+    """Attach Google identity `g` to an existing account. -> (user, disabled)."""
+    user_id = user["user_id"]
+    if user.get("google_sub") and user["google_sub"] != g["sub"]:
+        raise CodedApiError(409, "This email is already linked to a different "
+                                 "Google account.", GOOGLE_ERR_CONFLICT)
+    try:
+        _users.put_item(
+            Item={"user_id": _google_claim_id(g["sub"]), "claims_google_sub": g["sub"],
+                  "claims_user_id": user_id, "created_at": _now_iso()},
+            ConditionExpression="attribute_not_exists(user_id)")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        winner = _users.get_item(Key={"user_id": _google_claim_id(g["sub"])}).get("Item") or {}
+        if winner.get("claims_user_id") != user_id:
+            raise CodedApiError(409, "This Google account is already linked to "
+                                     "another MinuteX account.", GOOGLE_ERR_CONFLICT)
+
+    names, values = {}, {":g": g["sub"], ":now": _now_iso()}
+    sets = ["google_sub = :g", "email_verified_at = if_not_exists(email_verified_at, :now)"]
+    removes = []
+    # See the section header: an unproven password is a squatter's password
+    # until shown otherwise.
+    disabled = bool(user.get("password_hash")) and not user.get("email_verified_at")
+    if disabled:
+        removes = ["password_hash", "salt"]
+    if not str(user.get("name") or "").strip() and g["name"]:
+        names["#n"] = "name"
+        values[":name"] = g["name"]
+        sets.append("#n = :name")
+    kwargs = {"ExpressionAttributeNames": names} if names else {}
+    updated = _users.update_item(
+        Key={"user_id": user_id},
+        UpdateExpression="SET " + ", ".join(sets)
+                         + (" REMOVE " + ", ".join(removes) if removes else ""),
+        ConditionExpression="attribute_exists(user_id)",
+        ExpressionAttributeValues=values,
+        ReturnValues="ALL_NEW",
+        **kwargs,
+    )["Attributes"]
+    if disabled:
+        print(f"[google-signin] linked user={user_id}; unverified password disabled")
+    return updated, disabled
+
+
+def _create_google_user(g: dict):
+    user_id = str(uuid.uuid4())
+    google_claim = _google_claim_id(g["sub"])
+    email_claim = _user_email_claim(g["email"])
+    now = _now_iso()
+    try:
+        _users.put_item(
+            Item={"user_id": google_claim, "claims_google_sub": g["sub"],
+                  "claims_user_id": user_id, "created_at": now},
+            ConditionExpression="attribute_not_exists(user_id)")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            # A concurrent first sign-in with the same Google account won.
+            raise ApiError(409, "Sign-in already in progress. Please try again.")
+        raise
+    try:
+        _users.put_item(
+            Item={"user_id": email_claim, "claims_email": g["email"],
+                  "claims_user_id": user_id, "created_at": now},
+            ConditionExpression="attribute_not_exists(user_id)")
+    except ClientError as e:
+        _users.delete_item(Key={"user_id": google_claim})
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        # The address was registered between our lookup and now: link instead.
+        existing_id = _user_id_for_email(g["email"])
+        existing = existing_id and _users.get_item(Key={"user_id": existing_id}).get("Item")
+        if not existing:
+            raise ApiError(409, "Sign-in already in progress. Please try again.")
+        user, disabled = _link_google(existing, g)
+        return _google_signed_in(user, False, disabled)
+
+    item = {"user_id": user_id, "email": g["email"], "name": g["name"],
+            "avatar_url": "", "created_at": now, "google_sub": g["sub"],
+            "email_verified_at": now}
+    try:
+        _users.put_item(Item=item, ConditionExpression="attribute_not_exists(user_id)")
+    except Exception:
+        # Never leave claims that no account owns (same rollback as signup).
+        _users.delete_item(Key={"user_id": google_claim})
+        _users.delete_item(Key={"user_id": email_claim})
+        raise
+    return _google_signed_in(item, True)
+
+
+def google_sign_in(event):
+    """POST /auth/google {id_token} -> {token, user_id, email, name, created,
+    password_disabled}. No JWT. 201 when an account was created."""
+    if not GOOGLE_SIGNIN_CLIENT_IDS:
+        raise CodedApiError(503, "Google sign-in isn't available yet.",
+                            GOOGLE_ERR_UNAVAILABLE)
+    data = _body(event)
+    id_token = str(data.get("id_token") or "").strip()
+    if not id_token or len(id_token) > 4096:
+        raise ApiError(400, "id_token required")
+    g = _verify_google_id_token(id_token)
+
+    # 1. Already linked — by `sub`, so a renamed Gmail address still works.
+    claim = _users.get_item(Key={"user_id": _google_claim_id(g["sub"])}).get("Item")
+    if claim:
+        user = _users.get_item(Key={"user_id": claim.get("claims_user_id", "")}).get("Item")
+        if user:
+            return _google_signed_in(user, False)
+        # The account was removed by hand (scripts/90) but its claim was not.
+        _users.delete_item(Key={"user_id": _google_claim_id(g["sub"])})
+
+    # 2. An account with this (Google-verified) email — link it.
+    existing_id = _user_id_for_email(g["email"])
+    if existing_id:
+        existing = _users.get_item(Key={"user_id": existing_id}).get("Item")
+        if existing:
+            user, disabled = _link_google(existing, g)
+            return _google_signed_in(user, False, disabled)
+
+    # 3. New account.
+    return _create_google_user(g)
 
 
 # ---------------------------------------------------------------------------
@@ -1859,8 +2440,17 @@ def _can_read_meeting(user_id, item, *, role=None, devices=None):
     optimization only: omitting them changes no decision, it just costs
     reads.
 
-    Returns the access reason ("OWNER", "ROLE", or a workspace_schema.ACCESS_*
-    value), or "" for denied, so callers can report WHY without re-deriving.
+    Returns the access reason ("OWNER" or "ROLE"), or "" for denied, so
+    callers can report WHY without re-deriving.
+
+    SECURITY INVARIANT — MeetingAccess IS NOT CONSULTED HERE. MeetingAccess
+    must never be used as general meeting authorization. It is consumed only
+    by the shared read-only route (_viewer_access / get_assignee_meeting).
+    This predicate gates get_recording (full transcript + presigned audio),
+    the org Desk list, the AI assistant's meeting set and more; letting a
+    participant grant through here would turn a NOTES grant into a
+    transcript, and a FULL grant into general meeting access. A participant's
+    level decides what the SHARED payload contains, and nothing else.
     """
     if not item:
         return ""
@@ -1885,13 +2475,9 @@ def _can_read_meeting(user_id, item, *, role=None, devices=None):
     if item.get("device_id") in devices:
         return "OWNER"
 
-    if is_org:
-        if workspace_schema.role_sees_all_meetings(role):
-            return "ROLE"
-        granted = _meeting_access_row(item.get("audio_s3_key", ""), user_id)
-        if granted:
-            return str(granted.get("access_type")
-                       or workspace_schema.ACCESS_EXPLICIT)
+    if is_org and workspace_schema.role_sees_all_meetings(role):
+        return "ROLE"
+    # No MeetingAccess branch — see SECURITY INVARIANT in the docstring.
     return ""
 
 
@@ -1925,11 +2511,18 @@ def _can_write_meeting(user_id, item, *, role=None, devices=None):
 
 
 def _meeting_access_row(meeting_id, user_id):
-    """The MeetingAccess row granting this user access, or None.
+    """The MeetingAccess row for this user on this meeting, or None.
+
+    SECURITY INVARIANT: MeetingAccess must never be used as general meeting
+    authorization. It is consumed only by the shared read-only route
+    (_viewer_access). Do not call this from _can_read_meeting,
+    _can_write_meeting, _owned_recording or any owner route.
+
+    A row can also mean "no access": the recorder's explicit NONE is stored,
+    so callers read workspace_schema.grant_level(row), never truthiness.
 
     Best-effort: a missing table (the feature not yet deployed) reads as "no
-    explicit grant" rather than failing the request, because every other
-    branch of _can_read_meeting still works without it.
+    grant" rather than failing the request.
     """
     mid = str(meeting_id or "").strip()
     uid = str(user_id or "").strip()
@@ -1943,29 +2536,118 @@ def _meeting_access_row(meeting_id, user_id):
         return None
 
 
-def _grant_meeting_access(meeting_id, user_id, access_type, *,
-                          workspace_id="", granted_by=""):
-    """Record that a user may reach a meeting. Idempotent.
+def _meeting_access_rows(meeting_id):
+    """{user_id: row} for every grant on one meeting. One Query, any size."""
+    mid = str(meeting_id or "").strip()
+    if not mid:
+        return {}
+    try:
+        rows = _query_all(_meeting_access,
+                          KeyConditionExpression=Key("meeting_id").eq(mid))
+    except ClientError as err:
+        print(f"[workspace] meeting access list failed {mid}: {err}")
+        return {}
+    return {str(r.get("user_id") or ""): r for r in rows if r.get("user_id")}
 
-    Only ever called for ORGANISATION meetings: in a personal workspace the
-    owner is the only member, so a grant row would be noise that can never
-    change an answer.
+
+def _grant_meeting_access(meeting_id, user_id, access_type, *,
+                          workspace_id="", granted_by="",
+                          access_level=workspace_schema.ACCESS_LEVEL_NOTES,
+                          only_if_absent=False):
+    """Record a participant's access level on a meeting.
+
+    Returns the PRIOR level ("" when there was no row), or None when nothing
+    was written — an only_if_absent call that found a row, or a failed write.
+    The caller decides from the prior level whether this was a real grant
+    (absent/NONE -> NOTES/FULL) worth a notification.
+
+    only_if_absent is the AUTO-GRANT on tagging: a conditional put, so it can
+    never overwrite a level the recorder chose — least of all an explicit
+    NONE. Without it, re-tagging someone the recorder removed would silently
+    give them access back.
+
+    Personal and organisation meetings alike: a tagged MinuteX user may be
+    given access to either. The row still carries the meeting's workspace_id
+    so an organisation can revoke its members' grants when they leave.
     """
     mid = str(meeting_id or "").strip()
     uid = str(user_id or "").strip()
     if not mid or not uid:
         return None
-    if not workspace_schema.is_organisation_workspace_id(workspace_id):
-        return None
+    level = workspace_schema.coerce_access_level(access_level)
+    now = _now_iso()
     item = workspace_schema.new_meeting_access(
-        mid, uid, access_type, _now_iso(),
-        workspace_id=workspace_id, granted_by=granted_by)
+        mid, uid, access_type, now,
+        workspace_id=workspace_id, granted_by=granted_by,
+        access_level=level)
     try:
+        if only_if_absent:
+            _meeting_access.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(user_id)")
+            return ""
+        prior = _meeting_access_row(mid, uid)
+        if prior and prior.get("created_at"):
+            # "When were they first given access" survives a level change.
+            item["created_at"] = prior["created_at"]
         _meeting_access.put_item(Item=item)
+        return workspace_schema.grant_level(prior) if prior else ""
     except ClientError as err:
+        if err.response.get("Error", {}).get("Code")                 == "ConditionalCheckFailedException":
+            return None
         print(f"[workspace] meeting access write failed {mid}/{uid}: {err}")
         return None
-    return item
+
+
+def _revoke_meeting_access(meeting_id, user_id):
+    """Delete one grant row. Idempotent and best-effort.
+
+    Used when the person is no longer part of the meeting at all (untagged,
+    contact deleted, left the organisation, meeting deleted) — NOT for the
+    recorder's "No access", which is stored as NONE.
+    """
+    mid = str(meeting_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not mid or not uid:
+        return
+    try:
+        _meeting_access.delete_item(Key={"meeting_id": mid, "user_id": uid})
+    except ClientError as err:
+        print(f"[workspace] meeting access delete failed {mid}/{uid}: {err}")
+
+
+def _delete_meeting_grants(meeting_id):
+    """Remove every grant on a meeting — it is being permanently deleted."""
+    for uid in _meeting_access_rows(meeting_id):
+        _revoke_meeting_access(meeting_id, uid)
+
+
+def _revoke_workspace_grants(user_id, workspace_id):
+    """Remove a user's grants on one organisation's meetings.
+
+    Called when they are removed from that organisation: a former employee
+    must not keep reading its meetings through a participant grant (the grant
+    path deliberately skips the membership gate, so this is what closes it).
+    Grants on other workspaces' meetings are untouched.
+    """
+    uid = str(user_id or "").strip()
+    wid = str(workspace_id or "").strip()
+    if not uid or not wid:
+        return 0
+    try:
+        rows = _query_all(_meeting_access,
+                          IndexName=MEETING_ACCESS_USER_INDEX,
+                          KeyConditionExpression=Key("user_id").eq(uid))
+    except ClientError as err:
+        print(f"[workspace] grant sweep failed for {uid}: {err}")
+        return 0
+    revoked = 0
+    for row in rows:
+        if str(row.get("workspace_id") or "") != wid:
+            continue
+        _revoke_meeting_access(row.get("meeting_id"), uid)
+        revoked += 1
+    return revoked
 
 
 def list_devices(event):
@@ -2026,6 +2708,40 @@ def _as_duration(value):
     except (TypeError, ValueError, InvalidOperation):
         return None
     return d if d >= 0 else None
+
+
+_CLIENT_REF_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# How far back a client's recorded_at may lie. A recording waiting offline for
+# weeks still dedupes; an absurd value just falls back to a fresh identity.
+_CLIENT_RECORDED_AT_MAX_AGE = 90 * 86400
+
+
+def _derived_upload_identity(user_id, data, fmt):
+    """{source: key} derived from the client's session, or None.
+
+    Deterministic in (user, client_ref, recorded_at, format), so a repeated
+    first presign for one on-device session always names the same key. The
+    meeting id is a hash, never the raw client value, so a client cannot steer
+    keys and two users' refs cannot collide on one row (user_id is in the key
+    path anyway).
+    """
+    ref = str(data.get("client_ref") or "").strip()
+    if not _CLIENT_REF_RE.match(ref):
+        return None
+    try:
+        ts = int(data.get("recorded_at"))
+    except (TypeError, ValueError):
+        return None
+    now = int(time.time())
+    if ts > now + 86400 or ts < now - _CLIENT_RECORDED_AT_MAX_AGE:
+        return None
+    digest = hashlib.sha256(f"{user_id}:{ref}".encode("utf-8")).hexdigest()[:10]
+    out = {}
+    for src in USER_UPLOAD_SOURCES:
+        prefix = "mobile" if src == SOURCE_MOBILE else "upload"
+        out[src] = (f"recordings/{user_id}/{SOURCE_SEGMENTS[src]}/"
+                    f"{prefix}-{digest}_{ts}.{fmt}")
+    return out
 
 
 def request_upload(event):
@@ -2115,14 +2831,54 @@ def request_upload(event):
                 "content_type": UPLOAD_FORMATS[fmt],
             })
 
+    # IDEMPOTENT FIRST PRESIGN. The `key` branch above only helps once the
+    # client has stored a key, and the client can only store it AFTER this
+    # handler has written the row. An app killed in that window, or a session
+    # sidecar lost to a crash, came back with no key and minted a second row
+    # for the same recording (observed: an imported .mp4 as an UPLOAD row and,
+    # 8 s later, a MOBILE row — both stuck at "uploading").
+    #
+    # With the client's session id and creation time, the identity is derived
+    # rather than random, so a repeat lands on the same key. Both source
+    # segments are checked because an older build recovered every session as
+    # MOBILE. Only the caller's own still-uploading row is re-used; anything
+    # else (uploaded, trashed, foreign) falls through to a fresh identity,
+    # exactly as before.
+    prefix = "mobile" if source == SOURCE_MOBILE else "upload"
+    derived = _derived_upload_identity(user_id, data, fmt)
+    if derived:
+        for cand_source, cand in derived.items():
+            prior = _recordings.get_item(Key={"audio_s3_key": cand}).get("Item")
+            if not prior:
+                continue
+            if (_can_write_meeting(user_id, prior)
+                    and prior.get("status") == STATUS_UPLOADING):
+                return _resp(200, {
+                    "upload_url": _s3.generate_presigned_url(
+                        "put_object",
+                        Params={"Bucket": BUCKET_NAME, "Key": cand},
+                        ExpiresIn=UPLOAD_URL_EXPIRY,
+                    ),
+                    "key": cand,
+                    "recording_id": prior.get("recording_id", ""),
+                    "expires_in": UPLOAD_URL_EXPIRY,
+                    "content_type": UPLOAD_FORMATS[fmt],
+                })
+            derived = None  # taken by a finished/foreign row: mint fresh
+            break
+
     # recording_id keeps the device convention "{meeting_id}_{timestamp}" so
     # the pipeline's one key parser works unchanged. e.g. mobile-3fa8c2_1754.
-    prefix = "mobile" if source == SOURCE_MOBILE else "upload"
-    meeting_id = f"{prefix}-{uuid.uuid4().hex[:10]}"
-    recorded_at = str(int(time.time()))
-    recording_id = f"{meeting_id}_{recorded_at}"
     segment = SOURCE_SEGMENTS[source]
-    key = f"recordings/{user_id}/{segment}/{recording_id}.{fmt}"
+    if derived:
+        key = derived[source]
+        recording_id = key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        meeting_id, recorded_at = recording_id.rsplit("_", 1)
+    else:
+        meeting_id = f"{prefix}-{uuid.uuid4().hex[:10]}"
+        recorded_at = str(int(time.time()))
+        recording_id = f"{meeting_id}_{recorded_at}"
+        key = f"recordings/{user_id}/{segment}/{recording_id}.{fmt}"
     content_type = UPLOAD_FORMATS[fmt]
 
     # ContentType is deliberately NOT signed. Signing it forces the client to
@@ -2571,6 +3327,9 @@ def patch_recording(event):
         **({"ExpressionAttributeNames": names} if names else {}),
         ExpressionAttributeValues=values,
     )
+    if (":t" in values and values[":t"] != (item.get("title") or "")) or \
+            (":sn" in values and values[":sn"] != (item.get("speaker_names") or {})):
+        _webhook_mark_meeting_dirty(key, "meeting")
     updated = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") or {}
     # Hydrated like get_recording: the app ADOPTS this response as its current
     # recording (see updateRecording in lib/api.ts), and its Transcript tab
@@ -2681,6 +3440,7 @@ def delete_recording(event):
                                    ":t": deleted_at},
     )
     print(f"[trash] {key} moved to trash (status '{item.get('status')}')")
+    _webhook_mark_meeting_dirty(key, "lifecycle", immediate=True)
     return _resp(200, {"trashed": True, "key": key, "deleted_at": deleted_at})
 
 
@@ -2728,6 +3488,7 @@ def restore_recording(event):
         ExpressionAttributeValues=values,
     )
     print(f"[trash] {key} restored (status '{restored_status}')")
+    _webhook_mark_meeting_dirty(key, "lifecycle", immediate=True)
     return _resp(200, {"restored": True, "key": key, "status": restored_status})
 
 
@@ -2845,7 +3606,12 @@ def permanently_delete_recording(event):
             except Exception as err:  # noqa: BLE001 — see the docstring
                 print(f"[delete] {what} object {s3_key} not removed: {err}")
 
+    # Before the row goes: the delivery state must know a meeting.deleted is
+    # owed, and it cannot learn that from a row that no longer exists.
+    _webhook_note_permanent_delete(key)
     _recordings.delete_item(Key={"audio_s3_key": key})
+    # Grants point at a meeting that no longer exists.
+    _delete_meeting_grants(key)
     print(f"[delete] {key} permanently removed (was '{status}')")
     return _resp(200, {"deleted": True, "key": key})
 
@@ -2866,8 +3632,9 @@ def get_recording(event):
     # Ownership check: the recording is stamped with the user's user_id
     # (user-owned uploads / unpair backfill), or — legacy rows only — its
     # device is one the user currently owns. Since Phase 2B this also admits
-    # an ORGANISATION reader (OWNER/MANAGER, or an explicit grant) via
-    # _can_read_meeting, which returns "" for everyone else.
+    # an ORGANISATION reader (OWNER/MANAGER) via _can_read_meeting, which
+    # returns "" for everyone else. A participant grant NEVER opens this
+    # route — grantees read /recordings/shared-with-me/{key+} instead.
     if not _can_read_meeting(user_id, item):
         # Do not leak existence of recordings owned by others.
         raise ApiError(404, "recording not found")
@@ -3848,24 +4615,32 @@ def quick_action(event):
 def regenerate_highlights(event):
     """POST /recordings/{key+}/highlights {regenerate?} -> {meeting_highlights}.
 
-    The staged pipeline normally writes highlights right after the summary. This
-    route exists for the two cases where it didn't: the second Groq call was
-    rate-limited during processing, or the recording predates this feature. The
-    workspace calls it on first open when the field is missing, which is what
-    makes the whole thing work on the existing back catalogue.
+    READ-ONLY unless `regenerate` is true. The processing pipeline extracts
+    highlights in the same Groq call as the Overview and stores them when it
+    finds any, so without `regenerate` this returns what is stored — or empty
+    highlights — and NEVER calls Groq. It used to generate whenever nothing was
+    stored, and an empty result is (rightly) never stored, so every Calendar
+    visit re-ran Groq for each meeting with nothing to find, each call holding
+    a Lambda slot for up to ~29 s. Meetings processed before highlights existed
+    are deliberately not backfilled (decided 2026-10-12).
 
-    Single Groq call, truncating a long transcript rather than map-reducing it —
-    the response has to land inside API Gateway's 29s window. `segments_covered`
-    / `segments_total` in the response say whether the whole meeting was seen.
+    With `regenerate`: single Groq call, truncating a long transcript rather
+    than map-reducing it — the response has to land inside API Gateway's 29s
+    window. `segments_covered` / `segments_total` in the response say whether
+    the whole meeting was seen.
     """
-    _, key, item = _owned_recording(event)
+    # The transcript is not needed to READ stored highlights: no S3 fetch.
+    _, key, item = _owned_recording(event, hydrate=False)
     data = _body(event) if event.get("body") else {}
     regenerate = bool(data.get("regenerate"))
 
-    stored = item.get("meeting_highlights")
-    if not regenerate and isinstance(stored, dict) and \
-            not ai_schema.highlights_empty(stored):
-        return _resp(200, {"meeting_highlights": stored, "cached": True})
+    if not regenerate:
+        stored = item.get("meeting_highlights")
+        if isinstance(stored, dict) and not ai_schema.highlights_empty(stored):
+            return _resp(200, {"meeting_highlights": stored, "cached": True})
+        return _resp(200, {"meeting_highlights": ai_schema.empty_highlights(), "cached": True})
+
+    _, key, item = _owned_recording(event)   # regenerate reads the transcript
 
     transcript = _require_transcript(item)
 
@@ -3875,7 +4650,7 @@ def regenerate_highlights(event):
     # transcript here took 22s on the first chunk and then died on a 429 retry
     # at API Gateway's 29s ceiling, returning an opaque gateway 500. The staged
     # pipeline (which has 300s and nobody waiting) is where full-fidelity
-    # map-reduce belongs; this route exists to backfill rows it missed.
+    # map-reduce belongs; this route only regenerates on explicit request.
     budget = _transcript_budget_chars(prompts.HIGHLIGHTS_SYSTEM, reserve_tokens=900)
     truncated = len(transcript) > budget
     deadline = time.monotonic() + ONDEMAND_DEADLINE_SECONDS
@@ -3903,6 +4678,7 @@ def regenerate_highlights(event):
                 ":fp": ai_schema.fingerprint(transcript), ":now": _now_iso(),
             },
         )
+        _webhook_mark_meeting_dirty(key, "summary")
     return _resp(200, {"meeting_highlights": highlights, "cached": False,
                        "segments_covered": covered, "segments_total": total})
 
@@ -4090,12 +4866,17 @@ def retrieve_meeting_context(item, key, question, system_prompt):
     array — segment ids the app already knows how to deep-link. `metrics` is
     for the log line, never for the response body.
 
-    THE TWO PATHS, and why the choice is made on size alone:
-      * transcript FITS the budget -> send all of it. Retrieval could only
-        subtract, and the model answering from the complete record is strictly
-        better than answering from a chosen part of it.
-      * transcript does NOT fit -> retrieve. This is the case the old code
-        answered with the first N characters.
+    RETRIEVAL IS THE DEFAULT, whatever the meeting's size. It used to engage
+    only when the transcript overflowed the budget, but on the 300k-TPM plan
+    that budget is ~460k chars (~8 hours of English), so every real meeting
+    took the full-transcript path and each question paid for the whole
+    transcript again. The analysis digest and the MoM ride along on every
+    path, so overview questions still have the whole meeting to answer from;
+    the transcript lines are there for the specifics and the citations.
+
+    The full transcript is sent only when there is no usable index (no
+    timestamps, a lost single-flight claim, a failed build) and it fits; past
+    the budget it falls back to the old head-truncated context.
     """
     started = time.monotonic()
     names = _speaker_names(item)
@@ -4119,21 +4900,27 @@ def retrieve_meeting_context(item, key, question, system_prompt):
     metrics = {"retrieval_mode": "full", "retrieved_segments": 0,
                "nodes_selected": 0, "retrieval_ms": 0}
 
-    if len(labelled) <= budget:
-        # Whole meeting fits. Note this is now the LABELLED transcript, so even
-        # this path can cite segment ids — evidence is not a retrieval-only
-        # feature.
-        context = prompts.build_grounded_context(
-            item, labelled, highlights=highlights, mom_markdown=mom)
-        metrics["retrieved_segments"] = len(timestamps)
-        metrics["retrieval_ms"] = int((time.monotonic() - started) * 1000)
-        return context, [], metrics
+    # No timestamps means no segments to index — skip the claim and the S3
+    # write rather than storing an empty tree for every such meeting.
+    tree = None
+    if timestamps:
+        tree = _ensure_index(
+            key, item, _row_fingerprint(item),
+            deadline=time.monotonic() + RETRIEVAL_DEADLINE_SECONDS)
+    # A stored tree with no nodes is "ready" but has nothing to retrieve from;
+    # navigating it would send the model no transcript at all.
+    nodes = (tree or {}).get("nodes") or []
 
-    fingerprint = _row_fingerprint(item)
-    tree = _ensure_index(key, item, fingerprint,
-                         deadline=time.monotonic() + RETRIEVAL_DEADLINE_SECONDS)
-
-    if not tree:
+    if not nodes:
+        if len(labelled) <= budget:
+            # No index, but the whole meeting fits. Note this is the LABELLED
+            # transcript, so even this path can cite segment ids — evidence is
+            # not a retrieval-only feature.
+            context = prompts.build_grounded_context(
+                item, labelled, highlights=highlights, mom_markdown=mom)
+            metrics["retrieved_segments"] = len(timestamps)
+            metrics["retrieval_ms"] = int((time.monotonic() - started) * 1000)
+            return context, [], metrics
         # NO INDEX AND WE COULD NOT MAKE ONE. Fall back to the old behaviour
         # rather than failing the question: a head-truncated answer is what the
         # user got yesterday, and it is not nothing. The MoM still rides along,
@@ -4147,8 +4934,13 @@ def retrieve_meeting_context(item, key, question, system_prompt):
                        "===\n" + mom.strip() + "\n\n" + context)
         return context, [], metrics
 
-    node_ids, mode = _navigate(tree, question, item,
-                               time.monotonic() + RETRIEVAL_DEADLINE_SECONDS)
+    if len(nodes) == 1:
+        # One section (a meeting of a few minutes): there is nothing to choose
+        # between, so a navigation call would only add latency and tokens.
+        node_ids, mode = [nodes[0]["node_id"]], "single"
+    else:
+        node_ids, mode = _navigate(tree, question, item,
+                                   time.monotonic() + RETRIEVAL_DEADLINE_SECONDS)
     segments = pageindex.segments_for_nodes(tree, timestamps, node_ids)
     lines, kept, truncated = _fit_segments(segments, budget - len(mom), names)
 
@@ -4607,6 +5399,7 @@ def _persist_mom(key, item, mom, regenerated=False):
     )
 
     document = _mirror_document(key, item, mom)
+    _webhook_mark_meeting_dirty(key, "minutes")
     return mom, document
 
 
@@ -4763,6 +5556,7 @@ def delete_mom(event):
         ExpressionAttributeNames={"#mom": MOM_ATTR},
         ExpressionAttributeValues={":now": _now_iso()},
     )
+    _webhook_mark_meeting_dirty(key, "minutes")
     return _resp(200, {"deleted": True})
 
 
@@ -5115,6 +5909,7 @@ def delete_task(event):
         ExpressionAttributeNames={"#tasks": TASKS_ATTR, "#t": task_id},
         ExpressionAttributeValues={":now": _now_iso()},
     )
+    _webhook_mark_meeting_dirty(key, "action_items")
     return _resp(200, {"deleted": True, "id": task_id})
 
 
@@ -6595,6 +7390,7 @@ def delete_contact(event):
             "organisation instead.")
 
     participants = 0
+    untagged_meetings = set()
     res = _meeting_participants.query(
         IndexName=PARTICIPANTS_CONTACT_INDEX,
         KeyConditionExpression=Key("contact_id").eq(cid),
@@ -6603,7 +7399,15 @@ def delete_contact(event):
         _meeting_participants.delete_item(
             Key={"audio_s3_key": row["audio_s3_key"],
                  "speaker_id": row["speaker_id"]})
+        untagged_meetings.add(row["audio_s3_key"])
         participants += 1
+    # The person those rows tagged may now be on none of those meetings, so
+    # the access their tag gave is revoked — unless another contact still
+    # maps to the same account there.
+    linked_user = _contact_minutex_user(item)
+    for meeting_key in untagged_meetings:
+        _reconcile_participant_access(meeting_key, {linked_user})
+        _webhook_mark_meeting_dirty(meeting_key, "participants")
 
     unassigned = 0
     res = _tasks.query(
@@ -6713,6 +7517,192 @@ def _participant_rows(key):
     return res.get("Items", [])
 
 
+# ===========================================================================
+# PARTICIPANT MEETING ACCESS.
+#
+# A tagged person who has a MinuteX account can open the meeting — READ-ONLY,
+# on the shared view — at the level the RECORDER picks:
+#
+#     NONE  -> no access (stored, so re-tagging does not undo the choice)
+#     NOTES -> notes only                    (the default on tagging)
+#     FULL  -> notes + transcript + audio    (still read-only)
+#
+# THE RECORDER IS UNCHANGED. They keep every existing owner read, write and
+# meeting-edit permission; these permissions are unchanged by participant
+# grants. Nothing below touches _can_write_meeting or _owned_recording, and
+# no level — FULL included — is a write permission anywhere.
+#
+# SECURITY INVARIANT: MeetingAccess must never be used as general meeting
+# authorization. It is consumed only by the shared read-only route.
+#
+# WHO IS ELIGIBLE: any MinuteX user the recorder tags, in or outside the
+# organisation. The person is resolved from the CONTACT (minutex_user_id, a
+# member-<uid> projection, or the contact's email) — a participant row stores
+# no user id of its own. Access is per USER, so someone tagged as a speaker
+# AND as an attendee has one access state, not two.
+# ===========================================================================
+def _contact_minutex_user(contact, *, resolve_email=False):
+    """The MinuteX user_id behind a contact, or "".
+
+    `resolve_email` looks an unlinked contact's email up in Users (one GSI
+    query) and backfills minutex_user_id, so a contact created before its
+    person signed up becomes linked the next time they are tagged. It is off
+    for list reads, which must not cost a query per participant.
+    """
+    if not contact:
+        return ""
+    cid = str(contact.get("contact_id") or "")
+    uid = str(contact.get("minutex_user_id") or "").strip()
+    if not uid and _is_member_contact(cid):
+        uid = cid[len(MEMBER_CONTACT_PREFIX):]
+    if uid or not resolve_email:
+        return uid
+    email = str(contact.get("email_lc") or contact.get("email") or "") \
+        .strip().lower()
+    uid = _resolve_minutex_user(email)
+    if uid and cid:
+        try:
+            _contacts.update_item(
+                Key={"contact_id": cid},
+                UpdateExpression="SET minutex_user_id = :u",
+                ConditionExpression="attribute_exists(contact_id)",
+                ExpressionAttributeValues={":u": uid})
+        except ClientError as err:
+            # The link is still correct for THIS request; only the backfill
+            # failed, and the next tag will try again.
+            print(f"[access] contact link backfill failed {cid}: {err}")
+    return uid
+
+
+def _contact_user_id_by_id(contact_id, cache):
+    """_contact_minutex_user for a stored contact_id, memoised per request."""
+    cid = str(contact_id or "")
+    if not cid:
+        return ""
+    if cid not in cache:
+        if _is_member_contact(cid):
+            cache[cid] = cid[len(MEMBER_CONTACT_PREFIX):]
+        else:
+            row = _contacts.get_item(Key={"contact_id": cid}).get("Item")
+            cache[cid] = _contact_minutex_user(row)
+    return cache[cid]
+
+
+def _participant_user_ids(key, rows=None):
+    """Every MinuteX user currently tagged on a meeting, speaker or attendee."""
+    cache = {}
+    rows = _participant_rows(key) if rows is None else rows
+    return {uid for uid in (_contact_user_id_by_id(r.get("contact_id"), cache)
+                            for r in rows) if uid}
+
+
+def _recorder_display_name(user_id):
+    profile = _users_by_ids([user_id]).get(user_id) if user_id else None
+    return workspace_schema.display_name(profile, fallback_user_id="")
+
+
+def _notify_meeting_access_granted(recipient, recorder_id, key, item):
+    """Tell a participant the recorder gave them access. In-app only.
+
+    Once per (meeting, person) — dedupe_key is per entity — so toggling a
+    level back and forth cannot spam them.
+    """
+    title = _recording_title(item)
+    who = _recorder_display_name(recorder_id) or "Someone"
+    return _notify(
+        recipient, notification_schema.TYPE_MEETING_ACCESS_GRANTED, key,
+        message=f"{who} gave you access to \u201c{title}\u201d",
+        metadata={"meeting_title": title, "shared_by_name": who},
+        actor_user_id=recorder_id)
+
+
+def _auto_grant_participant(recorder_id, key, item, contact):
+    """The default on tagging: NOTES for a MinuteX user, once, never over a
+    level the recorder already chose. Never raises into the tag request."""
+    try:
+        uid = _contact_minutex_user(contact, resolve_email=True)
+        if not uid or uid == recorder_id:
+            # Not on MinuteX, or the recorder tagging themselves — they
+            # already own the meeting and need no grant.
+            return
+        prior = _grant_meeting_access(
+            key, uid, workspace_schema.ACCESS_PARTICIPANT,
+            workspace_id=_row_workspace_id(item), granted_by=recorder_id,
+            access_level=workspace_schema.ACCESS_LEVEL_NOTES,
+            only_if_absent=True)
+        if prior == "":
+            _audit("meeting.access_auto_granted", recorder_id, key,
+                   grantee=uid, level=workspace_schema.ACCESS_LEVEL_NOTES)
+            _notify_meeting_access_granted(uid, recorder_id, key, item)
+    except Exception as err:  # noqa: BLE001 — the tag itself already succeeded
+        print(f"[access] auto-grant failed on {key}: "
+              f"{type(err).__name__}: {err}")
+
+
+def _reconcile_participant_access(key, user_ids):
+    """Revoke grants for people no longer tagged on the meeting at all.
+
+    Someone still tagged under another row (a speaker who is also an
+    attendee) keeps their access. Best-effort, like the grant.
+    """
+    candidates = {u for u in (user_ids or ()) if u}
+    if not candidates:
+        return
+    try:
+        still_tagged = _participant_user_ids(key)
+        for uid in candidates - still_tagged:
+            _revoke_meeting_access(key, uid)
+    except Exception as err:  # noqa: BLE001
+        print(f"[access] reconcile failed on {key}: "
+              f"{type(err).__name__}: {err}")
+
+
+def _public_access(uid, grants):
+    """The participant row's `access` field. None -> not on MinuteX."""
+    if not uid:
+        return None
+    return {"user_id": uid,
+            "level": workspace_schema.grant_level(grants.get(uid)).lower()}
+
+
+def set_meeting_access(event):
+    """PUT /recordings/access/{key+} {user_id, level} -> {access}
+
+    The recorder's per-person control: level is "none" | "notes" | "full".
+
+    RECORDER ONLY, via _owned_recording — anyone else (a grantee included,
+    FULL or not) gets 404. The target must be a MinuteX user currently tagged
+    on THIS meeting; an arbitrary user id is refused, so this cannot be used
+    to push a meeting to someone the recorder never tagged.
+    """
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+    target = str(data.get("user_id") or "").strip()
+    if not target:
+        raise ApiError(400, "user_id required")
+    try:
+        level = workspace_schema.coerce_access_level(data.get("level"))
+    except workspace_schema.WorkspaceValidationError as err:
+        raise ApiError(400, str(err))
+    if target == user_id:
+        raise ApiError(400, "the recorder already owns this meeting")
+    if target not in _participant_user_ids(key):
+        raise ApiError(404, "participant not found")
+
+    prior = _grant_meeting_access(
+        key, target, workspace_schema.ACCESS_PARTICIPANT,
+        workspace_id=_row_workspace_id(item), granted_by=user_id,
+        access_level=level)
+    if prior is None:
+        raise ApiError(500, "could not update access")
+    _audit("meeting.access_set", user_id, key, grantee=target,
+           level=level, prior=prior or "ABSENT")
+    if level != workspace_schema.ACCESS_LEVEL_NONE and \
+            prior in ("", workspace_schema.ACCESS_LEVEL_NONE):
+        _notify_meeting_access_granted(target, user_id, key, item)
+    return _resp(200, {"access": {"user_id": target, "level": level.lower()}})
+
+
 def list_participants(event):
     """GET /recordings/participants/{key+} -> {participants, speakers,
     folder_contacts, folder_id}
@@ -6723,6 +7713,8 @@ def list_participants(event):
     """
     user_id, key, item = _owned_recording(event)
     rows = _participant_rows(key)
+    # ONE query for every grant on the meeting, not a read per participant.
+    grants = _meeting_access_rows(key)
 
     participants = []
     for row in rows:
@@ -6732,7 +7724,13 @@ def list_participants(event):
             # Central gate, so a SHARED organisation contact hydrates for
             # every member rather than only for whoever created it.
             contact = _readable_contact(user_id, cid)
-        participants.append(_public_participant(row, contact))
+        public = _public_participant(row, contact)
+        # `access` is null for someone with no MinuteX account (the app says
+        # "Not on MinuteX") and for the recorder, who owns the meeting.
+        uid = _contact_minutex_user(contact)
+        public["access"] = (_public_access(uid, grants)
+                            if uid and uid != user_id else None)
+        participants.append(public)
     # Speakers first in speaker order, then attendance-only rows by name.
     # _speaker_sort_key already puts non-numeric labels after numeric ones, so
     # the sentinel sorts last without a special case — but the explicit key
@@ -6852,8 +7850,15 @@ def set_participant(event):
     if clearing:
         if not speaker_id:
             raise ApiError(400, "speaker_id required to clear a mapping")
+        cleared_row = _meeting_participants.get_item(
+            Key={"audio_s3_key": key, "speaker_id": speaker_id}).get("Item")
         _meeting_participants.delete_item(
             Key={"audio_s3_key": key, "speaker_id": speaker_id})
+        # Untagging the LAST row that maps to a person revokes their access;
+        # another row for the same person (speaker + attendee) keeps it.
+        if cleared_row:
+            _reconcile_participant_access(key, {_contact_user_id_by_id(
+                cleared_row.get("contact_id"), {})})
         # An attendance row was never in speaker_names, so there is nothing
         # there to unwind — and calling this for one would bump
         # speaker_mapping_version, marking every generated document stale over
@@ -6863,6 +7868,7 @@ def set_participant(event):
                                             None)
         _audit("meeting.participant_cleared", user_id, key,
                speaker_id=speaker_id)
+        _webhook_mark_meeting_dirty(key, "participants")
         return _resp(200, {"cleared": True, "speaker_id": speaker_id})
 
     # Materializes a projected organisation member (Phase 2D) — this row
@@ -6899,6 +7905,15 @@ def set_participant(event):
         row["created_at"] = prior["created_at"]
     _meeting_participants.put_item(Item=row)
 
+    # MEETING ACCESS for tagged MinuteX users — read-only, on the shared view
+    # only; the recorder's own permissions are unchanged by it. A re-map that
+    # moved this slot AWAY from someone may have untagged them entirely.
+    prior_cid = str((prior or {}).get("contact_id") or "")
+    if prior_cid and prior_cid != contact["contact_id"]:
+        _reconcile_participant_access(
+            key, {_contact_user_id_by_id(prior_cid, {})})
+    _auto_grant_participant(user_id, key, item, contact)
+
     # THE TWO SPEAKER SIDE EFFECTS, SKIPPED FOR ATTENDANCE.
     #
     # Writing speaker_names would make the sentinel a label _speaker_labels
@@ -6910,6 +7925,7 @@ def set_participant(event):
     if attendance_only:
         _audit("meeting.attendee_self_tagged", user_id, key,
                contact_id=contact["contact_id"])
+        _webhook_mark_meeting_dirty(key, "participants")
         return _resp(200, {"participant": _public_participant(row, contact),
                            "tasks_resolved": 0})
 
@@ -6921,6 +7937,7 @@ def set_participant(event):
 
     _audit("meeting.participant_set", user_id, key, speaker_id=speaker_id,
            contact_id=contact["contact_id"], tasks_resolved=resolved)
+    _webhook_mark_meeting_dirty(key, "participants")
     return _resp(200, {"participant": _public_participant(row, contact),
                        "tasks_resolved": resolved})
 
@@ -7592,6 +8609,11 @@ def _mirror_task_to_recording(key, task_row):
     except Exception as e:  # noqa: BLE001
         print(f"[warn] task mirror failed for {key}/{task_row['task_id']}: "
               f"{type(e).__name__}: {e}")
+    # Every task create/update/reassign/status change reaches this mirror,
+    # so it is the one place a changed action item is noticed.
+    _webhook_mark_meeting_dirty(key, "action_items")
+    # Every task create/update/reassign/status change reaches this mirror,
+    # so it is the one place a changed action item is noticed.
 
 
 def _migrate_embedded_tasks(user_id, key, item):
@@ -7671,6 +8693,7 @@ def _migrate_embedded_tasks(user_id, key, item):
         created += 1
     if created:
         print(f"[migrate] {key}: {created} embedded task(s) -> Tasks table")
+        _webhook_mark_meeting_dirty(key, "action_items")
     return created
 
 
@@ -8216,6 +9239,7 @@ def delete_meeting_task(event):
                     not in ("ValidationException",):
                 raise
     _audit("task.deleted", user_id, row["task_id"], recording_key=key)
+    _webhook_mark_meeting_dirty(key, "action_items")
     return _resp(200, {"deleted": True, "id": task_id})
 
 
@@ -8487,15 +9511,24 @@ def get_task(event):
 
     cid = row.get("assignee_contact_id")
     if cid:
-        c = _contacts.get_item(Key={"contact_id": cid}).get("Item")
-        if c and c.get("owner_user_id") == user_id:
+        # _readable_contact, NOT an inline `owner_user_id == user_id`. In an
+        # organisation workspace the assignee is usually a SHARED contact a
+        # colleague created, or a materialized member contact — readable by
+        # this caller but not owned by them. The inline test withheld it, so
+        # the detail screen said "Nobody is assigned" while the task list
+        # (which renders the row's assignee_name) showed the person.
+        c = _readable_contact(user_id, cid)
+        if c:
             out["contact"] = _public_contact(c)
-        elif _is_task_assignee(user_id, row):
-            # The assignee, seeing THEMSELVES. Built from the task row rather
-            # than the creator's contact record: it is the same person, and
-            # this way no address-book row crosses a tenant boundary. The id
-            # is deliberately omitted — it addresses a contact they cannot
-            # open, and offering it would only produce a 404 on tap.
+        elif (creator and row.get("assignee_name")) \
+                or _is_task_assignee(user_id, row):
+            # The row still names someone: the assignee seeing THEMSELVES, or
+            # the creator whose contact was since deleted / left the
+            # organisation. Built from the task row's own display fields, so
+            # no address-book row crosses a tenant boundary and the detail
+            # never contradicts the list. The id is deliberately omitted — it
+            # addresses a contact they cannot open, and offering it would only
+            # produce a 404 on tap.
             out["contact"] = {
                 "id": "",
                 "name": row.get("assignee_name", ""),
@@ -12200,18 +13233,63 @@ def _assignee_tasks_in_recording(user_id, key):
             and _is_task_assignee(user_id, row)]
 
 
+def _full_share_config():
+    """The synthetic config a FULL participant grant renders under.
+
+    Notes plus transcript plus audio — still the share assembler, so nothing
+    beyond what a public link could carry can reach the grantee, and still
+    READ-ONLY: this route has no write counterpart at any level.
+    """
+    config = share_schema.coerce_config({})
+    config["transcript_enabled"] = True
+    config["audio_enabled"] = True
+    return config
+
+
+def _viewer_access(user_id, item):
+    """(access, level) for the SHARED read-only view, or ("", "").
+
+    THE ONE PLACE MeetingAccess is consumed. The first rule that matches wins:
+
+        _can_read_meeting (recorder / org role)  -> ("owner"|"organisation", "notes")
+        participant grant FULL                   -> ("participant", "full")
+        participant grant NOTES                  -> ("participant", "notes")
+        task assignee                            -> ("assignee", "notes")
+        otherwise                                -> denied (404)
+
+    An owner or org reader already has the real screen; this route serves
+    them notes so it never lies about a meeting they can open.
+
+    The grant rules deliberately do NOT require organisation membership: the
+    recorder may give access to any MinuteX user. A member who LEAVES an
+    organisation loses its grants through remove_member instead.
+
+    Nothing returned here authorizes a write. FULL is read-only access to
+    notes, transcript and audio, and grants no write or edit permission.
+    """
+    notes = "notes"
+    reason = _can_read_meeting(user_id, item)
+    if reason:
+        return ("owner" if reason == "OWNER" else "organisation", notes)
+    key = str(item.get("audio_s3_key") or "")
+    level = workspace_schema.grant_level(_meeting_access_row(key, user_id))
+    if level == workspace_schema.ACCESS_LEVEL_FULL:
+        return ("participant", "full")
+    if level == workspace_schema.ACCESS_LEVEL_NOTES:
+        return ("participant", notes)
+    if _assignee_tasks_in_recording(user_id, key):
+        return ("assignee", notes)
+    return ("", "")
+
+
 def _assignee_readable_recording(event):
-    """(user_id, key, item) when the caller may READ this meeting's notes.
+    """(user_id, key, item, access, level) when the caller may READ this
+    meeting on the shared view.
 
-    The assignee counterpart to _owned_recording, deliberately shaped like it
-    so the two read the same at every call site. 404 for a caller with no
-    task here, for a meeting that does not exist, and for one in the Trash —
-    a trashed meeting stops being readable through a task exactly as it stops
-    being readable through a share link.
-
-    The OWNER is allowed through too: they can already open the meeting
-    properly, and rejecting them would make the route lie about a recording
-    the caller demonstrably owns.
+    Shaped like _owned_recording so the two read the same at every call
+    site. 404 — never 403 — for a caller with no access, for a meeting that
+    does not exist, and for one in the Trash: a trashed meeting stops being
+    readable through a grant or a task exactly as through a share link.
     """
     user_id = _require_auth(event)
     key = _url_unquote((event.get("pathParameters") or {}).get("key", ""))
@@ -12222,56 +13300,108 @@ def _assignee_readable_recording(event):
     if not item or _is_trashed(item):
         raise ApiError(404, "recording not found")
 
-    # Routed through the ONE authoritative predicate rather than repeating a
-    # creator test (P1 remediation): this now admits an organisation
-    # OWNER/MANAGER — who could already open the meeting through
-    # get_recording, so 404-ing them here made the API inconsistent — and it
-    # DENIES a member removed from the owning organisation.
-    #
-    # The assignee fallback is preserved exactly: a task assignee who is not
-    # a workspace member still reads the meeting their work came from, which
-    # is the Phase-1 behaviour this route exists for.
-    if not _can_read_meeting(user_id, item) \
-            and not _assignee_tasks_in_recording(user_id, key):
+    access, level = _viewer_access(user_id, item)
+    if not access:
         raise ApiError(404, "recording not found")
-    return user_id, key, item
+    return user_id, key, item, access, level
 
 
 def get_assignee_meeting(event):
-    """GET /recordings/shared-with-me/{key+} -> {meeting, access}
+    """GET /recordings/shared-with-me/{key+}
+        -> {meeting, access, level, shared_by_name}
 
-    The read-only meeting an ASSIGNEE opens from their task. Notes only: no
-    transcript, no audio, no presigned URL — and no route here can write.
+    The read-only meeting a PARTICIPANT the recorder gave access to, or a
+    task ASSIGNEE, opens. No route here can write, at any level.
+
+      level "notes" -> notes only: no transcript, no audio, no presigned URL.
+      level "full"  -> notes + transcript + a short-lived audio URL.
 
     The MoM is resolved against the recording's OWNER, not the caller. The
     stored structure and its fresh-build fallback both belong to the owner's
-    meeting, and building them as the assignee would produce an empty
-    document. That is a read of the owner's content on the assignee's behalf,
-    which is the point of the route; what it can EMIT is still bounded by
-    public_payload and the pinned-off toggles above.
+    meeting, and building them as the viewer would produce an empty document.
+    What it can EMIT is bounded by public_payload and the config below.
     """
-    user_id, key, item = _assignee_readable_recording(event)
+    user_id, key, item, access, level = _assignee_readable_recording(event)
 
     # Hydrated because the MoM fallback builds its sections from the
-    # transcript. The transcript still cannot LEAVE: transcript_enabled is
-    # False, so public_payload never copies it into the response.
+    # transcript. At "notes" the transcript still cannot LEAVE:
+    # transcript_enabled is False, so public_payload never copies it.
     item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
     owner_id = str(item.get("user_id") or "")
-    config = _assignee_share_config()
+    full = level == "full"
+    config = _full_share_config() if full else _assignee_share_config()
     mom = _shared_mom(owner_id, key, item)
 
-    # audio_url is not merely omitted from the response — it is never
-    # GENERATED. A presign is a bearer credential, and minting one the payload
-    # then drops would still put it in this Lambda's memory and in any future
-    # log line. Hence audio_url=None here, on top of audio_enabled being False.
-    meeting = share_schema.public_payload(item, mom, config, audio_url=None)
+    # At "notes" audio_url is not merely omitted — it is never GENERATED. A
+    # presign is a bearer credential, and minting one the payload then drops
+    # would still put it in this Lambda's memory and in any future log line.
+    audio_url = None
+    if full and BUCKET_NAME:
+        try:
+            audio_url = _s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": BUCKET_NAME, "Key": key},
+                ExpiresIn=AUDIO_URL_EXPIRY,
+            )
+        except Exception:  # noqa: BLE001 — notes still load without playback
+            audio_url = None
+    meeting = share_schema.public_payload(item, mom, config,
+                                          audio_url=audio_url)
     return _resp(200, {
         "meeting": meeting,
-        # Lets the app pick the right screen without re-deriving the rule.
+        # Lets the app pick the right banner without re-deriving the rule.
         # Enforcement stays here regardless of what any client does.
-        "access": "owner" if owner_id == user_id else "assignee",
+        "access": access,
+        "level": level,
+        "shared_by_name": _recorder_display_name(_recorded_by(item)),
     })
 
+
+# Newest grants a Desk shows. A person is rarely tagged on hundreds of
+# meetings; the cap bounds the per-row recording reads this list costs.
+SHARED_WITH_ME_MAX = 200
+
+
+def list_shared_with_me(event):
+    """GET /recordings/shared-with-me -> {recordings, count}
+
+    The meetings other people's recorders gave this caller access to — the
+    Desk's "Shared with you" section. Built from MeetingAccess alone
+    (user-index, every page followed), so it spans workspaces: a grant from
+    another organisation shows up here too.
+
+    NONE rows, trashed meetings, deleted meetings and the caller's own
+    recordings are left out. Each row carries `access_level` and the
+    recorder's name/avatar. Rows are for the SHARED view: the app opens
+    /meeting/[key]/shared for them, never the owner screen.
+    """
+    user_id = _require_auth(event)
+    try:
+        grants = _query_all(_meeting_access,
+                            IndexName=MEETING_ACCESS_USER_INDEX,
+                            KeyConditionExpression=Key("user_id").eq(user_id))
+    except ClientError as err:
+        print(f"[access] shared-with-me query failed for {user_id}: {err}")
+        grants = []
+    live = [g for g in grants
+            if workspace_schema.grant_level(g)
+            != workspace_schema.ACCESS_LEVEL_NONE]
+    live.sort(key=lambda g: str(g.get("updated_at") or g.get("created_at")
+                                or ""), reverse=True)
+
+    out = []
+    for grant in live[:SHARED_WITH_ME_MAX]:
+        key = str(grant.get("meeting_id") or "")
+        row = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+        if not row or _is_trashed(row) or row.get("user_id") == user_id:
+            continue
+        summary = _with_source({k: row.get(k, "") for k in LIST_FIELDS})
+        summary["access_level"] = workspace_schema.grant_level(grant).lower()
+        out.append(summary)
+
+    out.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    _attach_recorder(out)
+    return _resp(200, {"recordings": out, "count": len(out)})
 
 def create_share(event):
     """POST /recordings/share/{key+} -> {share_id, url, expires_at, share}
@@ -14530,6 +15660,11 @@ def handle_seed_tasks_event(event):
     seeded = _seed_ai_tasks(user_id, key, item)
 
     _audit("tasks.seeded", user_id, key, seeded=seeded, migrated=migrated)
+    # The pipeline's one call back into this Lambda, made after
+    # analyze_and_persist: a reprocess or STT reconcile has just rewritten the
+    # transcript, summary and overview of a meeting that may already be
+    # delivered. (A never-pushed meeting has no delivery state: a no-op.)
+    _webhook_mark_meeting_dirty(key, "reprocessed")
     return {"seeded": seeded, "migrated": migrated, "key": key}
 
 
@@ -15141,7 +16276,12 @@ def remove_member(event):
             ":removed": workspace_schema.MEMBERSHIP_REMOVED,
             ":now": _now_iso(), ":actor": actor_id})
 
-    _audit("workspace.member_removed", actor_id, wid, target=target_id)
+    # The shared read-only route skips the membership gate (grants may go to
+    # anyone), so a removed member's grants on THIS organisation's meetings
+    # are deleted here rather than left to be refused later.
+    revoked = _revoke_workspace_grants(target_id, wid)
+    _audit("workspace.member_removed", actor_id, wid, target=target_id,
+           grants_revoked=revoked)
     return _resp(200, {"removed": True, "user_id": target_id,
                        "workspace_id": wid})
 
@@ -15200,8 +16340,12 @@ SITE_OP_PEOPLE_SYNC = "salesforce_site_people_sync"
 # Authenticated-channel jobs (see the AUTHENTICATED ORG CONNECTION section).
 SITE_OP_SF_DISCOVER = "salesforce_site_discover"
 SITE_OP_SF_TASK = "salesforce_site_task"
+# Webhook Contract v2 (see the WEBHOOK CONTRACT v2 section). Same job table,
+# queue and worker; its own runner and retry policy.
+SITE_OP_WEBHOOK_EVENT = "webhook_event"
 SITE_DELIVERY_OPERATIONS = frozenset({SITE_OP_MEETING, SITE_OP_PEOPLE_SYNC,
-                                      SITE_OP_SF_DISCOVER, SITE_OP_SF_TASK})
+                                      SITE_OP_SF_DISCOVER, SITE_OP_SF_TASK,
+                                      SITE_OP_WEBHOOK_EVENT})
 SITE_NOT_CONFIGURED_CODE = "site_delivery_not_configured"
 SITE_PEOPLE_PROVIDER = "salesforce"
 CONTACT_SOURCE_PEOPLE = "people_sync"
@@ -15318,8 +16462,25 @@ def site_delivery_put(event):
     enabled = data.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ApiError(400, "enabled must be true or false")
+    row = _site_save_endpoint(wid, user_id, url, auth_mode, secret, enabled,
+                              rotate_audio_links=data.get("rotate_audio_links") is True)
+    warnings = []
+    if auth_mode == site_delivery_client.AUTH_MODE_NONE:
+        warnings.append("auth_mode none sends requests unsigned. Use it only "
+                        "with a development org.")
+    return _resp(200, {"endpoint": _public_site_endpoint(row),
+                       "warnings": warnings})
 
+
+def _site_save_endpoint(wid, user_id, url, auth_mode, secret, enabled=True,
+                        rotate_audio_links=False):
+    """Store the workspace's Site endpoint (secrets KMS-encrypted). `url` is
+    already validated. Shared by the Site settings route and the in-app
+    install flow."""
     current = _site_endpoint(wid) or {}
+    # Shared by the settings route and the install flow: neither may replace
+    # a v2 webhook row, and with it the webhook's signing secret.
+    _refuse_if_webhook_endpoint(current)
     creds = _site_secrets(current)
     if auth_mode == site_delivery_client.AUTH_MODE_HMAC:
         if secret:
@@ -15331,7 +16492,7 @@ def site_delivery_put(event):
             raise ApiError(400, "shared_secret is required for hmac_sha256")
     else:
         creds.pop("hmac_secret", None)
-    if data.get("rotate_audio_links") is True or not creds.get("audio_key"):
+    if rotate_audio_links or not creds.get("audio_key"):
         creds["audio_key"] = secrets.token_urlsafe(32)
 
     now = _now_iso()
@@ -15352,12 +16513,7 @@ def site_delivery_put(event):
     _site_endpoints.put_item(Item=row)
     _audit("site_delivery.configured", user_id, wid, auth_mode=auth_mode,
            enabled=enabled)
-    warnings = []
-    if auth_mode == site_delivery_client.AUTH_MODE_NONE:
-        warnings.append("auth_mode none sends requests unsigned. Use it only "
-                        "with a development org.")
-    return _resp(200, {"endpoint": _public_site_endpoint(row),
-                       "warnings": warnings})
+    return row
 
 
 def site_delivery_delete(event):
@@ -15371,6 +16527,7 @@ def site_delivery_delete(event):
     user_id, wid, _m = _require_workspace_capability(
         event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
         workspace_id=_site_path_workspace(event))
+    _refuse_if_webhook_endpoint(_site_endpoint(wid))
     _site_endpoints.delete_item(Key={"workspace_id": wid})
     _audit("site_delivery.removed", user_id, wid)
     return _resp(200, {"deleted": True})
@@ -15388,7 +16545,7 @@ def site_delivery_health(event):
         event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
         workspace_id=_site_path_workspace(event))
     endpoint = _site_endpoint(wid)
-    if not endpoint:
+    if not endpoint or _is_webhook_endpoint(endpoint):
         raise SiteDeliveryApiError(409, "Salesforce Site delivery is not "
                                         "configured", SITE_NOT_CONFIGURED_CODE)
     request_id = site_contract.new_request_id()
@@ -15621,6 +16778,10 @@ def execute_site_delivery_job(job_id):
         print(f"[site-delivery] job {job_id} has operation={operation!r}, "
               f"not a site operation — dropping")
         return {"job_id": job_id, "dropped": True}
+    if operation == SITE_OP_WEBHOOK_EVENT:
+        # Its own state machine: debounce hops are not attempts, and retries
+        # are fresh delayed messages rather than the generic _CrmSyncJobRetry.
+        return _run_webhook_event_job(job)
     if job.get("status") in CRM_JOB_TERMINAL_STATUSES:
         print(f"[site-delivery] job {job_id} already {job.get('status')} — "
               f"duplicate message ignored")
@@ -15703,7 +16864,9 @@ def _run_site_meeting_job(job, attempt):
             workspace=_site_workspace_block(wid),
             meeting_url=_meeting_deep_link(key),
             audio=_site_audio_block(key, item, endpoint, job_id),
-            relation=_site_meeting_relation_for_delivery(wid, key, item))
+            relation=_site_meeting_relation_for_delivery(wid, key, item),
+            destination=_site_meeting_destination_for_delivery(item, _site_sf_connection(wid)),
+            acting_user_id=_site_sf_acting_user_id(wid, job.get("requested_by_user_id")))
     except site_contract.ContractError as e:
         return _site_fail(job_id, attempt, CRM_ERROR_VALIDATION, e.code,
                           e.message)
@@ -15785,6 +16948,22 @@ def _site_record_meeting_delivery(key, wid, job_id, payload, resp, result):
                               "record_id": ref.get("record_id", ""),
                               "name": ref.get("name", "")}
     url = str(resp.result.get("record_url") or "")
+    dest = resp.result.get("destination") if isinstance(resp.result.get("destination"), dict) else None
+    destination = None
+    if dest and dest.get("record_id"):
+        durl = str(dest.get("record_url") or "")
+        destination = {
+            "destination_id": str(dest.get("destination_id") or ""),
+            "name": str(dest.get("name") or "")[:255],
+            "object_label": str(dest.get("object_label") or "")[:255],
+            "record_id": str(dest.get("record_id") or ""),
+            "record_name": str(dest.get("record_name") or "")[:255],
+            "record_url": durl if durl.startswith("https://") else "",
+            "updated_fields": [str(f)[:255] for f in dest.get("updated_fields") or []][:50],
+            "truncated_fields": [str(f)[:255] for f in dest.get("truncated_fields") or []][:50],
+            "skipped": [{"field": str(x.get("field") or "")[:255], "reason": str(x.get("reason") or "")[:40]}
+                        for x in dest.get("skipped") or [] if isinstance(x, dict)][:50],
+        }
     try:
         _recordings.update_item(
             Key={"audio_s3_key": key},
@@ -15798,6 +16977,7 @@ def _site_record_meeting_delivery(key, wid, job_id, payload, resp, result):
                 "meeting_id": (payload.get("meeting") or {}).get("id", ""),
                 "title": str((payload.get("meeting") or {}).get("title") or "")[:255],
                 "relation": relation,
+                "destination": destination,
                 "job_id": job_id,
                 "delivered_at": result.get("delivered_at", ""),
             }})
@@ -15824,13 +17004,25 @@ def _public_meeting_record(rec):
     if not rec:
         return None
     relation = rec.get("relation") or {}
+    dest = rec.get("destination") if isinstance(rec.get("destination"), dict) else None
     return {
         "object_label": SITE_MEETING_OBJECT_LABEL,
         "name": rec.get("title", ""),
         "related_to": [{"slot": slot, "object_label": relation[slot].get("object_label", ""),
                         "name": relation[slot].get("name", "")}
                        for slot in ("who", "what") if relation.get(slot)],
-        "url": rec.get("record_url", ""),
+        # The customer's own record this push updated — what a person sees.
+        "destination": {
+            "destination_id": dest.get("destination_id", ""),
+            "name": dest.get("name", ""),
+            "record_name": dest.get("record_name", ""),
+            "url": dest.get("record_url", ""),
+            "updated_fields": dest.get("updated_fields") or [],
+            "truncated_fields": dest.get("truncated_fields") or [],
+            "skipped": dest.get("skipped") or [],
+        } if dest else None,
+        # "Open in Salesforce": the destination record when there is one.
+        "url": (dest or {}).get("record_url") or rec.get("record_url", ""),
         "delivered_at": rec.get("delivered_at", ""),
     }
 
@@ -15862,6 +17054,18 @@ def _site_people_channel(job, attempt):
                                     "workspace_inactive",
                                     "this workspace is no longer active")
     endpoint = _site_endpoint(wid)
+    if _webhook_endpoint_enabled(endpoint):
+        try:
+            return _webhook_people_post(wid, endpoint), None
+        except webhook_client.WebhookDeliveryError as e:
+            print(f"[site-delivery] people job {job['job_id']} not sent: code={e.code}")
+            return None, _site_fail(job["job_id"], attempt, e.category, e.code, e.message)
+        except Exception as e:  # noqa: BLE001
+            print(f"[site-delivery] people job {job['job_id']} credentials "
+                  f"unavailable: {type(e).__name__}")
+            return None, _site_fail(job["job_id"], attempt, CRM_ERROR_TRANSIENT,
+                                    "credentials_unavailable",
+                                    "the endpoint credentials could not be read; will retry")
     if not _site_endpoint_enabled(endpoint):
         return None, _site_fail(job["job_id"], attempt, CRM_ERROR_PERMANENT,
                                 SITE_NOT_CONFIGURED_CODE,
@@ -16137,12 +17341,17 @@ def site_delivery_audio(event):
     if claims["e"] < int(time.time()):
         return gone(410)
     job = _get_crm_sync_job(claims["j"])
-    if not job or job.get("operation") != SITE_OP_MEETING \
+    if not job or job.get("operation") not in (SITE_OP_MEETING, SITE_OP_WEBHOOK_EVENT) \
             or not job.get("recording_key"):
         return gone(404)
     wid, key = job["workspace_id"], job["recording_key"]
     endpoint = _site_endpoint(wid)
-    if not _site_endpoint_enabled(endpoint):
+    # The endpoint must still be enabled FOR THE JOB'S OWN PATH: a v1 job's
+    # link dies when the workspace moves to v2, and vice versa.
+    enabled = _webhook_endpoint_enabled(endpoint) \
+        if job.get("operation") == SITE_OP_WEBHOOK_EVENT \
+        else _site_endpoint_enabled(endpoint)
+    if not enabled:
         return gone(404)
     try:
         audio_key = _site_secrets(endpoint).get("audio_key", "")
@@ -16179,7 +17388,10 @@ def site_people_sync_start(event):
     user_id, wid, _m = _require_workspace_capability(
         event, workspace_schema.CAP_MANAGE_CONTACTS,
         workspace_id=_site_path_workspace(event))
-    if not _site_endpoint_enabled(_site_endpoint(wid)):
+    endpoint = _site_endpoint(wid)
+    # Either path: People Sync fills the tagging directory, and a workspace
+    # on v2 must not have it silently frozen (docs/webhook-contract-v2.md §7).
+    if not (_site_endpoint_enabled(endpoint) or _webhook_endpoint_enabled(endpoint)):
         raise SiteDeliveryApiError(
             409, "Salesforce Site delivery is not enabled for this workspace",
             SITE_NOT_CONFIGURED_CODE)
@@ -16242,14 +17454,30 @@ def people_contact(event):
     tagging, attendance, task assignment) offer Salesforce Contacts and Users
     without learning a second person type: the sheet resolves the pick to a
     Contact and carries on exactly as for a hand-picked one. Reads the local
-    People Store only; no Salesforce call.
+    People Store only; no Salesforce call. A person picked from LIVE search
+    (not in the store yet) is sent as `person` and saved by this pick.
     """
     user_id, wid, _m = _require_workspace_member(
         event, workspace_id=_site_path_workspace(event))
-    person_key = str(_body(event).get("person_key") or "").strip()
+    body = _body(event)
+    person_key = str(body.get("person_key") or "").strip()
     if not person_key or len(person_key) > 400:
         raise ApiError(400, "person_key required")
     person = people_store.get_person(_people, wid, person_key)
+    if (not person or person.get("status") == people_store.STATUS_DELETED)             and isinstance(body.get("person"), dict):
+        # Picked from LIVE search: this person was never synced, so the pick
+        # itself saves them, and only them. Only for a workspace that has a
+        # Salesforce connection, and only a row that validates as a person
+        # with exactly the key the client named.
+        live = site_contract.normalize_person(body["person"])
+        if live is None or live["person_key"] != person_key:
+            raise ApiError(400, "person does not match person_key")
+        if not _webhook_endpoint_enabled(_site_endpoint(wid)):
+            raise SiteDeliveryApiError(409, "Salesforce isn't connected for this workspace",
+                                       WEBHOOK_NOT_CONFIGURED_CODE)
+        people_store.upsert_people(_people, wid, [body["person"]],
+                                   people_store.LIVE_RUN_ID, _now_iso())
+        person = people_store.get_person(_people, wid, person_key)
     if not person or person.get("status") == people_store.STATUS_DELETED:
         raise ApiError(404, "person not found")
     contact_id = _site_contact_for_person(user_id, wid, person)
@@ -16556,6 +17784,15 @@ def site_sf_connect(event):
         event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
         workspace_id=_site_path_workspace(event))
     data = _body(event)
+    row, endpoint = _site_sf_connect_core(user_id, wid, data.get("allow_org_change") is True)
+    return _resp(200, {"connection": _public_site_sf_connection(row, endpoint)})
+
+
+def _site_sf_connect_core(user_id, wid, allow_org_change):
+    """Read org_info through the workspace's Site endpoint and pin the org.
+    Returns (connection row, endpoint). Raises SiteDeliveryApiError, incl.
+    409 org_mismatch when the Site answers for another org and
+    allow_org_change is not set."""
     endpoint = _site_endpoint(wid)
     if not _site_endpoint_enabled(endpoint):
         raise SiteDeliveryApiError(409, "Configure and enable the Salesforce Site "
@@ -16575,7 +17812,7 @@ def site_sf_connect(event):
         raise SiteDeliveryApiError(502, "The receiver did not report its org id",
                                    "invalid_response")
     if current.get("org_id") and _site_org(current["org_id"]) != _site_org(org_id) \
-            and data.get("allow_org_change") is not True:
+            and not allow_org_change:
         # Named by org NAME, never id: this message is shown to people.
         was = current.get("org_name") or "another Salesforce org"
         now_name = str((info.get("org") or {}).get("org_name") or "") or "a different org"
@@ -16603,7 +17840,7 @@ def site_sf_connect(event):
     _site_sf_connections.put_item(Item=row)
     _audit("site_salesforce.connected", user_id, wid, org_id=org_id,
            org_changed=org_changed)
-    return _resp(200, {"connection": _public_site_sf_connection(row, endpoint)})
+    return row, endpoint
 
 
 def site_sf_get(event):
@@ -16628,6 +17865,231 @@ def site_sf_disconnect(event):
         + _site_sf_purge(_site_sf_schema, wid, site_salesforce_schema.FLD_PREFIX)
     _audit("site_salesforce.disconnected", user_id, wid, schema_rows=removed)
     return _resp(200, {"disconnected": True})
+
+
+# ---------------------------------------------------------------------------
+# In-app install: "Install MinuteX in Salesforce" -> "Connect Salesforce"
+#
+#   1. POST .../site-salesforce/install   (app, owner/manager)
+#      A one-time SETUP CODE (8 characters, 45 minutes) and the package's
+#      install link. The app opens the link; the admin installs MinuteX.
+#   2. POST /salesforce/pair               (NO JWT: called by the org's MinuteX
+#      Setup tab, Apex callout) {setup_code, site_url, shared_secret, org_id}
+#      The code is the credential. MinuteX calls the Site back, signed with
+#      that secret, and only accepts it when the receiver answers for the
+#      org it claims — so a code cannot bind a workspace to an address that
+#      is not a working MinuteX receiver.
+#   3. GET .../site-salesforce/install     (app polls) waiting | installed
+#      -> "✓ MinuteX installed in <org>"
+#   4. POST .../site-salesforce/install/connect (app) -> the Site endpoint is
+#      saved (signed mode) and the org pinned, exactly as a manual connect;
+#      then objects and people start syncing.
+#
+# Nothing is copied by hand: no link, id or secret passes through a person
+# or the app. The secret goes Salesforce -> MinuteX directly and is stored
+# KMS-encrypted, like every Site secret.
+#
+# TABLE SiteSalesforcePairings (scripts/83): PK pairing_key
+#   "code#<sha256(code)>"  one pairing: workspace, status, verified org, the
+#                          KMS-encrypted secret; TTL `expires_epoch`
+#   "ws#<workspace_id>"    the workspace's current pairing (so the app can
+#                          show its code and status again after a restart)
+# ---------------------------------------------------------------------------
+SITE_SF_PAIRINGS_TABLE = os.environ.get("SITE_SF_PAIRINGS_TABLE", "SiteSalesforcePairings")
+SITE_SF_PACKAGE_VERSION_ID = os.environ.get("SITE_SF_PACKAGE_VERSION_ID", "")
+SITE_SF_PAIRING_TTL_SECONDS = 45 * 60
+# No 0/O, 1/I/L: a code is read off a phone and typed into Salesforce.
+_PAIRING_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+_site_sf_pairings = _ddb.Table(SITE_SF_PAIRINGS_TABLE)
+
+
+def _pairing_code():
+    raw = "".join(secrets.choice(_PAIRING_ALPHABET) for _ in range(8))
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def _pairing_key(code):
+    norm = re.sub(r"[^A-Z0-9]", "", str(code or "").upper())
+    return "code#" + hashlib.sha256(f"minutex-pairing:{norm}".encode()).hexdigest()
+
+
+def _install_url(sandbox):
+    if not SITE_SF_PACKAGE_VERSION_ID.startswith("04t"):
+        return ""
+    host = "test.salesforce.com" if sandbox else "login.salesforce.com"
+    return f"https://{host}/packaging/installPackage.apexp?p0={SITE_SF_PACKAGE_VERSION_ID}"
+
+
+def _public_pairing(row, *, with_code):
+    if not row:
+        return {"status": "none"}
+    status = row.get("status", "waiting")
+    if status in ("waiting", "installed") and int(row.get("expires_epoch") or 0) < int(time.time()):
+        status = "expired"
+    out = {"status": status, "expires_at": row.get("expires_at", ""),
+           "org_name": row.get("org_name", ""), "sandbox": bool(row.get("sandbox")),
+           "install_url": _install_url(bool(row.get("sandbox"))) if status == "waiting" else ""}
+    if with_code and status == "waiting":
+        out["setup_code"] = row.get("setup_code", "")
+    return out
+
+
+def _workspace_pairing(wid):
+    pointer = _site_sf_pairings.get_item(Key={"pairing_key": f"ws#{wid}"}).get("Item") or {}
+    if not pointer.get("current"):
+        return None
+    row = _site_sf_pairings.get_item(Key={"pairing_key": pointer["current"]}).get("Item")
+    if row:
+        row["setup_code"] = pointer.get("setup_code", "")
+    return row
+
+
+def site_sf_install_start(event):
+    """POST /workspaces/{workspace_id}/site-salesforce/install {sandbox?}
+    (JWT, CAP_MANAGE_INTEGRATIONS) -> {install}
+
+    A fresh setup code (any earlier one stops working) and the install link."""
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    sandbox = _body(event).get("sandbox") is True
+    if not _install_url(sandbox):
+        raise SiteDeliveryApiError(503, "Installing MinuteX in Salesforce isn't available "
+                                        "right now. Try again later.", "install_unavailable")
+    previous = _site_sf_pairings.get_item(Key={"pairing_key": f"ws#{wid}"}).get("Item") or {}
+    if previous.get("current"):
+        _site_sf_pairings.delete_item(Key={"pairing_key": previous["current"]})
+    code = _pairing_code()
+    now = int(time.time())
+    expires = now + SITE_SF_PAIRING_TTL_SECONDS
+    row = {"pairing_key": _pairing_key(code), "workspace_id": wid, "status": "waiting",
+           "sandbox": sandbox, "created_by": user_id, "created_at": _now_iso(),
+           "expires_epoch": expires,
+           "expires_at": datetime.fromtimestamp(expires, tz=timezone.utc).isoformat()}
+    _site_sf_pairings.put_item(Item=row)
+    _site_sf_pairings.put_item(Item={"pairing_key": f"ws#{wid}", "current": row["pairing_key"],
+                                     "setup_code": code, "expires_epoch": expires + 86400})
+    _audit("site_salesforce.install_started", user_id, wid, sandbox=sandbox)
+    row["setup_code"] = code
+    return _resp(201, {"install": _public_pairing(row, with_code=True)})
+
+
+def site_sf_install_status(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/install (JWT, member)
+    -> {install: {status: none|waiting|installed|connected|expired, ...}}"""
+    _user_id, wid, membership = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    admin = workspace_schema.role_can(membership.get("role"),
+                                      workspace_schema.CAP_MANAGE_INTEGRATIONS)
+    return _resp(200, {"install": _public_pairing(_workspace_pairing(wid), with_code=admin)})
+
+
+def site_sf_pair(event):
+    """POST /salesforce/pair {setup_code, site_url, shared_secret, org_id,
+    org_name?} (NO JWT — the one-time setup code is the credential; called by
+    the org's MinuteX Setup tab) -> {paired, workspace}
+
+    Verifies the Site before accepting: a signed org_info call to the given
+    address must answer for the claimed org. Every refusal of the code
+    itself reads the same, so the route is no oracle for valid codes."""
+    data = _body(event)
+    invalid = SiteDeliveryApiError(400, "This setup code isn't valid or has expired. "
+                                        "Start again from the MinuteX app.", "invalid_setup_code")
+    code = str(data.get("setup_code") or "")
+    if not 8 <= len(re.sub(r"[^A-Za-z0-9]", "", code)) <= 12:
+        raise invalid
+    row = _site_sf_pairings.get_item(Key={"pairing_key": _pairing_key(code)}).get("Item")
+    if not row or row.get("status") != "waiting" or int(row.get("expires_epoch") or 0) < int(time.time()):
+        raise invalid
+    secret = str(data.get("shared_secret") or "")
+    org_id = str(data.get("org_id") or "")
+    if len(secret) < site_delivery_client.MIN_SECRET_CHARS or not org_id.startswith("00D"):
+        raise SiteDeliveryApiError(400, "Finish the MinuteX Setup steps in Salesforce first.",
+                                   "setup_incomplete")
+    try:
+        url = site_delivery_client.validate_endpoint_url(
+            site_contract_receiver_url(str(data.get("site_url") or "")),
+            SITE_DELIVERY_ALLOWED_HOST_SUFFIXES)
+    except ValueError:
+        raise SiteDeliveryApiError(400, "Choose the Salesforce Site in MinuteX Setup first.",
+                                   "setup_incomplete")
+    try:
+        resp = _site_client(15).post(
+            url, site_delivery_client.make_auth(site_delivery_client.AUTH_MODE_HMAC, secret),
+            site_contract.envelope(site_contract.ACTION_ORG_INFO,
+                                   request_id=site_contract.new_request_id()))
+    except site_delivery_client.SiteDeliveryError as e:
+        print(f"[site-salesforce] pairing check failed code={e.code}")
+        raise SiteDeliveryApiError(400, "MinuteX couldn't reach this org's Site. Check that the "
+                                        "Site is active and has MinuteX access (MinuteX Setup "
+                                        "steps 2–3).", "site_unreachable")
+    answered = _site_org((resp.result.get("org") or {}).get("org_id") or resp.body.get("org_id"))
+    if not answered or answered != _site_org(org_id):
+        raise SiteDeliveryApiError(400, "That Site belongs to a different Salesforce org.",
+                                   "org_mismatch")
+    org_name = str((resp.result.get("org") or {}).get("org_name") or data.get("org_name") or "")[:255]
+    _site_sf_pairings.update_item(
+        Key={"pairing_key": row["pairing_key"]},
+        UpdateExpression="SET #s = :i, site_url = :u, secrets_enc = :e, org_id = :o, "
+                         "org_name = :n, verified_at = :now",
+        ConditionExpression="#s = :w",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":i": "installed", ":w": "waiting", ":u": url,
+                                   ":e": _integration_kms_encrypt(json.dumps({"hmac_secret": secret})),
+                                   ":o": org_id, ":n": org_name, ":now": _now_iso()})
+    workspace = _workspace_row(row["workspace_id"]) or {}
+    print(f"[site-salesforce] pairing verified workspace={row['workspace_id']} org={org_id[:15]}")
+    return _resp(200, {"paired": True, "workspace": str(workspace.get("name") or "MinuteX")[:255],
+                       "org_name": org_name})
+
+
+def site_contract_receiver_url(site_url):
+    """The Site's address -> the receiver URL (adds the Apex REST path)."""
+    base = str(site_url or "").strip().rstrip("/")
+    marker = "/services/apexrest"
+    if marker in base.lower():
+        base = base[:base.lower().index(marker)]
+    return base + site_delivery_client.RECEIVER_PATH
+
+
+def site_sf_install_connect(event):
+    """POST /workspaces/{workspace_id}/site-salesforce/install/connect
+    {allow_org_change?} (JWT, CAP_MANAGE_INTEGRATIONS) -> {connection}
+
+    Finishes the install: saves the verified Site (signed) as the workspace's
+    endpoint, pins the org, and starts objects + people syncing. 409
+    org_mismatch when the workspace is connected to another org (the app asks
+    before switching)."""
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    row = _workspace_pairing(wid)
+    status = _public_pairing(row, with_code=False)["status"]
+    if status != "installed":
+        raise SiteDeliveryApiError(409, "Finish installing MinuteX in Salesforce first.",
+                                   "install_not_finished" if status != "expired" else "install_expired")
+    secret = json.loads(_integration_kms_decrypt(row["secrets_enc"])).get("hmac_secret", "")
+    _site_save_endpoint(wid, user_id, row["site_url"], site_delivery_client.AUTH_MODE_HMAC, secret)
+    conn, endpoint = _site_sf_connect_core(user_id, wid, _body(event).get("allow_org_change") is True)
+    _site_sf_pairings.update_item(
+        Key={"pairing_key": row["pairing_key"]}, UpdateExpression="SET #s = :c REMOVE secrets_enc",
+        ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues={":c": "connected"})
+    for operation, extra in ((SITE_OP_SF_DISCOVER, {"discover_phase": "org", "discover_cursor": "",
+                                                    "discover_queue": [], "discover_counts": {}}),
+                             (SITE_OP_PEOPLE_SYNC, {"people_cursor": "", "people_pages": 0,
+                                                    "people_counts": {}})):
+        try:
+            job = _create_site_job(workspace_id=wid, operation=operation, user_id=user_id, extra=extra)
+            if operation == SITE_OP_SF_DISCOVER:
+                _site_sf_set_discovery(wid, {"job_id": job["job_id"], "status": job["status"],
+                                             "requested_by": user_id, "updated_at": _now_iso()})
+            else:
+                _site_set_people_sync(wid, {"job_id": job["job_id"], "status": job["status"],
+                                            "requested_by": user_id, "updated_at": _now_iso()})
+        except Exception as e:  # noqa: BLE001 — the connection itself succeeded
+            print(f"[site-salesforce] post-install {operation} not started: {type(e).__name__}")
+    _audit("site_salesforce.installed", user_id, wid, org_id=conn.get("org_id", ""))
+    return _resp(200, {"connection": _public_site_sf_connection(conn, endpoint)})
 
 
 # ---------------------------------------------------------------------------
@@ -17262,8 +18724,17 @@ def _site_sf_person_ref(wid, person, source):
 
 
 def _site_sf_stored_ref(wid, ref):
-    """A stored side, re-validated against today's discovered metadata."""
-    if not isinstance(ref, dict) or not ref.get("record_id"):
+    """A stored side, re-validated against today's discovered metadata.
+    A DESTINATION side was validated against the org's own destination list
+    when chosen (and is re-checked by the receiver at every push), so it is
+    kept as stored. A one-record-per-meeting destination has no record id
+    until Salesforce creates the record on the first push."""
+    if not isinstance(ref, dict):
+        return None
+    if ref.get("source") == "destination" and (
+            ref.get("record_id") or ref.get("write_mode") == SITE_SF_WRITE_MEETING_RECORD):
+        return dict(ref)
+    if not ref.get("record_id"):
         return None
     try:
         return site_salesforce_schema.relation_ref(
@@ -17329,8 +18800,15 @@ def _public_relation_side(ref):
 
 def _public_meeting_relation(relations, context):
     """The relationship as the app shows it: names and object labels, never
-    a Salesforce record id or API name."""
+    a Salesforce record id or API name. `destination` is the meeting's chosen
+    Salesforce destination and record ("Site Visit" / "Mumbai Tower A")."""
+    what = relations.get("what") or {}
     return {
+        "destination": {"destination_id": what.get("destination_id", ""),
+                        "name": what.get("destination_name") or what.get("object_label", ""),
+                        "object_label": what.get("object_label", ""),
+                        "record_name": what.get("record_name", "")}
+        if what.get("source") == "destination" else None,
         "who": _public_relation_side(relations.get("who")),
         "what": _public_relation_side(relations.get("what")),
         "automatic": context["automatic"],
@@ -17438,6 +18916,212 @@ def site_sf_meeting_relation_put(event):
                        "connected": True})
 
 
+# ---------------------------------------------------------------------------
+# Salesforce DESTINATIONS — where a meeting is pushed
+#
+# The customer's org decides which of its objects are meeting destinations,
+# which fields each push writes, and who may use each (MinuteX Destination +
+# MinuteX Field Mapping, in Salesforce; see MinuteXSiteDestinations). MinuteX
+# never hard-codes a customer field: it lists the destinations the PERSON may
+# use, lets them pick one of its existing records, and sends one generic
+# meeting payload naming that record. Salesforce updates it.
+#
+# THE ACTING USER. Destinations, record search and field access follow the
+# Salesforce User the MinuteX person is: the synced Salesforce User with the
+# same email (People Sync). No match -> the org's integration user answers,
+# as before.
+# ---------------------------------------------------------------------------
+
+def _site_sf_acting_user_id(wid, user_id):
+    """The Salesforce User id the MinuteX user `user_id` is, or ""."""
+    if not user_id:
+        return ""
+    email = _norm_email((_users.get_item(Key={"user_id": user_id}).get("Item") or {}).get("email"))
+    if not email:
+        return ""
+    try:
+        people, _t = people_store.search_people(_people, Key, wid, email, "user", 10)
+    except ClientError:
+        return ""
+    for p in people:
+        if (p.get("email") or "").lower() == email and p.get("status") == "active":
+            return str(p.get("external_id") or "")
+    return ""
+
+
+def _site_sf_list_destinations(wid, conn, user_id):
+    """The destinations this person may use, live from the org.
+    Returns (destinations, receiver_supports_destinations)."""
+    payload = {}
+    acting = _site_sf_acting_user_id(wid, user_id)
+    if acting:
+        payload["acting_user_id"] = acting
+    try:
+        result = _site_sf_call(conn, site_contract.envelope(
+            site_contract.ACTION_LIST_DESTINATIONS, payload,
+            request_id=site_contract.new_request_id()), 15).result
+    except site_delivery_client.SiteDeliveryError as e:
+        if e.code == "unsupported_action":
+            return [], False  # a receiver older than 1.5.0
+        raise _site_sf_api_error(e)
+    out = []
+    for d in result.get("destinations") or []:
+        if not isinstance(d, dict) or not site_salesforce_schema.is_api_name(d.get("object_type")):
+            continue
+        out.append({
+            "destination_id": str(d.get("id") or "")[:18],
+            "name": str(d.get("name") or "")[:255],
+            "object_label": str(d.get("object_label") or "")[:255],
+            "object_api_name": d["object_type"],
+            "key_prefix": str(d.get("key_prefix") or "")[:3],
+            "task_supported": d.get("task_relatable") is True,
+            # update_record: the person picks an existing record to update.
+            # meeting_record: Salesforce keeps ONE record per meeting (found by
+            # its MinuteX Meeting ID) — nothing to pick. Receivers before
+            # 1.6.0 send no mode: they only update picked records.
+            "write_mode": (SITE_SF_WRITE_MEETING_RECORD if d.get("write_mode") == SITE_SF_WRITE_MEETING_RECORD
+                           else SITE_SF_WRITE_UPDATE_RECORD),
+            "fields": [str(f)[:255] for f in d.get("fields") or []][:50],
+        })
+    return out, True
+
+
+SITE_SF_WRITE_UPDATE_RECORD = "update_record"
+SITE_SF_WRITE_MEETING_RECORD = "meeting_record"
+
+
+def _public_destination(d):
+    # object_api_name / key_prefix stay server-side: the app picks by id.
+    return {k: d[k] for k in ("destination_id", "name", "object_label", "task_supported",
+                              "write_mode", "fields")}
+
+
+def site_sf_destinations(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/destinations
+    (JWT, member) -> {destinations: [{destination_id, name, object_label,
+    task_supported, fields}], supported}
+
+    Where THIS person may push meetings, as the org's admin configured it and
+    their Salesforce access allows. `supported: false` means the org's
+    MinuteX receiver predates destinations (update it)."""
+    user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    conn = _site_sf_require_connection(wid)
+    destinations, supported = _site_sf_list_destinations(wid, conn, user_id)
+    return _resp(200, {"destinations": [_public_destination(d) for d in destinations],
+                       "supported": supported})
+
+
+def _site_sf_destination(wid, conn, user_id, destination_id):
+    destinations, _supported = _site_sf_list_destinations(wid, conn, user_id)
+    for d in destinations:
+        if d["destination_id"] == str(destination_id or "")[:18]:
+            return d
+    raise SiteDeliveryApiError(404, "That Salesforce destination isn't available to you.",
+                               "destination_unavailable")
+
+
+def site_sf_destination_records(event):
+    """GET /workspaces/{workspace_id}/site-salesforce/destinations/{destination_id}/records
+    ?q= (JWT, member) -> {records: [{id, name}]}
+
+    Existing records of the destination's object that THIS person can see,
+    searched live in Salesforce with their access."""
+    user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    conn = _site_sf_require_connection(wid)
+    dest = _site_sf_destination(wid, conn, user_id,
+                                (event.get("pathParameters") or {}).get("destination_id"))
+    qs = event.get("queryStringParameters") or {}
+    query = str(qs.get("q") or "").strip()
+    if len(query) > 100:
+        raise ApiError(400, "q must be at most 100 characters")
+    payload = {"object": dest["object_api_name"], "query": query, "limit": 25}
+    acting = _site_sf_acting_user_id(wid, user_id)
+    if acting:
+        payload["acting_user_id"] = acting
+    try:
+        result = _site_sf_call(conn, site_contract.envelope(
+            "record_search", payload, request_id=site_contract.new_request_id())).result
+    except site_delivery_client.SiteDeliveryError as e:
+        raise _site_sf_api_error(e)
+    records = [{"id": str(r.get("id") or ""), "name": str(r.get("name") or "")[:255]}
+               for r in result.get("records") or [] if isinstance(r, dict)
+               and site_salesforce_schema.valid_record_id(r.get("id"), dest["key_prefix"])]
+    return _resp(200, {"records": records})
+
+
+def _site_sf_save_relation(key, conn, current, user_id):
+    if any(current.get(slot) for slot in site_salesforce_schema.RELATION_SLOTS):
+        _recordings.update_item(
+            Key={"audio_s3_key": key}, UpdateExpression=f"SET {SITE_SF_RELATION_ATTR} = :r",
+            ExpressionAttributeValues={":r": {**current, "org_id": conn["org_id"],
+                                              "updated_by": user_id, "updated_at": _now_iso()}})
+    else:
+        _recordings.update_item(Key={"audio_s3_key": key},
+                                UpdateExpression=f"REMOVE {SITE_SF_RELATION_ATTR}")
+
+
+def site_sf_meeting_destination_put(event):
+    """PUT /workspaces/{workspace_id}/site-salesforce/meeting-destination
+    {meeting_key, destination_id, record_id, record_name} | {meeting_key, clear: true}
+    (JWT, member who can EDIT the meeting) -> {relation}
+
+    "Push this meeting to Site Visit -> Mumbai Tower A". The destination must
+    be one this person may use (checked live); the record must be of its
+    object. Stored as the meeting's What, so Push sends it and Tasks inherit
+    it; the tagged Contact stays the Who."""
+    user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    _uid, key, item = _site_sf_relation_meeting(event, wid, write=True)
+    conn = _site_sf_require_connection(wid)
+    data = _body(event)
+    stored = item.get(SITE_SF_RELATION_ATTR) if isinstance(
+        item.get(SITE_SF_RELATION_ATTR), dict) else {}
+    if _site_org(stored.get("org_id")) != _site_org(conn["org_id"]):
+        stored = {}
+    current = {slot: stored.get(slot) for slot in site_salesforce_schema.RELATION_SLOTS}
+    if data.get("clear") is True:
+        current["what"] = None
+    else:
+        dest = _site_sf_destination(wid, conn, user_id, data.get("destination_id"))
+        per_meeting = dest["write_mode"] == SITE_SF_WRITE_MEETING_RECORD
+        record_id = "" if per_meeting else str(data.get("record_id") or "").strip()
+        if not per_meeting and not site_salesforce_schema.valid_record_id(record_id, dest["key_prefix"]):
+            raise SiteDeliveryApiError(400, f"Choose the {dest['object_label']} record to push "
+                                            "this meeting to.", "invalid_record")
+        current["what"] = {
+            "slot": "what", "source": "destination",
+            "destination_id": dest["destination_id"], "destination_name": dest["name"],
+            "object_api_name": dest["object_api_name"], "object_label": dest["object_label"],
+            "record_id": record_id,
+            "record_name": "" if per_meeting else str(data.get("record_name") or "")[:255],
+            "write_mode": dest["write_mode"],
+            "tasks_supported": dest["task_supported"], "person_key": ""}
+        if (current.get("who") or {}).get("object_api_name") == "Lead":
+            current["who"] = None
+    _site_sf_save_relation(key, conn, current, user_id)
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") or item
+    relations, context = _site_sf_meeting_relation(wid, key, item, conn)
+    _audit("site_salesforce.meeting_destination_set", user_id, wid,
+           destination=bool(current.get("what")))
+    return _resp(200, {"relation": _public_meeting_relation(relations, context),
+                       "meeting_record": _public_meeting_record(_site_meeting_record(item, conn)),
+                       "connected": True})
+
+
+def _site_meeting_destination_for_delivery(item, conn):
+    """{destination_id, record_id} for upsert_meeting, or None."""
+    stored = item.get(SITE_SF_RELATION_ATTR) if isinstance(
+        item.get(SITE_SF_RELATION_ATTR), dict) else {}
+    if not conn or _site_org(stored.get("org_id")) != _site_org(conn.get("org_id")):
+        return None
+    what = stored.get("what") or {}
+    if what.get("source") != "destination" or not what.get("destination_id"):
+        return None
+    return {"destination_id": what["destination_id"], "record_id": what.get("record_id", "")}
+
+
 def _site_meeting_relation_for_delivery(wid, key, item):
     """The relation block for upsert_meeting, or None. Best-effort: a meeting
     is still delivered (unrelated) when the relationship cannot be read."""
@@ -17521,11 +19205,12 @@ def _site_sf_row_relations(wid, row):
     out = {"who": None, "what": None}
     has_split = any(row.get(f"{slot}_record_id") for slot in site_salesforce_schema.RELATION_SLOTS)
     pairs = ([(row.get(f"{slot}_object_type"), row.get(f"{slot}_record_id"),
-               row.get(f"{slot}_record_name")) for slot in site_salesforce_schema.RELATION_SLOTS]
+               row.get(f"{slot}_record_name"), slot, row.get(f"{slot}_object_label"))
+              for slot in site_salesforce_schema.RELATION_SLOTS]
              if has_split else
              [(row.get("related_object_type"), row.get("related_record_id"),
-               row.get("related_record_name"))])
-    for obj_name, record_id, record_name in pairs:
+               row.get("related_record_name"), "", "")])
+    for obj_name, record_id, record_name, stored_slot, stored_label in pairs:
         if not record_id:
             continue
         if obj_name == SITE_MEETING_OBJECT:
@@ -17536,6 +19221,14 @@ def _site_sf_row_relations(wid, row):
             out["what"]["source"] = "stored"
             continue
         obj = _site_sf_object(wid, obj_name)
+        if not obj and stored_slot and site_salesforce_schema.is_api_name(obj_name):
+            # A destination object the catalog does not list: the side was
+            # validated when chosen; the receiver re-checks it at delivery.
+            out[stored_slot] = {
+                "slot": stored_slot, "object_api_name": obj_name,
+                "object_label": stored_label or obj_name, "record_id": str(record_id),
+                "record_name": str(record_name or ""), "source": "stored", "person_key": ""}
+            continue
         if not obj or not obj.get("task_relation"):
             continue
         out[obj["task_relation"]] = {
@@ -17678,7 +19371,26 @@ def _site_sf_inherited_relation(wid, conn, meeting_key):
     item = _recordings.get_item(Key={"audio_s3_key": meeting_key}).get("Item")
     if not item:
         return None
+    relations, _ctx = _site_sf_meeting_relation(wid, meeting_key, item, conn)
+    what = relations.get("what") or {}
+    who = relations.get("who")
+    if (who or {}).get("object_api_name") == "Lead":
+        who = None
+    if what.get("source") == "destination" and what.get("tasks_supported") and what.get("record_id"):
+        # The meeting's destination record ("Site Visit -> Mumbai Tower A")
+        # takes Tasks: they go straight onto it, with the Contact as Name.
+        return {"who": who, "what": dict(what)}
     rec = _site_meeting_record(item, conn)
+    if what.get("source") == "destination" and what.get("tasks_supported") and not what.get("record_id"):
+        # One record per meeting: Salesforce creates it on the first push, so
+        # Tasks wait for that push and then go onto the record it created.
+        placed = (rec or {}).get("destination") or {}
+        if placed.get("destination_id") != what.get("destination_id") or not placed.get("record_id"):
+            raise SiteDeliveryApiError(409, "Push the meeting to Salesforce first: its Tasks are "
+                                            "attached to the meeting's Salesforce record.",
+                                       "meeting_not_pushed")
+        return {"who": who, "what": {**what, "record_id": placed["record_id"],
+                                     "record_name": placed.get("record_name", "")}}
     if not rec:
         raise SiteDeliveryApiError(409, "Push the meeting to Salesforce first: its Tasks are "
                                         "attached to the meeting's Salesforce record.",
@@ -18109,12 +19821,2402 @@ def _run_site_sf_task_job(job, attempt):
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
+
+
+# ===========================================================================
+# WEBHOOK CONTRACT v2 — delivery_type = "webhook", provider = "salesforce"
+#
+# A SEPARATE PATH from the MinuteX Salesforce package above (Site receiver,
+# install flow, Destinations, Field Mappings). The customer owns the endpoint
+# AND the business logic (docs/webhook-contract-v2.md). MinuteX owns the
+# meeting identity, the events, signing, idempotency, delivery/retry and
+# status, and caches the customer's configuration (meeting types). It never
+# creates a customer record itself.
+#
+# ONE ENDPOINT ROW PER WORKSPACE, shared with v1: SiteDeliveryEndpoints,
+# told apart by delivery_type. _site_endpoint_enabled only matches
+# "salesforce_site", so every v1 path switches itself off on a v2 row; the
+# 409 guards (here, and in _site_save_endpoint / site_delivery_delete /
+# site_delivery_health) stop either mode silently replacing the other.
+#
+# DELIVERY STATE is ONE long-lived CrmSyncJobs row per meeting
+# (job_id = "whk_" + sha256(recording key)), not a Recordings attribute: the
+# row is small, dirty-marking writes stay off the large and hot Recordings
+# item, and the row survives a permanent delete — which meeting.deleted needs.
+# Keyed on the recording alone so a hook can find it without reading the
+# Recordings row; the runner re-checks the workspace on every attempt.
+#
+# THE INVARIANTS (tests pin each one):
+#   * A sequence is never re-bound to other content. The pending event
+#     (sequence, event_id, content_hash) is replaced ONLY in the same
+#     conditional write that increments `sequence`.
+#   * The SQS receive count is never the attempt count. Every retry is a
+#     FRESH message with DelaySeconds and the runner returns normally, so the
+#     queue's maxReceiveCount=5 redrive can never DLQ a webhook that is still
+#     inside its 8-attempt budget.
+#   * No change is lost. `dirty_version` is bumped by every change; success is
+#     a conditional write on the version the snapshot was built from, and a
+#     change that landed during delivery turns it into a follow-up.
+#   * FAILED is never reopened by an automatic change — the user retries, and
+#     the retry sends the LATEST snapshot.
+# ===========================================================================
+WEBHOOK_ENABLED = os.environ.get("WEBHOOK_ENABLED", "false").strip().lower() \
+    in ("1", "true", "yes")
+WEBHOOK_DEBOUNCE_SECONDS = int(os.environ.get("WEBHOOK_DEBOUNCE_SECONDS", "60"))
+# A meeting edited continuously still goes out this long after its FIRST
+# pending change, so debounce can never starve delivery.
+WEBHOOK_MAX_WAIT_SECONDS = 300
+WEBHOOK_MAX_ATTEMPTS = int(os.environ.get("WEBHOOK_MAX_ATTEMPTS", "8"))
+WEBHOOK_BACKOFF_SECONDS = (60, 300, 900, 1800, 3600, 3600, 3600)
+WEBHOOK_CONFIG_TTL_SECONDS = 15 * 60
+WEBHOOK_CONFIG_REFRESH_MIN_SECONDS = 30
+WEBHOOK_SECRET_GRACE_SECONDS = 24 * 3600
+# SQS DelaySeconds maximum. A longer wait is a chain of hops (see the runner).
+WEBHOOK_MAX_SQS_DELAY = 900
+# A SYNCING row this old belongs to a worker that died (the worker's own
+# timeout is 120s), so it may be claimed again.
+WEBHOOK_SYNCING_STALE_SECONDS = 300
+WEBHOOK_NOT_CONFIGURED_CODE = "webhook_not_configured"
+WEBHOOK_DISABLED_CODE = "webhook_disabled"
+WEBHOOK_MODE_ACTIVE_CODE = "webhook_mode_active"
+WEBHOOK_JOB_PREFIX = "whk_"
+
+# Injected clock, so the tests can walk debounce windows and backoffs.
+_webhook_clock = time.time
+
+
+def _webhook_client():
+    return webhook_client.WebhookClient()
+
+
+def _webhook_iso(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() \
+        .replace("+00:00", "Z")
+
+
+def _webhook_ts(iso):
+    try:
+        return datetime.fromisoformat(str(iso or "").replace("Z", "+00:00")) \
+            .timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _webhook_require_enabled():
+    if not WEBHOOK_ENABLED:
+        raise SiteDeliveryApiError(404, "Webhook delivery is not available",
+                                   WEBHOOK_DISABLED_CODE)
+
+
+def _is_webhook_endpoint(endpoint):
+    return bool(endpoint) and \
+        endpoint.get("delivery_type") == webhook_contract.DELIVERY_TYPE_WEBHOOK
+
+
+def _webhook_endpoint_enabled(endpoint):
+    return WEBHOOK_ENABLED and _is_webhook_endpoint(endpoint) \
+        and bool(endpoint.get("enabled"))
+
+
+def _refuse_if_webhook_endpoint(endpoint):
+    """For the v1 writers: never let a Site save/delete/health replace or act
+    on a v2 row (and with it the webhook's signing secret)."""
+    if _is_webhook_endpoint(endpoint):
+        raise SiteDeliveryApiError(
+            409, "This workspace delivers to a Salesforce webhook. Remove it "
+                 "before setting up the MinuteX Salesforce package.",
+            WEBHOOK_MODE_ACTIVE_CODE)
+
+
+def _endpoint_mode(endpoint):
+    if _is_webhook_endpoint(endpoint):
+        return "webhook"
+    if endpoint and endpoint.get("delivery_type") == \
+            site_contract.DELIVERY_TYPE_SALESFORCE_SITE:
+        return "site"
+    return "none"
+
+
+def _webhook_envelope_workspace(wid):
+    # A personal workspace id embeds the owner's user id: never sent out.
+    return wid if workspace_schema.is_organisation_workspace_id(wid) else ""
+
+
+def _webhook_live_creds(creds, now=None):
+    """The decrypted credentials with an EXPIRED previous secret dropped."""
+    now = _webhook_clock() if now is None else now
+    creds = dict(creds or {})
+    if creds.get("previous_hmac_secret") and \
+            _webhook_ts(creds.get("previous_expires_at")) <= now:
+        creds.pop("previous_hmac_secret", None)
+        creds.pop("previous_expires_at", None)
+    return creds
+
+
+def _webhook_signer(endpoint):
+    """How every call to the receiver is authenticated. With an
+    integration-user connection (SalesforceOAuthConnections) the receiver is
+    called at the org's API address as that user, still HMAC-signed;
+    without one, at the Site address as the guest user, as before.
+
+    Raises WebhookDeliveryError (category permission, never a 401 to the
+    app) when the connection needs reconnecting."""
+    creds = _webhook_live_creds(_site_secrets(endpoint))
+    hmac_signer = webhook_client.WebhookSigner(creds.get("hmac_secret", ""),
+                                               creds.get("previous_hmac_secret", ""))
+    wid = (endpoint or {}).get("workspace_id", "")
+    if not SALESFORCE_OAUTH_ENABLED or not wid or not _sf_oauth_connection(wid):
+        return hmac_signer
+
+    def token_source(force):
+        if force:
+            _sf_access_cache.pop(wid, None)
+        try:
+            return _sf_access_token(wid)
+        except SiteDeliveryApiError as e:
+            raise webhook_client.WebhookDeliveryError(
+                webhook_client.CATEGORY_PERMISSION, e.code or SF_OAUTH_RECONNECT_CODE,
+                e.message)
+
+    return webhook_client.BearerSigner(hmac_signer, token_source)
+
+
+def _public_webhook_configuration(endpoint):
+    cfg = (endpoint or {}).get("configuration") or {}
+    return {
+        "status": cfg.get("status") or "never",
+        "configuration_version": cfg.get("configuration_version", ""),
+        "fetched_at": cfg.get("fetched_at", ""),
+        "last_attempt_at": cfg.get("last_attempt_at", ""),
+        "last_error_code": cfg.get("last_error_code", ""),
+        "meeting_types": cfg.get("meeting_types") or [],
+        "linkable_objects": cfg.get("linkable_objects"),
+    }
+
+
+def _public_webhook_endpoint(endpoint):
+    """Never returns a secret: only whether one exists and its last 4."""
+    if not _is_webhook_endpoint(endpoint):
+        return {"configured": False, "enabled": False,
+                "delivery_type": webhook_contract.DELIVERY_TYPE_WEBHOOK}
+    return {
+        "configured": True,
+        "enabled": bool(endpoint.get("enabled")),
+        "delivery_type": webhook_contract.DELIVERY_TYPE_WEBHOOK,
+        "provider": endpoint.get("provider", ""),
+        "contract_version": endpoint.get("contract_version", ""),
+        "url": endpoint.get("url", ""),
+        "has_secret": bool(endpoint.get("secrets_enc")),
+        "secret_last4": endpoint.get("secret_last4", ""),
+        "secret_created_at": endpoint.get("secret_created_at", ""),
+        "previous_secret_expires_at": endpoint.get("previous_secret_expires_at", ""),
+        "last_test": endpoint.get("last_test") or {},
+        "configuration": _public_webhook_configuration(endpoint),
+        "people_sync": endpoint.get("people_sync") or {},
+        "updated_at": endpoint.get("updated_at", ""),
+    }
+
+
+def _webhook_api_error(err):
+    """A third-party failure, as the app sees it: ALWAYS 409 with a code —
+    never 401, which would clear the user's session — and never the
+    endpoint's raw body."""
+    code = getattr(err, "code", "") or "webhook_error"
+    message = getattr(err, "message", "") or "The webhook endpoint failed."
+    return SiteDeliveryApiError(409, message, code)
+
+
+def _webhook_endpoint_for(wid, *, require_enabled=True):
+    endpoint = _site_endpoint(wid)
+    if not _is_webhook_endpoint(endpoint) or \
+            (require_enabled and not _webhook_endpoint_enabled(endpoint)):
+        raise SiteDeliveryApiError(
+            409, "Salesforce webhook delivery is not set up for this workspace",
+            WEBHOOK_NOT_CONFIGURED_CODE)
+    return endpoint
+
+
+# ---------------------------------------------------------------------------
+# Endpoint configuration routes
+# ---------------------------------------------------------------------------
+
+def webhook_get(event):
+    """GET /workspaces/{workspace_id}/webhook (JWT, any member)
+    -> {mode, endpoint}. Never returns a secret."""
+    _webhook_require_enabled()
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    endpoint = _site_endpoint(wid)
+    return _resp(200, {"mode": _endpoint_mode(endpoint),
+                       "endpoint": _public_webhook_endpoint(endpoint)})
+
+
+def webhook_put(event):
+    """PUT /workspaces/{workspace_id}/webhook {url, enabled?, replace_site?}
+    (JWT, CAP_MANAGE_INTEGRATIONS) -> {endpoint, secret?}
+
+    The FIRST save generates the signing secret and returns it — the only
+    response that ever carries it. Later saves change url/enabled and keep
+    the secret. Refuses (409 site_mode_active) to replace an enabled
+    MinuteX Salesforce package connection unless replace_site is true.
+    """
+    _webhook_require_enabled()
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    data = _body(event)
+    try:
+        url = webhook_client.validate_webhook_url(data.get("url"))
+    except ValueError as e:
+        raise ApiError(400, str(e))
+    enabled = data.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ApiError(400, "enabled must be true or false")
+    current = _site_endpoint(wid)
+    now = _now_iso()
+
+    if _is_webhook_endpoint(current):
+        url_changed = url != current.get("url")
+        sets = ["#u = :u", "enabled = :e", "updated_at = :t", "updated_by = :by"]
+        values = {":u": url, ":e": enabled, ":t": now, ":by": user_id}
+        if url_changed:
+            # A different endpoint's meeting types are not this one's.
+            sets += ["configuration = :c", "last_test = :lt"]
+            values.update({":c": {"status": "never"}, ":lt": {}})
+        _site_endpoints.update_item(
+            Key={"workspace_id": wid},
+            UpdateExpression="SET " + ", ".join(sets),
+            ConditionExpression="attribute_exists(workspace_id)",
+            ExpressionAttributeNames={"#u": "url"},
+            ExpressionAttributeValues=values)
+        _audit("webhook.updated", user_id, wid, enabled=enabled,
+               url_changed=url_changed)
+        return _resp(200, {"endpoint": _public_webhook_endpoint(_site_endpoint(wid))})
+
+    if current and current.get("enabled") and data.get("replace_site") is not True:
+        raise SiteDeliveryApiError(
+            409, "This workspace already delivers through the MinuteX "
+                 "Salesforce package. Replacing it stops that delivery.",
+            "site_mode_active")
+
+    secret = webhook_client.new_secret()
+    creds = {"hmac_secret": secret, "audio_key": secrets.token_urlsafe(32)}
+    row = {
+        "workspace_id": wid,
+        "delivery_type": webhook_contract.DELIVERY_TYPE_WEBHOOK,
+        "provider": webhook_contract.PROVIDER_SALESFORCE,
+        "contract_version": webhook_contract.CONTRACT_VERSION,
+        "url": url,
+        "enabled": enabled,
+        "secrets_enc": _integration_kms_encrypt(json.dumps(creds)),
+        "secret_last4": secret[-4:],
+        "secret_created_at": now,
+        "configuration": {"status": "never"},
+        "last_test": {},
+        "people_sync": {},
+        "created_at": now,
+        "created_by": user_id,
+        "updated_at": now,
+        "updated_by": user_id,
+    }
+    _site_endpoints.put_item(Item=row)
+    _audit("webhook.configured", user_id, wid, enabled=enabled,
+           replaced=_endpoint_mode(current))
+    return _resp(200, {"endpoint": _public_webhook_endpoint(row), "secret": secret})
+
+
+def webhook_delete(event):
+    """DELETE /workspaces/{workspace_id}/webhook (JWT, CAP_MANAGE_INTEGRATIONS)
+    Removes the endpoint and its keys; audio links stop working at once."""
+    _webhook_require_enabled()
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    if not _is_webhook_endpoint(_site_endpoint(wid)):
+        raise ApiError(404, "no webhook is configured")
+    _site_endpoints.delete_item(Key={"workspace_id": wid})
+    _audit("webhook.removed", user_id, wid)
+    return _resp(200, {"deleted": True})
+
+
+def webhook_rotate_secret(event):
+    """POST /workspaces/{workspace_id}/webhook/secret
+    (JWT, CAP_MANAGE_INTEGRATIONS) -> {endpoint, secret}
+
+    The new secret is returned once. The previous one keeps being sent (dual
+    signature) for WEBHOOK_SECRET_GRACE_SECONDS so the customer can update
+    their endpoint without dropping a single delivery.
+    """
+    _webhook_require_enabled()
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    endpoint = _webhook_endpoint_for(wid, require_enabled=False)
+    creds = _webhook_live_creds(_site_secrets(endpoint))
+    secret = webhook_client.new_secret()
+    expires = _webhook_iso(_webhook_clock() + WEBHOOK_SECRET_GRACE_SECONDS)
+    creds.update(previous_hmac_secret=creds.get("hmac_secret", ""),
+                 previous_expires_at=expires, hmac_secret=secret)
+    now = _now_iso()
+    _site_endpoints.update_item(
+        Key={"workspace_id": wid},
+        UpdateExpression="SET secrets_enc = :s, secret_last4 = :l4, "
+                         "secret_created_at = :t, previous_secret_expires_at = :x, "
+                         "updated_at = :t, updated_by = :by",
+        ConditionExpression="attribute_exists(workspace_id)",
+        ExpressionAttributeValues={
+            ":s": _integration_kms_encrypt(json.dumps(creds)),
+            ":l4": secret[-4:], ":t": now, ":x": expires, ":by": user_id})
+    _audit("webhook.secret_rotated", user_id, wid)
+    return _resp(200, {"endpoint": _public_webhook_endpoint(_site_endpoint(wid)),
+                       "secret": secret})
+
+
+# ---------------------------------------------------------------------------
+# Customer configuration (meeting types) — fetched, validated, cached
+# ---------------------------------------------------------------------------
+
+def _webhook_fetch_configuration(wid, endpoint):
+    request_id = site_contract.new_request_id()
+    env = webhook_contract.configuration_request(
+        request_id=request_id, workspace_id=_webhook_envelope_workspace(wid))
+    resp = _webhook_client().query(
+        endpoint["url"], webhook_contract.PATH_CONFIGURATION, env,
+        _webhook_signer(endpoint),
+        timeout=webhook_client.CONFIGURATION_TIMEOUT_SECONDS,
+        max_bytes=webhook_contract.MAX_CONFIGURATION_BYTES)
+    fetched = webhook_contract.validate_configuration(resp.body)
+    fetched["linkable_objects"] = contract_v3.normalize_linkable_objects(
+        fetched.get("linkable_objects"))
+    return fetched, resp
+
+
+def _webhook_refresh_configuration(wid, endpoint):
+    """Fetch and store the customer's configuration. NEVER raises.
+
+    A failure keeps the last good meeting types and marks them stale — a
+    temporarily unavailable org must not make the integration unusable.
+    Only a workspace that has never had a good fetch is in "error".
+    """
+    # The injected clock: the TTL and rate-limit checks compare against it.
+    now = _webhook_iso(_webhook_clock())
+    cfg = dict((endpoint or {}).get("configuration") or {})
+    try:
+        fetched, _r = _webhook_fetch_configuration(wid, endpoint)
+        cfg = {"status": "ok", "configuration_version": fetched["configuration_version"],
+               "meeting_types": fetched["meeting_types"],
+               "linkable_objects": fetched["linkable_objects"], "fetched_at": now,
+               "last_attempt_at": now, "last_error_code": ""}
+        print(f"[webhook] configuration workspace={wid} "
+              f"version={cfg['configuration_version']} "
+              f"types={len(cfg['meeting_types'])}")
+    except (webhook_client.WebhookDeliveryError, webhook_contract.ContractError) as e:
+        cfg.update(status="stale" if cfg.get("fetched_at") else "error",
+                   last_attempt_at=now, last_error_code=e.code)
+        print(f"[webhook] configuration workspace={wid} failed code={e.code} "
+              f"kept_version={cfg.get('configuration_version', '')}")
+    except Exception as e:  # noqa: BLE001 — credentials, KMS
+        cfg.update(status="stale" if cfg.get("fetched_at") else "error",
+                   last_attempt_at=now, last_error_code="credentials_unavailable")
+        print(f"[webhook] configuration workspace={wid} failed "
+              f"{type(e).__name__}")
+    try:
+        _site_endpoints.update_item(
+            Key={"workspace_id": wid},
+            UpdateExpression="SET configuration = :c",
+            ConditionExpression="attribute_exists(workspace_id)",
+            ExpressionAttributeValues={":c": cfg})
+    except ClientError:
+        pass
+    return cfg
+
+
+def _webhook_may_refresh(cfg):
+    return _webhook_clock() - _webhook_ts((cfg or {}).get("last_attempt_at")) \
+        >= WEBHOOK_CONFIG_REFRESH_MIN_SECONDS
+
+
+def _webhook_configuration(wid, endpoint, *, allow_refresh=True):
+    """The cached configuration, refreshed inline when older than the TTL
+    (and not attempted in the last few seconds)."""
+    cfg = dict((endpoint or {}).get("configuration") or {})
+    fresh = cfg.get("status") == "ok" and \
+        _webhook_clock() - _webhook_ts(cfg.get("fetched_at")) < WEBHOOK_CONFIG_TTL_SECONDS
+    if allow_refresh and not fresh and _webhook_may_refresh(cfg):
+        cfg = _webhook_refresh_configuration(wid, endpoint)
+    return cfg
+
+
+def _webhook_meeting_type(cfg, type_id):
+    for t in (cfg or {}).get("meeting_types") or []:
+        if t.get("id") == type_id:
+            return t
+    return None
+
+
+def _webhook_resolve_type(wid, endpoint, type_id):
+    """(meeting type, configuration). On a miss, ONE synchronous refresh —
+    the admin may have just added the type in Salesforce."""
+    cfg = _webhook_configuration(wid, endpoint)
+    found = _webhook_meeting_type(cfg, type_id)
+    if found is None and _webhook_may_refresh(cfg):
+        cfg = _webhook_refresh_configuration(wid, endpoint)
+        found = _webhook_meeting_type(cfg, type_id)
+    return found, cfg
+
+
+def webhook_test(event):
+    """POST /workspaces/{workspace_id}/webhook/test (JWT,
+    CAP_MANAGE_INTEGRATIONS) -> {test, configuration}
+
+    A signed configuration fetch: proves the URL, the signature and the
+    receiver's contract in one call, and refreshes the cache. A failing
+    endpoint is a 200 with test.ok=false — the check ran; that is its answer.
+    """
+    _webhook_require_enabled()
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    endpoint = _webhook_endpoint_for(wid, require_enabled=False)
+    at = _webhook_iso(_webhook_clock())
+    try:
+        fetched, resp = _webhook_fetch_configuration(wid, endpoint)
+        test = {"ok": True, "at": at, "http_status": resp.http_status,
+                "elapsed_ms": resp.elapsed_ms,
+                "configuration_version": fetched["configuration_version"],
+                "meeting_type_count": len(fetched["meeting_types"])}
+        cfg = {"status": "ok", "configuration_version": fetched["configuration_version"],
+               "meeting_types": fetched["meeting_types"],
+               "linkable_objects": fetched["linkable_objects"], "fetched_at": at,
+               "last_attempt_at": at, "last_error_code": ""}
+    except (webhook_client.WebhookDeliveryError, webhook_contract.ContractError) as e:
+        test = {"ok": False, "at": at, "code": e.code, "message": e.message,
+                "http_status": getattr(e, "http_status", 0),
+                "configuration_version": ""}
+        cfg = dict(endpoint.get("configuration") or {})
+        cfg.update(status="stale" if cfg.get("fetched_at") else "error",
+                   last_attempt_at=at, last_error_code=e.code)
+    _site_endpoints.update_item(
+        Key={"workspace_id": wid},
+        UpdateExpression="SET last_test = :t, configuration = :c",
+        ConditionExpression="attribute_exists(workspace_id)",
+        ExpressionAttributeValues={":t": test, ":c": cfg})
+    print(f"[webhook] test workspace={wid} by={user_id} ok={test['ok']} "
+          f"code={test.get('code', '')} "
+          f"version={test.get('configuration_version', '')}")
+    return _resp(200, {"test": test, "configuration":
+                       _public_webhook_configuration(_site_endpoint(wid))})
+
+
+def webhook_configuration_get(event):
+    """GET /workspaces/{workspace_id}/webhook/configuration (JWT, any member)"""
+    _webhook_require_enabled()
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    endpoint = _webhook_endpoint_for(wid)
+    _webhook_configuration(wid, endpoint)
+    return _resp(200, {"configuration":
+                       _public_webhook_configuration(_site_endpoint(wid))})
+
+
+def webhook_configuration_refresh(event):
+    """POST /workspaces/{workspace_id}/webhook/configuration/refresh (JWT, any
+    member) -> {configuration, rate_limited}. At most one fetch per
+    WEBHOOK_CONFIG_REFRESH_MIN_SECONDS per workspace, whoever asks."""
+    _webhook_require_enabled()
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    endpoint = _webhook_endpoint_for(wid)
+    rate_limited = not _webhook_may_refresh(endpoint.get("configuration") or {})
+    if not rate_limited:
+        _webhook_refresh_configuration(wid, endpoint)
+    return _resp(200, {"configuration":
+                       _public_webhook_configuration(_site_endpoint(wid)),
+                       "rate_limited": rate_limited})
+
+
+def webhook_records_search(event):
+    """GET /workspaces/{workspace_id}/webhook/records
+    ?meeting_type_id=&q=&cursor=&limit= (JWT, any member)
+    -> {records, next_cursor}
+
+    Sent upstream as a signed POST: the search term stays out of URLs and
+    logs on the customer side too. Never logged here either.
+    """
+    _webhook_require_enabled()
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    endpoint = _webhook_endpoint_for(wid)
+    qs = event.get("queryStringParameters") or {}
+    type_id = str(qs.get("meeting_type_id") or "").strip()
+    meeting_type, _cfg = _webhook_resolve_type(wid, endpoint, type_id)
+    if meeting_type is None:
+        raise SiteDeliveryApiError(422, "That meeting type is not available",
+                                   "unknown_meeting_type")
+    if not (meeting_type.get("record_selection") or {}).get("enabled"):
+        raise SiteDeliveryApiError(422, "This meeting type has no record to pick",
+                                   "record_selection_disabled")
+    try:
+        limit = int(qs.get("limit") or 10)
+    except ValueError:
+        raise ApiError(400, "limit must be a number")
+    try:
+        env = webhook_contract.search_request(
+            request_id=site_contract.new_request_id(), meeting_type_id=type_id,
+            query=str(qs.get("q") or ""), limit=limit,
+            cursor=str(qs.get("cursor") or ""),
+            workspace_id=_webhook_envelope_workspace(wid))
+    except webhook_contract.ContractError as e:
+        raise ApiError(400, e.message)
+    try:
+        resp = _webhook_client().query(
+            endpoint["url"], webhook_contract.PATH_SEARCH, env,
+            _webhook_signer(endpoint),
+            timeout=webhook_client.SEARCH_TIMEOUT_SECONDS,
+            max_bytes=webhook_contract.MAX_SEARCH_BYTES)
+        out = webhook_contract.validate_search_response(resp.body)
+    except (webhook_client.WebhookDeliveryError, webhook_contract.ContractError) as e:
+        print(f"[webhook] search workspace={wid} type={type_id} failed code={e.code}")
+        raise _webhook_api_error(e)
+    return _resp(200, out)
+
+
+# ===========================================================================
+# SALESFORCE ORG CONNECTION — integration-user OAuth (approved 2026-10-05)
+#
+# A workspace's owner or manager connects the company's Salesforce org by
+# signing in AS A DEDICATED INTEGRATION USER (OAuth 2.0 web-server flow +
+# PKCE). MinuteX keeps that user's refresh token, KMS-encrypted, in its own
+# table (SalesforceOAuthConnections, one row per workspace) and mints short-
+# lived access tokens from it. Every later call to the MinuteX package goes
+# out with that bearer token.
+#
+# Separate from the address + signing-secret connection (webhook path),
+# which keeps working until the package replaces it. Switched off unless
+# SALESFORCE_OAUTH_ENABLED=1.
+#
+# Errors are 409 + code, NEVER 401: a 401 from userApi signs the MinuteX user
+# out, and a dead Salesforce credential is not a dead MinuteX session.
+# ===========================================================================
+SALESFORCE_OAUTH_ENABLED = os.environ.get("SALESFORCE_OAUTH_ENABLED", "0") == "1"
+SF_OAUTH_CLIENT_ID = os.environ.get("SF_OAUTH_CLIENT_ID", "")
+# Optional: an External Client App can require only PKCE. When it also
+# requires the secret, it lives in Secrets Manager, never in a Lambda env var.
+SF_OAUTH_CLIENT_SECRET_ARN = os.environ.get("SF_OAUTH_CLIENT_SECRET_ARN", "")
+SF_OAUTH_REDIRECT_URI = os.environ.get("SF_OAUTH_REDIRECT_URI", "")
+SF_OAUTH_CONNECTIONS_TABLE = os.environ.get("SF_OAUTH_CONNECTIONS_TABLE",
+                                            "SalesforceOAuthConnections")
+SF_OAUTH_PROVIDER = "salesforce_org"
+SF_OAUTH_STATUS_CONNECTED = "connected"
+SF_OAUTH_STATUS_RECONNECT = "reconnect_needed"
+SF_OAUTH_RECONNECT_CODE = "salesforce_reconnect_needed"
+SF_OAUTH_NOT_CONNECTED_CODE = "salesforce_not_connected"
+# Salesforce doesn't say how long an access token lives (it follows the
+# org's session timeout, 2 hours by default); reuse one for 30 minutes.
+SF_ACCESS_TOKEN_TTL_SECONDS = int(os.environ.get("SF_ACCESS_TOKEN_TTL_SECONDS", "1800"))
+# The MinuteX managed package version customers install (04t…), and whether
+# it is RELEASED (installs anywhere) or a beta (sandboxes and Developer
+# Edition orgs only). Set by script 88; a new version needs no app release.
+SF_PACKAGE_VERSION_ID = os.environ.get("SF_PACKAGE_VERSION_ID", "").strip()
+SF_PACKAGE_RELEASED = os.environ.get("SF_PACKAGE_RELEASED", "0") == "1"
+_SF_PACKAGE_VERSION_RE = re.compile(r"^04t[0-9A-Za-z]{12}(?:[0-9A-Za-z]{3})?$")
+
+
+# The MinuteX package's namespace: where its receiver lives in a customer
+# org (/services/apexrest/<namespace>/minutex/v2). A receiver built from the
+# setup guide has none, so that is tried next.
+SF_PACKAGE_NAMESPACE = os.environ.get("SF_PACKAGE_NAMESPACE", "DevMinuteX").strip()
+SF_RECEIVER_PATH = "minutex/v2"
+
+# One-click setup outcomes (the app words each one).
+SF_SETUP_READY = "ready"              # receiver found, secret set, saved
+SF_SETUP_NO_RECEIVER = "no_receiver"  # the package isn't installed in the org
+SF_SETUP_NOT_ALLOWED = "not_allowed"  # the user lacks the MinuteX Integration permission set
+SF_SETUP_MANUAL = "manual"            # an older receiver: address + secret by hand
+SF_SETUP_FAILED = "failed"            # Salesforce or MinuteX couldn't finish now
+
+
+def _sf_receiver_bases(instance_url):
+    """The receiver addresses to try in an org, the package's first."""
+    base = instance_url.rstrip("/") + webhook_client.APEX_REST_PREFIX
+    names = [SF_PACKAGE_NAMESPACE] if SF_PACKAGE_NAMESPACE else []
+    return [base + (f"{ns}/" if ns else "") + SF_RECEIVER_PATH for ns in names + [""]]
+
+
+def _sf_api_post_json(url, access_token, body):
+    """POST JSON to the org as the connected user; (status, parsed JSON or
+    {}). Network seam, patched in tests. Never logs the body (a secret)."""
+    if not salesforce_oauth.is_salesforce_url(url):
+        raise salesforce_oauth.OAuthError("invalid_host", "Not a Salesforce address.")
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "Authorization": f"Bearer {access_token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw, status = r.read(64 * 1024), r.status
+    except urllib.error.HTTPError as e:
+        raw, status = e.read(64 * 1024), e.code
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise salesforce_oauth.OAuthError("salesforce_unreachable",
+                                          "Salesforce isn't answering right now.")
+    try:
+        parsed = json.loads(raw.decode("utf-8") or "{}")
+    except (ValueError, UnicodeDecodeError):
+        parsed = {}
+    return status, parsed if isinstance(parsed, dict) else {}
+
+
+def _sf_save_receiver(wid, user_id, url, secret):
+    """Save the receiver the way the manual setup does (webhook_put), with
+    the secret the org now holds. Keeps the recording-link key of an
+    existing connection; a new address resets its configuration."""
+    current = _site_endpoint(wid)
+    now = _now_iso()
+    old = _site_secrets(current) if _is_webhook_endpoint(current) else {}
+    creds = {"hmac_secret": secret,
+             "audio_key": old.get("audio_key") or secrets.token_urlsafe(32)}
+    if _is_webhook_endpoint(current):
+        sets = ["#u = :u", "enabled = :e", "secrets_enc = :s", "secret_last4 = :l4",
+                "secret_created_at = :t", "previous_secret_expires_at = :x",
+                "updated_at = :t", "updated_by = :by"]
+        values = {":u": url, ":e": True, ":s": _integration_kms_encrypt(json.dumps(creds)),
+                  ":l4": secret[-4:], ":t": now, ":x": "", ":by": user_id}
+        if url != current.get("url"):
+            sets += ["configuration = :c", "last_test = :lt"]
+            values.update({":c": {"status": "never"}, ":lt": {}})
+        _site_endpoints.update_item(
+            Key={"workspace_id": wid}, UpdateExpression="SET " + ", ".join(sets),
+            ConditionExpression="attribute_exists(workspace_id)",
+            ExpressionAttributeNames={"#u": "url"}, ExpressionAttributeValues=values)
+    else:
+        _site_endpoints.put_item(Item={
+            "workspace_id": wid,
+            "delivery_type": webhook_contract.DELIVERY_TYPE_WEBHOOK,
+            "provider": webhook_contract.PROVIDER_SALESFORCE,
+            "contract_version": webhook_contract.CONTRACT_VERSION,
+            "url": url, "enabled": True,
+            "secrets_enc": _integration_kms_encrypt(json.dumps(creds)),
+            "secret_last4": secret[-4:], "secret_created_at": now,
+            "configuration": {"status": "never"}, "last_test": {}, "people_sync": {},
+            "created_at": now, "created_by": user_id, "updated_at": now, "updated_by": user_id,
+        })
+    return _site_endpoint(wid)
+
+
+def _sf_setup_receiver(wid, user_id, access=None):
+    """ONE-CLICK SETUP, right after the Salesforce login: find the MinuteX
+    receiver in the org, set a new signing secret in it (setup/secret, as
+    the connected user; the package's settings are protected, so no admin
+    can paste one), and save the address and secret. Returns {status, ...}
+    (SF_SETUP_*). Never raises: a failure leaves any existing connection
+    as it was, and the app offers "Finish setup" to try again."""
+    current = _site_endpoint(wid)
+    if current and not _is_webhook_endpoint(current) and current.get("enabled"):
+        return {"status": SF_SETUP_FAILED, "code": "site_mode_active"}
+    try:
+        # `access` = (token, instance) the login just returned: no refresh
+        # (which would also rotate the refresh token for nothing).
+        token, instance = access or _sf_access_token(wid)
+    except SiteDeliveryApiError as e:
+        return {"status": SF_SETUP_FAILED, "code": e.code}
+    secret = webhook_client.new_secret()
+    body = {"type": "setup.secret", "contract_version": contract_v3.CONTRACT_VERSION,
+            "request_id": site_contract.new_request_id(), "secret": secret}
+    for url in _sf_receiver_bases(instance):
+        try:
+            status, reply = _sf_api_post_json(url + "/setup/secret", token, body)
+        except salesforce_oauth.OAuthError as e:
+            return {"status": SF_SETUP_FAILED, "code": e.code}
+        if status == 404:
+            continue                      # no receiver at this address
+        code = str((reply.get("error") or {}).get("code") or "")
+        if status == 401 or code == "receiver_disabled":
+            # A receiver that checks the signature before anything else:
+            # built before one-click setup. It works, set up by hand.
+            return {"status": SF_SETUP_MANUAL}
+        if status == 403:
+            # The receiver's own "not_allowed", or Salesforce refusing the
+            # class: the user lacks the MinuteX Integration permission set.
+            return {"status": SF_SETUP_NOT_ALLOWED}
+        if 200 <= status < 300 and reply.get("ok") is True:
+            endpoint = _sf_save_receiver(wid, user_id, url, secret)
+            _webhook_refresh_configuration(wid, endpoint)
+            _audit("salesforce_oauth.receiver_set_up", user_id, wid,
+                   namespace=str(reply.get("namespace") or ""))
+            print(f"[salesforce-oauth] receiver set up workspace={wid}")
+            return {"status": SF_SETUP_READY, "namespace": str(reply.get("namespace") or "")}
+        print(f"[salesforce-oauth] setup refused workspace={wid} http={status}")
+        return {"status": SF_SETUP_FAILED, "code": code or str(status)}
+    return {"status": SF_SETUP_NO_RECEIVER}
+
+
+def salesforce_setup(event):
+    """POST /workspaces/{workspace_id}/salesforce/setup (JWT,
+    CAP_MANAGE_INTEGRATIONS) -> {setup, endpoint}
+
+    "Finish setup": run the one-click setup again (after installing the
+    package or assigning the permission set), without logging in again."""
+    _sf_oauth_require_enabled()
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    result = _sf_setup_receiver(wid, user_id)
+    return _resp(200, {"setup": result,
+                       "endpoint": _public_webhook_endpoint(_site_endpoint(wid))})
+
+
+def _sf_package_install():
+    """{version_id, released, production_url, sandbox_url}, or None when no
+    valid package version is configured. Salesforce's own install page."""
+    vid = SF_PACKAGE_VERSION_ID
+    if not _SF_PACKAGE_VERSION_RE.match(vid):
+        return None
+    path = "/packaging/installPackage.apexp?p0=" + vid
+    return {"version_id": vid, "released": SF_PACKAGE_RELEASED,
+            "production_url": "https://login.salesforce.com" + path,
+            "sandbox_url": "https://test.salesforce.com" + path}
+
+_sf_oauth_connections = _ddb.Table(SF_OAUTH_CONNECTIONS_TABLE)
+# workspace_id -> (access_token, instance_url, minted_at). Per container.
+_sf_access_cache = {}
+
+
+_sf_secret_cache = None
+
+
+def _sf_client_secret():
+    """The client secret from Secrets Manager, or "" when the app needs only
+    PKCE. Cached per container, like _google_client_secret()."""
+    global _sf_secret_cache
+    if _sf_secret_cache is None:
+        if not SF_OAUTH_CLIENT_SECRET_ARN:
+            _sf_secret_cache = ""
+        else:
+            sm = boto3.client("secretsmanager", region_name=REGION)
+            _sf_secret_cache = sm.get_secret_value(
+                SecretId=SF_OAUTH_CLIENT_SECRET_ARN)["SecretString"]
+    return _sf_secret_cache
+
+
+def _sf_oauth_require_enabled():
+    if not SALESFORCE_OAUTH_ENABLED:
+        raise SiteDeliveryApiError(404, "Salesforce login isn't available yet.",
+                                   "salesforce_oauth_disabled")
+    if not (SF_OAUTH_CLIENT_ID and SF_OAUTH_REDIRECT_URI):
+        raise SiteDeliveryApiError(503, "Salesforce login isn't configured on the server.",
+                                   "salesforce_oauth_not_configured")
+
+
+def _sf_oauth_post(url, form):
+    """POST a form to Salesforce; (status, parsed JSON or {}). The one network
+    seam of this section, patched in tests. Never logs the form."""
+    if not salesforce_oauth.is_salesforce_url(url):
+        raise salesforce_oauth.OAuthError("invalid_host", "Not a Salesforce address.")
+    req = urllib.request.Request(
+        url, data=urllib.parse.urlencode(form).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read(256 * 1024)
+            status = r.status
+    except urllib.error.HTTPError as e:
+        raw = e.read(64 * 1024)
+        status = e.code
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise salesforce_oauth.OAuthError("salesforce_unreachable",
+                                          "Salesforce isn't answering right now.")
+    try:
+        parsed = json.loads(raw.decode("utf-8") or "{}")
+    except (ValueError, UnicodeDecodeError):
+        parsed = {}
+    return status, parsed if isinstance(parsed, dict) else {}
+
+
+def _sign_sf_state(user_id, wid, host, verifier):
+    """HMAC-signed, expiring state for the Salesforce org connection: CSRF
+    guard, PKCE carrier, and the workspace and login host it belongs to.
+    Same construction and secret as _sign_integration_state."""
+    payload = {"sub": user_id, "pv": SF_OAUTH_PROVIDER, "ws": wid, "lh": host,
+               "cv": verifier, "exp": int(time.time()) + INTEGRATION_STATE_TTL}
+    seg = _b64u_encode(json.dumps(payload, separators=(",", ":")).encode())
+    sig = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
+    return seg + "." + _b64u_encode(sig)
+
+
+def _verify_sf_state(state):
+    """(user_id, wid, host, verifier) or ApiError."""
+    try:
+        seg, sig_b64 = state.split(".")
+        expected = hmac.new(_jwt_secret().encode(), seg.encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, _b64u_decode(sig_b64)):
+            raise ValueError("bad signature")
+        payload = json.loads(_b64u_decode(seg))
+    except (ValueError, TypeError, KeyError):
+        raise ApiError(400, "invalid or tampered state")
+    if not isinstance(payload, dict) or payload.get("exp", 0) < int(time.time()):
+        raise ApiError(410, "connect session expired")
+    if payload.get("pv") != SF_OAUTH_PROVIDER:
+        raise ApiError(400, "state does not match this integration")
+    out = (payload.get("sub"), payload.get("ws"), payload.get("lh"), payload.get("cv"))
+    if not all(out) or not salesforce_oauth.is_salesforce_url(out[2]):
+        raise ApiError(400, "invalid state")
+    return out
+
+
+def _sf_oauth_connection(wid):
+    if not wid:
+        return None
+    return _sf_oauth_connections.get_item(Key={"workspace_id": wid}).get("Item")
+
+
+def _public_sf_oauth(row):
+    if not row:
+        return {"connected": False, "status": "not_connected"}
+    return {
+        "connected": row.get("status") == SF_OAUTH_STATUS_CONNECTED,
+        "status": row.get("status", ""),
+        "org_id": row.get("org_id", ""),
+        "instance_host": urllib.parse.urlsplit(row.get("instance_url", "")).hostname or "",
+        "integration_user_id": row.get("sf_user_id", ""),
+        "connected_at": row.get("connected_at", ""),
+        "connected_by": row.get("connected_by", ""),
+        "status_message": row.get("status_message", ""),
+    }
+
+
+def salesforce_oauth_connect(event):
+    """POST /workspaces/{workspace_id}/salesforce/connect
+    {environment: "production"|"sandbox"|"my_domain", my_domain?}
+    (JWT, CAP_MANAGE_INTEGRATIONS) -> {authorize_url}
+
+    The app opens the URL; the admin signs in to Salesforce AS THE
+    INTEGRATION USER and approves. Salesforce then calls the callback.
+    """
+    _sf_oauth_require_enabled()
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    data = _body(event)
+    try:
+        host = salesforce_oauth.login_host(data.get("environment"), data.get("my_domain") or "")
+        verifier = _new_pkce_verifier()
+        url = salesforce_oauth.authorize_url(
+            host, client_id=SF_OAUTH_CLIENT_ID, redirect_uri=SF_OAUTH_REDIRECT_URI,
+            state=_sign_sf_state(user_id, wid, host, verifier),
+            code_challenge=_pkce_challenge(verifier))
+    except salesforce_oauth.OAuthError as e:
+        raise SiteDeliveryApiError(400, e.message, e.code)
+    _audit("salesforce_oauth.connect_started", user_id, wid)
+    return _resp(200, {"authorize_url": url})
+
+
+def salesforce_oauth_callback(event):
+    """GET /salesforce/oauth/callback?code&state (NO JWT: Salesforce's browser
+    redirect). `state` is the credential. Ends in a 302 to the app's return
+    link with provider=salesforce and connected=1 or a reason."""
+    qs = event.get("queryStringParameters") or {}
+
+    def _redirect(ok, reason="", setup=""):
+        params = {"provider": "salesforce"}
+        params.update({"connected": "1"} if ok else {"connected": "0", "reason": reason})
+        if setup:
+            params["setup"] = setup
+        target = INTEGRATION_RETURN_URL or "/"
+        return {"statusCode": 302,
+                "headers": {"Location": f"{target}?{urllib.parse.urlencode(params)}"},
+                "body": ""}
+
+    if not SALESFORCE_OAUTH_ENABLED:
+        return _redirect(False, "failed")
+    if qs.get("error"):
+        print(f"[salesforce-oauth] callback error param: {qs.get('error')}")
+        # OAUTH_INVALID_NONCE: an already-used sign-in page was opened again
+        # (the phone's browser re-showed it); a new Connect works.
+        return _redirect(False, {"access_denied": "denied",
+                                 "OAUTH_INVALID_NONCE": "reused"}.get(qs.get("error"), "failed"))
+    code, state = qs.get("code"), qs.get("state")
+    if not code or not state:
+        return _redirect(False, "missing_params")
+    try:
+        user_id, wid, host, verifier = _verify_sf_state(state)
+    except ApiError as e:
+        print(f"[salesforce-oauth] state rejected: {e.message}")
+        return _redirect(False, "expired")
+    # Permissions can change between starting and finishing: check again.
+    membership = _active_membership(wid, user_id)
+    if not membership or not workspace_schema.role_can(
+            membership.get("role"), workspace_schema.CAP_MANAGE_INTEGRATIONS):
+        print(f"[salesforce-oauth] {user_id} may no longer connect workspace {wid}")
+        return _redirect(False, "not_allowed")
+    try:
+        status, body = _sf_oauth_post(host + salesforce_oauth.TOKEN_PATH, salesforce_oauth.token_form(
+            code=code, code_verifier=verifier, client_id=SF_OAUTH_CLIENT_ID,
+            client_secret=_sf_client_secret(), redirect_uri=SF_OAUTH_REDIRECT_URI))
+        token = salesforce_oauth.parse_token(body, require_refresh=True,
+                                             client_secret=_sf_client_secret())
+    except salesforce_oauth.OAuthError as e:
+        print(f"[salesforce-oauth] exchange failed workspace={wid} code={e.code}")
+        return _redirect(False, "no_refresh_token" if e.code == "no_refresh_token"
+                         else "exchange_failed")
+    previous = _sf_oauth_connection(wid) or {}
+    org_changed = bool(previous.get("org_id")) and \
+        not salesforce_oauth.same_org(previous["org_id"], token["org_id"])
+    now = _now_iso()
+    _sf_oauth_connections.put_item(Item={
+        "workspace_id": wid,
+        "status": SF_OAUTH_STATUS_CONNECTED,
+        "status_message": "",
+        "login_host": host,
+        "instance_url": token["instance_url"],
+        "org_id": token["org_id"],
+        "sf_user_id": token["user_id"],
+        "refresh_token_enc": _integration_kms_encrypt(token["refresh_token"]),
+        "connected_by": user_id,
+        "connected_at": previous.get("connected_at") if previous and not org_changed else now,
+        "updated_at": now,
+    })
+    _sf_access_cache.pop(wid, None)
+    _audit("salesforce_oauth.connected", user_id, wid, org_id=token["org_id"],
+           org_changed=org_changed)
+    # One-click: find the receiver and set its secret now.
+    return _redirect(True, setup=_sf_setup_receiver(
+        wid, user_id, access=(token["access_token"], token["instance_url"]))["status"])
+
+
+def salesforce_oauth_status(event):
+    """GET /workspaces/{workspace_id}/salesforce/connection (JWT, any member)
+    -> {connection}. Never returns a token."""
+    _sf_oauth_require_enabled()
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    connection = _public_sf_oauth(_sf_oauth_connection(wid))
+    connection["install"] = _sf_package_install()
+    return _resp(200, {"connection": connection})
+
+
+def salesforce_oauth_disconnect(event):
+    """DELETE /workspaces/{workspace_id}/salesforce/connection
+    (JWT, CAP_MANAGE_INTEGRATIONS) -> {disconnected}
+
+    Revokes the grant with Salesforce (best effort) and DELETES the row, so
+    no credential is left behind."""
+    _sf_oauth_require_enabled()
+    user_id, wid, _m = _require_workspace_capability(
+        event, workspace_schema.CAP_MANAGE_INTEGRATIONS,
+        workspace_id=_site_path_workspace(event))
+    row = _sf_oauth_connection(wid)
+    if row:
+        try:
+            _sf_oauth_post(row["instance_url"] + salesforce_oauth.REVOKE_PATH,
+                           {"token": _integration_kms_decrypt(row["refresh_token_enc"])})
+        except Exception as e:  # noqa: BLE001 - revoke is best effort
+            print(f"[salesforce-oauth] revoke failed workspace={wid}: {type(e).__name__}")
+        _sf_oauth_connections.delete_item(Key={"workspace_id": wid})
+    _sf_access_cache.pop(wid, None)
+    _audit("salesforce_oauth.disconnected", user_id, wid)
+    return _resp(200, {"disconnected": True})
+
+
+def _sf_access_token(wid):
+    """(access_token, instance_url) for the workspace's org, minted from the
+    stored refresh token and reused for SF_ACCESS_TOKEN_TTL_SECONDS.
+
+    A refresh token Salesforce no longer accepts (revoked, user deactivated,
+    app removed) marks the connection reconnect_needed and raises 409; the
+    admin connects again. Never 401."""
+    cached = _sf_access_cache.get(wid)
+    if cached and time.time() - cached[2] < SF_ACCESS_TOKEN_TTL_SECONDS:
+        return cached[0], cached[1]
+    row = _sf_oauth_connection(wid)
+    if not row or row.get("status") != SF_OAUTH_STATUS_CONNECTED:
+        raise SiteDeliveryApiError(409, "Salesforce isn't connected for this workspace.",
+                                   SF_OAUTH_NOT_CONNECTED_CODE if not row
+                                   else SF_OAUTH_RECONNECT_CODE)
+    if not INTEGRATIONS_KMS_KEY_ID:
+        # Salesforce ROTATES the refresh token on every refresh. Without the
+        # key to store its successor, refreshing would spend the stored token
+        # and lose the new one (the connection then needs a reconnect). Stop
+        # BEFORE asking Salesforce: a configuration error, never a lost login.
+        print(f"[salesforce-oauth] refresh refused workspace={wid}: INTEGRATIONS_KMS_KEY_ID not set")
+        raise SiteDeliveryApiError(503, "Salesforce credentials can't be stored on this server.",
+                                   "credential_storage_unconfigured")
+    def refresh(r):
+        _status, body = _sf_oauth_post(r["login_host"] + salesforce_oauth.TOKEN_PATH,
+                                       salesforce_oauth.refresh_form(
+                                           refresh_token=_integration_kms_decrypt(r["refresh_token_enc"]),
+                                           client_id=SF_OAUTH_CLIENT_ID,
+                                           client_secret=_sf_client_secret()))
+        return salesforce_oauth.parse_token(body, require_refresh=False,
+                                            client_secret=_sf_client_secret())
+
+    try:
+        try:
+            token = refresh(row)
+        except salesforce_oauth.OAuthError as e:
+            # Refresh Token Rotation: another Lambda may have just used this
+            # refresh token and stored its successor. Use that one, once.
+            latest = _sf_oauth_connection(wid) if e.code in ("invalid_grant", "token_refused") else None
+            if not latest or latest.get("refresh_token_enc") == row["refresh_token_enc"] \
+                    or latest.get("status") != SF_OAUTH_STATUS_CONNECTED:
+                raise
+            row = latest
+            token = refresh(row)
+    except salesforce_oauth.OAuthError as e:
+        if e.code in ("invalid_grant", "token_refused"):
+            _sf_oauth_connections.update_item(
+                Key={"workspace_id": wid},
+                UpdateExpression="SET #s = :s, status_message = :m, updated_at = :u",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": SF_OAUTH_STATUS_RECONNECT,
+                                           ":m": "Salesforce no longer accepts MinuteX's sign-in.",
+                                           ":u": _now_iso()})
+            raise SiteDeliveryApiError(409, "Connect Salesforce again.", SF_OAUTH_RECONNECT_CODE)
+        raise SiteDeliveryApiError(409, e.message, e.code)
+    if not salesforce_oauth.same_org(token["org_id"], row["org_id"]):
+        raise SiteDeliveryApiError(409, "Salesforce answered for a different org.", "org_mismatch")
+    if token["refresh_token"]:
+        # Rotation is on: the refresh token just used is spent. Store its
+        # successor, unless another Lambda already replaced the one we used.
+        try:
+            _sf_oauth_connections.update_item(
+                Key={"workspace_id": wid},
+                UpdateExpression="SET refresh_token_enc = :n, updated_at = :u",
+                ConditionExpression="refresh_token_enc = :o",
+                ExpressionAttributeValues={
+                    ":n": _integration_kms_encrypt(token["refresh_token"]),
+                    ":o": row["refresh_token_enc"], ":u": _now_iso()})
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+    _sf_access_cache[wid] = (token["access_token"], token["instance_url"], time.time())
+    return token["access_token"], token["instance_url"]
+
+
+# ---------------------------------------------------------------------------
+# Linking a meeting to records (Contract v3)
+# ---------------------------------------------------------------------------
+
+LINK_CONTEXT_ATTR = "salesforce_links"
+
+# Outputs not available yet (refused with a clear code rather than accepted
+# and silently not sent). Empty now that files are delivered.
+LINK_OUTPUTS_NOT_YET = ()
+# Where uploaded MoM PDFs are kept, beside the recordings.
+MEETING_FILES_PREFIX = "meeting-files"
+MEETING_FILES_ATTR = "salesforce_files"
+FILE_UPLOAD_TIMEOUT_SECONDS = 30
+
+
+def _meeting_links(item):
+    links = (item or {}).get(LINK_CONTEXT_ATTR)
+    return links if isinstance(links, dict) and links.get("links") else None
+
+
+def _public_meeting_links(links):
+    if not links:
+        return None
+    return {"links": [{"object": l.get("object", ""), "id": l.get("id", ""),
+                       "name": l.get("name", ""), "primary": bool(l.get("primary"))}
+                      for l in links.get("links") or []],
+            "included_outputs": list(links.get("included_outputs") or []),
+            "task_relations": dict(links.get("task_relations") or {}),
+            # None: every document goes (meetings linked before the choice).
+            "included_documents": (list(links["included_documents"])
+                                   if isinstance(links.get("included_documents"), list) else None),
+            "selected_at": links.get("selected_at", "")}
+
+
+def _webhook_linkable_objects(wid, endpoint):
+    """The receiver's linkable objects (None: it doesn't support linking)."""
+    return _webhook_configuration(wid, endpoint).get("linkable_objects")
+
+
+def webhook_link_config(event):
+    """GET /workspaces/{workspace_id}/webhook/link-config (JWT, any member)
+    -> {supported, max_links, objects}
+
+    What the link sheet needs. `max_links` is contract_v3.MAX_LINKS, the one
+    place the records-per-meeting limit is set.
+    """
+    _webhook_require_enabled()
+    _user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    endpoint = _webhook_endpoint_for(wid)
+    return _resp(200, contract_v3.link_config_block(_webhook_linkable_objects(wid, endpoint)))
+
+
+def webhook_link_records(event):
+    """GET /workspaces/{workspace_id}/webhook/link-records?q=&limit=
+    (JWT, any member) -> {records: [{id, display_name, secondary_text, object_type}]}
+
+    Search across every linkable object at once. The caller's email travels
+    for the receiver's record-access check; the term is never logged.
+    """
+    _webhook_require_enabled()
+    user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    endpoint = _webhook_endpoint_for(wid)
+    objects = _webhook_linkable_objects(wid, endpoint)
+    if objects is None:
+        raise SiteDeliveryApiError(409, "This Salesforce connection doesn't support linking yet.",
+                                   "linking_unsupported")
+    qs = event.get("queryStringParameters") or {}
+    try:
+        limit = int(qs.get("limit") or 10)
+    except ValueError:
+        raise ApiError(400, "limit must be a number")
+    email = _norm_email((_users.get_item(Key={"user_id": user_id}).get("Item") or {}).get("email"))
+    try:
+        env = contract_v3.link_search_request(
+            request_id=site_contract.new_request_id(), query=str(qs.get("q") or ""),
+            objects=[o["object"] for o in objects], limit=limit, user_email=email,
+            workspace_id=_webhook_envelope_workspace(wid))
+    except contract_v3.ContractError as e:
+        raise SiteDeliveryApiError(400, e.message, e.code)
+    try:
+        resp = _webhook_client().query(
+            endpoint["url"], webhook_contract.PATH_SEARCH, env, _webhook_signer(endpoint),
+            timeout=webhook_client.SEARCH_TIMEOUT_SECONDS,
+            max_bytes=webhook_contract.MAX_SEARCH_BYTES)
+        out = webhook_contract.validate_search_response(resp.body)
+    except (webhook_client.WebhookDeliveryError, webhook_contract.ContractError) as e:
+        print(f"[webhook] link search workspace={wid} failed code={e.code}")
+        raise _webhook_api_error(e)
+    linkable = {o["object"].lower() for o in objects}
+    out["records"] = [r for r in out["records"] if r["object_type"].lower() in linkable]
+    return _resp(200, out)
+
+
+def webhook_mom_pdf_put(event):
+    """PUT /recordings/webhook-mom-pdf/{key+} {content_base64, filename}
+    (JWT, meeting write access) -> {file}
+
+    The MoM PDF the app rendered, uploaded when the user links the meeting
+    (the server has no PDF renderer of its own). Kept in S3 beside the
+    recording and sent to Salesforce with the MoM output. A changed PDF
+    marks the meeting so the next delivery sends the new version.
+    """
+    _webhook_require_enabled()
+    _user_id, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+    try:
+        content = base64.b64decode(str(data.get("content_base64") or ""), validate=True)
+    except (ValueError, TypeError):
+        raise ApiError(400, "content_base64 is not valid base64")
+    if not meeting_files.valid_pdf(content):
+        raise SiteDeliveryApiError(422, "That isn't a PDF.", "invalid_pdf")
+    if len(content) > contract_v3.MAX_FILE_BYTES:
+        raise SiteDeliveryApiError(
+            422, f"The PDF is larger than {contract_v3.MAX_FILE_BYTES // (1024 * 1024)} MB.",
+            "file_too_large")
+    digest = hashlib.sha256(content).hexdigest()
+    s3_key = f"{MEETING_FILES_PREFIX}/{hashlib.sha256(key.encode()).hexdigest()[:32]}/mom.pdf"
+    filename = meeting_files.safe_filename(
+        str(data.get("filename") or f"MoM – {item.get('title') or 'MinuteX meeting'}")
+        .removesuffix(".pdf"), "pdf")
+    old = (item.get(MEETING_FILES_ATTR) or {}).get(contract_v3.FILE_MOM_PDF) or {}
+    if old.get("sha256") != digest:
+        _s3.put_object(Bucket=BUCKET_NAME, Key=s3_key, Body=content,
+                       ContentType="application/pdf")
+    stored = {"s3_key": s3_key, "sha256": digest, "filename": filename,
+              "size_bytes": len(content), "uploaded_at": _now_iso()}
+    files = dict(item.get(MEETING_FILES_ATTR) or {})
+    files[contract_v3.FILE_MOM_PDF] = stored
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression=f"SET {MEETING_FILES_ATTR} = :f",
+        ConditionExpression="attribute_exists(audio_s3_key)",
+        ExpressionAttributeValues={":f": files})
+    if old.get("sha256") != digest and _meeting_links(item):
+        _webhook_mark_meeting_dirty(key, "files")
+    return _resp(200, {"file": {"kind": contract_v3.FILE_MOM_PDF, "filename": filename,
+                                "size_bytes": len(content), "uploaded_at": stored["uploaded_at"]}})
+
+
+# Generated documents' PDFs, inside MEETING_FILES_ATTR: {doc type: {s3_key,
+# sha256, source_sha256, filename, size_bytes, uploaded_at}}. source_sha256
+# is the document TEXT the PDF was made from: a PDF of older text is never
+# sent, and re-uploading the same text changes nothing.
+MEETING_DOCUMENT_PDFS = "documents"
+
+
+def _sendable_document_types(item):
+    """The meeting's generated documents that go as PDFs (the MoM's mirror
+    goes as the MoM PDF instead), in a stable order."""
+    docs = (item or {}).get(DOCUMENTS_ATTR) or {}
+    return sorted(t for t, d in docs.items()
+                  if t != contract_v3.MOM_DOCUMENT_TYPE and isinstance(d, dict)
+                  and str(d.get("content") or "").strip()
+                  and contract_v3.DOCUMENT_NAME_RE.match(t))
+
+
+def _document_source_sha(item, doc_type):
+    doc = ((item or {}).get(DOCUMENTS_ATTR) or {}).get(doc_type) or {}
+    return hashlib.sha256(str(doc.get("content") or "").encode("utf-8")).hexdigest()
+
+
+def _linked_document_types(item, links=None):
+    """The documents that go with the meeting's links: the ones the user
+    ticked (included_documents), or every one when there's no such list
+    (meetings linked before documents could be picked one by one)."""
+    types = _sendable_document_types(item)
+    chosen = (links if links is not None else _meeting_links(item) or {}).get("included_documents")
+    if not isinstance(chosen, list):
+        return types
+    return [t for t in types if t in chosen]
+
+
+def _stale_document_pdfs(item):
+    """Document types going to Salesforce whose PDF is missing or was made
+    from older text."""
+    pdfs = ((item or {}).get(MEETING_FILES_ATTR) or {}).get(MEETING_DOCUMENT_PDFS) or {}
+    return [t for t in _linked_document_types(item)
+            if (pdfs.get(t) or {}).get("source_sha256") != _document_source_sha(item, t)]
+
+
+def webhook_doc_pdf_put(event):
+    """PUT /recordings/webhook-doc-pdf/{key+} {doc_type, content_base64, filename}
+    (JWT, meeting write access) -> {file, unchanged}
+
+    One generated document as the PDF the app rendered (the server has no PDF
+    renderer). Recorded against the document's CURRENT text: the same text
+    again is a no-op (the renderer stamps a new time into every PDF, so the
+    bytes can't be compared); new text marks the meeting so the next
+    delivery sends the new version.
+    """
+    _webhook_require_enabled()
+    _user_id, key, item = _owned_recording(event, hydrate=False)
+    data = _body(event)
+    doc_type = str(data.get("doc_type") or "")
+    if doc_type not in _sendable_document_types(item):
+        raise SiteDeliveryApiError(404, "That document isn't on this meeting.", "document_not_found")
+    try:
+        content = base64.b64decode(str(data.get("content_base64") or ""), validate=True)
+    except (ValueError, TypeError):
+        raise ApiError(400, "content_base64 is not valid base64")
+    if not meeting_files.valid_pdf(content):
+        raise SiteDeliveryApiError(422, "That isn't a PDF.", "invalid_pdf")
+    if len(content) > contract_v3.MAX_FILE_BYTES:
+        raise SiteDeliveryApiError(
+            422, f"The PDF is larger than {contract_v3.MAX_FILE_BYTES // (1024 * 1024)} MB.",
+            "file_too_large")
+    source = _document_source_sha(item, doc_type)
+    files = dict(item.get(MEETING_FILES_ATTR) or {})
+    pdfs = dict(files.get(MEETING_DOCUMENT_PDFS) or {})
+    old = pdfs.get(doc_type) or {}
+    label = str((((item.get(DOCUMENTS_ATTR) or {}).get(doc_type)) or {}).get("label") or doc_type)
+    filename = meeting_files.safe_filename(
+        str(data.get("filename") or f"{label} – {item.get('title') or 'MinuteX meeting'}")
+        .removesuffix(".pdf"), "pdf")
+    if old.get("source_sha256") == source and old.get("s3_key"):
+        return _resp(200, {"file": {"kind": contract_v3.FILE_DOCUMENT, "name": doc_type,
+                                    "filename": old.get("filename", filename)}, "unchanged": True})
+    s3_key = (f"{MEETING_FILES_PREFIX}/{hashlib.sha256(key.encode()).hexdigest()[:32]}"
+              f"/documents/{doc_type}.pdf")
+    _s3.put_object(Bucket=BUCKET_NAME, Key=s3_key, Body=content, ContentType="application/pdf")
+    pdfs[doc_type] = {"s3_key": s3_key, "sha256": hashlib.sha256(content).hexdigest(),
+                      "source_sha256": source, "filename": filename,
+                      "size_bytes": len(content), "uploaded_at": _now_iso()}
+    files[MEETING_DOCUMENT_PDFS] = pdfs
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression=f"SET {MEETING_FILES_ATTR} = :f",
+        ConditionExpression="attribute_exists(audio_s3_key)",
+        ExpressionAttributeValues={":f": files})
+    links = _meeting_links(item)
+    if links and contract_v3.OUTPUT_DOCUMENTS in (links.get("included_outputs") or [])             and doc_type in _linked_document_types(item, links):
+        _webhook_mark_meeting_dirty(key, "files")
+    return _resp(200, {"file": {"kind": contract_v3.FILE_DOCUMENT, "name": doc_type,
+                                "filename": filename}, "unchanged": False})
+
+
+def webhook_links_get(event):
+    """GET /recordings/webhook-links/{key+} (JWT, meeting write access)
+    -> {links}"""
+    _webhook_require_enabled()
+    _user_id, _key, item = _owned_recording(event, hydrate=False)
+    links = _public_meeting_links(_meeting_links(item))
+    if links is not None:
+        links["stale_documents"] = _stale_document_pdfs(item) \
+            if contract_v3.OUTPUT_DOCUMENTS in links["included_outputs"] else []
+    return _resp(200, {"links": links})
+
+
+def webhook_links_put(event):
+    """PUT /recordings/webhook-links/{key+}
+    {links: [{object, id, name, primary}], included_outputs: [...],
+     task_relations: {task_id: {object, id} | null}}
+    (JWT, meeting write access) -> {links}
+
+    Saves which records the meeting is linked to and what goes with it,
+    checked against the admin's per-object settings HERE (the app's sheet is
+    only a convenience). A change marks the meeting so the next delivery
+    sends it. Separate from the v2 meeting type / record context.
+    """
+    _webhook_require_enabled()
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    wid = _row_workspace_id(item)
+    endpoint = _webhook_endpoint_for(wid)
+    objects = _webhook_linkable_objects(wid, endpoint)
+    if objects is None:
+        raise SiteDeliveryApiError(409, "This Salesforce connection doesn't support linking yet.",
+                                   "linking_unsupported")
+    data = _body(event)
+    asked = [str(o) for o in (data.get("included_outputs") or [])]
+    for not_yet in LINK_OUTPUTS_NOT_YET:
+        if not_yet in asked:
+            raise SiteDeliveryApiError(
+                422, "Sending the transcript to Salesforce isn't available yet.",
+                "output_not_available_yet")
+    try:
+        links, outputs, relations = contract_v3.apply_link_policy(
+            data.get("links"), asked, data.get("task_relations") or {}, objects)
+        documents = contract_v3.normalize_included_documents(data.get("included_documents"))
+    except contract_v3.ContractError as e:
+        raise SiteDeliveryApiError(422, e.message, e.code)
+    outputs = [o for o in outputs if o not in LINK_OUTPUTS_NOT_YET]
+    # Documents picked one by one. The admin fixing Documents means every
+    # document; ticking none means no Documents at all.
+    if contract_v3.OUTPUT_DOCUMENTS not in outputs or contract_v3.output_locked(
+            links, contract_v3.OUTPUT_DOCUMENTS, objects):
+        documents = None
+    elif documents == []:
+        outputs = [o for o in outputs if o != contract_v3.OUTPUT_DOCUMENTS]
+        documents = None
+    stored = {"links": links, "included_outputs": outputs, "task_relations": relations,
+              "included_documents": documents,
+              "selected_by": user_id, "selected_at": _now_iso()}
+    old = _meeting_links(item) or {}
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression=f"SET {LINK_CONTEXT_ATTR} = :l",
+        ConditionExpression="attribute_exists(audio_s3_key)",
+        ExpressionAttributeValues={":l": stored})
+    if any(old.get(k) != stored[k]
+           for k in ("links", "included_outputs", "task_relations", "included_documents")):
+        _webhook_mark_meeting_dirty(key, "links")
+    return _resp(200, {"links": _public_meeting_links(stored)})
+
+
+def webhook_people_related(event):
+    """GET /recordings/webhook-people/{key+} (JWT, meeting write access)
+    -> {people: [person + relation], live: true}
+
+    The people on the record(s) this meeting is linked to, from the
+    customer's org, so speaker tagging can suggest them before anyone types.
+    A meeting not linked to a record answers an empty list without calling
+    out. An older receiver without the route answers 409
+    `people_related_unsupported`; the app then just shows no suggestions.
+    """
+    _webhook_require_enabled()
+    user_id, _key, item = _owned_recording(event, hydrate=False)
+    wid = _row_workspace_id(item)
+    endpoint = _webhook_endpoint_for(wid)
+    record_ids = _webhook_linked_record_ids(item)
+    if not record_ids:
+        return _resp(200, {"people": [], "live": True})
+    email = _norm_email((_users.get_item(Key={"user_id": user_id}).get("Item") or {}).get("email"))
+    env = webhook_contract.people_related_request(
+        request_id=site_contract.new_request_id(), record_ids=record_ids,
+        user_email=email, workspace_id=_webhook_envelope_workspace(wid))
+    try:
+        resp = _webhook_client().query(
+            endpoint["url"], webhook_contract.PATH_PEOPLE_RELATED, env,
+            _webhook_signer(endpoint),
+            timeout=webhook_client.SEARCH_TIMEOUT_SECONDS,
+            max_bytes=webhook_contract.MAX_PEOPLE_SEARCH_BYTES)
+        people = webhook_contract.validate_people_related_response(resp.body)
+    except (webhook_client.WebhookDeliveryError, webhook_contract.ContractError) as e:
+        print(f"[webhook] related people workspace={wid} failed code={e.code}")
+        if getattr(e, "http_status", 0) == 404:
+            raise SiteDeliveryApiError(
+                409, "This Salesforce connection doesn't suggest people from records yet.",
+                "people_related_unsupported")
+        raise _webhook_api_error(e)
+    return _resp(200, {"people": [{**people_store.public_person(p), "relation": p["relation"]}
+                                  for p in people], "live": True})
+
+
+def _webhook_linked_record_ids(item):
+    """The Salesforce record ids this meeting is linked to: its Contract v3
+    links when it has them, else the one record chosen in its context."""
+    links = _meeting_links(item)
+    if links:
+        return [l["id"] for l in links.get("links") or [] if l.get("id")]
+    record_id = str(_meeting_context(item).get("record_id") or "").strip()
+    return [record_id] if record_id else []
+
+
+def webhook_people_search(event):
+    """GET /workspaces/{workspace_id}/webhook/people?q=&limit=&types=
+    (JWT, any member) -> {people: [person], live: true}
+
+    LIVE search of the customer's Contacts, Leads and Users for speaker
+    tagging: the receiver searches its own org, nothing is copied in bulk.
+    The caller's email travels with the query so a receiver that checks
+    record access returns only people this user may see. A receiver that
+    doesn't have the route yet answers 404, which becomes 409
+    `people_search_unsupported` so the app can fall back to the synced list.
+    """
+    _webhook_require_enabled()
+    user_id, wid, _m = _require_workspace_member(
+        event, workspace_id=_site_path_workspace(event))
+    endpoint = _webhook_endpoint_for(wid)
+    qs = event.get("queryStringParameters") or {}
+    try:
+        limit = int(qs.get("limit") or webhook_contract.MAX_PEOPLE_SEARCH_LIMIT)
+    except ValueError:
+        raise ApiError(400, "limit must be a number")
+    types = [t.strip().lower() for t in str(qs.get("types") or "").split(",") if t.strip()]
+    email = _norm_email((_users.get_item(Key={"user_id": user_id}).get("Item") or {}).get("email"))
+    try:
+        env = webhook_contract.people_search_request(
+            request_id=site_contract.new_request_id(), query=str(qs.get("q") or ""),
+            limit=limit, types=types or None, user_email=email,
+            workspace_id=_webhook_envelope_workspace(wid))
+    except webhook_contract.ContractError as e:
+        raise SiteDeliveryApiError(400, e.message, e.code)
+    try:
+        resp = _webhook_client().query(
+            endpoint["url"], webhook_contract.PATH_PEOPLE_SEARCH, env,
+            _webhook_signer(endpoint),
+            timeout=webhook_client.SEARCH_TIMEOUT_SECONDS,
+            max_bytes=webhook_contract.MAX_PEOPLE_SEARCH_BYTES)
+        people = webhook_contract.validate_people_search_response(resp.body)
+    except (webhook_client.WebhookDeliveryError, webhook_contract.ContractError) as e:
+        # The search term is never logged, here or upstream.
+        print(f"[webhook] people search workspace={wid} failed code={e.code}")
+        if getattr(e, "http_status", 0) == 404:
+            raise SiteDeliveryApiError(
+                409, "This Salesforce connection doesn't support live people search yet.",
+                "people_search_unsupported")
+        raise _webhook_api_error(e)
+    return _resp(200, {"people": [people_store.public_person(p) for p in people],
+                       "live": True})
+
+
+# ---------------------------------------------------------------------------
+# Per-meeting context: the meeting type and (optional) business record
+# ---------------------------------------------------------------------------
+
+INTEGRATION_CONTEXT_ATTR = "integration_context"
+
+
+def _meeting_context(item):
+    ctx = item.get(INTEGRATION_CONTEXT_ATTR)
+    return ctx if isinstance(ctx, dict) else {}
+
+
+def _public_context(ctx):
+    """What the app shows. The record id is included so the picker can mark
+    the current selection, but the UI never renders it as a label."""
+    return {
+        "meeting_type_id": ctx.get("meeting_type_id") or None,
+        "meeting_type_name": ctx.get("meeting_type_name") or None,
+        "record": {"id": ctx.get("record_id"),
+                   "display_name": ctx.get("record_display_name", ""),
+                   "secondary_text": ctx.get("record_secondary_text", "")}
+        if ctx.get("record_id") else None,
+        "selected_at": ctx.get("selected_at", ""),
+    }
+
+
+def webhook_context_get(event):
+    """GET /recordings/webhook-context/{key+} (JWT, meeting write access)"""
+    _webhook_require_enabled()
+    _user_id, _key, item = _owned_recording(event, hydrate=False)
+    return _resp(200, {"context": _public_context(_meeting_context(item))})
+
+
+def webhook_context_put(event):
+    """PUT /recordings/webhook-context/{key+}
+    {meeting_type_id: str|null, record: {id, display_name, secondary_text}|null}
+    (JWT, meeting write access) -> {context}
+
+    Independent of participant tagging: this stores WHAT KIND of meeting it
+    was and WHICH business record it is about; the people in it are the
+    participants, set elsewhere and never touched here (docs §3.1).
+    """
+    _webhook_require_enabled()
+    user_id, key, item = _owned_recording(event, hydrate=False)
+    wid = _row_workspace_id(item)
+    endpoint = _webhook_endpoint_for(wid)
+    data = _body(event)
+    type_id = data.get("meeting_type_id")
+    record = data.get("record")
+    now = _now_iso()
+    if type_id in (None, ""):
+        if record:
+            raise ApiError(400, "choose a meeting type before a record")
+        ctx = {"provider": webhook_contract.PROVIDER_SALESFORCE,
+               "selected_by": user_id, "selected_at": now}
+    else:
+        type_id = str(type_id).strip()
+        meeting_type, _cfg = _webhook_resolve_type(wid, endpoint, type_id)
+        if meeting_type is None:
+            raise SiteDeliveryApiError(422, "That meeting type is not available",
+                                       "unknown_meeting_type")
+        ctx = {"provider": webhook_contract.PROVIDER_SALESFORCE,
+               "meeting_type_id": type_id,
+               "meeting_type_name": meeting_type.get("name", ""),
+               "selected_by": user_id, "selected_at": now}
+        if record:
+            if not isinstance(record, dict):
+                raise ApiError(400, "record must be an object")
+            if not (meeting_type.get("record_selection") or {}).get("enabled"):
+                raise SiteDeliveryApiError(
+                    422, "This meeting type has no record to pick",
+                    "record_selection_disabled")
+            record_id = str(record.get("id") or "").strip()
+            display = str(record.get("display_name") or "").strip()
+            if not webhook_contract.ID_RE.match(record_id) or not display:
+                raise ApiError(400, "record needs an id and a display_name")
+            ctx.update(record_id=record_id, record_display_name=display[:200],
+                       record_secondary_text=str(
+                           record.get("secondary_text") or "").strip()[:200])
+    old = _meeting_context(item)
+    _recordings.update_item(
+        Key={"audio_s3_key": key},
+        UpdateExpression=f"SET {INTEGRATION_CONTEXT_ATTR} = :c",
+        ConditionExpression="attribute_exists(audio_s3_key)",
+        ExpressionAttributeValues={":c": ctx})
+    changed = [f for f in ("meeting_type_id", "record_id")
+               if (old.get(f) or "") != (ctx.get(f) or "")]
+    if changed:
+        _webhook_mark_meeting_dirty(
+            key, "meeting_type" if "meeting_type_id" in changed else "record_context")
+    return _resp(200, {"context": _public_context(ctx)})
+
+
+# ---------------------------------------------------------------------------
+# Delivery-state job
+# ---------------------------------------------------------------------------
+
+def _webhook_job_id(key):
+    return WEBHOOK_JOB_PREFIX + hashlib.sha256(
+        f"minutex-webhook:v2:{key}".encode("utf-8")).hexdigest()[:32]
+
+
+def _webhook_job(key):
+    return _get_crm_sync_job(_webhook_job_id(key))
+
+
+def _enqueue_webhook_job(job, delay=0):
+    """One minimal message (no content, no credential) with DelaySeconds."""
+    if not CRM_SYNC_QUEUE_URL:
+        raise ApiError(503, "CRM sync queue is not configured")
+    _sqs_client.send_message(
+        QueueUrl=CRM_SYNC_QUEUE_URL,
+        MessageBody=json.dumps({
+            "job_id": job["job_id"], "workspace_id": job.get("workspace_id", ""),
+            "recording_key": job.get("recording_key", ""),
+            "operation": SITE_OP_WEBHOOK_EVENT}),
+        DelaySeconds=int(max(0, min(WEBHOOK_MAX_SQS_DELAY, delay))))
+
+
+def _webhook_delivery_status(job):
+    status = job.get("status", "")
+    delivered = int(job.get("delivered_sequence") or 0) > 0
+    return {
+        CRM_JOB_STATUS_PENDING: "update_pending" if delivered else "queued",
+        CRM_JOB_STATUS_SYNCING: "delivering",
+        CRM_JOB_STATUS_SYNCED: "delivered",
+        CRM_JOB_STATUS_RETRYING: "retrying",
+        CRM_JOB_STATUS_FAILED: "failed",
+    }.get(status, "unknown")
+
+
+def _public_webhook_job(job):
+    if not job:
+        return None
+    result = job.get("result") or {}
+    pending = job.get("pending_event") or {}
+    return {
+        "job_id": job.get("job_id", ""),
+        "status": job.get("status", ""),
+        "delivery_status": _webhook_delivery_status(job),
+        "attempt": int(job.get("webhook_attempts") or 0),
+        "max_attempts": WEBHOOK_MAX_ATTEMPTS,
+        "has_pending_changes": int(job.get("dirty_version") or 0)
+        > int(job.get("attempted_dirty_version") or 0),
+        "delivered": int(job.get("delivered_sequence") or 0) > 0,
+        "delivered_sequence": int(job.get("delivered_sequence") or 0),
+        "last_delivered_at": job.get("last_delivered_at", ""),
+        "lifecycle": job.get("lifecycle", webhook_contract.LIFECYCLE_ACTIVE),
+        "next_attempt_at": job.get("next_attempt_at", ""),
+        "last_error_category": job.get("last_error_category", ""),
+        "last_error_code": job.get("last_error_code", ""),
+        "last_error_message": job.get("last_error_message", ""),
+        "last_event": {"event": result.get("event", ""),
+                       "sequence": int(result.get("sequence") or 0),
+                       "event_id": result.get("event_id", "")}
+        if result.get("event") else None,
+        "pending_event": {"event": pending.get("event", ""),
+                          "sequence": int(pending.get("sequence") or 0)}
+        if pending else None,
+        "external": {"record_id": result.get("external_record_id", ""),
+                     "url": result.get("external_url", "")}
+        if result.get("external_record_id") or result.get("external_url") else None,
+        "updated_at": job.get("updated_at", ""),
+    }
+
+
+def _webhook_new_job(key, wid, user_id, now_iso):
+    return {
+        "job_id": _webhook_job_id(key),
+        "workspace_id": wid,
+        "recording_key": key,
+        "requested_by_user_id": user_id,
+        "operation": SITE_OP_WEBHOOK_EVENT,
+        "delivery_type": webhook_contract.DELIVERY_TYPE_WEBHOOK,
+        "provider": webhook_contract.PROVIDER_SALESFORCE,
+        "meeting_id": site_contract.opaque_meeting_id(key),
+        "status": CRM_JOB_STATUS_PENDING,
+        "sequence": 0,
+        "delivered_sequence": 0,
+        "delivered_content_hash": "",
+        "section_hashes": {},
+        "dirty_version": 1,
+        "attempted_dirty_version": 0,
+        "dirty_at": now_iso,
+        "dirty_since": now_iso,
+        "dirty_reasons": ["push"],
+        "debounce_until": now_iso,
+        "lifecycle": webhook_contract.LIFECYCLE_ACTIVE,
+        "deleted_at": "",
+        "webhook_attempts": 0,
+        "attempt_count": 0,
+        "claim_token": "",
+        "delivery_generation": 0,
+        "idempotency_key": _crm_job_idempotency_key(wid, key, SITE_OP_WEBHOOK_EVENT),
+        "next_attempt_at": now_iso,
+        "last_attempt_at": "",
+        "last_error_category": "",
+        "last_error_code": "",
+        "last_error_message": "",
+        "result": {},
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "completed_at": "",
+    }
+
+
+def _webhook_job_update(job_id, fields, *, condition=None, cond_values=None,
+                        remove=()):
+    """SET `fields` (+ REMOVE `remove`) on the job, optionally conditional.
+    Returns False when the condition failed."""
+    fields = dict(fields)
+    # The injected clock, like every other webhook timestamp: the stall and
+    # debounce checks compare against it.
+    fields["updated_at"] = _webhook_iso(_webhook_clock())
+    names = {f"#{k}": k for k in fields}
+    values = {f":{k}": v for k, v in fields.items()}
+    expr = "SET " + ", ".join(f"#{k} = :{k}" for k in fields)
+    if remove:
+        expr += " REMOVE " + ", ".join(f"#r_{k}" for k in remove)
+        names.update({f"#r_{k}": k for k in remove})
+    kwargs = {}
+    if condition:
+        kwargs["ConditionExpression"] = condition
+        names.update((cond_values or {}).get("names", {}))
+        values.update((cond_values or {}).get("values", {}))
+    try:
+        _crm_sync_jobs.update_item(
+            Key={"job_id": job_id}, UpdateExpression=expr,
+            ExpressionAttributeNames=names, ExpressionAttributeValues=values,
+            **kwargs)
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def _webhook_debounce_until(now, dirty_since_iso):
+    since = _webhook_ts(dirty_since_iso) or now
+    return _webhook_iso(min(now + WEBHOOK_DEBOUNCE_SECONDS,
+                            since + WEBHOOK_MAX_WAIT_SECONDS))
+
+
+def _webhook_mark_meeting_dirty(key, reason, *, immediate=False,
+                                lifecycle=None):
+    """Tell the meeting's delivery state that its content changed.
+
+    BEST-EFFORT and cheap: never raises (a delivery hiccup must not fail the
+    user's edit), is a no-op with the feature off, and costs one small
+    get_item for a meeting that was never pushed.
+
+      SYNCED            -> PENDING, debounced (or immediate), enqueued
+      PENDING           -> debounce window extended (capped by max wait)
+      SYNCING/RETRYING  -> version bumped; that cycle picks the change up
+      FAILED            -> version bumped ONLY: never reopened automatically
+                           (except a permanent delete of a delivered meeting,
+                           which the user can no longer retry from)
+    """
+    if not WEBHOOK_ENABLED or not key:
+        return
+    try:
+        for _ in range(3):
+            job = _webhook_job(key)
+            if not job:
+                return
+            now = _webhook_clock()
+            now_iso = _webhook_iso(now)
+            status = job.get("status", "")
+            version = int(job.get("dirty_version") or 0)
+            reasons = [r for r in (job.get("dirty_reasons") or []) if r != reason]
+            reasons = (reasons + [reason])[-10:]
+            fields = {"dirty_version": version + 1, "dirty_at": now_iso,
+                      "dirty_reasons": reasons}
+            if lifecycle:
+                fields["lifecycle"] = lifecycle
+                if lifecycle == webhook_contract.LIFECYCLE_DELETED:
+                    fields["deleted_at"] = now_iso
+            delivered = int(job.get("delivered_sequence") or 0) > 0
+            reopen = status == CRM_JOB_STATUS_SYNCED or (
+                status == CRM_JOB_STATUS_FAILED and delivered
+                and lifecycle == webhook_contract.LIFECYCLE_DELETED)
+            enqueue_delay = None
+            if reopen:
+                fields.update(status=CRM_JOB_STATUS_PENDING, dirty_since=now_iso,
+                              debounce_until=now_iso if immediate else
+                              _webhook_debounce_until(now, now_iso),
+                              webhook_attempts=0, next_attempt_at=now_iso,
+                              completed_at="")
+                enqueue_delay = 0 if immediate else WEBHOOK_DEBOUNCE_SECONDS
+            elif status == CRM_JOB_STATUS_PENDING:
+                fields["debounce_until"] = now_iso if immediate else \
+                    _webhook_debounce_until(now, job.get("dirty_since") or now_iso)
+                if immediate:
+                    enqueue_delay = 0
+            ok = _webhook_job_update(
+                job["job_id"], fields,
+                condition="#c_s = :c_s AND #c_v = :c_v",
+                cond_values={"names": {"#c_s": "status", "#c_v": "dirty_version"},
+                             "values": {":c_s": status, ":c_v": version}})
+            if not ok:
+                continue  # raced another writer: re-read and apply again
+            if enqueue_delay is not None:
+                _enqueue_webhook_job(job, enqueue_delay)
+            print(f"[webhook] dirty meeting={job.get('meeting_id', '')} "
+                  f"reason={reason} status={status} version={version + 1}")
+            return
+    except Exception as e:  # noqa: BLE001 — best-effort by contract
+        print(f"[webhook] mark dirty failed for a meeting: {type(e).__name__}: {e}")
+
+
+def _webhook_note_permanent_delete(key):
+    """Called BEFORE the Recordings row is deleted, so the delivery state
+    knows a meeting.deleted is owed even though the row will be gone."""
+    _webhook_mark_meeting_dirty(key, "deleted", immediate=True,
+                                lifecycle=webhook_contract.LIFECYCLE_DELETED)
+
+
+def _webhook_validate_push(wid, endpoint, item):
+    """The push preconditions, as stable codes the app branches on."""
+    cfg = _webhook_configuration(wid, endpoint)
+    if not cfg.get("fetched_at"):
+        raise SiteDeliveryApiError(
+            409, "MinuteX could not load the meeting types from Salesforce yet",
+            "configuration_unavailable")
+    if _meeting_links(item):
+        # Linked to records (Contract v3): the links were checked when saved.
+        return
+    ctx = _meeting_context(item)
+    type_id = ctx.get("meeting_type_id") or ""
+    if not type_id:
+        raise SiteDeliveryApiError(422, "Choose a meeting type first",
+                                   "meeting_type_required")
+    meeting_type, cfg = _webhook_resolve_type(wid, endpoint, type_id)
+    if meeting_type is None:
+        raise SiteDeliveryApiError(
+            409, "This meeting type is no longer available. Choose another.",
+            "meeting_type_unavailable")
+    selection = meeting_type.get("record_selection") or {}
+    if selection.get("required") and not ctx.get("record_id"):
+        raise SiteDeliveryApiError(
+            422, f"Choose a {selection.get('label') or 'record'} first",
+            "record_required")
+    chars = site_contract.text_length(str(item.get("transcript") or "").strip())
+    if chars > site_contract.MAX_TRANSCRIPT_CHARS:
+        raise SiteDeliveryApiError(
+            422, str(site_contract.TranscriptTooLarge(chars)), "transcript_too_large")
+
+
+def _webhook_job_is_stalled(job, now):
+    status = job.get("status", "")
+    age = now - _webhook_ts(job.get("updated_at"))
+    if status == CRM_JOB_STATUS_SYNCING:
+        return age > WEBHOOK_SYNCING_STALE_SECONDS
+    if status in (CRM_JOB_STATUS_PENDING, CRM_JOB_STATUS_RETRYING):
+        wake = max(_webhook_ts(job.get("debounce_until")),
+                   _webhook_ts(job.get("next_attempt_at")))
+        return now > wake + SITE_STALLED_JOB_SECONDS
+    return False
+
+
+def _webhook_recover_stalled(job, now):
+    """A lost SQS send (or a dead worker) must not strand a meeting."""
+    _webhook_job_update(job["job_id"], {
+        "status": CRM_JOB_STATUS_PENDING, "debounce_until": _webhook_iso(now),
+        "next_attempt_at": _webhook_iso(now)})
+    _enqueue_webhook_job(job, 0)
+    print(f"[webhook] re-enqueued stalled job {job['job_id']}")
+
+
+def webhook_meeting_push(event):
+    """POST /recordings/webhook/{key+} (JWT, meeting write access) -> 202 {job}
+
+    First push creates the delivery state and sends meeting.created. A push
+    means "send now": on a DELIVERED meeting, or one waiting out the minute
+    that batches quick edits (PENDING), it sends without waiting; on one
+    waiting before its next attempt (RETRYING) it tries now. Nothing is sent
+    if nothing changed. A delivery already running is left alone (re-enqueued
+    only if it stalled). A FAILED job is retried with POST .../webhook-retry.
+    """
+    _webhook_require_enabled()
+    user_id, key, item = _owned_recording(event, hydrate=True)
+    wid = _row_workspace_id(item)
+    endpoint = _webhook_endpoint_for(wid)
+    _webhook_validate_push(wid, endpoint, item)
+    now = _webhook_clock()
+    job = _webhook_job(key)
+    if job is None or job.get("workspace_id") != wid:
+        # First push — or the meeting moved workspace, and the old
+        # endpoint's delivery state is not this one's: start over.
+        moved = job is not None
+        job = _webhook_new_job(key, wid, user_id, _webhook_iso(now))
+        try:
+            _crm_sync_jobs.put_item(
+                Item=job, **({} if moved else
+                             {"ConditionExpression": "attribute_not_exists(job_id)"}))
+            _enqueue_webhook_job(job, 0)
+            print(f"[webhook] job {job['job_id']} created meeting={job['meeting_id']} "
+                  f"workspace={wid} by={user_id}")
+        except ClientError:
+            job = _webhook_job(key)  # a double tap: the other request won
+        return _resp(202, {"job": _public_webhook_job(job)})
+    if job.get("status") in (CRM_JOB_STATUS_SYNCED, CRM_JOB_STATUS_PENDING):
+        _webhook_mark_meeting_dirty(key, "push", immediate=True)
+    elif job.get("status") == CRM_JOB_STATUS_RETRYING:
+        now_iso = _webhook_iso(now)
+        if _webhook_job_update(job["job_id"], {"next_attempt_at": now_iso,
+                                               "debounce_until": now_iso},
+                               condition="#c_s = :c_s",
+                               cond_values={"names": {"#c_s": "status"},
+                                            "values": {":c_s": CRM_JOB_STATUS_RETRYING}}):
+            _enqueue_webhook_job(job, 0)
+    elif job.get("status") == CRM_JOB_STATUS_FAILED:
+        raise SiteDeliveryApiError(409, "The last delivery failed. Retry it.",
+                                   "delivery_failed")
+    elif _webhook_job_is_stalled(job, now):
+        _webhook_recover_stalled(job, now)
+    return _resp(202, {"job": _public_webhook_job(_webhook_job(key))})
+
+
+def webhook_meeting_status(event):
+    """GET /recordings/webhook/{key+} (JWT, meeting write access)
+    -> {mode, endpoint, job, context, configuration, earlier_record}
+
+    Answers whether or not Salesforce is connected now: the job row outlives
+    a disconnect, so a meeting that was already sent still shows where it
+    went. `earlier_record` is a meeting the retired package sent (read-only
+    history; never written again)."""
+    _webhook_require_enabled()
+    _user_id, key, item = _owned_recording(event, hydrate=False)
+    wid = _row_workspace_id(item)
+    endpoint = _site_endpoint(wid)
+    configuration = None
+    job = _webhook_job(key)
+    if _webhook_endpoint_enabled(endpoint):
+        _webhook_configuration(wid, endpoint)
+        configuration = _public_webhook_configuration(_site_endpoint(wid))
+        now = _webhook_clock()
+        if job and _webhook_job_is_stalled(job, now):
+            _webhook_recover_stalled(job, now)
+            job = _webhook_job(key)
+    return _resp(200, {
+        "mode": _endpoint_mode(endpoint),
+        "endpoint": {"configured": _is_webhook_endpoint(endpoint),
+                     "enabled": _webhook_endpoint_enabled(endpoint)},
+        "job": _public_webhook_job(job),
+        "context": _public_context(_meeting_context(item)),
+        "configuration": configuration,
+        "links": _public_meeting_links(_meeting_links(item)),
+        "earlier_record": _public_meeting_record(_site_meeting_record(item, None)),
+    })
+
+
+def webhook_meeting_retry(event):
+    """POST /recordings/webhook-retry/{key+} (JWT, meeting write access)
+    -> 202 {job}
+
+    Only a FAILED delivery. The attempt budget starts again and the runner
+    rebuilds the snapshot from the meeting AS IT IS NOW: unchanged content
+    re-sends the same event_id; changed content gets a new sequence (the
+    failed one becomes a gap, which receivers accept — docs §3.4).
+    """
+    _webhook_require_enabled()
+    _user_id, key, item = _owned_recording(event, hydrate=False)
+    _webhook_endpoint_for(_row_workspace_id(item))
+    job = _webhook_job(key)
+    if not job:
+        raise ApiError(404, "this meeting has not been pushed yet")
+    if job.get("status") != CRM_JOB_STATUS_FAILED:
+        raise ApiError(409, "only a failed delivery can be retried")
+    now_iso = _webhook_iso(_webhook_clock())
+    ok = _webhook_job_update(job["job_id"], {
+        "status": CRM_JOB_STATUS_PENDING, "webhook_attempts": 0,
+        "delivery_generation": int(job.get("delivery_generation") or 0) + 1,
+        "debounce_until": now_iso, "next_attempt_at": now_iso, "completed_at": "",
+        "last_error_category": "", "last_error_code": "", "last_error_message": ""},
+        condition="#c_s = :c_s",
+        cond_values={"names": {"#c_s": "status"},
+                     "values": {":c_s": CRM_JOB_STATUS_FAILED}})
+    if ok:
+        _enqueue_webhook_job(job, 0)
+    return _resp(202, {"job": _public_webhook_job(_webhook_job(key))})
+
+
+# ---------------------------------------------------------------------------
+# The runner (crmSyncWorker -> execute_site_delivery_job -> here)
+# ---------------------------------------------------------------------------
+
+def _webhook_snapshot(job, item, endpoint):
+    """(data, hashes, content_hash, meeting_type, record_context) for the
+    meeting's CURRENT state. Raises ContractError (transcript too large) and
+    whatever hydrate raises. A meeting linked to records, on a receiver that
+    supports linking, is built as Contract v3 instead (_webhook_snapshot_v3);
+    its links ride in `record_context`'s place as {"v3": ...}."""
+    links = _meeting_links(item)
+    cfg = (endpoint or {}).get("configuration") or {}
+    if links and cfg.get("linkable_objects") is not None:
+        return _webhook_snapshot_v3(job, item, endpoint, links)
+    key = job["recording_key"]
+    item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+    tasks = [r for r in _tasks_for_recording(key)
+             if str(r.get("status") or "") != TASK_STATUS_CANCELLED]
+    lifecycle = webhook_contract.LIFECYCLE_TRASHED if _is_trashed(item) \
+        else webhook_contract.LIFECYCLE_ACTIVE
+    ctx = _meeting_context(item)
+    meeting_type = webhook_contract.meeting_type_block(ctx)
+    record_context = webhook_contract.record_context_block(ctx)
+    data = webhook_contract.build_snapshot(
+        item, tasks,
+        participants=_site_participants(key, item),
+        workspace=_site_workspace_block(job["workspace_id"]),
+        meeting_url=_meeting_deep_link(key),
+        audio=_site_audio_block(key, item, endpoint, job["job_id"]),
+        lifecycle=lifecycle,
+        minutes_markdown=_authoritative_mom(item))
+    hashes = webhook_contract.section_hashes(data, meeting_type, record_context)
+    return data, hashes, webhook_contract.content_hash(hashes), meeting_type, \
+        record_context
+
+
+def _webhook_snapshot_v3(job, item, endpoint, links):
+    key = job["recording_key"]
+    item = transcript_store.hydrate(_s3, BUCKET_NAME, item)
+    tasks = [r for r in _tasks_for_recording(key)
+             if str(r.get("status") or "") != TASK_STATUS_CANCELLED]
+    lifecycle = contract_v3.LIFECYCLE_TRASHED if _is_trashed(item) \
+        else contract_v3.LIFECYCLE_ACTIVE
+    outputs = list(links.get("included_outputs") or [])
+    link_rows = list(links.get("links") or [])
+    bodies = _webhook_file_bodies(key, item, outputs, links)
+    data = contract_v3.build_snapshot(
+        item, tasks, included_outputs=outputs,
+        participants=_site_participants(key, item),
+        workspace=_site_workspace_block(job["workspace_id"]),
+        audio=_site_audio_block(key, item, endpoint, job["job_id"]),
+        lifecycle=lifecycle, minutes_markdown=_authoritative_mom(item),
+        recorded_by=_webhook_recorded_by(item),
+        task_relations=links.get("task_relations") or {},
+        files=[contract_v3.file_ref_for(site_contract.opaque_meeting_id(key), fid, body)
+               for fid, (body, _name) in bodies.items()],
+        # The transcript as the app shows it: names and times, as text.
+        transcript_body=meeting_files.transcript_text(
+            transcript=item.get("transcript"), timestamps=item.get("timestamps"),
+            speaker_names=_speaker_names(item)),
+        overview_body=_webhook_overview_text(item))
+    hashes = contract_v3.section_hashes(data, link_rows, outputs)
+    return data, hashes, contract_v3.content_hash(hashes), None, \
+        {"v3": {"links": link_rows, "included_outputs": outputs, "file_bodies": bodies}}
+
+
+def _webhook_overview_text(item):
+    """The meeting's full Overview as the app shows it: each AI-chosen
+    section's heading and points, with "Speaker N" replaced by the speaker's
+    current name. A meeting analysed before the Overview existed has only
+    its summary, which is used instead."""
+    text = ai_schema.overview_text(item.get("overview")) or str(item.get("summary") or "")
+    return speaker_identity.substitute_speaker_names(text, _speaker_names(item))
+
+
+def _webhook_file_bodies(key, item, outputs, links=None):
+    """{file id: (bytes, filename)} for the files this state sends (the
+    transcript is not one: it goes as text): the uploaded MoM PDF when the
+    MoM is included and one was uploaded, and the PDF of each document the
+    user picked when Documents is included and its PDF matches the
+    document's current text.
+    A file over the limit is left out (and logged) rather than failing the
+    whole meeting."""
+    out = {}
+    title = str(item.get("title") or "MinuteX meeting")
+    stored = (item.get(MEETING_FILES_ATTR) or {}).get(contract_v3.FILE_MOM_PDF)
+    if contract_v3.OUTPUT_MOM in outputs and isinstance(stored, dict) and stored.get("s3_key"):
+        body = _s3.get_object(Bucket=BUCKET_NAME, Key=stored["s3_key"])["Body"].read()
+        out[contract_v3.FILE_MOM_PDF] = (body, stored.get("filename")
+                                         or meeting_files.safe_filename(f"MoM – {title}", "pdf"))
+    if contract_v3.OUTPUT_DOCUMENTS in outputs:
+        pdfs = (item.get(MEETING_FILES_ATTR) or {}).get(MEETING_DOCUMENT_PDFS) or {}
+        for doc_type in _linked_document_types(item, links):
+            stored = pdfs.get(doc_type)
+            if not isinstance(stored, dict) or not stored.get("s3_key"):
+                continue
+            if stored.get("source_sha256") != _document_source_sha(item, doc_type):
+                continue   # made from older text: wait for the app's new PDF
+            body = _s3.get_object(Bucket=BUCKET_NAME, Key=stored["s3_key"])["Body"].read()
+            out[contract_v3.file_id(contract_v3.FILE_DOCUMENT, doc_type)] = (
+                body, stored.get("filename") or meeting_files.safe_filename(doc_type, "pdf"))
+    for kind in list(out):
+        if len(out[kind][0]) > contract_v3.MAX_FILE_BYTES:
+            print(f"[webhook] {kind} for a meeting is over the file limit; not sent")
+            out.pop(kind)
+    return out
+
+
+def _webhook_send_files(job, endpoint, signer, data, bodies):
+    """POST /files for each file whose content changed since it was last
+    sent, BEFORE the event (so the event's files already exist). Returns the
+    {kind: sha256} now sent. Raises WebhookDeliveryError like an event."""
+    sent = dict(job.get("files_sent") or {})
+    for ref in data.get("files") or []:
+        fid = contract_v3.file_id(ref["kind"], ref.get("name", ""))
+        if sent.get(fid) == ref["sha256"]:
+            continue
+        body, filename = bodies[fid]
+        req = contract_v3.file_request(
+            meeting_id=job["meeting_id"], kind=ref["kind"], content=body,
+            filename=filename, request_id=site_contract.new_request_id(),
+            name=ref.get("name", ""))
+        _webhook_client().query(endpoint["url"], contract_v3.PATH_FILES, req, signer,
+                                timeout=FILE_UPLOAD_TIMEOUT_SECONDS, max_bytes=64 * 1024)
+        sent[fid] = ref["sha256"]
+        _update_crm_sync_job(job["job_id"], files_sent=sent)
+    return sent
+
+
+def _webhook_recorded_by(item):
+    """{name, email} of whoever recorded the meeting, or None."""
+    uid = _recorded_by(item)
+    if not uid:
+        return None
+    row = _users.get_item(Key={"user_id": uid}).get("Item") or {}
+    return {"name": str(row.get("name") or ""), "email": str(row.get("email") or "")}
+
+
+def _webhook_claim(job, now):
+    """PENDING/RETRYING (or a stale SYNCING) -> SYNCING, exactly once. The
+    token makes the claim exactly-once even when two messages read the same
+    row in the same second (a stale SYNCING being recovered)."""
+    status = job.get("status", "")
+    if status == CRM_JOB_STATUS_SYNCING and not _webhook_job_is_stalled(job, now):
+        return False
+    if status not in (CRM_JOB_STATUS_PENDING, CRM_JOB_STATUS_RETRYING,
+                      CRM_JOB_STATUS_SYNCING):
+        return False
+    return _webhook_job_update(
+        job["job_id"], {"status": CRM_JOB_STATUS_SYNCING,
+                        "claim_token": uuid.uuid4().hex,
+                        "last_attempt_at": _webhook_iso(now)},
+        condition="#c_s = :c_s AND #c_t = :c_t",
+        cond_values={"names": {"#c_s": "status", "#c_t": "claim_token"},
+                     "values": {":c_s": status,
+                                ":c_t": job.get("claim_token", "")}})
+
+
+def _webhook_bind_event(job, event_name, content, changed, now_iso):
+    """The pending event to send for this content: the stored one when it
+    carries EXACTLY this content, else a newly allocated sequence. The
+    allocation and the new pending event are ONE conditional write on the
+    sequence that was read — the whole of the "a sequence is never re-bound
+    to other content" invariant."""
+    for _ in range(5):
+        pending = job.get("pending_event") or {}
+        if pending and pending.get("content_hash") == content \
+                and pending.get("event") == event_name:
+            return pending
+        current = int(job.get("sequence") or 0)
+        seq = current + 1
+        pe = {"sequence": seq,
+              "event_id": webhook_contract.event_id(job["meeting_id"], seq),
+              "event": event_name, "content_hash": content,
+              "occurred_at": now_iso, "changed_fields": changed}
+        if _webhook_job_update(
+                job["job_id"], {"sequence": seq, "pending_event": pe},
+                condition="#c_q = :c_q",
+                cond_values={"names": {"#c_q": "sequence"},
+                             "values": {":c_q": current}}):
+            return pe
+        job = _get_crm_sync_job(job["job_id"]) or job
+    raise RuntimeError("could not allocate a webhook sequence")
+
+
+def _webhook_finish_failure(job, attempts, category, code, message, *,
+                            retry_after=0, seen_version=0):
+    """RETRYING with a FRESH delayed message, or FAILED. Returns normally —
+    never _CrmSyncJobRetry — so SQS receive counts never approach the DLQ."""
+    now = _webhook_clock()
+    fields = {"webhook_attempts": attempts, "attempt_count": attempts,
+              "attempted_dirty_version": seen_version,
+              "last_error_category": category, "last_error_code": code,
+              "last_error_message": (message or "")[:500]}
+    retryable = category == CRM_ERROR_TRANSIENT and attempts < WEBHOOK_MAX_ATTEMPTS
+    if retryable:
+        delay = WEBHOOK_BACKOFF_SECONDS[min(attempts - 1,
+                                            len(WEBHOOK_BACKOFF_SECONDS) - 1)]
+        delay = max(delay, int(retry_after or 0))
+        fields.update(status=CRM_JOB_STATUS_RETRYING,
+                      next_attempt_at=_webhook_iso(now + delay))
+        _webhook_job_update(job["job_id"], fields)
+        _enqueue_webhook_job(job, delay)
+        print(f"[webhook] job {job['job_id']} RETRYING attempt={attempts}/"
+              f"{WEBHOOK_MAX_ATTEMPTS} code={code} delay={delay}s")
+    else:
+        fields.update(status=CRM_JOB_STATUS_FAILED, completed_at=_webhook_iso(now),
+                      next_attempt_at="")
+        _webhook_job_update(job["job_id"], fields)
+        print(f"[webhook] job {job['job_id']} FAILED attempt={attempts} "
+              f"category={category} code={code}")
+    return _get_crm_sync_job(job["job_id"])
+
+
+def _webhook_finish_success(job, seen_version, fields):
+    """SYNCED — but only if nothing changed since the snapshot was built.
+    If something did, the same write becomes PENDING + a follow-up."""
+    now = _webhook_clock()
+    done = dict(fields, status=CRM_JOB_STATUS_SYNCED, webhook_attempts=0,
+                attempted_dirty_version=seen_version, dirty_since="",
+                dirty_reasons=[], completed_at=_webhook_iso(now),
+                next_attempt_at="", last_error_category="", last_error_code="",
+                last_error_message="")
+    if _webhook_job_update(job["job_id"], done, condition="#c_v = :c_v",
+                           cond_values={"names": {"#c_v": "dirty_version"},
+                                        "values": {":c_v": seen_version}},
+                           remove=("pending_event",)):
+        return _get_crm_sync_job(job["job_id"])
+    # A change landed while this one was being delivered: follow up.
+    now_iso = _webhook_iso(now)
+    follow = dict(fields, status=CRM_JOB_STATUS_PENDING, webhook_attempts=0,
+                  attempted_dirty_version=seen_version, dirty_since=now_iso,
+                  debounce_until=_webhook_debounce_until(now, now_iso),
+                  next_attempt_at=now_iso, last_error_category="",
+                  last_error_code="", last_error_message="")
+    _webhook_job_update(job["job_id"], follow, remove=("pending_event",))
+    _enqueue_webhook_job(job, WEBHOOK_DEBOUNCE_SECONDS)
+    print(f"[webhook] job {job['job_id']} changed during delivery; follow-up queued")
+    return _get_crm_sync_job(job["job_id"])
+
+
+def _run_webhook_event_job(job):
+    job_id = job["job_id"]
+    now = _webhook_clock()
+    status = job.get("status", "")
+    if status in (CRM_JOB_STATUS_SYNCED, CRM_JOB_STATUS_FAILED):
+        return job  # a stale or duplicate message
+    if not WEBHOOK_ENABLED:
+        print(f"[webhook] job {job_id} skipped: webhook delivery is switched off")
+        return job
+
+    # 1. HOPS. Debounce and long backoffs are waits, not attempts: re-enqueue
+    # for the remaining time (SQS caps one delay at 15 minutes).
+    wake = max(_webhook_ts(job.get("debounce_until")),
+               _webhook_ts(job.get("next_attempt_at")))
+    if status != CRM_JOB_STATUS_SYNCING and wake > now + 1:
+        _enqueue_webhook_job(job, int(wake - now) + 1)
+        return job
+    if not _webhook_claim(job, now):
+        return job
+    job = _get_crm_sync_job(job_id)
+    seen_version = int(job.get("dirty_version") or 0)
+    attempts = int(job.get("webhook_attempts") or 0) + 1
+    now_iso = _webhook_iso(now)
+
+    wid, key = job["workspace_id"], job.get("recording_key", "")
+    endpoint = _site_endpoint(wid)
+    if not _webhook_endpoint_enabled(endpoint):
+        return _webhook_finish_failure(
+            job, attempts, CRM_ERROR_PERMANENT, WEBHOOK_NOT_CONFIGURED_CODE,
+            "Salesforce webhook delivery is not enabled for this workspace",
+            seen_version=seen_version)
+    if workspace_schema.is_organisation_workspace_id(wid):
+        row = _workspace_row(wid)
+        if not row or not workspace_schema.workspace_is_active(row):
+            return _webhook_finish_failure(
+                job, attempts, CRM_ERROR_PERMANENT, "workspace_inactive",
+                "this workspace is no longer active", seen_version=seen_version)
+
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") if key else None
+    delivered = int(job.get("delivered_sequence") or 0) > 0
+    meeting_type = record_context = None
+    if item is None or job.get("lifecycle") == webhook_contract.LIFECYCLE_DELETED:
+        if not delivered:
+            print(f"[webhook] job {job_id} meeting deleted before any delivery; "
+                  f"nothing to send")
+            return _webhook_finish_success(job, seen_version, {
+                "lifecycle": webhook_contract.LIFECYCLE_DELETED,
+                "result": {"note": "nothing_to_delete"}})
+        deleted_at = job.get("deleted_at") or now_iso
+        event_name = webhook_contract.EVENT_DELETED
+        data = webhook_contract.deleted_snapshot(job["meeting_id"], deleted_at)
+        hashes = {}
+        content = "deleted:" + deleted_at
+        changed = ["lifecycle"]
+        if job.get("delivered_content_hash") == content:
+            return _webhook_finish_success(job, seen_version, {})
+    else:
+        if _row_workspace_id(item) != wid:
+            return _webhook_finish_failure(
+                job, attempts, CRM_ERROR_PERMANENT, "workspace_mismatch",
+                "this meeting no longer belongs to this workspace",
+                seen_version=seen_version)
+        try:
+            data, hashes, content, meeting_type, record_context = \
+                _webhook_snapshot(job, item, endpoint)
+        except site_contract.ContractError as e:
+            return _webhook_finish_failure(job, attempts, CRM_ERROR_VALIDATION,
+                                           e.code, e.message,
+                                           seen_version=seen_version)
+        except Exception as e:  # noqa: BLE001 — S3 blinked: retry, never send empty
+            print(f"[webhook] job {job_id} snapshot failed: {type(e).__name__}: {e}")
+            return _webhook_finish_failure(
+                job, attempts, CRM_ERROR_TRANSIENT, "snapshot_unavailable",
+                "the meeting could not be read; will retry",
+                seen_version=seen_version)
+        if delivered and content == job.get("delivered_content_hash"):
+            print(f"[webhook] job {job_id} no changes since sequence "
+                  f"{job.get('delivered_sequence')}; nothing sent")
+            return _webhook_finish_success(job, seen_version, {
+                "result": dict(job.get("result") or {}, note="no_changes")})
+        event_name = webhook_contract.EVENT_UPDATED if delivered \
+            else webhook_contract.EVENT_CREATED
+        # A v3 snapshot has its own sections (links, included_outputs, files).
+        sections = contract_v3 if isinstance(record_context, dict)             and "v3" in record_context else webhook_contract
+        changed = sections.changed_fields(job.get("section_hashes") or {},
+                                          hashes) if delivered else []
+
+    pending = _webhook_bind_event(job, event_name, content, changed, now_iso)
+    v3 = (record_context or {}).get("v3") if isinstance(record_context, dict) else None
+    if v3 is not None:
+        env = contract_v3.event_envelope(
+            event_name, meeting_id=job["meeting_id"], sequence=pending["sequence"],
+            occurred_at=pending["occurred_at"],
+            workspace_id=_webhook_envelope_workspace(wid),
+            links=v3["links"], included_outputs=v3["included_outputs"],
+            changed=pending.get("changed_fields") or [], data=data)
+    else:
+        env = webhook_contract.event_envelope(
+            event_name, meeting_id=job["meeting_id"], sequence=pending["sequence"],
+            occurred_at=pending["occurred_at"],
+            workspace_id=_webhook_envelope_workspace(wid),
+            meeting_type=meeting_type, record_context=record_context,
+            changed=pending.get("changed_fields") or [], data=data)
+    try:
+        signer = _webhook_signer(endpoint)
+    except webhook_client.WebhookDeliveryError as e:
+        # The integration user's connection needs an admin (reconnect).
+        print(f"[webhook] job {job_id} not sent: category={e.category} code={e.code}")
+        return _webhook_finish_failure(job, attempts, e.category, e.code, e.message,
+                                       seen_version=seen_version)
+    except Exception as e:  # noqa: BLE001
+        print(f"[webhook] job {job_id} credentials unavailable: {type(e).__name__}")
+        return _webhook_finish_failure(
+            job, attempts, CRM_ERROR_TRANSIENT, "credentials_unavailable",
+            "the endpoint credentials could not be read; will retry",
+            seen_version=seen_version)
+    try:
+        if v3 is not None and data.get("files"):
+            _webhook_send_files(job, endpoint, signer, data, v3.get("file_bodies") or {})
+        resp = _webhook_client().post_event(endpoint["url"], env, signer,
+                                            attempt=attempts)
+    except webhook_client.WebhookDeliveryError as e:
+        print(f"[webhook] job {job_id} {event_name} seq={pending['sequence']} "
+              f"failed category={e.category} code={e.code} http={e.http_status}")
+        return _webhook_finish_failure(job, attempts, e.category, e.code, e.message,
+                                       retry_after=e.retry_after,
+                                       seen_version=seen_version)
+    external_url = str(resp.result.get("url") or "")
+    result = {"event": event_name, "event_id": pending["event_id"],
+              "sequence": pending["sequence"], "http_status": resp.http_status,
+              "duplicate": resp.duplicate, "elapsed_ms": resp.elapsed_ms,
+              "external_record_id": str(resp.result.get("record_id") or "")[:64],
+              "external_url": external_url[:2048]
+              if external_url.startswith("https://") else "",
+              "delivered_at": _webhook_iso(_webhook_clock())}
+    print(f"[webhook] job {job_id} delivered {event_name} seq={pending['sequence']} "
+          f"http={resp.http_status} duplicate={resp.duplicate} "
+          f"changed={','.join(pending.get('changed_fields') or [])}")
+    return _webhook_finish_success(job, seen_version, {
+        "delivered_sequence": pending["sequence"],
+        "delivered_content_hash": content, "section_hashes": hashes,
+        "last_delivered_at": result["delivered_at"], "result": result,
+        "lifecycle": webhook_contract.LIFECYCLE_DELETED
+        if event_name == webhook_contract.EVENT_DELETED
+        else job.get("lifecycle", webhook_contract.LIFECYCLE_ACTIVE)})
+
+
+# ---------------------------------------------------------------------------
+# People Sync over v2 — the SAME job, cursor and People Store as v1; only the
+# channel differs. Tagging reads the People Store and never notices.
+# ---------------------------------------------------------------------------
+
+class _WebhookPeoplePage:
+    """Adapts a v2 people page to what _run_site_people_job reads from a v1
+    DeliveryResponse (`.result`)."""
+
+    def __init__(self, people, next_cursor, done):
+        self.result = {"people": people, "next_cursor": next_cursor, "done": done}
+
+
+def _webhook_people_post(wid, endpoint):
+    signer = _webhook_signer(endpoint)
+
+    def post(env):
+        payload = env.get("payload") or {}
+        request = webhook_contract.people_request(
+            request_id=env.get("request_id") or site_contract.new_request_id(),
+            cursor=payload.get("cursor", ""),
+            page_size=payload.get("page_size") or SITE_PEOPLE_PAGE_SIZE,
+            workspace_id=_webhook_envelope_workspace(wid))
+        try:
+            resp = _webhook_client().query(
+                endpoint["url"], webhook_contract.PATH_PEOPLE, request, signer,
+                timeout=webhook_client.PEOPLE_TIMEOUT_SECONDS,
+                max_bytes=webhook_contract.MAX_PEOPLE_BYTES)
+            people, cursor, done = webhook_contract.validate_people_page(resp.body)
+        except webhook_client.WebhookDeliveryError as e:
+            raise site_delivery_client.SiteDeliveryError(
+                e.category, e.code, e.message, http_status=e.http_status,
+                field=e.field, request_id=e.request_id)
+        except webhook_contract.ContractError as e:
+            raise site_delivery_client.SiteDeliveryError(
+                CRM_ERROR_PERMANENT, e.code, e.message)
+        return _WebhookPeoplePage(people, cursor, done)
+    return post
+
+
 _ROUTES = {
     ("POST", "/signup"): signup,
     ("POST", "/login"): login,
     ("GET", "/me"): get_me,
     ("PATCH", "/me"): patch_me,
     ("POST", "/me/password"): change_password,
+    ("POST", "/password/forgot"): forgot_password,
+    ("POST", "/password/reset"): reset_password,
+    ("POST", "/auth/google"): google_sign_in,
     ("POST", "/avatars/upload-request"): request_avatar_upload,
     ("POST", "/devices/pair-request"): pair_request,
     ("POST", "/devices/pair"): pair_device,
@@ -18240,6 +22342,11 @@ _ROUTES = {
     # assignment rather than on ownership, and read-only by construction —
     # see the Assignee Meeting Access section above.
     ("GET", "/recordings/shared-with-me/{key+}"): get_assignee_meeting,
+    # Participant meeting access. The list is JWT-scoped to the caller; the
+    # PUT is recorder-only (_owned_recording). Neither can write meeting
+    # content — see PARTICIPANT MEETING ACCESS.
+    ("GET", "/recordings/shared-with-me"): list_shared_with_me,
+    ("PUT", "/recordings/access/{key+}"): set_meeting_access,
     ("PATCH", "/shares/{share_id}"): update_share,
     ("DELETE", "/shares/{share_id}"): revoke_share,
     ("GET", "/share/{token}"): public_share,
@@ -18319,6 +22426,10 @@ _ROUTES = {
     # Salesforce Site — org connection through the Site endpoint:
     # discovery, manual Task mappings, record selection, Tasks.
     ("PUT", "/workspaces/{workspace_id}/site-salesforce/connect"): site_sf_connect,
+    ("POST", "/workspaces/{workspace_id}/site-salesforce/install"): site_sf_install_start,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/install"): site_sf_install_status,
+    ("POST", "/workspaces/{workspace_id}/site-salesforce/install/connect"): site_sf_install_connect,
+    ("POST", "/salesforce/pair"): site_sf_pair,
     ("GET", "/workspaces/{workspace_id}/site-salesforce"): site_sf_get,
     ("DELETE", "/workspaces/{workspace_id}/site-salesforce"): site_sf_disconnect,
     ("POST", "/workspaces/{workspace_id}/site-salesforce/discover"): site_sf_discover_start,
@@ -18332,12 +22443,46 @@ _ROUTES = {
     ("PUT", "/workspaces/{workspace_id}/site-salesforce/task-mappings/{mapping_id}"): site_sf_mapping_update,
     ("DELETE", "/workspaces/{workspace_id}/site-salesforce/task-mappings/{mapping_id}"): site_sf_mapping_delete,
     ("GET", "/workspaces/{workspace_id}/site-salesforce/meeting-relation"): site_sf_meeting_relation_get,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/destinations"): site_sf_destinations,
+    ("GET", "/workspaces/{workspace_id}/site-salesforce/destinations/{destination_id}/records"): site_sf_destination_records,
+    ("PUT", "/workspaces/{workspace_id}/site-salesforce/meeting-destination"): site_sf_meeting_destination_put,
     ("PUT", "/workspaces/{workspace_id}/site-salesforce/meeting-relation"): site_sf_meeting_relation_put,
     ("GET", "/workspaces/{workspace_id}/site-salesforce/tasks"): site_sf_tasks_list,
     ("POST", "/workspaces/{workspace_id}/site-salesforce/tasks"): site_sf_task_create,
     ("GET", "/workspaces/{workspace_id}/site-salesforce/tasks/{task_ref}"): site_sf_task_get,
     ("PATCH", "/workspaces/{workspace_id}/site-salesforce/tasks/{task_ref}"): site_sf_task_update,
     ("POST", "/workspaces/{workspace_id}/site-salesforce/tasks/{task_ref}/retry"): site_sf_task_retry,
+
+    # Webhook Contract v2 (delivery_type=webhook, provider=salesforce) — a
+    # separate path from the package above; see the WEBHOOK CONTRACT v2
+    # section and docs/webhook-contract-v2.md.
+    ("GET", "/workspaces/{workspace_id}/webhook"): webhook_get,
+    ("PUT", "/workspaces/{workspace_id}/webhook"): webhook_put,
+    ("DELETE", "/workspaces/{workspace_id}/webhook"): webhook_delete,
+    ("POST", "/workspaces/{workspace_id}/webhook/secret"): webhook_rotate_secret,
+    ("POST", "/workspaces/{workspace_id}/webhook/test"): webhook_test,
+    ("GET", "/workspaces/{workspace_id}/webhook/configuration"): webhook_configuration_get,
+    ("POST", "/workspaces/{workspace_id}/webhook/configuration/refresh"): webhook_configuration_refresh,
+    ("GET", "/workspaces/{workspace_id}/webhook/records"): webhook_records_search,
+    ("GET", "/workspaces/{workspace_id}/webhook/people"): webhook_people_search,
+    ("GET", "/recordings/webhook-people/{key+}"): webhook_people_related,
+    ("GET", "/workspaces/{workspace_id}/webhook/link-config"): webhook_link_config,
+    ("GET", "/workspaces/{workspace_id}/webhook/link-records"): webhook_link_records,
+    ("GET", "/recordings/webhook-links/{key+}"): webhook_links_get,
+    ("PUT", "/recordings/webhook-links/{key+}"): webhook_links_put,
+    ("PUT", "/recordings/webhook-mom-pdf/{key+}"): webhook_mom_pdf_put,
+    ("PUT", "/recordings/webhook-doc-pdf/{key+}"): webhook_doc_pdf_put,
+    ("POST", "/workspaces/{workspace_id}/salesforce/connect"): salesforce_oauth_connect,
+    ("GET", "/salesforce/oauth/callback"): salesforce_oauth_callback,
+    ("GET", "/workspaces/{workspace_id}/salesforce/connection"): salesforce_oauth_status,
+    ("POST", "/workspaces/{workspace_id}/salesforce/setup"): salesforce_setup,
+    ("DELETE", "/workspaces/{workspace_id}/salesforce/connection"): salesforce_oauth_disconnect,
+    ("GET", "/recordings/webhook-context/{key+}"): webhook_context_get,
+    ("PUT", "/recordings/webhook-context/{key+}"): webhook_context_put,
+    ("POST", "/recordings/webhook/{key+}"): webhook_meeting_push,
+    ("GET", "/recordings/webhook/{key+}"): webhook_meeting_status,
+    ("POST", "/recordings/webhook-retry/{key+}"): webhook_meeting_retry,
+
 }
 
 

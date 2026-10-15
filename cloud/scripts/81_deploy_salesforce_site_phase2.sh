@@ -20,6 +20,9 @@
 #      GET/PUT /workspaces/{workspace_id}/site-salesforce/meeting-relation
 #      POST    /workspaces/{workspace_id}/people/contact
 #      PUT     /workspaces/{workspace_id}/site-salesforce/object-preferences
+#      GET     /workspaces/{workspace_id}/site-salesforce/destinations
+#      GET     /workspaces/{workspace_id}/site-salesforce/destinations/{destination_id}/records
+#      PUT     /workspaces/{workspace_id}/site-salesforce/meeting-destination
 #
 # THEN, in each connected Salesforce org, deploy the receiver (1.3.0: the
 # relationship fields, Who+What Tasks) — see salesforce/minutex-site/README.md:
@@ -117,6 +120,9 @@ ensure_route "GET /workspaces/{workspace_id}/site-salesforce/meeting-relation"
 ensure_route "PUT /workspaces/{workspace_id}/site-salesforce/meeting-relation"
 ensure_route "POST /workspaces/{workspace_id}/people/contact"
 ensure_route "PUT /workspaces/{workspace_id}/site-salesforce/object-preferences"
+ensure_route "GET /workspaces/{workspace_id}/site-salesforce/destinations"
+ensure_route "GET /workspaces/{workspace_id}/site-salesforce/destinations/{destination_id}/records"
+ensure_route "PUT /workspaces/{workspace_id}/site-salesforce/meeting-destination"
 
 echo ">> Done. Deploy the Salesforce receiver (1.3.0) to each connected org, then"
 echo "   re-run Discover Salesforce Objects once per workspace."

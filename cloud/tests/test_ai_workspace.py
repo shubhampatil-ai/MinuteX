@@ -1268,18 +1268,20 @@ class TestCoercion(unittest.TestCase):
 
     def test_the_extraction_is_only_the_sections_with_readers(self):
         """important_numbers and risks were removed with their (nonexistent)
-        consumers — their content now lands in the overview instead. Each
-        remaining section is read by something: see
+        consumers — their content now lands in the overview instead — and
+        action_items went too: the task list is the one source of truth for
+        work. Each remaining section is read by something: see
         ai_schema.HIGHLIGHT_SECTIONS."""
         self.assertEqual(sorted(ai_schema.HIGHLIGHT_SECTIONS),
-                         ["action_items", "deadlines", "decisions",
-                          "open_questions"])
+                         ["deadlines", "decisions", "open_questions"])
         got = ai_schema.coerce_highlights({
             "important_numbers": [{"label": "l", "value": "5"}],
             "risks": ["a risk"],
+            "action_items": [{"task": "t", "owner": "", "deadline": ""}],
         })
         self.assertNotIn("important_numbers", got)
         self.assertNotIn("risks", got)
+        self.assertNotIn("action_items", got)
 
     def test_highlights_empty_detects_nothing_to_show(self):
         self.assertTrue(ai_schema.highlights_empty(ai_schema.empty_highlights()))
@@ -1390,14 +1392,13 @@ class TestMerge(unittest.TestCase):
         the first mention keeps its position but gains the missing fields."""
         merged = ai_schema.merge_highlights([
             {**ai_schema.empty_highlights(),
-             "action_items": [{"task": "Send quote", "owner": "", "deadline": ""}]},
+             "deadlines": [{"what": "Send quote", "when": ""}]},
             {**ai_schema.empty_highlights(),
-             "action_items": [{"task": "send quote", "owner": "Ravi",
-                               "deadline": "Friday"}]},
+             "deadlines": [{"what": "send quote", "when": "Friday"}]},
         ])
-        self.assertEqual(len(merged["action_items"]), 1)
-        self.assertEqual(merged["action_items"][0]["owner"], "Ravi")
-        self.assertEqual(merged["action_items"][0]["deadline"], "Friday")
+        self.assertEqual(len(merged["deadlines"]), 1)
+        self.assertEqual(merged["deadlines"][0]["what"], "Send quote")
+        self.assertEqual(merged["deadlines"][0]["when"], "Friday")
 
     def test_same_deadline_text_folds_but_distinct_ones_do_not(self):
         """De-dup keys on the LOAD-BEARING field, not the whole dict: a later
@@ -2335,30 +2336,32 @@ class TestExplicitOutputTokenLimit(unittest.TestCase):
             merge=lambda p: p[0], coerce=lambda o: o,
             deadline_seconds=60, label="analyze", key="k"))
         self.assertEqual(got["max_tokens"],
-                         groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS)
+                         groq_client.ANALYSIS_MAX_OUTPUT_TOKENS)
 
     def test_the_limit_is_above_groqs_truncating_default(self):
         """The whole point: 3072 is what truncated production."""
-        self.assertGreater(groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS, 3072)
+        self.assertGreater(groq_client.ANALYSIS_MAX_OUTPUT_TOKENS, 3072)
 
     def test_the_limit_is_within_the_models_ceiling(self):
         """openai/gpt-oss-120b reports max_completion_tokens=65536 (verified
         against GET /openai/v1/models). Asking for more is a 400."""
-        self.assertLessEqual(groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS,
-                             65536)
+        self.assertLessEqual(groq_client.ANALYSIS_MAX_OUTPUT_TOKENS, 65536)
 
-    def test_the_sent_limit_is_the_same_number_the_budget_reserves(self):
-        """The transcript budget subtracts this exact constant, so sending a
-        DIFFERENT number would silently overcommit the context window."""
-        got = self._payload_of(lambda: groq_client.analyze(
-            "Speaker 0: hi.", "SYS", "RED",
-            merge=lambda p: p[0], coerce=lambda o: o,
-            deadline_seconds=60, label="analyze", key="k"))
-        budget = groq_client.single_pass_budget_tokens("SYS")
-        self.assertEqual(
-            got["max_tokens"], groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS)
+    def test_a_full_transcript_plus_the_sent_limit_fits_the_context(self):
+        """The sent cap is deliberately NOT the input reserve (see
+        ANALYSIS_MAX_OUTPUT_TOKENS), so what must hold is the sum: system
+        prompt + the largest transcript the budget admits + the reply cap
+        stays inside the window. Run with the context window binding (prod's
+        TPM is far above it) and the real 16-speaker analysis prompt."""
+        import prompts
+        system = prompts.unified_analysis_system(
+            [f"Speaker {i}" for i in range(16)])
+        with mock.patch.object(groq_client, "GROQ_TPM_LIMIT", 10 ** 9):
+            budget = groq_client.single_pass_budget_tokens(system)
         self.assertLess(
-            budget + got["max_tokens"], groq_client.GROQ_CONTEXT_TOKENS)
+            groq_client.est_tokens(system) + budget
+            + groq_client.ANALYSIS_MAX_OUTPUT_TOKENS,
+            groq_client.GROQ_CONTEXT_TOKENS)
 
     # -- map_reduce's single-call branch ----------------------------------
     def test_map_reduce_short_input_also_caps_its_reply(self):
@@ -2369,7 +2372,7 @@ class TestExplicitOutputTokenLimit(unittest.TestCase):
             merge=lambda p: p[0], coerce=lambda o: o,
             deadline_seconds=60, label="analyze", key="k"))
         self.assertEqual(got["max_tokens"],
-                         groq_client.SINGLE_PASS_OUTPUT_RESERVE_TOKENS)
+                         groq_client.ANALYSIS_MAX_OUTPUT_TOKENS)
 
     # -- untouched paths ---------------------------------------------------
     def test_prose_completions_are_unchanged(self):
@@ -3684,15 +3687,17 @@ class TestQuickActions(AiTestCase):
 
 
 class TestHighlights(AiTestCase):
-    """regenerate_highlights makes ONE Groq call (complete_json), never
-    map_reduce — a long transcript is truncated to fit one TPM window instead
-    of being split across paced calls. That change is what fixed a real
-    production failure: map-reducing a 45k-char transcript behind API
-    Gateway's 29s ceiling took 22s on chunk 1, then died on a 429 retry,
-    returning an opaque gateway 500. The staged pipeline (300s, nobody
-    waiting) is where full map-reduce still belongs; this route only
-    backfills rows it missed.
+    """regenerate_highlights is READ-ONLY unless `regenerate` is true (the
+    pipeline extracts highlights; this route used to re-run Groq on every
+    Calendar visit for each meeting with nothing to find). With `regenerate`
+    it makes ONE Groq call (complete_json), never map_reduce — a long
+    transcript is truncated to fit one TPM window instead of being split
+    across paced calls. That change is what fixed a real production failure:
+    map-reducing a 45k-char transcript behind API Gateway's 29s ceiling took
+    22s on chunk 1, then died on a 429 retry, returning an opaque gateway 500.
     """
+
+    REGEN = {"regenerate": True}
 
     def test_cached_highlights_are_served(self):
         self.item["meeting_highlights"] = HIGHLIGHTS
@@ -3701,11 +3706,36 @@ class TestHighlights(AiTestCase):
         self.assertTrue(body["cached"])
         cj.assert_not_called()
 
-    def test_missing_highlights_are_generated(self):
-        """This is what makes the workspace work on the back catalogue."""
+    def test_missing_highlights_are_not_generated_without_regenerate(self):
+        """The Calendar asks for every recent meeting. With nothing stored the
+        answer is EMPTY highlights — never a Groq call, never a write."""
+        with mock.patch.object(groq_client, "complete_json") as cj:
+            status, body = parse(call(api.regenerate_highlights, event(body={})))
+        self.assertEqual(status, 200)
+        self.assertTrue(body["cached"])
+        self.assertTrue(ai_schema.highlights_empty(body["meeting_highlights"]))
+        cj.assert_not_called()
+        self.table.update_item.assert_not_called()
+
+    def test_stored_empty_highlights_are_not_regenerated(self):
+        self.item["meeting_highlights"] = ai_schema.empty_highlights()
+        with mock.patch.object(groq_client, "complete_json") as cj:
+            status, body = parse(call(api.regenerate_highlights, event(body={})))
+        self.assertEqual(status, 200)
+        cj.assert_not_called()
+
+    def test_reading_does_not_fetch_the_transcript(self):
+        """A read is one DynamoDB lookup: no S3 transcript download."""
+        with mock.patch.object(api, "_owned_recording",
+                               wraps=api._owned_recording) as owned:
+            call(api.regenerate_highlights, event(body={}))
+        self.assertEqual(owned.call_count, 1)
+        self.assertFalse(owned.call_args.kwargs.get("hydrate", True))
+
+    def test_missing_highlights_are_generated_on_regenerate(self):
         with mock.patch.object(groq_client, "complete_json",
                                return_value=HIGHLIGHTS):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(status, 200)
         self.assertFalse(body["cached"])
         self.assertEqual(len(body["meeting_highlights"]["decisions"]), 1)
@@ -3725,7 +3755,7 @@ class TestHighlights(AiTestCase):
         meeting genuinely can have no decisions or numbers."""
         with mock.patch.object(groq_client, "complete_json",
                                return_value=ai_schema.empty_highlights()):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(status, 200)
         self.table.update_item.assert_not_called()
 
@@ -3754,7 +3784,7 @@ class TestHighlights(AiTestCase):
 
         with mock.patch.object(groq_client, "GROQ_CHUNK_TOKENS", 1000), \
              mock.patch.object(groq_client, "complete_json", side_effect=fake):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(status, 200)
         self.assertLess(captured["len"], len(self.item["transcript"]),
                         "the oversized transcript was not truncated")
@@ -3766,7 +3796,7 @@ class TestHighlights(AiTestCase):
     def test_short_transcript_reports_full_coverage(self):
         with mock.patch.object(groq_client, "complete_json",
                                return_value=HIGHLIGHTS):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(body["segments_covered"], 1)
         self.assertEqual(body["segments_total"], 1)
 
@@ -3778,7 +3808,7 @@ class TestHighlights(AiTestCase):
                 groq_client, "complete_json",
                 side_effect=groq_client.GroqError(
                     "no time left to retry", status=429, retryable=True)):
-            status, body = parse(call(api.regenerate_highlights, event(body={})))
+            status, body = parse(call(api.regenerate_highlights, event(body=self.REGEN)))
         self.assertEqual(status, 502)
         self.table.update_item.assert_not_called()
 

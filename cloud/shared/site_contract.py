@@ -46,7 +46,12 @@ import meeting_payload
 # (a Who AND a What). A 1.1 receiver ignores both keys: the meeting is stored
 # unrelated, and a Task keeps the single related_object_type/related_record_id
 # pair, which is still sent.
-CONTRACT_VERSION = "1.2"
+# 1.3 (additive): `list_destinations`; upsert_meeting carries `destination`
+# (a MinuteX Destination + an EXISTING record of its object, updated with the
+# org's field mappings) and `acting_user_id` (the Salesforce User the MinuteX
+# person is — destinations, records and fields follow their permissions). A
+# 1.2 receiver refuses list_destinations and ignores both keys.
+CONTRACT_VERSION = "1.3"
 
 # The delivery type this contract belongs to — the value that separates this
 # path from the existing OAuth delivery everywhere it is stored (job rows,
@@ -63,15 +68,16 @@ ACTION_OBJECT_SCHEMA = "object_schema"
 ACTION_RECORD_SEARCH = "record_search"
 ACTION_CREATE_TASK = "create_task"
 ACTION_UPDATE_TASK = "update_task"
+ACTION_LIST_DESTINATIONS = "list_destinations"
 ACTIONS = (ACTION_HEALTH, ACTION_UPSERT_MEETING, ACTION_PEOPLE_SYNC,
            ACTION_ORG_INFO, ACTION_OBJECT_SCHEMA, ACTION_RECORD_SEARCH,
-           ACTION_CREATE_TASK, ACTION_UPDATE_TASK)
+           ACTION_CREATE_TASK, ACTION_UPDATE_TASK, ACTION_LIST_DESTINATIONS)
 
 # The Salesforce Long Text Area maximum, and therefore the receiver's
 # Transcript__c limit. Counted in UTF-16 code units — see text_length.
 MAX_TRANSCRIPT_CHARS = 131_072
 
-PEOPLE_TYPES = ("contact", "user")
+PEOPLE_TYPES = ("contact", "lead", "user")
 PEOPLE_STATUSES = ("active", "inactive")
 
 _PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
@@ -355,7 +361,7 @@ def task_related_records(relations):
 
 def build_meeting_payload(item, tasks=None, *, participants=None,
                           workspace=None, meeting_url="", audio=None,
-                          relation=None):
+                          relation=None, destination=None, acting_user_id=""):
     """THE upsert_meeting payload. Raises TranscriptTooLarge / ContractError.
 
     Args:
@@ -368,6 +374,9 @@ def build_meeting_payload(item, tasks=None, *, participants=None,
       meeting_url: a stable MinuteX deep link, or "".
       audio: the audio block (see audio_block), or None.
       relation: the meeting's {who, what} Salesforce relationship, or None.
+      destination: {destination_id, record_id} — the customer record this
+            meeting is pushed to (updated with the org's mappings), or None.
+      acting_user_id: the pushing person's Salesforce User id, or "".
     """
     item = item if isinstance(item, dict) else {}
     key = _s(item.get("audio_s3_key"))
@@ -430,6 +439,10 @@ def build_meeting_payload(item, tasks=None, *, participants=None,
         },
         "audio": audio if isinstance(audio, dict) else audio_block(None),
         "relation": relation_block(relation),
+        **({"destination": {"destination_id": _s(destination.get("destination_id"), 18),
+                            "record_id": _s(destination.get("record_id"), 18)}}
+           if isinstance(destination, dict) and _s(destination.get("destination_id")) else {}),
+        **({"acting_user_id": _s(acting_user_id, 18)} if _s(acting_user_id) else {}),
     }
 
 

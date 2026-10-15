@@ -139,6 +139,10 @@ class AssigneeAccessHarness(unittest.TestCase):
                               self.t["participants"]),
             mock.patch.object(api, "_tasks", self.t["tasks"]),
             mock.patch.object(api, "_users", self.t["users"]),
+            # Participant grants: empty here, so every viewer in this suite
+            # is decided by the task-assignee rule alone.
+            mock.patch.object(api, "_meeting_access",
+                              self.t["meeting_access"]),
             mock.patch.object(api, "Key", fdb.Key),
             mock.patch.object(api, "_s3", self.s3),
             mock.patch.object(api, "_require_auth",

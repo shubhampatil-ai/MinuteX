@@ -1149,15 +1149,28 @@ class TestMeetingVisibility(OrgHarness):
         reader."""
         self.assertEqual(api._can_read_meeting(MEMBER_A2, self.item), "")
 
-    def test_explicit_grant_admits_a_member(self):
-        api._grant_meeting_access(self.key, MEMBER_A2, ws.ACCESS_EXPLICIT,
-                                  workspace_id=ORG_A, granted_by=OWNER_A)
-        self.assertEqual(api._can_read_meeting(MEMBER_A2, self.item),
-                         ws.ACCESS_EXPLICIT)
+    def test_a_grant_is_never_general_meeting_authorization(self):
+        """CHANGED BEHAVIOUR — deliberate, recorded rather than deleted.
+
+        OLD (Phase 2B): a MeetingAccess row admitted a member through
+             _can_read_meeting, i.e. into get_recording (transcript + audio).
+        NEW: MeetingAccess is consumed ONLY by the shared read-only route, at
+             the level the recorder chose. _can_read_meeting is owner / org
+             role only. No grant rows existed in production when this changed.
+        WHY: a NOTES grant must not become a transcript, nor a FULL grant
+             general meeting access. See test_meeting_access.py.
+        """
+        for level in (ws.ACCESS_LEVEL_NOTES, ws.ACCESS_LEVEL_FULL):
+            api._grant_meeting_access(self.key, MEMBER_A2, ws.ACCESS_EXPLICIT,
+                                      workspace_id=ORG_A, granted_by=OWNER_A,
+                                      access_level=level)
+            with self.subTest(level=level):
+                self.assertEqual(
+                    api._can_read_meeting(MEMBER_A2, self.item), "")
 
     def test_a_grant_cannot_survive_losing_membership(self):
-        # Membership is checked BEFORE the grant, so a removed member's stale
-        # grant row cannot keep working.
+        # Leaving the organisation deletes the member's grants on its
+        # meetings, so a stale row cannot keep the shared view working.
         api._grant_meeting_access(self.key, MEMBER_A2, ws.ACCESS_PARTICIPANT,
                                   workspace_id=ORG_A)
         self.as_user(OWNER_A)
@@ -1166,6 +1179,7 @@ class TestMeetingVisibility(OrgHarness):
             route="/workspaces/{workspace_id}/members/{user_id}",
             path={"workspace_id": ORG_A, "user_id": MEMBER_A2}))
         self.assertEqual(api._can_read_meeting(MEMBER_A2, self.item), "")
+        self.assertIsNone(api._meeting_access_row(self.key, MEMBER_A2))
 
     def test_non_member_is_denied(self):
         self.assertEqual(api._can_read_meeting(OUTSIDER, self.item), "")

@@ -107,6 +107,7 @@ TYPE_TASK_DUE_TODAY = "TASK_DUE_TODAY"
 TYPE_TASK_OVERDUE = "TASK_OVERDUE"
 TYPE_MEETING_DOCUMENT_READY = "MEETING_DOCUMENT_READY"
 TYPE_MEETING_OUTPUT_SHARED = "MEETING_OUTPUT_SHARED"
+TYPE_MEETING_ACCESS_GRANTED = "MEETING_ACCESS_GRANTED"
 
 # The fallback shown when the fact a message needs is genuinely absent.
 #
@@ -191,6 +192,16 @@ TYPES = {
         "entity_type": ENTITY_MEETING,
         "title": "Meeting output shared",
         "message": "{subject} was shared",
+    },
+    TYPE_MEETING_ACCESS_GRANTED: {
+        # Goes to the PARTICIPANT the recorder tagged, never to the recorder.
+        # Points at the meeting, but the app opens the read-only shared view
+        # for it (a grantee cannot open the owner's screen). The event site
+        # supplies the whole message, because it names the recorder too.
+        "priority": PRIORITY_NORMAL,
+        "entity_type": ENTITY_MEETING,
+        "title": "Meeting shared with you",
+        "message": "{subject}",
     },
 }
 

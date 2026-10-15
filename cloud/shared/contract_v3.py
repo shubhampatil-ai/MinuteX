@@ -59,7 +59,7 @@ MAX_LINKS = 5
 # The outputs a meeting can carry, in their canonical order. The meeting's
 # identity (title, date, duration, language, recorded by) and its links are
 # not outputs: they always travel.
-OUTPUT_OVERVIEW = "overview"                      # overview, decisions, deadlines, open questions
+OUTPUT_OVERVIEW = "overview"                      # the full Overview, as text
 OUTPUT_MOM = "mom"                                # the MoM PDF File only, never text
 OUTPUT_TASKS = "tasks"
 OUTPUT_PARTICIPANTS = "participants"
@@ -88,6 +88,22 @@ MAX_TRANSCRIPT_CHARS = 131072
 TRANSCRIPT_FIELDS = 4
 TRANSCRIPT_CUT_NOTE = ("\n\n[The transcript continues in MinuteX: Salesforce holds "
                        "the first 524,288 characters.]")
+
+
+# The MinuteX Meeting's Overview field (Summary__c, labelled "Overview"): a
+# Long Text Area of 32,768 characters.
+MAX_OVERVIEW_CHARS = 32768
+OVERVIEW_CUT_NOTE = "\n\n[The overview continues in MinuteX.]"
+
+
+def fit_overview(text):
+    """(text, truncated): the Overview, cut at a line end with
+    OVERVIEW_CUT_NOTE when it is longer than the field."""
+    text = _s(text)
+    if site_contract.text_length(text) <= MAX_OVERVIEW_CHARS:
+        return text, False
+    room = MAX_OVERVIEW_CHARS - site_contract.text_length(OVERVIEW_CUT_NOTE)
+    return _cut_at_line(text, room).rstrip() + OVERVIEW_CUT_NOTE, True
 
 
 def _cut_at_line(text, room):
@@ -206,6 +222,28 @@ def normalize_linkable_objects(raw):
             "outputs_user_can_change": outs("outputs_user_can_change", allowed),
         })
     return out
+
+
+def output_locked(links, output, objects):
+    """True when the admin fixed `output` for these records: some linked
+    object allows it and none lets users change it (apply_link_policy then
+    sets it to its default whatever was sent)."""
+    by_object = {o["object"].lower(): o for o in (objects or [])}
+    allowing = [o for o in (by_object.get(l["object"].lower()) for l in links or [])
+                if o and output in o["outputs_allowed"]]
+    return bool(allowing) and not any(output in o["outputs_user_can_change"] for o in allowing)
+
+
+def normalize_included_documents(raw):
+    """None (every document) or the document types the user ticked,
+    de-duplicated and sorted. The MoM's mirror is never one."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or not all(
+            isinstance(d, str) and DOCUMENT_NAME_RE.match(d) for d in raw):
+        _bad("invalid_documents", "included_documents must be a list of document types",
+             field="included_documents")
+    return sorted(set(raw) - {MOM_DOCUMENT_TYPE})
 
 
 def apply_link_policy(links, included_outputs, task_relations, objects):
@@ -474,7 +512,7 @@ def _normalize_files(raw, outputs, meeting_id):
 def build_snapshot(item, tasks=None, *, included_outputs, participants=None,
                    workspace=None, audio=None, lifecycle=LIFECYCLE_ACTIVE,
                    minutes_markdown="", recorded_by=None, task_relations=None,
-                   files=None, transcript_body=None):
+                   files=None, transcript_body=None, overview_body=None):
     """The `data` of a created/updated v3 event.
 
     `task_relations` maps a MinuteX task id to the record the user chose for
@@ -482,6 +520,9 @@ def build_snapshot(item, tasks=None, *, included_outputs, participants=None,
     the list of file_ref() dicts already uploaded for this state.
     `transcript_body` is the readable transcript (names and times) to send
     when the transcript is included; without it, the stored text is used.
+    `overview_body` is the full Overview as text (headings, points, speaker
+    names) for the Overview output; without it, the stored summary is used.
+    Only that text travels: no sections, highlights or decisions.
     """
     outputs = normalize_outputs(included_outputs)
     item = dict(item if isinstance(item, dict) else {})
@@ -499,7 +540,9 @@ def build_snapshot(item, tasks=None, *, included_outputs, participants=None,
     data = {"meeting": meeting}
 
     if OUTPUT_OVERVIEW in outputs:
-        data["summary"] = base["summary"]
+        text, cut = fit_overview(base["summary"].get("text", "") if overview_body is None
+                                 else overview_body)
+        data["summary"] = {"text": text, "truncated": cut}
     # The MoM travels ONLY as its PDF (a File, see `files`), never as text:
     # the app renders it at Link and after every MoM change.
     if OUTPUT_TASKS in outputs:

@@ -38,6 +38,10 @@ STATUS_DELETED = "deleted"
 # Bounded partition reads. A search reads the workspace partition in pages;
 # this caps one search so a very large directory cannot stall the request.
 SEARCH_MAX_ROWS = 5000
+# The run stamp of a person saved because a user picked them from LIVE
+# search (not from a sync). A sync never "misses" such a person: it never
+# fetched them, so mark_missing must leave them alone.
+LIVE_RUN_ID = "live_search"
 MARK_MISSING_MAX_ROWS = 100_000
 
 _SOURCE_FIELDS = ("provider", "type", "external_id", "name", "email", "phone",
@@ -135,7 +139,7 @@ def mark_missing(table, key_cls, workspace_id, provider, run_id, now):
     for row in _partition(table, key_cls, workspace_id, MARK_MISSING_MAX_ROWS):
         if not str(row.get("person_key", "")).startswith(prefix):
             continue
-        if row.get("last_sync_run") == run_id or row.get("status") == STATUS_DELETED:
+        if row.get("last_sync_run") in (run_id, LIVE_RUN_ID)                 or row.get("status") == STATUS_DELETED:
             continue
         table.update_item(
             Key={"workspace_id": workspace_id, "person_key": row["person_key"]},

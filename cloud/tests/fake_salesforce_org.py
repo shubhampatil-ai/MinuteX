@@ -136,6 +136,27 @@ class FakeSalesforceOrg:
         self.supports_related_records = True
         # Standard objects reported as platform machinery (mru_enabled False).
         self.machinery = set()
+        # MinuteX Destinations (MinuteXSiteDestinations): which object, which
+        # MinuteX values go into which field, and who may use it (None = all).
+        self.destinations = [
+            {"id": "a0D000000000001AAA", "name": "Site Visit", "object_type": "Site_Visit__c",
+             "mappings": [("summary", "Meeting_Summary__c"), ("meeting_date", "Visit_Date__c"),
+                          ("transcript", "Transcript__c"), ("recording_url", "Recording_URL__c"),
+                          ("contact", "Contact__c")],
+             "allowed_users": None},
+            {"id": "a0D000000000002AAA", "name": "Booking", "object_type": "Booking__c",
+             "mappings": [("summary", "Notes__c")], "allowed_users": None},
+            {"id": "a0D000000000003AAA", "name": "Managers Only", "object_type": "Account",
+             "mappings": [("summary", "Description")], "allowed_users": set()},
+            # One record per meeting, found by its MinuteX Meeting ID.
+            {"id": "a0D000000000004AAA", "name": "Visit Log", "object_type": "Site_Visit__c",
+             "write_mode": "meeting_record",
+             "mappings": [("summary", "Meeting_Summary__c")], "allowed_users": None},
+        ]
+        self.meeting_records = {}   # (object, MinuteX meeting id) -> record id
+        self.supports_destinations = True
+        self.record_values = {}   # (object, record id) -> {field: value}
+        self.destination_writes = 0
         self.clock = 0
         # Extra synthetic Contacts, to exercise people_sync paging.
         self.extra_contacts = 0
@@ -180,7 +201,8 @@ class FakeSalesforceOrg:
         return out
 
     # -- receiver ----------------------------------------------------------------
-    ORG_ACTIONS = ("org_info", "object_schema", "record_search", "create_task", "update_task")
+    ORG_ACTIONS = ("org_info", "object_schema", "record_search", "create_task", "update_task",
+                   "list_destinations")
 
     def _handle(self, env):
         action, rid = env.get("action"), env.get("request_id", "")
@@ -211,6 +233,19 @@ class FakeSalesforceOrg:
             return self._schema(user, rid, payload)
         if action == "record_search":
             return self._search(user, rid, payload)
+        if action == "list_destinations":
+            if not self.supports_destinations:
+                return self._err(400, "unsupported_action", "no")
+            acting = payload.get("acting_user_id") or user
+            out = [{"id": d["id"], "name": d["name"], "object_type": d["object_type"],
+                    "object_label": OBJECTS[d["object_type"]][0],
+                    "key_prefix": OBJECTS[d["object_type"]][2],
+                    "task_relatable": bool(OBJECTS[d["object_type"]][4]),
+                    "write_mode": d.get("write_mode", "update_record"),
+                    "fields": [f for _s, f in d["mappings"]]}
+                   for d in self.destinations if self._may_use(d, acting)]
+            return self._ok(action, rid, {"destinations": out,
+                                          "acting_user": {"id": acting, "name": "x"}})
         return self._task(user, rid, env, action)
 
     def _schema(self, user, rid, payload):
@@ -250,6 +285,61 @@ class FakeSalesforceOrg:
                                   "inaccessible_field_count": 0})
         return self._ok("object_schema", rid, {"objects": described, "unknown": unknown,
                                                "inaccessible": inaccessible})
+
+    def _may_use(self, d, acting):
+        return (d["allowed_users"] is None or acting in d["allowed_users"]) \
+            and self.can(self.integration_user if acting not in self.perms else acting,
+                         d["object_type"], "edit")
+
+    def apply_destination(self, env):
+        """MinuteXSiteDestinations.apply: update the chosen EXISTING record.
+        Returns (error_status, error_code) or the destination result."""
+        payload = env.get("payload") or {}
+        dest = payload.get("destination") or {}
+        if not dest.get("destination_id"):
+            return None
+        d = next((x for x in self.destinations if x["id"] == dest["destination_id"]), None)
+        if d is None:
+            return (422, "destination_unavailable")
+        acting = payload.get("acting_user_id") or self.integration_user
+        if not self._may_use(d, acting):
+            return (403, "destination_not_allowed")
+        obj, record_id = d["object_type"], dest.get("record_id")
+        meeting = payload.get("meeting") or {}
+        created = False
+        if d.get("write_mode") == "meeting_record":
+            # Upsert on the MinuteX Meeting ID: never a second record.
+            record_id = self.meeting_records.get((obj, meeting.get("id")))
+            if record_id is None:
+                n = len(self.records.setdefault(obj, {})) + 900
+                record_id = f"{OBJECTS[obj][2]}000000000{n:03d}AAA"
+                self.records[obj][record_id] = meeting.get("title") or meeting.get("id")
+                self.meeting_records[(obj, meeting.get("id"))] = record_id
+                created = True
+        if record_id not in self.records.get(obj, {}):
+            return (422, "invalid_record")
+        values = {
+            "summary": (payload.get("summary") or {}).get("text"),
+            "meeting_date": str(meeting.get("started_at") or "")[:10] or None,
+            "transcript": (payload.get("transcript") or {}).get("text"),
+            "recording_url": (payload.get("audio") or {}).get("url"),
+            "contact": ((payload.get("relation") or {}).get("who") or {}).get("record_id"),
+        }
+        row = self.record_values.setdefault((obj, record_id), {})
+        updated, skipped = [], []
+        for source, field in d["mappings"]:
+            if values.get(source):
+                row[field] = values[source]
+                updated.append(field)
+            else:
+                skipped.append({"field": field, "reason": "no_value"})
+        self.destination_writes += 1
+        return {"destination_id": d["id"], "name": d["name"], "object_type": obj,
+                "object_label": OBJECTS[obj][0], "record_id": record_id,
+                "record_name": self.records[obj][record_id],
+                "record_url": f"https://acme.my.salesforce.com/lightning/r/{obj}/{record_id}/view",
+                "write_mode": d.get("write_mode", "update_record"), "created": created,
+                "updated_fields": updated, "truncated_fields": [], "skipped": skipped}
 
     def _search(self, user, rid, payload):
         name = next((o for o in OBJECTS if o.lower() == str(payload.get("object")).lower()), None)

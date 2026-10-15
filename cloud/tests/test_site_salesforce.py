@@ -51,7 +51,17 @@ class Router:
             action = ""
         if action != "upsert_meeting":
             return self.org.post(url, body, headers, timeout)
+        env = json.loads(body.decode("utf-8"))
+        applied = self.org.apply_destination(env)
+        if isinstance(applied, tuple):
+            # Refused: the whole push rolls back, like the Apex transaction.
+            return applied[0], json.dumps({"ok": False, "org_id": self.org.org_id, "error": {
+                "code": applied[1], "message": f"refused: {applied[1]}", "field": ""}}).encode()
         status, raw = self.receiver.post(url, body, headers, timeout)
+        if applied and status == 200:
+            reply = json.loads(raw)
+            reply.setdefault("result", {})["destination"] = applied
+            raw = json.dumps(reply).encode()
         # One org: the meeting record the receiver created is a record Tasks
         # can be related to (MinuteX_Site_Meeting__c allows activities).
         try:
@@ -675,14 +685,17 @@ class TaskTests(SFHarness):
                          ("FAILED", "org_mismatch"))
         self.assertEqual(self.org.tasks, {})
 
-    def adhoc(self, **body):
-        self.as_user(MEMBER)
+    def adhoc(self, as_user=MEMBER, **body):
+        self.as_user(as_user)
         out = call(api.site_sf_task_create, event("POST", W + "/tasks", wpath(), body))
         self.as_user(OWNER)
         return out
 
     def test_task_from_a_meeting_without_a_mapping(self):
-        status, body = self.adhoc(object_api_name="Site_Visit__c", record_id="a01000000000125AAA",
+        # As the meeting's owner: reading a colleague's meeting is not a
+        # plain member's right (see _can_read_meeting).
+        status, body = self.adhoc(as_user=OWNER, object_api_name="Site_Visit__c",
+                                  record_id="a01000000000125AAA",
                                   record_name="SV-00125", subject="Follow-up Call",
                                   assignee_person_key=self.person(fso.REP_USER),
                                   due_date="2026-09-28", status="Not Started",
@@ -920,8 +933,9 @@ class PeopleSyncPagingTests(SFHarness):
         self.sync_people()
         _, body = call(api.people_search, event(
             "GET", "/workspaces/{workspace_id}/people", wpath(), qs={"type": "user"}))
-        # Inactive users are not offered, and not counted.
-        self.assertEqual(body["counts"], {"contacts": 1, "users": 3})
+        # Inactive users are not offered, and not counted. Leads are a
+        # people type too (live search), with none synced here.
+        self.assertEqual(body["counts"], {"contacts": 1, "leads": 0, "users": 3})
         self.assertEqual({p["type"] for p in body["people"]}, {"user"})
         _, body = call(api.people_search, event(
             "GET", "/workspaces/{workspace_id}/people", wpath(), qs={"type": "contact"}))
@@ -1136,7 +1150,7 @@ class TaskInheritanceTests(RelationHarness):
         self.assertEqual((sf["who_id"], sf["what_id"], sf["owner_id"]),
                          ("003000000000001AAA", record, fso.REP_USER))
         _, env = [c for c in self.org.calls if c[1]["action"] == "create_task"][-1]
-        self.assertEqual(env["contract_version"], "1.2")
+        self.assertEqual(env["contract_version"], "1.3")
         self.assertEqual(env["payload"]["task"]["related_object_type"], "MinuteX_Site_Meeting__c")
         self.assertEqual(len(env["payload"]["task"]["related_records"]), 2)
 
@@ -1403,6 +1417,316 @@ class CatalogRelationTests(RelationHarness):
         self.drain()
         sf = self.org.tasks[self.task_row(body["task"]["task_ref"])["salesforce_task_id"]]
         self.assertEqual((sf["who_id"], sf["what_id"]), ("003000000000001AAA", record))
+
+
+# ===========================================================================
+# Destinations: "push this meeting to Site Visit -> Mumbai Tower A". The org
+# owns which objects, which fields and who may use each; MinuteX lists them
+# for the person, searches records with their access, sends one payload.
+# ===========================================================================
+OWNER_SF = "005000000000009AAA"   # the Salesforce User with OWNER's email
+SITE_VISIT = "a0D000000000001AAA"
+BOOKING = "a0D000000000002AAA"
+MANAGERS = "a0D000000000003AAA"
+VISIT_LOG = "a0D000000000004AAA"
+
+
+class DestinationTests(RelationHarness):
+    D = W + "/destinations"
+
+    def setUp(self):
+        super().setUp()
+        # OWNER is a Salesforce User too (matched by email); MEMBER is not.
+        self.org.users[OWNER_SF] = {"name": "Owner Rep", "email": f"{OWNER}@work.com", "active": True}
+        self.org.destinations[2]["allowed_users"] = {OWNER_SF}
+        self.assertEqual(self.sync_people()["status"], "SYNCED")
+
+    def destinations(self, as_user=OWNER):
+        self.as_user(as_user)
+        out = call(api.site_sf_destinations, event("GET", self.D, wpath()))
+        self.as_user(OWNER)
+        return out
+
+    def set_dest(self, destination_id=SITE_VISIT, record_id="a01000000000125AAA",
+                 record_name="SV-00125", **extra):
+        return call(api.site_sf_meeting_destination_put, event(
+            "PUT", W + "/meeting-destination", wpath(),
+            {"meeting_key": KEY, "destination_id": destination_id, "record_id": record_id,
+             "record_name": record_name, **extra}))
+
+    def test_each_person_sees_the_destinations_they_may_use(self):
+        status, body = self.destinations()
+        self.assertEqual(status, 200, body)
+        self.assertEqual([d["name"] for d in body["destinations"]],
+                         ["Site Visit", "Booking", "Managers Only", "Visit Log"])
+        self.assertTrue(body["supported"])
+        self.assertNotIn("object_api_name", json.dumps(body), "no API names to the app")
+        _, member = self.destinations(as_user=MEMBER)
+        self.assertEqual([d["name"] for d in member["destinations"]], ["Site Visit", "Booking", "Visit Log"],
+                         "MEMBER is not the Salesforce User the destination allows")
+        _, env = [c for c in self.org.calls if c[1]["action"] == "list_destinations"][-2]
+        self.assertEqual(env["payload"]["acting_user_id"], OWNER_SF)
+
+    def test_records_are_searched_within_the_destination(self):
+        status, body = call(api.site_sf_destination_records, event(
+            "GET", self.D + "/{destination_id}/records", wpath(destination_id=SITE_VISIT),
+            qs={"q": "sv-0012"}))
+        self.assertEqual(status, 200, body)
+        self.assertEqual([r["name"] for r in body["records"]], ["SV-00125", "SV-00126"])
+        self.as_user(MEMBER)
+        status, body = call(api.site_sf_destination_records, event(
+            "GET", self.D + "/{destination_id}/records", wpath(destination_id=MANAGERS)))
+        self.assertEqual((status, body["code"]), (404, "destination_unavailable"))
+
+    def test_push_updates_the_existing_record_with_the_orgs_mappings(self):
+        self.tag()
+        status, body = self.set_dest()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["relation"]["destination"]["name"], "Site Visit")
+        self.assertEqual(body["relation"]["destination"]["record_name"], "SV-00125")
+        self.assertEqual(self.get_rel()["relation"]["destination"]["name"], "Site Visit")
+        self.push_meeting()
+        values = self.org.record_values[("Site_Visit__c", "a01000000000125AAA")]
+        self.assertEqual(values["Meeting_Summary__c"], "Deck to follow.")
+        self.assertEqual(values["Transcript__c"], "Speaker 0: I will send the deck.")
+        self.assertEqual(values["Recording_URL__c"][:40], "https://api.example.com/delivery/audio/v")
+        self.assertEqual(values["Visit_Date__c"], "2026-09-21")
+        self.assertEqual(values["Contact__c"], "003000000000001AAA", "the tagged Contact")
+        _, env = [c for c in self.org.calls if c[1]["action"] == "list_destinations"][-1]
+        _, status_body = self.status()
+        placed = status_body["meeting_record"]["destination"]
+        self.assertEqual((placed["name"], placed["record_name"]), ("Site Visit", "SV-00125"))
+        self.assertIn("Meeting_Summary__c", placed["updated_fields"])
+        self.assertTrue(status_body["meeting_record"]["url"].endswith("a01000000000125AAA/view"))
+        # Pushed again: the SAME record is updated, never a second one.
+        self.push_meeting()
+        self.assertEqual(self.org.destination_writes, 2)
+        self.assertEqual(len(self.org.records["Site_Visit__c"]), 3)
+
+    def test_the_push_names_the_destination_and_the_acting_user(self):
+        self.set_dest()
+        from test_site_delivery import SiteHarness as _Base
+        seen = []
+        real = self.org.apply_destination
+        self.org.apply_destination = lambda env: seen.append(env["payload"]) or real(env)
+        _Base.push(self)
+        self.drain()
+        self.assertEqual(seen[0]["destination"], {"destination_id": SITE_VISIT,
+                                                  "record_id": "a01000000000125AAA"})
+        self.assertEqual(seen[0]["acting_user_id"], OWNER_SF)
+
+    def test_a_refused_destination_fails_the_push_clearly(self):
+        self.set_dest(destination_id=MANAGERS, record_id="001000000000001AAA",
+                      record_name="Acme Mumbai")
+        self.org.destinations[2]["allowed_users"] = set()   # access revoked since
+        from test_site_delivery import SiteHarness as _Base
+        _, body = _Base.push(self)
+        self.drain()
+        job = self.job(body["job"]["job_id"])
+        self.assertEqual((job["status"], job["last_error_code"]), ("FAILED", "destination_not_allowed"))
+        self.assertNotIn(("Account", "001000000000001AAA"), self.org.record_values)
+
+    def test_invalid_choices_are_refused_before_salesforce(self):
+        status, body = self.set_dest(record_id="001000000000001AAA")
+        self.assertEqual((status, body["code"]), (400, "invalid_record"))
+        status, body = self.set_dest(destination_id="a0D000000000999AAA")
+        self.assertEqual((status, body["code"]), (404, "destination_unavailable"))
+        self.as_user(MANAGER)   # can read a colleague's meeting, not edit it
+        self.assertEqual(self.set_dest()[0], 404)
+
+    def test_tasks_go_onto_a_task_capable_destination_record(self):
+        self.tag()
+        self.set_dest()
+        self.t["tasks"].put_item(Item={"task_id": "t-d1", "owner_user_id": OWNER,
+                                       "source_recording_id": KEY, "title": "Send proposal",
+                                       "status": "Open", "created_at": "2026-09-21T13:40:00Z"})
+        status, body = call(api.site_sf_task_create, event("POST", W + "/tasks", wpath(), {
+            "minutex_task_id": "t-d1", "assignee_person_key": self.person(fso.REP_USER)}))
+        self.assertEqual(status, 202, body)   # no meeting push needed first
+        self.drain()
+        sf = self.org.tasks[self.task_row(body["task"]["task_ref"])["salesforce_task_id"]]
+        self.assertEqual((sf["who_id"], sf["what_id"]), ("003000000000001AAA", "a01000000000125AAA"))
+
+    def test_a_destination_without_tasks_falls_back_to_the_meeting(self):
+        self.set_dest(destination_id=BOOKING, record_id="a02000000000001AAA", record_name="BK-1")
+        self.t["tasks"].put_item(Item={"task_id": "t-d2", "owner_user_id": OWNER,
+                                       "source_recording_id": KEY, "title": "Call back",
+                                       "status": "Open", "created_at": "2026-09-21T13:40:00Z"})
+        push = lambda: call(api.site_sf_task_create, event("POST", W + "/tasks", wpath(), {
+            "minutex_task_id": "t-d2", "assignee_person_key": self.person(fso.REP_USER)}))
+        self.assertEqual(push()[1]["code"], "meeting_not_pushed")
+        record = self.push_meeting()
+        _, body = push()
+        self.drain()
+        sf = self.org.tasks[self.task_row(body["task"]["task_ref"])["salesforce_task_id"]]
+        self.assertEqual(sf["what_id"], record)
+
+    def test_a_per_meeting_destination_needs_no_record_and_never_duplicates(self):
+        _, body = self.destinations()
+        modes = {d["name"]: d["write_mode"] for d in body["destinations"]}
+        self.assertEqual(modes["Visit Log"], "meeting_record")
+        self.assertEqual(modes["Site Visit"], "update_record")
+        status, body = self.set_dest(destination_id=VISIT_LOG, record_id="", record_name="")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["relation"]["destination"]["name"], "Visit Log")
+        self.assertEqual(body["relation"]["destination"]["record_name"], "", "nothing picked")
+        self.push_meeting()
+        self.push_meeting()
+        made = [r for (obj, _m), r in self.org.meeting_records.items() if obj == "Site_Visit__c"]
+        self.assertEqual(len(made), 1, "one Salesforce record for the meeting, updated on re-push")
+        self.assertEqual(self.org.record_values[("Site_Visit__c", made[0])]["Meeting_Summary__c"],
+                         "Deck to follow.")
+        _, status_body = self.status()
+        placed = status_body["meeting_record"]["destination"]
+        self.assertEqual(placed["name"], "Visit Log")
+        self.assertTrue(placed["record_name"], "the created record is named for the person")
+        self.assertEqual(self.set_dest(destination_id=VISIT_LOG, record_id="not-an-id")[0], 200,
+                         "a record id is ignored, not validated, for a per-meeting destination")
+
+    def test_tasks_go_onto_the_per_meeting_record_after_the_push(self):
+        self.tag()
+        self.set_dest(destination_id=VISIT_LOG, record_id="", record_name="")
+        self.t["tasks"].put_item(Item={"task_id": "t-d3", "owner_user_id": OWNER,
+                                       "source_recording_id": KEY, "title": "Send proposal",
+                                       "status": "Open", "created_at": "2026-09-21T13:40:00Z"})
+        push = lambda: call(api.site_sf_task_create, event("POST", W + "/tasks", wpath(), {
+            "minutex_task_id": "t-d3", "assignee_person_key": self.person(fso.REP_USER)}))
+        self.assertEqual(push()[1]["code"], "meeting_not_pushed", "the record exists only after the push")
+        self.push_meeting()
+        status, body = push()
+        self.assertEqual(status, 202, body)
+        self.drain()
+        sf = self.org.tasks[self.task_row(body["task"]["task_ref"])["salesforce_task_id"]]
+        created = next(r for (obj, _m), r in self.org.meeting_records.items() if obj == "Site_Visit__c")
+        self.assertEqual((sf["who_id"], sf["what_id"]), ("003000000000001AAA", created))
+
+    def test_an_older_receiver_reports_destinations_unsupported(self):
+        self.org.supports_destinations = False
+        status, body = self.destinations()
+        self.assertEqual((status, body["destinations"], body["supported"]), (200, [], False))
+
+
+# ===========================================================================
+# In-app install: Install MinuteX in Salesforce -> (setup code entered in the
+# org's MinuteX Setup tab) -> ✓ installed -> Connect Salesforce.
+# ===========================================================================
+import fake_dynamodb as fdb  # noqa: E402
+
+PKG = "04tgL000000MinuteX"
+I = W + "/install"
+
+
+class InstallFlowTests(SFHarness):
+    def setUp(self):
+        super().setUp()
+        # Start from a workspace with nothing configured.
+        self.t["site_endpoints"].delete_item(Key={"workspace_id": ORG})
+        self.pairings = fdb.FakeTable("SiteSalesforcePairings", "pairing_key")
+        for p in (mock.patch.object(api, "_site_sf_pairings", self.pairings),
+                  mock.patch.object(api, "SITE_SF_PACKAGE_VERSION_ID", PKG)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.org.secret = SECRET   # the org's receiver checks signatures
+
+    def start(self, as_user=OWNER, **body):
+        self.as_user(as_user)
+        out = call(api.site_sf_install_start, event("POST", I, wpath(), body))
+        self.as_user(OWNER)
+        return out
+
+    def status(self, as_user=OWNER):
+        self.as_user(as_user)
+        out = call(api.site_sf_install_status, event("GET", I, wpath()))
+        self.as_user(OWNER)
+        return out[1]["install"]
+
+    def pair(self, code, **over):
+        body = {"setup_code": code, "site_url": "https://acme.my.salesforce-sites.com/minutex",
+                "shared_secret": SECRET, "org_id": fso.ORG_ID, **over}
+        ev = event("POST", "/salesforce/pair", {}, body)
+        ev["headers"] = {}   # no JWT: the setup code is the credential
+        return call(api.site_sf_pair, ev)
+
+    def finish(self, **body):
+        return call(api.site_sf_install_connect, event("POST", I + "/connect", wpath(), body))
+
+    def test_install_link_and_a_one_time_code(self):
+        status, body = self.start()
+        self.assertEqual(status, 201, body)
+        inst = body["install"]
+        self.assertEqual(inst["status"], "waiting")
+        self.assertEqual(inst["install_url"],
+                         f"https://login.salesforce.com/packaging/installPackage.apexp?p0={PKG}")
+        self.assertRegex(inst["setup_code"], r"^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
+        self.assertTrue(self.start(sandbox=True)[1]["install"]["install_url"]
+                        .startswith("https://test.salesforce.com/"))
+        self.assertEqual(self.start(as_user=MEMBER)[0], 403, "owners/managers install")
+        self.assertNotIn("setup_code", self.status(as_user=MEMBER), "only admins see the code")
+        with mock.patch.object(api, "SITE_SF_PACKAGE_VERSION_ID", ""):
+            status, body = self.start()
+        self.assertEqual((status, body["code"]), (503, "install_unavailable"))
+
+    def test_salesforce_pairs_then_the_app_connects(self):
+        code = self.start()[1]["install"]["setup_code"]
+        self.assertEqual(self.finish()[1]["code"], "install_not_finished")
+        status, body = self.pair(code.lower().replace("-", ""))  # typed loosely
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["org_name"], "Acme Realty")
+        _, env = self.org.calls[-1]
+        self.assertEqual(env["action"], "org_info", "MinuteX verified the Site, signed")
+        inst = self.status()
+        self.assertEqual((inst["status"], inst["org_name"]), ("installed", "Acme Realty"))
+        self.assertNotIn("setup_code", inst)
+        self.assertEqual(self.pair(code)[1]["code"], "invalid_setup_code", "one use only")
+
+        status, body = self.finish()
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["connection"]["connected"])
+        self.assertEqual(body["connection"]["org_id"], fso.ORG_ID)
+        endpoint = self.t["site_endpoints"].get_item(Key={"workspace_id": ORG})["Item"]
+        self.assertEqual(endpoint["auth_mode"], "hmac_sha256")
+        self.assertEqual(api._site_secrets(endpoint)["hmac_secret"], SECRET)
+        self.assertEqual(self.status()["status"], "connected")
+        self.assertNotIn("secrets_enc", self.pairings.get_item(
+            Key={"pairing_key": api._pairing_key(code)})["Item"], "secret dropped once used")
+        self.drain()   # objects + people started by the connect
+        self.assertEqual(self.connection_row()["discovery"]["status"], "SYNCED")
+        self.assertTrue(self.t["people"].items, "people synced")
+
+    def test_refusals_are_clear(self):
+        code = self.start()[1]["install"]["setup_code"]
+        self.assertEqual(self.pair("ZZZZ-ZZZZ")[1]["code"], "invalid_setup_code")
+        self.assertEqual(self.pair(code, org_id="00D000000000000AAA")[1]["code"], "org_mismatch")
+        self.assertEqual(self.pair(code, shared_secret="short")[1]["code"], "setup_incomplete")
+        self.assertEqual(self.pair(code, site_url="https://evil.example.com/x")[1]["code"],
+                         "setup_incomplete")
+        self.org.faults = [("status", 503)] * 5
+        self.assertEqual(self.pair(code)[1]["code"], "site_unreachable")
+        self.org.faults = []
+        self.assertEqual(self.status()["status"], "waiting", "a refusal never consumes the code")
+        # A new start replaces the old code.
+        fresh = self.start()[1]["install"]["setup_code"]
+        self.assertEqual(self.pair(code)[1]["code"], "invalid_setup_code")
+        self.assertEqual(self.pair(fresh)[0], 200)
+
+    def test_an_expired_code_says_so(self):
+        code = self.start()[1]["install"]["setup_code"]
+        with mock.patch.object(api.time, "time", return_value=api.time.time() + 3600):
+            self.assertEqual(self.status()["status"], "expired")
+            self.assertEqual(self.pair(code)[1]["code"], "invalid_setup_code")
+
+    def test_installing_into_another_org_asks_before_switching(self):
+        code = self.start()[1]["install"]["setup_code"]
+        self.pair(code)
+        self.finish()
+        # Later the admin installs into a different org.
+        self.org.org_id = OTHER_SF_ORG
+        code = self.start()[1]["install"]["setup_code"]
+        self.assertEqual(self.pair(code, org_id=OTHER_SF_ORG)[0], 200)
+        status, body = self.finish()
+        self.assertEqual((status, body["code"]), (409, "org_mismatch"))
+        self.assertEqual(self.finish(allow_org_change=True)[0], 200)
+        self.assertEqual(self.connection_row()["org_id"], OTHER_SF_ORG)
 
 
 if __name__ == "__main__":

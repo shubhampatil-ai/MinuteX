@@ -770,6 +770,19 @@ class RecipientTests(IntegrationTestCase):
         self.assertIn("Neha Shah", msg)
         self.assertIn("Amit Patel", msg)
 
+    def test_a_contact_outside_the_meeting_can_be_included(self):
+        """The Share sheet adds people from contacts who were not in the
+        meeting. The route must keep accepting any contact the caller can
+        read — narrowing it to participants would silently break that."""
+        self.connect_gmail()
+        self.add_participant("0", CONTACT_RAHUL)
+        data = self.send_meeting({"recipients": [
+            {"contact_id": CONTACT_RAHUL}, {"contact_id": CONTACT_NEHA}]})
+        self.assertEqual(data["recipient_count"], 2)
+        to = self.last_message()["To"]
+        self.assertIn("rahul@example.com", to)
+        self.assertIn("neha@example.com", to)
+
     def test_duplicate_recipients_receive_one_email(self):
         self.connect_gmail()
         self.send_meeting({"recipients": [

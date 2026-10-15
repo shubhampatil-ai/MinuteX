@@ -98,6 +98,8 @@ class SelfTagHarness(unittest.TestCase):
                               self.t["participants"]),
             mock.patch.object(api, "_tasks", self.t["tasks"]),
             mock.patch.object(api, "_users", self.t["users"]),
+            mock.patch.object(api, "_meeting_access",
+                              self.t["meeting_access"]),
             mock.patch.object(api, "Key", fdb.Key),
             mock.patch.object(api, "_require_auth",
                               side_effect=lambda ev: self.current_user),

@@ -95,7 +95,8 @@ def is_claim_row(item):
     make email uniqueness atomic. It is not a user and must never be given a
     workspace — see _user_email_claim in the userApi.
     """
-    return str(item.get("user_id", "")).startswith("email#")
+    # "google#{sub}" rows (Google sign-in identity claims) are the same kind.
+    return str(item.get("user_id", "")).startswith(("email#", "google#"))
 
 
 def iter_users(users_table, only_user=None):

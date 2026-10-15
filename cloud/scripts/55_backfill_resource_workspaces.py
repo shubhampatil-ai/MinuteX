@@ -89,8 +89,7 @@ def is_claim_row(item, pk_attr):
     script would otherwise be one schema change away from corrupting one.
     """
     value = str(item.get(pk_attr, ""))
-    return value.startswith("name#") or value.startswith("email#") \
-        or value.startswith("idem#")
+    return value.startswith(("name#", "email#", "google#", "idem#"))
 
 
 def iter_rows(table, pk_attr):

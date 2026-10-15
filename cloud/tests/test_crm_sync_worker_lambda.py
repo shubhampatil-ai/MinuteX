@@ -150,3 +150,21 @@ class TestWorkerRoutingAndSecurity(WorkerHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWebhookJobsNeverUseTheQueueRetry(WorkerHarness):
+    """Webhook Contract v2: a retry is a FRESH delayed message sent by the
+    runner itself, never a batch item failure — the queue's maxReceiveCount
+    must not be able to DLQ a webhook still inside its attempt budget."""
+
+    def test_a_retrying_webhook_job_is_not_a_batch_item_failure(self):
+        job = {"job_id": "whk_1", "operation": api.SITE_OP_WEBHOOK_EVENT,
+               "status": api.CRM_JOB_STATUS_RETRYING}
+        with mock.patch.object(api, "_get_crm_sync_job", return_value=job), \
+                mock.patch.object(api, "_run_webhook_event_job",
+                                  return_value=job) as runner:
+            out = worker.lambda_handler({"Records": [sqs_record(
+                job_id="whk_1", operation=api.SITE_OP_WEBHOOK_EVENT)]}, None)
+        runner.assert_called_once_with(job)
+        self.assertEqual(out["batchItemFailures"], [])
+        self.sqs.change_message_visibility.assert_not_called()

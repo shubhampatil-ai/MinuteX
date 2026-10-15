@@ -444,19 +444,66 @@ ACCESS_EXPLICIT = "EXPLICIT"
 ACCESS_TYPES = (ACCESS_CREATOR, ACCESS_PARTICIPANT, ACCESS_EXPLICIT)
 
 
+# ACCESS LEVELS — what a PARTICIPANT grant lets its holder see, on the shared
+# read-only view and nowhere else. Every level is READ-ONLY; none is a write
+# permission, and FULL does not mean "full meeting ownership":
+#
+#     NONE   -> the recorder explicitly removed access. Stored, not deleted,
+#               so re-tagging the same person cannot silently re-grant it.
+#     NOTES  -> the meeting notes (overview / MoM / highlights / tasks).
+#     FULL   -> notes + transcript + audio. Still read-only.
+#
+# SECURITY INVARIANT: MeetingAccess is never general meeting authorization.
+# It is consumed only by the shared read-only route, so no level here can
+# reach the owner's recording route, MoM, tasks, participants or AI.
+ACCESS_LEVEL_NONE = "NONE"
+ACCESS_LEVEL_NOTES = "NOTES"
+ACCESS_LEVEL_FULL = "FULL"
+ACCESS_LEVELS = (ACCESS_LEVEL_NONE, ACCESS_LEVEL_NOTES, ACCESS_LEVEL_FULL)
+
+
+def coerce_access_level(value):
+    """A stored/requested level, upper-cased, or raise for anything else.
+
+    Case-insensitive because the app speaks lower-case ("notes") while rows
+    store the constant. An unknown value is rejected rather than defaulted:
+    guessing a level is guessing an authorization.
+    """
+    level = str(value or "").strip().upper()
+    if level not in ACCESS_LEVELS:
+        raise WorkspaceValidationError(
+            f"level must be one of {', '.join(l.lower() for l in ACCESS_LEVELS)}")
+    return level
+
+
+def grant_level(row):
+    """The effective level of a MeetingAccess row. NONE for no row.
+
+    A legacy row without access_level reads as NOTES — the narrowest level
+    that still grants anything — never as FULL.
+    """
+    if not row:
+        return ACCESS_LEVEL_NONE
+    level = str(row.get("access_level") or ACCESS_LEVEL_NOTES).upper()
+    return level if level in ACCESS_LEVELS else ACCESS_LEVEL_NONE
+
+
 def role_sees_all_meetings(role):
     """True for the roles that may read every meeting in their workspace."""
     return role_can(role, CAP_VIEW_ALL_MEETINGS)
 
 
 def new_meeting_access(meeting_id, user_id, access_type, now_iso,
-                       workspace_id="", granted_by=""):
+                       workspace_id="", granted_by="", access_level=""):
     item = {
         "meeting_id": meeting_id,
         "user_id": user_id,
         "access_type": access_type,
         "created_at": now_iso,
+        "updated_at": now_iso,
     }
+    if access_level:
+        item["access_level"] = access_level
     if workspace_id:
         item["workspace_id"] = workspace_id
     if granted_by:

@@ -243,7 +243,7 @@ class PeopleTests(unittest.TestCase):
         self.assertEqual(p["status"], "inactive")
 
     def test_rejects_unstorable_rows(self):
-        for bad in (None, "x", {}, {"provider": "salesforce", "type": "lead",
+        for bad in (None, "x", {}, {"provider": "salesforce", "type": "account",
                                     "external_id": "1", "name": "n"},
                     {"provider": "Sales Force", "type": "contact",
                      "external_id": "1", "name": "n"},
@@ -252,6 +252,12 @@ class PeopleTests(unittest.TestCase):
                     {"provider": "salesforce", "type": "contact",
                      "external_id": "003", "name": "", "email": ""}):
             self.assertIsNone(sc.normalize_person(bad), bad)
+
+    def test_leads_are_people(self):
+        # Live people search returns Leads alongside Contacts and Users.
+        p = sc.normalize_person({"provider": "salesforce", "type": "lead",
+                                 "external_id": "00Q000000000000001", "name": "Rahul"})
+        self.assertEqual(p["person_key"], "salesforce#lead#00Q000000000000001")
 
 
 if __name__ == "__main__":

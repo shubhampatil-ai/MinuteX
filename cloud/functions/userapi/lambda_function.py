@@ -10038,6 +10038,16 @@ ELEVENLABS_WEBHOOK_TOLERANCE = int(
 STT_WEBHOOK_EVENT = "speech_to_text_transcription"
 STT_METADATA_VERSION = 1
 
+# What ElevenLabs sends INSTEAD of a transcript when it cannot transcribe the
+# audio (seen in production for an undecodable .aac, 2026-10-17). It is not in
+# their published docs, so its payload shape is unverified: the handler logs a
+# summary of whatever arrives and only fails a row it can positively match.
+STT_ERROR_EVENT = "webhook_error"
+
+# Payload fields that plausibly carry the failure reason. Only these are ever
+# logged or stored — never the payload wholesale.
+_STT_ERROR_FIELDS = ("error", "message", "detail", "status", "code", "reason")
+
 # The completion event transcribeRecording's second entry point expects.
 STT_COMPLETED_EVENT = "stt.completed"
 
@@ -10217,6 +10227,8 @@ def stt_webhook(event):
 
     # 2. Payload structure/version.
     event_type = str(data.get("type") or "")
+    if event_type == STT_ERROR_EVENT:
+        return _stt_webhook_error_event(data)
     if event_type != STT_WEBHOOK_EVENT:
         # Another webhook type on the same URL is not an error worth retrying.
         print(f"[stt-webhook] ignoring event type {event_type!r}")
@@ -10353,18 +10365,84 @@ def _stt_webhook_failure(key, request_id, payload):
     the same staleness rule as a success — an old job's failure must not fail a
     recording that has since been re-queued and may be transcribing fine.
     """
-    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item") or {}
+    item = _recordings.get_item(Key={"audio_s3_key": key}).get("Item")
+    if not item:
+        # update_item on a missing key would CREATE a row — a ghost recording
+        # with nothing but status/error on it.
+        print(f"[stt-webhook] FAILURE for unknown recording {key} ignored")
+        return _resp(200, {"ignored": True, "reason": "unknown recording"})
     stored = str(item.get("stt_request_id") or "")
-    if stored and stored != request_id:
+    if stored != request_id:
+        # Same rule as a success: only the job the row is waiting on may end
+        # it. An old job's failure must not fail a re-queued recording.
         print(f"[stt-webhook] stale FAILURE for {key} ignored "
-              f"({request_id} != {stored})")
+              f"({request_id!r} != {stored!r})")
         return _resp(200, {"ignored": True, "reason": "stale request_id"})
+    if item.get("stt_completed_request_id") == request_id:
+        # The transcript for this very job already landed; a failure report
+        # arriving after it must not undo a finished meeting.
+        print(f"[stt-webhook] FAILURE for {key} ignored — {request_id} was "
+              f"already delivered")
+        return _resp(200, {"ignored": True, "reason": "already delivered"})
 
-    detail = (str(payload.get("error") or payload.get("message")
-                  or payload.get("status") or "transcription failed"))[:1000]
+    detail = _stt_failure_detail(payload)
     _update_recording_fields(key, {"status": "failed", "error": detail})
     print(f"[stt-webhook] transcription FAILED for {key}: {detail}")
     return _resp(200, {"accepted": True, "failed": True})
+
+
+def _stt_failure_detail(payload):
+    """A short, human-readable failure reason from a provider payload."""
+    for field in ("error", "message", "detail", "reason", "status"):
+        value = payload.get(field)
+        if isinstance(value, dict):
+            value = (value.get("message") or value.get("detail")
+                     or value.get("status") or value.get("code"))
+        if value and isinstance(value, (str, int, float)):
+            return str(value)[:1000]
+    return "transcription failed"
+
+
+def _stt_error_summary(data):
+    """What an error event contained, safe to log: its keys and error fields.
+
+    The event's shape is undocumented, so the first production delivery is how
+    we learn it — but a payload is never logged wholesale.
+    """
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    found = {}
+    for source in (data, payload):
+        for field in _STT_ERROR_FIELDS:
+            value = source.get(field)
+            if value not in (None, "", {}, []):
+                found[field] = str(value)[:300]
+    return (f"keys={sorted(data)} data_keys={sorted(payload)} "
+            f"request_id={str(payload.get('request_id') or '')!r} "
+            f"errors={found}")
+
+
+def _stt_webhook_error_event(data):
+    """ElevenLabs reported a job it could not transcribe (STT_ERROR_EVENT).
+
+    Fails the row through _stt_webhook_failure — with all its staleness guards
+    — when the event names our job (webhook_metadata + request_id). When it
+    does not, there is nothing safe to act on: it is logged and acknowledged,
+    and the row stays reconcilable. Always 200: a retry cannot make the audio
+    transcribable.
+    """
+    print(f"[stt-webhook] {STT_ERROR_EVENT}: {_stt_error_summary(data)}")
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    request_id = str(payload.get("request_id") or "").strip()
+    try:
+        key, _ = _stt_webhook_metadata(payload)
+    except ApiError as err:
+        print(f"[stt-webhook] {STT_ERROR_EVENT} not matched to a job: "
+              f"{err.message}")
+        return _resp(200, {"ignored": True, "reason": "unmatched error event"})
+    if not request_id:
+        print(f"[stt-webhook] {STT_ERROR_EVENT} for {key} has no request_id")
+        return _resp(200, {"ignored": True, "reason": "unmatched error event"})
+    return _stt_webhook_failure(key, request_id, payload)
 
 
 def _release_stt_claim(key):
